@@ -165,28 +165,24 @@ class BybitExchange(ExchangePyBase):
         )
         return trade_base_fee
 
-    async def _place_order(self,
+     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
                            amount: Decimal,
                            trade_type: TradeType,
-                           order_type: OrderType.LIMIT,
+                           order_type: "LIMIT",
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
-        type_str = "LIMIT"
+        #type_str = self.bybit_order_type(order_type)
 
         side_str = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "qty": amount_str,
-                      "type": type_str,
+                      "type": "LIMIT",
                       "orderLinkId": order_id}
-        #if order_type != OrderType.MARKET:
-        #    api_params["price"] = f"{price:f}"
-        #if order_type == OrderType.LIMIT:
-        #    api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
         api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
 
         order_result = await self._api_post(
