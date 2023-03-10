@@ -181,13 +181,13 @@ class BybitExchange(ExchangePyBase):
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "qty": amount_str,
-                      "type": type_str,
+                      "type": "LIMIT",
                       "orderLinkId": order_id}
-        if order_type != OrderType.MARKET:
-            api_params["price"] = f"{price:f}"
-        if order_type == OrderType.LIMIT:
-            api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
-
+        #if order_type != OrderType.MARKET:
+        #    api_params["price"] = f"{price:f}"
+        #if order_type == OrderType.LIMIT:
+        #    api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
+        api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
