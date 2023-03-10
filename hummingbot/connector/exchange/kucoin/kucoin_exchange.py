@@ -102,7 +102,7 @@ class KucoinExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
+        return [OrderType.LIMIT, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         pairs_prices = await self._api_get(path_url=CONSTANTS.ALL_TICKERS_PATH_URL)
