@@ -433,7 +433,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                                     f"with amount {quantized_order_amount}, "
                                     f"and profitability {best_profitability}")
             # get OrderTypes
-            buy_order_type = buy_market_trading_pair_tuple.market.get_taker_order_type()
+            buy_order_type = "LIMIT"
             sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
 
             # Set limit order expiration_seconds to _next_trade_delay for connectors that require order expiration for limit orders
