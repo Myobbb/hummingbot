@@ -199,7 +199,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             tracked_limit_orders = self.tracked_limit_orders
             tracked_market_orders = self.tracked_market_orders
 
-            if 1 = 2:
+            if 1 == 2:
                 print("oh my hod the humanity")
             else:
                 lines.extend(["", "  No pending limit orders."])
