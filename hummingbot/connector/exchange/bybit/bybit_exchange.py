@@ -111,7 +111,7 @@ class BybitExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT, OrderType.LIMIT]
+        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -180,13 +180,13 @@ class BybitExchange(ExchangePyBase):
         return trade_base_fee
 
     async def _place_order(self,
-                           order_id: str,
-                           trading_pair: str,
-                           amount: Decimal,
-                           trade_type: TradeType,
-                           order_type: OrderType,
-                           price: Decimal,
-                           **kwargs) -> Tuple[str, float]:
+                       order_id: str,
+                       trading_pair: str,
+                       amount: Decimal,
+                       trade_type: TradeType,
+                       order_type: OrderType,
+                       price: Decimal,
+                       **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
         type_str = self.bybit_order_type(order_type)
 
@@ -202,6 +202,11 @@ class BybitExchange(ExchangePyBase):
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
 
+        # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
+        if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
+            qty = float(amount_str) / float(price)
+            api_params["qty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
+
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
@@ -213,6 +218,7 @@ class BybitExchange(ExchangePyBase):
         o_id = str(order_result["result"]["orderId"])
         transact_time = int(order_result["result"]["transactTime"]) * 1e-3
         return (o_id, transact_time)
+
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         api_params = {}
