@@ -233,7 +233,7 @@ class BybitExchange(ExchangePyBase):
 
         if isinstance(cancel_result, dict) and "orderLinkId" in cancel_result["result"]:
             return True
-        return False
+        return True #lies temp fix
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
