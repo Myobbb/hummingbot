@@ -180,13 +180,13 @@ class BybitExchange(ExchangePyBase):
         return trade_base_fee
 
     async def _place_order(self,
-                       order_id: str,
-                       trading_pair: str,
-                       amount: Decimal,
-                       trade_type: TradeType,
-                       order_type: OrderType,
-                       price: Decimal,
-                       **kwargs) -> Tuple[str, float]:
+                           order_id: str,
+                           trading_pair: str,
+                           amount: Decimal,
+                           trade_type: TradeType,
+                           order_type: OrderType,
+                           price: Decimal,
+                           **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
         type_str = self.bybit_order_type(order_type)
 
@@ -204,7 +204,7 @@ class BybitExchange(ExchangePyBase):
 
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
-            qty = float(amount_str) / float(price)
+            qty = float(amount_str) * float(price)
             api_params["qty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
 
         order_result = await self._api_post(
