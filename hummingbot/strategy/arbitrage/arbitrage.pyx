@@ -199,17 +199,14 @@ cdef class ArbitrageStrategy(StrategyBase):
             tracked_limit_orders = self.tracked_limit_orders
             tracked_market_orders = self.tracked_market_orders
 
-            if len(tracked_limit_orders) > 0 or len(tracked_market_orders) > 0:
-                tracked_limit_orders_df = self.tracked_limit_orders_data_frame
+            if len(tracked_market_orders) > 0:
+                
                 tracked_market_orders_df = self.tracked_market_orders_data_frame
-                df_limit_lines = (str(tracked_limit_orders_df).split("\n")
-                                  if len(tracked_limit_orders) > 0
-                                  else list())
+                
                 df_market_lines = (str(tracked_market_orders_df).split("\n")
                                    if len(tracked_market_orders) > 0
                                    else list())
-                lines.extend(["", "  Pending limit orders:"] +
-                             ["    " + line for line in df_limit_lines] +
+                lines.extend(["", "  Pending market orders:"] +
                              ["    " + line for line in df_market_lines])
             else:
                 lines.extend(["", "  No pending limit orders."])
