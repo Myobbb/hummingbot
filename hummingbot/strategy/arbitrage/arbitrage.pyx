@@ -199,14 +199,17 @@ cdef class ArbitrageStrategy(StrategyBase):
             tracked_limit_orders = self.tracked_limit_orders
             tracked_market_orders = self.tracked_market_orders
 
-            if len(tracked_market_orders) > 0:
-                
+            if len(tracked_limit_orders) > 0 or len(tracked_market_orders) > 0:
+                tracked_limit_orders_df = self.tracked_limit_orders_data_frame
                 tracked_market_orders_df = self.tracked_market_orders_data_frame
-                
+                df_limit_lines = (str(tracked_limit_orders_df).split("\n")
+                                  if len(tracked_limit_orders) > 0
+                                  else list())
                 df_market_lines = (str(tracked_market_orders_df).split("\n")
                                    if len(tracked_market_orders) > 0
                                    else list())
-                lines.extend(["", "  Pending market orders:"] +
+                lines.extend(["", "  Pending limit orders:"] +
+                             ["    " + line for line in df_limit_lines] +
                              ["    " + line for line in df_market_lines])
             else:
                 lines.extend(["", "  No pending limit orders."])
@@ -349,9 +352,8 @@ cdef class ArbitrageStrategy(StrategyBase):
 
         for market_trading_pair_tuple in market_trading_pair_tuples:
             # Do not continue if there are pending limit order
-            #if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
-            #    return False
-  
+            if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
+                return False
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
             if market_trading_pair_tuple in self._last_trade_timestamps and ready_to_trade_time > self._current_timestamp:
