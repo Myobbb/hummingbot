@@ -46,7 +46,7 @@ ORDER_STATE = {
     "FILLED": OrderState.FILLED,
     #"PARTIALLYFILLEDCANCELED": OrderState.FILLED,  #not aplicable for v1, can use when switch to v3/v5
     "PENDING_CANCEL": OrderState.CANCELED,
-    "CANCELED": OrderState.CANCELED,
+    "CANCELED": OrderState.FILLED, #PARTIALLYFILLEDCANCELED come across as canceled for market buy orders in v1
     "REJECTED": OrderState.FAILED,
 }
 
