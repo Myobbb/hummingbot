@@ -42,10 +42,10 @@ ORDER_PATH_URL = "/spot/v1/order"
 ORDER_STATE = {
     "PENDING": OrderState.PENDING_CREATE,
     "NEW": OrderState.OPEN,
-    "PARTIALLY_FILLED": OrderState.FILLED,
+    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "FILLED": OrderState.FILLED,
-    "PARTIALLYFILLEDCANCELED": OrderState.FILLED,
-    "PENDING_CANCEL": OrderState.PENDING_CANCEL,
+    #"PARTIALLYFILLEDCANCELED": OrderState.FILLED,  #not aplicable for v1, can use when switch to v3/v5
+    "PENDING_CANCEL": OrderState.CANCELED,
     "CANCELED": OrderState.CANCELED,
     "REJECTED": OrderState.FAILED,
 }
