@@ -298,7 +298,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                 self.log_with_clock(logging.INFO,
                                     f"Limit order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} sell limit order completed on {market_trading_pair_tuple[0].name}")
-    
+
     cdef c_did_cancel_order(self, object cancel_event):
         """
         Output log for cancelled order.
@@ -311,7 +311,6 @@ cdef class ArbitrageStrategy(StrategyBase):
         if market_trading_pair_tuple is not None:
             self.log_with_clock(logging.INFO,
                                 f"Market order canceled on {market_trading_pair_tuple[0].name}: {order_id}")
-    
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair):
         """
@@ -353,8 +352,8 @@ cdef class ArbitrageStrategy(StrategyBase):
 
         for market_trading_pair_tuple in market_trading_pair_tuples:
             # Do not continue if there are pending limit order
-            #if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
-            #    return False
+            if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
+                return False
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
             if market_trading_pair_tuple in self._last_trade_timestamps and ready_to_trade_time > self._current_timestamp:
