@@ -298,19 +298,20 @@ cdef class ArbitrageStrategy(StrategyBase):
                 self.log_with_clock(logging.INFO,
                                     f"Limit order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} sell limit order completed on {market_trading_pair_tuple[0].name}")
-
+    """
     cdef c_did_cancel_order(self, object cancel_event):
-        """
+        
         Output log for cancelled order.
 
         :param cancel_event: Order cancelled event.
-        """
+        
         cdef:
             str order_id = cancel_event.order_id
             object market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
         if market_trading_pair_tuple is not None:
             self.log_with_clock(logging.INFO,
                                 f"Market order canceled on {market_trading_pair_tuple[0].name}: {order_id}")
+    """
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair):
         """
