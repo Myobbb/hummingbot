@@ -180,7 +180,7 @@ class BybitExchange(ExchangePyBase):
         return trade_base_fee
 
     async def _place_order(self,
-                           order_id: str,
+                           #order_id: str,  #removing for now, testing
                            trading_pair: str,
                            amount: Decimal,
                            trade_type: TradeType,
