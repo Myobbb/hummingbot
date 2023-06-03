@@ -46,7 +46,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                     min_profitability: Decimal,
                     logging_options: int = OPTION_LOG_ORDER_COMPLETED,
                     status_report_interval: float = 60.0,
-                    next_trade_delay_interval: float = 15.0,
+                    next_trade_delay_interval: float = 5.0,
                     failed_order_tolerance: int = 1,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
