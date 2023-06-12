@@ -32,10 +32,11 @@ EXCHANGE_INFO_PATH_URL = "/spot/v1/symbols"
 SNAPSHOT_PATH_URL = "/spot/quote/v1/depth"
 SERVER_TIME_PATH_URL = "/spot/v1/time"
 
-# Private API endpoints
+# Private API endpoints or BinanceClient function
 ACCOUNTS_PATH_URL = "/spot/v1/account"
 MY_TRADES_PATH_URL = "/spot/v1/myTrades"
 ORDER_PATH_URL = "/spot/v1/order"
+# BINANCE_USER_STREAM_PATH_URL = "/userDataStream"
 
 # Order States
 ORDER_STATE = {
@@ -43,8 +44,9 @@ ORDER_STATE = {
     "NEW": OrderState.OPEN,
     "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "FILLED": OrderState.FILLED,
-    "PENDING_CANCEL": OrderState.PENDING_CANCEL,
-    "CANCELED": OrderState.CANCELED,
+    #"PARTIALLYFILLEDCANCELED": OrderState.FILLED,  #not aplicable for v1, can use when switch to v3/v5
+    "PENDING_CANCEL": OrderState.CANCELED,
+    "CANCELED": OrderState.FILLED, #PARTIALLYFILLEDCANCELED come across as canceled for market buy orders in v1
     "REJECTED": OrderState.FAILED,
 }
 
