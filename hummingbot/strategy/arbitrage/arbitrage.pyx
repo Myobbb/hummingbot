@@ -425,7 +425,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         #filtering min order amount      
         if quantized_sell_amount & quantized_buy_amount < 1.1:
-            break
+            return
             
         if quantized_order_amount:
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
