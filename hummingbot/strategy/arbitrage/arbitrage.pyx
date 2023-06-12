@@ -422,7 +422,11 @@ cdef class ArbitrageStrategy(StrategyBase):
         quantized_buy_amount = buy_market.c_quantize_order_amount(buy_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
         quantized_sell_amount = sell_market.c_quantize_order_amount(sell_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
         quantized_order_amount = min(quantized_buy_amount, quantized_sell_amount)
-
+        
+        #filtering min order amount      
+        if quantized_sell_amount & quantized_buy_amount < 1.1:
+            break
+            
         if quantized_order_amount:
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                 self.log_with_clock(logging.INFO,
