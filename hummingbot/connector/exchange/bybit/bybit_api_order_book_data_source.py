@@ -219,31 +219,30 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 json_msg = await message_queue.get()
-
-                # Logging the receipt of a new message
                 self.logger().info(f"Received new order book snapshot message for processing: {json_msg}")
 
-                # Extract the trading pair from the new data format
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                     symbol=json_msg["data"]["s"])
 
-                # Extract bids and asks from the new data format
-                bids = json_msg["data"]["b"]
-                asks = json_msg["data"]["a"]
+                # Construct the message in the expected format
+                msg = {
+                    "trading_pair": trading_pair,
+                    "t": json_msg["data"]["t"],
+                    "b": json_msg["data"]["b"],
+                    "a": json_msg["data"]["a"]
+                }
 
-                # Construct the OrderBookMessage with the bids and asks
+                # Construct the OrderBookMessage with the formatted msg
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
-                    bids, asks, {"trading_pair": trading_pair})
+                    msg, timestamp=json_msg["data"]["t"], metadata={"trading_pair": trading_pair})
 
                 snapshot_queue.put_nowait(order_book_message)
                 self.logger().info(f"Processed and queued order book snapshot for {trading_pair}")
 
-            except asyncio.CancelledError:
-                raise
             except Exception as e:
-                # Logging the error details
                 self.logger().error(f"Unexpected error when processing public order book updates from exchange: {e}", exc_info=True)
                 raise
+
 
 
 
