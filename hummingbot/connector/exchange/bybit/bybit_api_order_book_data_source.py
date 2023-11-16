@@ -163,10 +163,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_payload = {
                     "op": "subscribe",
-                    "topic": f"orderbook.40.{symbol}",
-                    "params": {
-                        "binary": False
-                    }
+                    "args": f"orderbook.50.{symbol}"
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
