@@ -206,12 +206,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             event_type = data.get("type")
             if event_type == CONSTANTS.SNAPSHOT_EVENT_TYPE:
-                #if data.get("f"):
-                self.logger().info(f"got event type diff_event_type {event_type}...")
+                
+                
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
             else:
                     self.logger().info(f"non diff_event_type - {event_type}...")
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    #self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
             
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
@@ -219,12 +219,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 json_msg = await message_queue.get()
-                self.logger().info(f"Received new order book snapshot message for processing: {json_msg}")
+                
 
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                     symbol=json_msg["data"]["s"])
 
-                # Construct the message in the expected format
+         
                 msg = {
                     "trading_pair": trading_pair,
                     "t": json_msg["data"]["t"],
@@ -232,12 +232,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "a": json_msg["data"]["a"]
                 }
 
-                # Construct the OrderBookMessage with the formatted msg
+
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
                     msg, timestamp=json_msg["data"]["t"], metadata={"trading_pair": trading_pair})
 
                 snapshot_queue.put_nowait(order_book_message)
-                self.logger().info(f"Processed and queued order book snapshot for {trading_pair}")
+                
 
             except Exception as e:
                 self.logger().error(f"Unexpected error when processing public order book updates from exchange: {e}", exc_info=True)
