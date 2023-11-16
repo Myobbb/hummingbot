@@ -1,7 +1,6 @@
 import asyncio
 import time
 from collections import defaultdict
-import json
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import hummingbot.connector.exchange.bybit.bybit_constants as CONSTANTS
@@ -162,17 +161,17 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                self.logger().info(f"Subscribing to {symbol}...")
                 trade_payload = {
                     "op": "subscribe",
-                    "topic": f"orderbook.50.{symbol}",
+                    "args": f"orderbook.50.{symbol}",
                     "params": {
                         "binary": False
                     }
                 }
-                #subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
-                self.logger().info(f"Subscribing{symbol}...")
-                await ws.send(json.dumps({"op": "subscribe", "args": f"orderbook.50.{symbol}"}))
-                #await ws.send(subscribe_trade_request)
+                subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
+
+                await ws.send(subscribe_trade_request)
 
                 """
                 depth_payload = {
