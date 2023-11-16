@@ -18,6 +18,9 @@ REST_URLS = {"bybit_main": "https://api.bybit.com",
 WSS_V1_PUBLIC_URL = {"bybit_main": "wss://stream.bybit.com/spot/quote/ws/v1",
                      "bybit_testnet": "wss://stream-testnet.bybit.com/spot/quote/ws/v1"}
 
+WSS_V5_PUBLIC_URL = {"bybit_main": "wss://stream.bybit.com/v5/public/spot",
+                     "bybit_testnet": "wss://stream-testnet.bybit.com/spot/quote/ws/v1"}
+
 WSS_PRIVATE_URL = {"bybit_main": "wss://stream.bybit.com/spot/ws",
                    "bybit_testnet": "wss://stream-testnet.bybit.com/spot/ws"}
 
@@ -27,10 +30,10 @@ TRADE_EVENT_TYPE = "trade"
 SNAPSHOT_EVENT_TYPE = "depth"
 
 # Public API endpoints
-LAST_TRADED_PRICE_PATH = "/spot/quote/v1/ticker/price"
-EXCHANGE_INFO_PATH_URL = "/spot/v1/symbols"
-SNAPSHOT_PATH_URL = "/spot/quote/v1/depth"
-SERVER_TIME_PATH_URL = "/spot/v1/time"
+LAST_TRADED_PRICE_PATH = "/spot/v3/public/quote/ticker/price"
+EXCHANGE_INFO_PATH_URL = "/spot/v3/public/symbols"
+SNAPSHOT_PATH_URL = "/spot/v3/public/quote/depth"
+SERVER_TIME_PATH_URL = "/v3/public/time"
 
 # Private API endpoints or BinanceClient function
 ACCOUNTS_PATH_URL = "/spot/v1/account"
