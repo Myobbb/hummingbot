@@ -209,9 +209,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-            else:
-                    self.logger().info(f"non diff_event_type - {event_type}...")
-                    self.logger().info(f"data - {data}...")
+            #else:
+                    #self.logger().info(f"non diff_event_type - {event_type}...")
+                    #self.logger().info(f"data - {data}...")
                     #self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
             
 
