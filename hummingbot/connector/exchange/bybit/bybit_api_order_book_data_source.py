@@ -162,7 +162,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_payload = {
-                    "topic": "trade",
+                    "topic": "orderbook",
                     "event": "sub",
                     "symbol": symbol,
                     "params": {
@@ -171,6 +171,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
+                await ws.send(subscribe_trade_request)
+
+                """
                 depth_payload = {
                     "topic": "diffDepth",
                     "event": "sub",
@@ -181,9 +184,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
 
-                await ws.send(subscribe_trade_request)
+                
                 await ws.send(subscribe_orderbook_request)
-
+                """
                 self.logger().info(f"Subscribed to public order book and trade channels of {trading_pair}...")
         except asyncio.CancelledError:
             raise
@@ -199,7 +202,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = ws_response.data
             if data.get("msg") == "Success":
                 continue
-            event_type = data.get("topic")
+            event_type = data.get("type")
             if event_type == CONSTANTS.DIFF_EVENT_TYPE:
                 if data.get("f"):
                     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
