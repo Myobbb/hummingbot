@@ -141,7 +141,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except asyncio.TimeoutError:
                         ping_time = self._time()
                         payload = {
-                            "ping": int(ping_time * 1e3)
+                            "op": "ping"
                         }
                         ping_request = WSJSONRequest(payload=payload)
                         await ws.send(request=ping_request)
