@@ -2,7 +2,6 @@ import asyncio
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
-import json
 
 import hummingbot.connector.exchange.bybit.bybit_constants as CONSTANTS
 from hummingbot.connector.exchange.bybit import bybit_web_utils as web_utils
@@ -162,21 +161,16 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                
                 trade_payload = {
                     "op": "subscribe",
-                    "args": f"orderbook.50.{symbol}",
+                    "args": [
+        f"orderbook.40.{symbol}"
+    ],
                     "params": {
                         "binary": False
                     }
                 }
-                #subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
-                self.logger().info(f"Subscribing to {symbol}...")
-                await ws.send(json.dumps({"op": "subscribe", "args": f"orderbook.50.{symbol}", "params": {
-                        "binary": False
-                    } }))
-                #await ws.send(subscribe_trade_request)
-
+                subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
                 """
                 depth_payload = {
                     "topic": "diffDepth",
@@ -187,10 +181,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     }
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
-
-                
-                await ws.send(subscribe_orderbook_request)
                 """
+                await ws.send(subscribe_trade_request)
+               # await ws.send(subscribe_orderbook_request)
+
                 self.logger().info(f"Subscribed to public order book and trade channels of {trading_pair}...")
         except asyncio.CancelledError:
             raise
@@ -204,17 +198,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = ws_response.data
-            self.logger().info(f"Got bybit data: {data}...")
             if data.get("msg") == "Success":
                 continue
             event_type = data.get("type")
             if event_type == CONSTANTS.DIFF_EVENT_TYPE:
-                if data.get("f"):
-                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                else:
+                #if data.get("f"):
+                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+            else:
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-            elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
-                self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
+            
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
