@@ -172,7 +172,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }
                 #subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
                 self.logger().info(f"Subscribing to {symbol}...")
-                ws.send(json.dumps({"op": "subscribe", "args": f"orderbook.50.{symbol}"}))
+                await ws.send(json.dumps({"op": "subscribe", "args": f"orderbook.50.{symbol}"}))
                 #await ws.send(subscribe_trade_request)
 
                 """
