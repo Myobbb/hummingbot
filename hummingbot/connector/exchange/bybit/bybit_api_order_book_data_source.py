@@ -209,9 +209,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 #if data.get("f"):
                 self.logger().info(f"got event type diff_event_type {event_type}...")
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-            else:
-                    self.logger().info(f"non diff_event_type - {event_type}...")
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+            #else:
+             #       self.logger().info(f"non diff_event_type - {event_type}...")
+            #        self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
             
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
@@ -219,6 +219,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 json_msg = await message_queue.get()
+
+                # Logging the receipt of a new message
+                self.logger().info(f"Received new order book snapshot message for processing: {json_msg}")
 
                 # Extract the trading pair from the new data format
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
@@ -233,12 +236,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     bids, asks, {"trading_pair": trading_pair})
 
                 snapshot_queue.put_nowait(order_book_message)
+                self.logger().info(f"Processed and queued order book snapshot for {trading_pair}")
 
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().error("Unexpected error when processing public order book updates from exchange")
+            except Exception as e:
+                # Logging the error details
+                self.logger().error(f"Unexpected error when processing public order book updates from exchange: {e}", exc_info=True)
                 raise
+
 
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
