@@ -15,14 +15,14 @@ TIME_IN_FORCE_GTC = "GTC"
 REST_URLS = {"bybit_main": "https://api.bybit.com",
              "bybit_testnet": "https://api-testnet.bybit.com"}
 
-WSS_V1_PUBLIC_URL = {"bybit_main": "wss://stream.bybit.com/v5/public/spot",
+WSS_V1_PUBLIC_URL = {"bybit_main": "wss://stream.bybit.com/spot/public/v3",
                      "bybit_testnet": "wss://stream-testnet.bybit.com/spot/quote/ws/v1"}
 
 WSS_PRIVATE_URL = {"bybit_main": "wss://stream.bybit.com/spot/ws",
                    "bybit_testnet": "wss://stream-testnet.bybit.com/spot/ws"}
 
 # Websocket event types
-DIFF_EVENT_TYPE = "delta"
+DIFF_EVENT_TYPE = "snapshot"
 TRADE_EVENT_TYPE = "trade"
 SNAPSHOT_EVENT_TYPE = "snapshot"
 
