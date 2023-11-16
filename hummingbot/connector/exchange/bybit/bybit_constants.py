@@ -29,7 +29,7 @@ SNAPSHOT_EVENT_TYPE = "depth"
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/spot/quote/v1/ticker/price"
 EXCHANGE_INFO_PATH_URL = "/spot/v1/symbols"
-  SNAPSHOT_PATH_URL = "/spot/quote/v1/depth"
+SNAPSHOT_PATH_URL = "/spot/quote/v1/depth"
 SERVER_TIME_PATH_URL = "/spot/v1/time"
 
 # Private API endpoints or BinanceClient function
