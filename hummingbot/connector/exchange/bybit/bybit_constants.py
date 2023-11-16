@@ -22,9 +22,9 @@ WSS_PRIVATE_URL = {"bybit_main": "wss://stream.bybit.com/spot/ws",
                    "bybit_testnet": "wss://stream-testnet.bybit.com/spot/ws"}
 
 # Websocket event types
-DIFF_EVENT_TYPE = "diffDepth"
+DIFF_EVENT_TYPE = "delta"
 TRADE_EVENT_TYPE = "trade"
-SNAPSHOT_EVENT_TYPE = "depth"
+SNAPSHOT_EVENT_TYPE = "snapshot"
 
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/spot/quote/v1/ticker/price"
