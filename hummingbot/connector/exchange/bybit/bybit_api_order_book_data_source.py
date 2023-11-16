@@ -202,9 +202,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             event_type = data.get("type")
             if event_type == CONSTANTS.DIFF_EVENT_TYPE:
-                #if data.get("f"):
+         
+                self.logger().info(f"got event type diff_event_type {event_type}...")
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
             else:
+                    self.logger().info(f"non diff_event_type -  {event_type}...")
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
             
 
