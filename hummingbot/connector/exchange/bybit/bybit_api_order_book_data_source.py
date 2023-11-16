@@ -162,9 +162,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_payload = {
-                    "topic": "orderbook",
-                    "event": "sub",
-                    "symbol": symbol,
+                    "op": "subscribe",
+                    "topic": f"orderbook.40.{symbol}",
                     "params": {
                         "binary": False
                     }
