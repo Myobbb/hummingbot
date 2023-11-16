@@ -22,7 +22,7 @@ WSS_PRIVATE_URL = {"bybit_main": "wss://stream.bybit.com/spot/ws",
                    "bybit_testnet": "wss://stream-testnet.bybit.com/spot/ws"}
 
 # Websocket event types
-DIFF_EVENT_TYPE = "snapshot"
+DIFF_EVENT_TYPE = "Diffna"
 TRADE_EVENT_TYPE = "trade"
 SNAPSHOT_EVENT_TYPE = "snapshot"
 
