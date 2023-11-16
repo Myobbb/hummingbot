@@ -88,13 +88,14 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trade_message: OrderBookMessage = BybitOrderBook.trade_message_from_exchange(
                 trades, {"trading_pair": trading_pair})
             message_queue.put_nowait(trade_message)
-
+    """
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["symbol"])
         for diff_message in raw_message["data"]:
             order_book_message: OrderBookMessage = BybitOrderBook.diff_message_from_exchange(
                 diff_message, diff_message["t"], {"trading_pair": trading_pair})
             message_queue.put_nowait(order_book_message)
+    """
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
@@ -202,11 +203,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             event_type = data.get("type")
             if event_type == CONSTANTS.DIFF_EVENT_TYPE:
-         
+                #if data.get("f"):
                 self.logger().info(f"got event type diff_event_type {event_type}...")
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
             else:
-                    self.logger().info(f"non diff_event_type -  {event_type}...")
+                    self.logger().info(f"non diff_event_type - {event_type}...")
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
             
 
@@ -215,16 +216,27 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 json_msg = await message_queue.get()
+
+                # Extract the trading pair from the new data format
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                    symbol=json_msg["symbol"])
+                    symbol=json_msg["data"]["s"])
+
+                # Extract bids and asks from the new data format
+                bids = json_msg["data"]["b"]
+                asks = json_msg["data"]["a"]
+
+                # Construct the OrderBookMessage with the bids and asks
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
-                    json_msg["data"][0], json_msg["data"][0], {"trading_pair": trading_pair})
+                    bids, asks, {"trading_pair": trading_pair})
+
                 snapshot_queue.put_nowait(order_book_message)
+
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().error("Unexpected error when processing public order book updates from exchange")
                 raise
+
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
