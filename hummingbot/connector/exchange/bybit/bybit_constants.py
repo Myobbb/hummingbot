@@ -35,7 +35,7 @@ SERVER_TIME_PATH_URL = "/spot/v1/time"
 # Private API endpoints or BinanceClient function
 ACCOUNTS_PATH_URL = "/spot/v3/private/account"
 MY_TRADES_PATH_URL = "/spot/v1/myTrades"
-ORDER_PATH_URL = "/spot/v1/order"
+ORDER_PATH_URL = "/spot/v3/private/order"
 # BINANCE_USER_STREAM_PATH_URL = "/userDataStream"
 
 
