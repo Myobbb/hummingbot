@@ -194,9 +194,9 @@ class BybitExchange(ExchangePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         api_params = {"symbol": symbol,
                       "side": side_str,
-                      "qty": amount_str,
-                      "type": type_str,
-                      "orderLinkId": order_id}
+                      "orderQty": amount_str,
+                      "orderType": type_str}
+                      #"orderLinkId": order_id}
         if order_type != OrderType.MARKET:
             api_params["price"] = f"{price:f}"
         if order_type == OrderType.LIMIT:
@@ -205,7 +205,7 @@ class BybitExchange(ExchangePyBase):
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
             qty = float(amount_str) * float(price)
-            api_params["qty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
+            api_params["orderQty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
 
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
