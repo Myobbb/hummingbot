@@ -30,7 +30,7 @@ SNAPSHOT_EVENT_TYPE = "snapshot"
 LAST_TRADED_PRICE_PATH = "/spot/quote/v1/ticker/price"
 EXCHANGE_INFO_PATH_URL = "/spot/v1/symbols"
 SNAPSHOT_PATH_URL = "/spot/quote/v1/depth"
-SERVER_TIME_PATH_URL = "/spot/v1/time"
+SERVER_TIME_PATH_URL = "/v5/market/time"
 
 # Private API endpoints or BinanceClient function
 ACCOUNTS_PATH_URL = "/spot/v1/account"
