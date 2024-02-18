@@ -97,7 +97,7 @@ class OkxExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -184,10 +184,15 @@ class OkxExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
+                               
+        path_url = CONSTANTS.ORDERS_PATH_URL
+        side = trade_type.name.lower()
+        order_type_str = "market" if order_type == OrderType.MARKET else "limit"
+                               
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",
-            "ordType": "limit",
+            "ordType": "market",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
             "sz": str(amount),
