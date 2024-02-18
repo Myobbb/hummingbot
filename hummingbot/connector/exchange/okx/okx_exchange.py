@@ -181,13 +181,13 @@ class OkxExchange(ExchangePyBase):
                            trading_pair: str,
                            amount: Decimal,
                            trade_type: TradeType,
-                           order_type: OrderType,
+                           order_type: "market",
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",
-            "ordType": "limit",
+            "ordType": "market",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
             "sz": str(amount),
