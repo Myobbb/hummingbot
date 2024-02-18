@@ -185,9 +185,6 @@ class OkxExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
                                
-        path_url = CONSTANTS.ORDERS_PATH_URL
-        side = trade_type.name.lower()
-        order_type_str = "market" if order_type == OrderType.MARKET else "limit"
                                
         data = {
             "clOrdId": order_id,
