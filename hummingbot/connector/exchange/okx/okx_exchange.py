@@ -185,6 +185,7 @@ class OkxExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
                                
+        size = amount * price
                                
         data = {
             "clOrdId": order_id,
@@ -192,7 +193,7 @@ class OkxExchange(ExchangePyBase):
             "ordType": "market",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "sz": str(amount)*str(price)
+            "sz": str(size)
             #"px": str(price)
         }
 
