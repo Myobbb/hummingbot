@@ -97,7 +97,7 @@ class OkxExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -145,7 +145,7 @@ class OkxExchange(ExchangePyBase):
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
 
-        is_maker = is_maker or (order_type is OrderType.MARKET)
+        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
         fee = build_trade_fee(
             self.name,
             is_maker,
@@ -187,7 +187,7 @@ class OkxExchange(ExchangePyBase):
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",
-            "ordType": OrderType,
+            "ordType": "limit",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
             "sz": str(amount),
