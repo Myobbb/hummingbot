@@ -192,8 +192,8 @@ class OkxExchange(ExchangePyBase):
             "ordType": "market",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "sz": str(amount),
-            "px": str(price)
+            "sz": str(amount)*str(price)
+            #"px": str(price)
         }
 
         exchange_order_id = await self._api_request(
