@@ -216,7 +216,7 @@ class BybitExchange(ExchangePyBase):
         )
 
         o_id = str(order_result["result"]["orderId"])
-        transact_time = int(order_result["result"]["transactTime"]) * 1e-3
+        transact_time = int(order_result["time"]) * 1e-3
         return (o_id, transact_time)
 
 
