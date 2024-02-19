@@ -221,7 +221,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param price: the starting point price
         """
         trading_rule = self._trading_rules[trading_pair]
-        return Decimal(trading_rule.min_price_increment)
+        return Decimal(0) #trading_rule.min_price_increment
 
     def get_order_size_quantum(self, trading_pair: str, order_size: Decimal) -> Decimal:
         """
