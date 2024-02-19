@@ -195,7 +195,7 @@ class BybitExchange(ExchangePyBase):
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "orderQty": amount_str,
-                      "orderType": type_str},
+                      "orderType": type_str,
                       "orderLinkId": order_id}
         if order_type != OrderType.MARKET:
             api_params["price"] = f"{price:f}"
