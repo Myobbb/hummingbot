@@ -246,7 +246,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         trading_rule = self._trading_rules[trading_pair]
         quantized_amount: Decimal = super().quantize_order_amount(trading_pair, amount)
-
+        """
         # Check against min_order_size and min_notional_size. If not passing either check, return 0.
         if quantized_amount < trading_rule.min_order_size:
             self.logger().warning(f"Quantizing order amount to 0 because order amount of {quantized_amount} is below {trading_rule.min_order_size} market minimum order size.")
@@ -262,6 +262,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         if notional_size < trading_rule.min_notional_size * Decimal("1.01"):
             self.logger().warning(f"Quantizing order amount to 0 because order notional value is below {trading_rule.min_notional_size} market minimum notional value.")
             return s_decimal_0
+        """
         return quantized_amount
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
@@ -440,7 +441,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         exchange_order_id = ""
         trading_rule = self._trading_rules[trading_pair]
 
-        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+        if order_type in [OrderType.LIMIT]:
             price = self.quantize_order_price(trading_pair, price)
             quantize_amount_price = Decimal("0") if price.is_nan() else price
             amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount, price=quantize_amount_price)
