@@ -203,7 +203,7 @@ class KucoinExchange(ExchangePyBase):
             "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
             "type": order_type_str,
         }
-        if side ="buy":
+        if side == "buy":
             data["funds"] = str(amount)
         else:
             data["size"] = str(amount)
