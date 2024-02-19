@@ -295,10 +295,10 @@ class BybitExchange(ExchangePyBase):
             try:
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("name"))
 
-                min_order_size = -1 #rule.get("minTradeQuantity")
-                min_price_increment = -1 #rule.get("minPricePrecision")
-                min_base_amount_increment = -1 #rule.get("basePrecision")
-                min_notional_size = -1 #rule.get("minTradeAmount")
+                min_order_size = 0 #rule.get("minTradeQuantity")
+                min_price_increment = 0 #rule.get("minPricePrecision")
+                min_base_amount_increment = 0 #rule.get("basePrecision")
+                min_notional_size = 0 #rule.get("minTradeAmount")
                 """
                 retval.append(
                     TradingRule(trading_pair,
