@@ -221,7 +221,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param price: the starting point price
         """
         trading_rule = self._trading_rules[trading_pair]
-        return Decimal(0) #trading_rule.min_price_increment
+        return Decimal(trading_rule.min_price_increment)
 
     def get_order_size_quantum(self, trading_pair: str, order_size: Decimal) -> Decimal:
         """
@@ -246,7 +246,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         trading_rule = self._trading_rules[trading_pair]
         quantized_amount: Decimal = super().quantize_order_amount(trading_pair, amount)
-        """
+
         # Check against min_order_size and min_notional_size. If not passing either check, return 0.
         if quantized_amount < trading_rule.min_order_size:
             self.logger().warning(f"Quantizing order amount to 0 because order amount of {quantized_amount} is below {trading_rule.min_order_size} market minimum order size.")
@@ -257,12 +257,11 @@ class ExchangePyBase(ExchangeBase, ABC):
             notional_size = current_price * quantized_amount
         else:
             notional_size = price * quantized_amount
-        
+
         # Add 1% as a safety factor in case the prices changed while making the order.
         if notional_size < trading_rule.min_notional_size * Decimal("1.01"):
             self.logger().warning(f"Quantizing order amount to 0 because order notional value is below {trading_rule.min_notional_size} market minimum notional value.")
             return s_decimal_0
-        """
         return quantized_amount
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
@@ -440,14 +439,14 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         exchange_order_id = ""
         trading_rule = self._trading_rules[trading_pair]
-        """
-        if order_type in [OrderType.LIMIT]:
+
+        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
             price = self.quantize_order_price(trading_pair, price)
             quantize_amount_price = Decimal("0") if price.is_nan() else price
             amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount, price=quantize_amount_price)
         else:
             amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount)
-        """
+
         self.start_tracking_order(
             order_id=order_id,
             exchange_order_id=None,
