@@ -440,14 +440,14 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         exchange_order_id = ""
         trading_rule = self._trading_rules[trading_pair]
-
-        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+        """
+        if order_type in [OrderType.LIMIT]:
             price = self.quantize_order_price(trading_pair, price)
             quantize_amount_price = Decimal("0") if price.is_nan() else price
             amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount, price=quantize_amount_price)
         else:
             amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount)
-
+        """
         self.start_tracking_order(
             order_id=order_id,
             exchange_order_id=None,
