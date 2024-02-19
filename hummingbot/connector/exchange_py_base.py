@@ -470,14 +470,14 @@ class ExchangePyBase(ExchangeBase, ABC):
                                   f" size {trading_rule.min_order_size}. The order will not be created.")
             self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair)
             return
-        """
+        
         if price is not None and not math.isnan(price) and amount * price < trading_rule.min_notional_size:
             self.logger().warning(f"{trade_type.name.title()} order notional {amount * price} is lower than the "
                                   f"minimum notional size {trading_rule.min_notional_size}. "
                                   "The order will not be created.")
             self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair)
             return
-
+        """
         try:
             exchange_order_id = await self._place_order_and_process_update(order=order, **kwargs,)
 
