@@ -201,12 +201,12 @@ class BybitExchange(ExchangePyBase):
             api_params["price"] = f"{price:f}"
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
-
+        """
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
             qty = float(amount_str) # * float(price) removing for now since strategy sends amount in USDT when buy
             api_params["orderQty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
-
+        """
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
@@ -304,8 +304,8 @@ class BybitExchange(ExchangePyBase):
                 retval.append(
                     TradingRule(trading_pair,
                                 min_order_size=Decimal(min_order_size)*0,
-                                min_price_increment=Decimal(min_price_increment),
-                                min_base_amount_increment=Decimal(min_base_amount_increment),
+                                min_price_increment=Decimal(min_price_increment)*0,
+                                min_base_amount_increment=Decimal(min_base_amount_increment)*0,
                                 min_notional_size=Decimal(min_notional_size)))*0
 
             except Exception:
