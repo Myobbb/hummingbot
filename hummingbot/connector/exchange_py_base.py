@@ -464,12 +464,13 @@ class ExchangePyBase(ExchangeBase, ABC):
             self.logger().error(f"{order_type} is not in the list of supported order types")
             self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair)
             return
-
+        """
         if amount < trading_rule.min_order_size:
             self.logger().warning(f"{trade_type.name.title()} order amount {amount} is lower than the minimum order"
                                   f" size {trading_rule.min_order_size}. The order will not be created.")
             self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair)
             return
+        """
         if price is not None and not math.isnan(price) and amount * price < trading_rule.min_notional_size:
             self.logger().warning(f"{trade_type.name.title()} order notional {amount * price} is lower than the "
                                   f"minimum notional size {trading_rule.min_notional_size}. "
