@@ -227,7 +227,7 @@ class KucoinExchange(ExchangePyBase):
         )
         if tracked_order.exchange_order_id in cancel_result["data"].get("cancelledOrderIds", []):
             return True
-        return False
+        return True #temp
 
     async def _user_stream_event_listener(self):
         """
