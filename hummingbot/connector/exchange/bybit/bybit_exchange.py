@@ -195,8 +195,8 @@ class BybitExchange(ExchangePyBase):
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "orderQty": amount_str,
-                      "orderType": type_str}
-                      #"orderLinkId": order_id}
+                      "orderType": type_str},
+                      "orderLinkId": order_id}
         if order_type != OrderType.MARKET:
             api_params["price"] = f"{price:f}"
         if order_type == OrderType.LIMIT:
@@ -350,7 +350,7 @@ class BybitExchange(ExchangePyBase):
                                 fill_timestamp=int(event_message["E"]) * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
-
+                
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=int(event_message["E"]) * 1e-3,
@@ -377,7 +377,7 @@ class BybitExchange(ExchangePyBase):
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
-
+        """
         if order.exchange_order_id is not None:
             exchange_order_id = int(order.exchange_order_id)
             trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
@@ -411,7 +411,7 @@ class BybitExchange(ExchangePyBase):
                         fill_timestamp=int(trade["executionTime"]) * 1e-3,
                     )
                     trade_updates.append(trade_update)
-
+        """
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
