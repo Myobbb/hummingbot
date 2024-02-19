@@ -204,7 +204,7 @@ class BybitExchange(ExchangePyBase):
 
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
-            qty = float(amount_str) * float(price)
+            qty = float(amount_str) # * float(price) removing for now since strategy sends amount in USDT when buy
             api_params["orderQty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
 
         order_result = await self._api_post(
@@ -245,7 +245,7 @@ class BybitExchange(ExchangePyBase):
 
         if isinstance(cancel_result, dict) and "orderLinkId" in cancel_result["result"]:
             return True
-        return False #temp
+        return True #temp True
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -300,7 +300,7 @@ class BybitExchange(ExchangePyBase):
 
                 retval.append(
                     TradingRule(trading_pair,
-                                min_order_size=Decimal(min_order_size)/10000,
+                                min_order_size=Decimal(min_order_size)/1000000,
                                 min_price_increment=Decimal(min_price_increment),
                                 min_base_amount_increment=Decimal(min_base_amount_increment),
                                 min_notional_size=Decimal(min_notional_size)))
