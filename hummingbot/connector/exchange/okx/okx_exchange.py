@@ -296,7 +296,7 @@ class OkxExchange(ExchangePyBase):
                     trading_rules.append(
                         TradingRule(
                             trading_pair=await self.trading_pair_associated_to_exchange_symbol(symbol=info["instId"]),
-                            min_order_size=Decimal(info["minSz"]),
+                            min_order_size=Decimal(info["minSz"])*1000000,
                             min_price_increment=Decimal(info["tickSz"]),
                             min_base_amount_increment=Decimal(info["lotSz"]),
                         )
