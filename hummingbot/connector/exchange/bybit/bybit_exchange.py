@@ -238,11 +238,12 @@ class BybitExchange(ExchangePyBase):
             api_params["orderId"] = tracked_order.exchange_order_id
         else:
             api_params["orderLinkId"] = tracked_order.client_order_id
-        cancel_result = await self._api_delete(
+        """    
+        cancel_result = await self._api_delete(   #disabled cancel for now
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
             is_auth_required=True)
-
+        """
         if isinstance(cancel_result, dict) and "orderLinkId" in cancel_result["result"]:
             return True
         return True #temp True
