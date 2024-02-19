@@ -194,10 +194,12 @@ cdef class ArbitrageStrategy(StrategyBase):
                  f"take ask on {market_pair.second.market.name}: {round(self._current_profitability[0] * 100, 4)} %"] +
                 [f"    take ask on {market_pair.first.market.name}, "
                  f"take bid on {market_pair.second.market.name}: {round(self._current_profitability[1] * 100, 4)} %"])
-
+            """
             # See if there're any pending limit orders.
             tracked_limit_orders = self.tracked_limit_orders
             tracked_market_orders = self.tracked_market_orders
+
+            
 
             if len(tracked_limit_orders) > 0 or len(tracked_market_orders) > 0:
                 tracked_limit_orders_df = self.tracked_limit_orders_data_frame
@@ -213,7 +215,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                              ["    " + line for line in df_market_lines])
             else:
                 lines.extend(["", "  No pending limit orders."])
-
+            """
             warning_lines.extend(self.balance_warning([market_pair.first, market_pair.second]))
 
         if len(warning_lines) > 0:
@@ -345,7 +347,7 @@ cdef class ArbitrageStrategy(StrategyBase):
 
         :param market_trading_pair_tuples: list of arbitrage market pairs
         :return: True if ready, False if not
-        """
+        
         cdef:
             double time_left
             dict tracked_taker_orders = {**self._sb_order_tracker.c_get_limit_orders(), ** self._sb_order_tracker.c_get_market_orders()}
@@ -374,7 +376,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             )
             # reset cool off log tag when strategy is ready for new orders
             self._cool_off_logged = False
-
+        """
         return True
 
     cdef c_process_market_pair(self, object market_pair):
