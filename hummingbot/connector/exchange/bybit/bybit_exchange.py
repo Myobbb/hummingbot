@@ -215,9 +215,21 @@ class BybitExchange(ExchangePyBase):
             headers={"referer": CONSTANTS.HBOT_BROKER_ID},
         )
 
-        o_id = str(order_result["result"]["orderId"])
-        transact_time = int(order_result["time"]) * 1e-3
-        return (o_id, transact_time)
+        o_id = None
+        transact_time = None
+
+        if "result" in order_result and "orderId" in order_result["result"]:
+            o_id = str(order_result["result"]["orderId"])
+
+        if "time" in order_result:
+            transact_time = int(order_result["time"]) * 1e-3
+
+        if o_id is not None and transact_time is not None:
+            return (o_id, transact_time)
+        else:
+            # Handle the case where either o_id or transact_time could not be determined
+            # This might involve raising an exception or returning a specific error value
+            return (None, None)
 
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
