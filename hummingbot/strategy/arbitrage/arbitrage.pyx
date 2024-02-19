@@ -416,7 +416,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             ExchangeBase buy_market = buy_market_trading_pair_tuple.market
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
 
-        best_amount, best_profitability, sell_price, buy_price, total_bid_value = self.c_find_best_profitable_amount(
+        best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount(
             buy_market_trading_pair_tuple, sell_market_trading_pair_tuple 
         )
         quantized_buy_amount = buy_market.c_quantize_order_amount(buy_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
@@ -427,9 +427,9 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         #filtering min order amount below $1.1   
         if volume_in_USD < 2.1:
-            self.log_with_clock(logging.INFO,
+            #self.log_with_clock(logging.INFO,
             #                        f"volume_in_USD is below 1.1: {volume_in_USD}, quantized_order_amount: {quantized_order_amount}, sell_price: {sell_price}")
-            f"total bid value test: {total_bid_value})
+            #f"total bid value test: {total_bid_value})
             return
         #else:
             #self.log_with_clock(logging.INFO,
@@ -449,7 +449,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
 
             # Set limit order expiration_seconds to _next_trade_delay for connectors that require order expiration for limit orders
-            self.c_buy_with_specific_market(buy_market_trading_pair_tuple, total_bid_value,
+            self.c_buy_with_specific_market(buy_market_trading_pair_tuple, volume_in_USD,
                                             order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
             self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
                                              order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
@@ -616,7 +616,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                 ).to_string()
             )
 
-        return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price, total_bid_value
+        return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
 
     # The following exposed Python functions are meant for unit tests
     # ---------------------------------------------------------------
