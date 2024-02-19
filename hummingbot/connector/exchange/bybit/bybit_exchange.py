@@ -303,10 +303,10 @@ class BybitExchange(ExchangePyBase):
 
                 retval.append(
                     TradingRule(trading_pair,
-                                min_order_size=Decimal(min_order_size/1000000),
+                                min_order_size=Decimal(min_order_size),
                                 min_price_increment=Decimal(min_price_increment),
                                 min_base_amount_increment=Decimal(min_base_amount_increment),
-                                min_notional_size=Decimal(min_notional_size/1000000)))
+                                min_notional_size=Decimal(min_notional_size)))
 
             except Exception:
                 self.logger().exception(f"Error parsing the trading pair rule {rule.get('name')}. Skipping.")
