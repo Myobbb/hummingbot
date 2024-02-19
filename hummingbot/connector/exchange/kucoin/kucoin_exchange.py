@@ -280,11 +280,11 @@ class KucoinExchange(ExchangePyBase):
                     if updatable_order is not None:
                         updated_status = updatable_order.current_state
                         if order_event_type == "open":
-                            updated_status = OrderState.OPEN
+                            updated_status = OrderState.CANCELED
                         elif order_event_type == "match":
-                            updated_status = OrderState.PARTIALLY_FILLED
+                            updated_status = OrderState.CANCELED
                         elif order_event_type == "filled":
-                            updated_status = OrderState.FILLED
+                            updated_status = OrderState.CANCELED
                         elif order_event_type == "canceled":
                             updated_status = OrderState.CANCELED
 
@@ -489,7 +489,7 @@ class KucoinExchange(ExchangePyBase):
         if ordered_canceled or op_type == "CANCEL":
             new_state = OrderState.CANCELED
         elif not is_active:
-            new_state = OrderState.FILLED
+            new_state = OrderState.CANCELED
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
