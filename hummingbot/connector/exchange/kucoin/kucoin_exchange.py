@@ -197,17 +197,16 @@ class KucoinExchange(ExchangePyBase):
         side = trade_type.name.lower()
         order_type_str = "market" if order_type == OrderType.MARKET else "limit"
         data = {
-            "size": str(amount),
+            #"size": str(amount),
             "clientOid": order_id,
             "side": side,
             "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
             "type": order_type_str,
         }
-        if order_type is OrderType.LIMIT:
-            data["price"] = str(price)
-        elif order_type is OrderType.LIMIT_MAKER:
-            data["price"] = str(price)
-            data["postOnly"] = True
+        if side ="buy":
+            data["funds"] = str(amount)
+        else:
+            data["size"] = str(amount)
         exchange_order_id = await self._api_post(
             path_url=path_url,
             data=data,
