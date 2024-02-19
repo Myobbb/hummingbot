@@ -195,18 +195,18 @@ class BybitExchange(ExchangePyBase):
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "orderQty": amount_str,
-                      "orderType": type_str}
-                      #"orderLinkId": order_id}
+                      "orderType": type_str,
+                      "orderLinkId": order_id}
         if order_type != OrderType.MARKET:
             api_params["price"] = f"{price:f}"
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
-
+        """
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
             qty = float(amount_str) # * float(price) removing for now since strategy sends amount in USDT when buy
             api_params["orderQty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
-
+        """
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
@@ -243,9 +243,10 @@ class BybitExchange(ExchangePyBase):
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
             is_auth_required=True)
-        """
+        
         if isinstance(cancel_result, dict) and "orderLinkId" in cancel_result["result"]:
             return True
+        """
         return True #temp True
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
@@ -294,18 +295,18 @@ class BybitExchange(ExchangePyBase):
             try:
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("name"))
 
-                min_order_size = rule.get("minTradeQuantity")
-                min_price_increment = rule.get("minPricePrecision")
-                min_base_amount_increment = rule.get("basePrecision")
-                min_notional_size = rule.get("minTradeAmount")
-
+                min_order_size = -1 #rule.get("minTradeQuantity")
+                min_price_increment = -1 #rule.get("minPricePrecision")
+                min_base_amount_increment = -1 #rule.get("basePrecision")
+                min_notional_size = -1 #rule.get("minTradeAmount")
+                """
                 retval.append(
                     TradingRule(trading_pair,
                                 min_order_size=Decimal(min_order_size)/1000000,
                                 min_price_increment=Decimal(min_price_increment),
                                 min_base_amount_increment=Decimal(min_base_amount_increment),
                                 min_notional_size=Decimal(min_notional_size)))/1000000
-
+                """
             except Exception:
                 self.logger().exception(f"Error parsing the trading pair rule {rule.get('name')}. Skipping.")
         return retval
