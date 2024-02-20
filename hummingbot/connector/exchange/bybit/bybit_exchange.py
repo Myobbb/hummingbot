@@ -111,7 +111,7 @@ class BybitExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.MARKET]
+        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -215,21 +215,9 @@ class BybitExchange(ExchangePyBase):
             headers={"referer": CONSTANTS.HBOT_BROKER_ID},
         )
 
-        o_id = None
-        transact_time = None
-
-        if "result" in order_result and "orderId" in order_result["result"]:
-            o_id = str(order_result["result"]["orderId"])
-
-        if "time" in order_result:
-            transact_time = int(order_result["time"]) * 1e-3
-
-        if o_id is not None and transact_time is not None:
-            return (o_id, transact_time)
-        else:
-            # Handle the case where either o_id or transact_time could not be determined
-            # This might involve raising an exception or returning a specific error value
-            return (None, None)
+        o_id = str(order_result["result"]["orderId"])
+        transact_time = int(order_result["result"]["transactTime"]) * 1e-3
+        return (o_id, transact_time)
 
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
