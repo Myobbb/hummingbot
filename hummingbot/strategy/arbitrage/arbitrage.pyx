@@ -194,12 +194,10 @@ cdef class ArbitrageStrategy(StrategyBase):
                  f"take ask on {market_pair.second.market.name}: {round(self._current_profitability[0] * 100, 4)} %"] +
                 [f"    take ask on {market_pair.first.market.name}, "
                  f"take bid on {market_pair.second.market.name}: {round(self._current_profitability[1] * 100, 4)} %"])
-            """
+
             # See if there're any pending limit orders.
             tracked_limit_orders = self.tracked_limit_orders
             tracked_market_orders = self.tracked_market_orders
-
-            
 
             if len(tracked_limit_orders) > 0 or len(tracked_market_orders) > 0:
                 tracked_limit_orders_df = self.tracked_limit_orders_data_frame
@@ -215,7 +213,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                              ["    " + line for line in df_market_lines])
             else:
                 lines.extend(["", "  No pending limit orders."])
-            """
+
             warning_lines.extend(self.balance_warning([market_pair.first, market_pair.second]))
 
         if len(warning_lines) > 0:
@@ -354,8 +352,8 @@ cdef class ArbitrageStrategy(StrategyBase):
 
         for market_trading_pair_tuple in market_trading_pair_tuples:
             # Do not continue if there are pending limit order
-            #if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
-            #    return False
+            if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
+                return False
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
             if market_trading_pair_tuple in self._last_trade_timestamps and ready_to_trade_time > self._current_timestamp:
@@ -376,7 +374,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             )
             # reset cool off log tag when strategy is ready for new orders
             self._cool_off_logged = False
-        
+
         return True
 
     cdef c_process_market_pair(self, object market_pair):
@@ -419,7 +417,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
 
         best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount(
-            buy_market_trading_pair_tuple, sell_market_trading_pair_tuple 
+            buy_market_trading_pair_tuple, sell_market_trading_pair_tuple
         )
         quantized_buy_amount = buy_market.c_quantize_order_amount(buy_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
         quantized_sell_amount = sell_market.c_quantize_order_amount(sell_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
@@ -431,7 +429,6 @@ cdef class ArbitrageStrategy(StrategyBase):
         if volume_in_USD < 2.1:
             #self.log_with_clock(logging.INFO,
             #                        f"volume_in_USD is below 1.1: {volume_in_USD}, quantized_order_amount: {quantized_order_amount}, sell_price: {sell_price}")
-            #f"total bid value test: {total_bid_value})
             return
         #else:
             #self.log_with_clock(logging.INFO,
@@ -451,10 +448,10 @@ cdef class ArbitrageStrategy(StrategyBase):
             sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
 
             # Set limit order expiration_seconds to _next_trade_delay for connectors that require order expiration for limit orders
-            self.c_buy_with_specific_market(buy_market_trading_pair_tuple, volume_in_USD,
-                                            order_type=buy_order_type, price=buy_price)
+            self.c_buy_with_specific_market(buy_market_trading_pair_tuple, quantized_order_amount,
+                                            order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
             self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
-                                             order_type=sell_order_type, price=sell_price)
+                                             order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
             self.logger().info(self.format_status())
 
     @staticmethod
