@@ -195,18 +195,18 @@ class BybitExchange(ExchangePyBase):
         api_params = {"symbol": symbol,
                       "side": side_str,
                       "orderQty": amount_str,
-                      "orderType": type_str,
-                      "orderLinkId": order_id}
+                      "orderType": type_str}
+                      #"orderLinkId": order_id}
         if order_type != OrderType.MARKET:
             api_params["price"] = f"{price:f}"
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
-        """
+
         # Modify 'qty' value for TradeType.BUY and OrderType.MARKET
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
-            qty = float(amount_str) # * float(price) removing for now since strategy sends amount in USDT when buy
+            qty = float(amount_str) * float(price)
             api_params["orderQty"] = f"{qty:.8f}"  # Assuming 8 decimal places, adjust accordingly
-        """
+
         order_result = await self._api_post(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
@@ -233,22 +233,19 @@ class BybitExchange(ExchangePyBase):
 
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        """
         api_params = {}
         if tracked_order.exchange_order_id:
             api_params["orderId"] = tracked_order.exchange_order_id
         else:
             api_params["orderLinkId"] = tracked_order.client_order_id
-        x    
-        cancel_result = await self._api_delete(   #disabled cancel for now
+        cancel_result = await self._api_delete(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
             is_auth_required=True)
-        
+
         if isinstance(cancel_result, dict) and "orderLinkId" in cancel_result["result"]:
             return True
-        """
-        return True #temp True
+        return False #temp
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -350,7 +347,7 @@ class BybitExchange(ExchangePyBase):
                                 fill_timestamp=int(event_message["E"]) * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
-                
+
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=int(event_message["E"]) * 1e-3,
@@ -377,7 +374,7 @@ class BybitExchange(ExchangePyBase):
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
-        """
+
         if order.exchange_order_id is not None:
             exchange_order_id = int(order.exchange_order_id)
             trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
@@ -411,7 +408,7 @@ class BybitExchange(ExchangePyBase):
                         fill_timestamp=int(trade["executionTime"]) * 1e-3,
                     )
                     trade_updates.append(trade_update)
-        """
+
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
