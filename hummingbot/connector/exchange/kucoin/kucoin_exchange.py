@@ -227,7 +227,7 @@ class KucoinExchange(ExchangePyBase):
         )
         if tracked_order.exchange_order_id in cancel_result["data"].get("cancelledOrderIds", []):
             return True
-        return True #temp
+        return False
 
     async def _user_stream_event_listener(self):
         """
@@ -280,11 +280,11 @@ class KucoinExchange(ExchangePyBase):
                     if updatable_order is not None:
                         updated_status = updatable_order.current_state
                         if order_event_type == "open":
-                            updated_status = OrderState.CANCELED
+                            updated_status = OrderState.OPEN
                         elif order_event_type == "match":
-                            updated_status = OrderState.CANCELED
+                            updated_status = OrderState.PARTIALLY_FILLED
                         elif order_event_type == "filled":
-                            updated_status = OrderState.CANCELED
+                            updated_status = OrderState.FILLED
                         elif order_event_type == "canceled":
                             updated_status = OrderState.CANCELED
 
@@ -489,7 +489,7 @@ class KucoinExchange(ExchangePyBase):
         if ordered_canceled or op_type == "CANCEL":
             new_state = OrderState.CANCELED
         elif not is_active:
-            new_state = OrderState.CANCELED
+            new_state = OrderState.FILLED
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
