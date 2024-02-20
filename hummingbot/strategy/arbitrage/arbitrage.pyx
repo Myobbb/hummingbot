@@ -452,9 +452,9 @@ cdef class ArbitrageStrategy(StrategyBase):
 
             # Set limit order expiration_seconds to _next_trade_delay for connectors that require order expiration for limit orders
             self.c_buy_with_specific_market(buy_market_trading_pair_tuple, volume_in_USD,
-                                            order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
+                                            order_type=buy_order_type, price=buy_price)
             self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
-                                             order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
+                                             order_type=sell_order_type, price=sell_price)
             self.logger().info(self.format_status())
 
     @staticmethod
