@@ -97,7 +97,7 @@ class OkxExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.MARKET]
+        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -184,18 +184,24 @@ class OkxExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
+
                                
-        #size = amount * price
-                               
+        if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
+            sz = amount * price
+            sz = f"{sz:.8f}"
+        else:
+            sz = str(amount)
+        
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",
             "ordType": "market",
             "side": trade_type.name.lower(),
             "instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "sz": str(amount)
-            #"px": str(price)
+            "sz": sz,
+            "px": str(price)
         }
+          
 
         exchange_order_id = await self._api_request(
             path_url=CONSTANTS.OKX_PLACE_ORDER_PATH,
@@ -296,7 +302,7 @@ class OkxExchange(ExchangePyBase):
                     trading_rules.append(
                         TradingRule(
                             trading_pair=await self.trading_pair_associated_to_exchange_symbol(symbol=info["instId"]),
-                            min_order_size=Decimal(info["minSz"])/1000000,
+                            min_order_size=Decimal(info["minSz"]),
                             min_price_increment=Decimal(info["tickSz"]),
                             min_base_amount_increment=Decimal(info["lotSz"]),
                         )
