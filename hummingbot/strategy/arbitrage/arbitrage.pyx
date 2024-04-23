@@ -20,6 +20,9 @@ from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketP
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.client.performance import PerformanceMetrics
 
+import time
+from hummingbot.core.event.events import OrderFailedEvent, MarketEvent
+
 NaN = float("nan")
 s_decimal_0 = Decimal(0)
 as_logger = None
@@ -41,12 +44,15 @@ cdef class ArbitrageStrategy(StrategyBase):
             as_logger = logging.getLogger(__name__)
         return as_logger
 
+    def __init__(self):
+        self._failed_order_count = 0  
+
     def init_params(self,
                     market_pairs: List[ArbitrageMarketPair],
                     min_profitability: Decimal,
                     logging_options: int = OPTION_LOG_ORDER_COMPLETED,
                     status_report_interval: float = 60.0,
-                    next_trade_delay_interval: float = 2.0,
+                    next_trade_delay_interval: float = 5.0,
                     failed_order_tolerance: int = 1,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
@@ -95,6 +101,11 @@ cdef class ArbitrageStrategy(StrategyBase):
 
         self.c_add_markets(list(all_markets))
 
+        for market_pair in self._market_pairs:
+            for market in [market_pair.first.market, market_pair.second.market]:
+                market.c_add_listener(MarketEvent.OrderFailure.value, self._order_failed_listener)
+                self.logger().debug(f"Added listener for market: {market}")
+
     @property
     def min_profitability(self) -> Decimal:
         return self._min_profitability
@@ -118,6 +129,16 @@ cdef class ArbitrageStrategy(StrategyBase):
     @property
     def tracked_market_orders_data_frame(self) -> List[pd.DataFrame]:
         return self._sb_order_tracker.tracked_market_orders_data_frame
+
+    def _order_failed_listener(self, event: OrderFailedEvent):
+        self._failed_order_count += 1
+        self.logger().error(f"Order failed: {event}")
+        if self._failed_order_count > self._failed_order_tolerance:
+            self.logger().warning("Maximum failed order tolerance reached, pausing strategy for 10 minutes.")
+            time.sleep(600)  # Sleep for 10 minutes
+            self._failed_order_count = 0  # Reset counter after sleep
+        else:
+            self.logger().debug(f"Failed order count: {self._failed_order_count}")
 
     def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
         """
@@ -426,7 +447,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         volume_in_USD = quantized_order_amount * sell_price
         
         #filtering min order amount below $1.1   
-        if volume_in_USD < 10:
+        if volume_in_USD < 2.1:
             #self.log_with_clock(logging.INFO,
             #                        f"volume_in_USD is below 1.1: {volume_in_USD}, quantized_order_amount: {quantized_order_amount}, sell_price: {sell_price}")
             return
