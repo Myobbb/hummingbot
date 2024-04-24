@@ -233,15 +233,17 @@ class BybitExchange(ExchangePyBase):
             "price": f"{_price:f}",
             "orderLinkId": order_id
         }
-        # sort params required for V5
-        api_params = dict(sorted(api_params.items()))
+        
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
             
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
-            qty = float(amount_str) * float(_price)
-            api_params["qty"] = f"{qty:.8f}" 
-
+            qty = float(amount) * float(price)
+            api_params["qty"] = f"{qty:f}" 
+            
+        # sort params required for V5
+        api_params = dict(sorted(api_params.items()))
+                               
         response = await self._api_post(
             path_url=CONSTANTS.ORDER_PLACE_PATH_URL,
             data=api_params,
