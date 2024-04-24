@@ -20,6 +20,20 @@ from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketP
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.client.performance import PerformanceMetrics
 
+from typing import Union
+import time
+import unittest
+
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderExpiredEvent,
+    MarketEvent,
+    OrderType,
+    SellOrderCompletedEvent,
+)
+
 NaN = float("nan")
 s_decimal_0 = Decimal(0)
 as_logger = None
@@ -118,7 +132,21 @@ cdef class ArbitrageStrategy(StrategyBase):
     @property
     def tracked_market_orders_data_frame(self) -> List[pd.DataFrame]:
         return self._sb_order_tracker.tracked_market_orders_data_frame
+    """
+    def simulate_order_failed(market_info: MarketTradingPairTuple, order: Union[LimitOrder, MarketOrder]):
+        market_info.market.trigger_event(
+            MarketEvent.OrderFailure,
+            MarketOrderFailureEvent(
+                int(time.time() * 1e3),
+                order.client_order_id if isinstance(order, LimitOrder) else order.order_id,
+                OrderType.LIMIT if isinstance(order, LimitOrder) else OrderType.MARKET
+            )
+        )
 
+    def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
+        self.set_order_failed(order_id=order_failed_event.order_id)
+    """
+    
     def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
         """
         Find conversion rates from secondary market to primary market
