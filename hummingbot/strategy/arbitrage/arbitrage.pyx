@@ -20,8 +20,6 @@ from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketP
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.client.performance import PerformanceMetrics
 
-from hummingbot.core.event.events import OrderFailedEvent, MarketEvent
-
 NaN = float("nan")
 s_decimal_0 = Decimal(0)
 as_logger = None
@@ -96,10 +94,6 @@ cdef class ArbitrageStrategy(StrategyBase):
             }
 
         self.c_add_markets(list(all_markets))
-        for market_pair in self._market_pairs:
-            for market in [market_pair.first.market, market_pair.second.market]:
-                market.c_add_listener(MarketEvent.OrderFailure.value, self._order_failed_listener)
-                self.logger().debug(f"Added listener for market: {market}")
 
     @property
     def min_profitability(self) -> Decimal:
@@ -124,20 +118,6 @@ cdef class ArbitrageStrategy(StrategyBase):
     @property
     def tracked_market_orders_data_frame(self) -> List[pd.DataFrame]:
         return self._sb_order_tracker.tracked_market_orders_data_frame
-
-
-    def handle_failed_order(self):
-        """Increases the next trade delay when a failed order is detected."""
-        if self._failed_order_count > self._failed_order_tolerance:
-            self._next_trade_delay += 600  # Extend the cool-off period by 10 minutes
-            self.logger().warning("Maximum failed order tolerance reached. Extending cool off period by 10 minutes.")
-            self._failed_order_count = 0  # Optionally reset the count here or based on some other logic
-
-    def _order_failed_listener(self, event: OrderFailedEvent):
-        """Handles a failed order event by logging the failure and adjusting trading conditions."""
-        self._failed_order_count += 1
-        self.logger().error(f"Order failed: {event}")
-        self.handle_failed_order()
 
     def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
         """
