@@ -239,8 +239,8 @@ class BybitExchange(ExchangePyBase):
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
             
         if trade_type == TradeType.BUY and order_type == OrderType.MARKET:
-            qty = float(amount_str) * float(price)
-            api_params["orderQty"] = f"{qty:.8f}" 
+            qty = float(amount_str) * float(_price)
+            api_params["qty"] = f"{qty:.8f}" 
 
         response = await self._api_post(
             path_url=CONSTANTS.ORDER_PLACE_PATH_URL,
