@@ -73,6 +73,7 @@ TRADE_HISTORY_PATH_URL = "/v5/execution/list"
 ORDER_STATE = {
     "New": OrderState.OPEN,
     "PartiallyFilled": OrderState.PARTIALLY_FILLED,
+    "PartiallyFilledCanceled": OrderState.FILLED,
     "Filled": OrderState.FILLED,
     "Cancelled": OrderState.CANCELED,
     "Rejected": OrderState.FAILED,
