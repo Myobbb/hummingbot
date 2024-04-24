@@ -266,22 +266,6 @@ cdef class ArbitrageStrategy(StrategyBase):
                 self._last_conv_rates_logged = self._current_timestamp
         finally:
             self._last_timestamp = timestamp
-            
-    cdef c_did_fail_order(self, object failed_order_event):
-        """
-        Output log for failed order.
-
-        :param failed_order_event: Order failed event
-        """
-        cdef:
-            object market = failed_order_event.market
-            object order_id = failed_order_event.order_id
-            object market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
-        if market_trading_pair_tuple is not None:
-            self.log_with_clock(logging.INFO,
-                                f"Market order failed on {market.name}: {order_id}")
-            self.notify_hb_app_with_timestamp(f"Market order failed on {market.name}: {order_id}")
-
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """
