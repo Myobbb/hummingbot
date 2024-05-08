@@ -10,7 +10,7 @@ from hummingbot.connector.exchange.bybit.bybit_api_order_book_data_source import
 from hummingbot.connector.exchange.bybit.bybit_api_user_stream_data_source import BybitAPIUserStreamDataSource
 from hummingbot.connector.exchange.bybit.bybit_auth import BybitAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
-from hummingbot.connector.trading_rule import TradingRuleFREE
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
@@ -386,7 +386,7 @@ class BybitExchange(ExchangePyBase):
                             balances = account["coin"]
                     for balance_entry in balances:
                         asset_name = balance_entry["coin"]
-                        free_balance = Decimal(balance_entry["availableToWithdraw"])
+                        free_balance = Decimal(balance_entry["free"])
                         total_balance = Decimal(balance_entry["walletBalance"])
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
