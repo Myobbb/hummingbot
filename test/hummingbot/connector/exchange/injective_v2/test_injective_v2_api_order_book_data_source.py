@@ -22,6 +22,7 @@ from hummingbot.connector.exchange.injective_v2.injective_v2_exchange import Inj
 from hummingbot.connector.exchange.injective_v2.injective_v2_utils import (
     InjectiveConfigMap,
     InjectiveDelegatedAccountMode,
+    InjectiveMessageBasedTransactionFeeCalculatorMode,
     InjectiveTestnetNetworkMode,
 )
 from hummingbot.core.data_type.common import TradeType
@@ -66,6 +67,7 @@ class InjectiveV2APIOrderBookDataSourceTests(TestCase):
         injective_config = InjectiveConfigMap(
             network=network_config,
             account_type=account_config,
+            fee_calculator=InjectiveMessageBasedTransactionFeeCalculatorMode(),
         )
 
         self.connector = InjectiveV2Exchange(
@@ -84,6 +86,11 @@ class InjectiveV2APIOrderBookDataSourceTests(TestCase):
             ".InjectiveGranteeDataSource.initialize_trading_account"
         )
         self.initialize_trading_account_patch.start()
+        self._initialize_timeout_height_patch = patch(
+            "hummingbot.connector.exchange.injective_v2.data_sources.injective_grantee_data_source"
+            ".AsyncClient.sync_timeout_height"
+        )
+        self._initialize_timeout_height_patch.start()
 
         self.query_executor = ProgrammableQueryExecutor()
         self.connector._data_source._query_executor = self.query_executor
@@ -101,6 +108,7 @@ class InjectiveV2APIOrderBookDataSourceTests(TestCase):
 
     def tearDown(self) -> None:
         self.async_run_with_timeout(self.data_source._data_source.stop())
+        self._initialize_timeout_height_patch.stop()
         self.initialize_trading_account_patch.stop()
         for task in self.async_tasks:
             task.cancel()

@@ -24,7 +24,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, get_new_client_order_id
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -40,20 +40,23 @@ bpm_logger = None
 
 class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     web_utils = web_utils
+
     SHORT_POLL_INTERVAL = 5.0
     LONG_POLL_INTERVAL = 12.0
 
     def __init__(
             self,
             client_config_map: "ClientConfigAdapter",
-            hyperliquid_perpetual_api_key: str = None,
             hyperliquid_perpetual_api_secret: str = None,
+            use_vault: bool = False,
+            hyperliquid_perpetual_api_key: str = None,
             trading_pairs: Optional[List[str]] = None,
             trading_required: bool = True,
             domain: str = CONSTANTS.DOMAIN,
     ):
         self.hyperliquid_perpetual_api_key = hyperliquid_perpetual_api_key
         self.hyperliquid_perpetual_secret_key = hyperliquid_perpetual_api_secret
+        self._use_vault = use_vault
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
@@ -62,6 +65,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self.coin_to_asset: Dict[str, int] = {}
         super().__init__(client_config_map)
 
+    SHORT_POLL_INTERVAL = 5.0
+
+    LONG_POLL_INTERVAL = 12.0
+
     @property
     def name(self) -> str:
         # Note: domain here refers to the entire exchange name. i.e. hyperliquid_perpetual or hyperliquid_perpetual_testnet
@@ -69,7 +76,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def authenticator(self) -> HyperliquidPerpetualAuth:
-        return HyperliquidPerpetualAuth(self.hyperliquid_perpetual_api_key, self.hyperliquid_perpetual_secret_key)
+        return HyperliquidPerpetualAuth(self.hyperliquid_perpetual_api_key, self.hyperliquid_perpetual_secret_key,
+                                        self._use_vault)
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -215,11 +223,15 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_order_status(self):
         await self._update_orders()
 
+    async def _update_lost_orders_status(self):
+        await self._update_lost_orders()
+
     def _get_fee(self,
                  base_currency: str,
                  quote_currency: str,
                  order_type: OrderType,
                  order_side: TradeType,
+                 position_action: PositionAction,
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
@@ -257,7 +269,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.CANCEL_ORDER_URL,
             data=api_params,
             is_auth_required=True)
-        if "error" in cancel_result["response"]["data"]["statuses"][0]:
+
+        if cancel_result.get("status") == "err" or "error" in cancel_result["response"]["data"]["statuses"][0]:
             self.logger().debug(f"The order {order_id} does not exist on Hyperliquid Perpetuals. "
                                 f"No cancelation needed.")
             await self._order_tracker.process_order_not_found(order_id)
@@ -376,7 +389,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 "isBuy": True if trade_type is TradeType.BUY else False,
                 "limitPx": float(price),
                 "sz": float(amount),
-                "reduceOnly": position_action == PositionAction.CLOSE,
+                "reduceOnly": False,
                 "orderType": param_order_type,
                 "cloid": order_id,
             }
@@ -385,7 +398,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.CREATE_ORDER_URL,
             data=api_params,
             is_auth_required=True)
-        o_order_result = order_result['response']["data"]["statuses"][0]
+        if order_result.get("status") == "err":
+            raise IOError(f"Error submitting order {order_id}: {order_result['response']}")
+        else:
+            o_order_result = order_result['response']["data"]["statuses"][0]
         if "error" in o_order_result:
             raise IOError(f"Error submitting order {order_id}: {o_order_result['error']}")
         o_data = o_order_result.get("resting") or o_order_result.get("filled")
@@ -449,16 +465,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
         try:
             raise error
-        except KeyError:
-            _order_update: OrderUpdate = OrderUpdate(
-                trading_pair=order.trading_pair,
-                update_timestamp=int(time.time()),
-                new_state=OrderState.PENDING_CREATE,
-                client_order_id=order.client_order_id,
-                exchange_order_id=str(order.exchange_order_id),
-            )
-            self._order_tracker.process_order_update(_order_update)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, KeyError):
             self.logger().debug(
                 f"Tracked order {order.client_order_id} does not have an exchange id. "
                 f"Attempting fetch in next polling interval."
@@ -470,7 +477,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().warning(
                 f"Error fetching status update for the active order {order.client_order_id}: {request_error}.",
             )
-            self.logger().debug(f"Order {order.client_order_id} not found counter: {self._order_tracker._order_not_found_records.get(order.client_order_id, 0)}")
+            self.logger().debug(
+                f"Order {order.client_order_id} not found counter: {self._order_tracker._order_not_found_records.get(order.client_order_id, 0)}")
             await self._order_tracker.process_order_not_found(order.client_order_id)
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
@@ -534,7 +542,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 elif channel == CONSTANTS.USEREVENT_ENDPOINT_NAME:
                     if "fills" in results:
                         for trade_msg in results["fills"]:
-                            self._process_trade_message(trade_msg)
+                            await self._process_trade_message(trade_msg)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -542,7 +550,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                     "Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
 
-    def _process_trade_message(self, trade: Dict[str, Any], client_order_id: Optional[str] = None):
+    async def _process_trade_message(self, trade: Dict[str, Any], client_order_id: Optional[str] = None):
         """
         Updates in-flight order and trigger order filled event for trade message received. Triggers order completed
         event if the total executed amount equals to the specified order amount.
@@ -552,30 +560,36 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_order_id)
 
         if tracked_order is None:
-            self.logger().debug(f"Ignoring trade message with id {client_order_id}: not in in_flight_orders.")
-        else:
-            trading_pair_base_coin = tracked_order.base_asset
-            if trade["coin"] == trading_pair_base_coin:
-                position_action = PositionAction.OPEN if trade["dir"].split(" ")[0] == "Open" else PositionAction.CLOSE
-                fee_asset = tracked_order.quote_asset
-                fee = TradeFeeBase.new_perpetual_fee(
-                    fee_schema=self.trade_fee_schema(),
-                    position_action=position_action,
-                    percent_token=fee_asset,
-                    flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=fee_asset)]
-                )
-                trade_update: TradeUpdate = TradeUpdate(
-                    trade_id=str(trade["tid"]),
-                    client_order_id=tracked_order.client_order_id,
-                    exchange_order_id=str(trade["oid"]),
-                    trading_pair=tracked_order.trading_pair,
-                    fill_timestamp=trade["time"] * 1e-3,
-                    fill_price=Decimal(trade["px"]),
-                    fill_base_amount=Decimal(trade["sz"]),
-                    fill_quote_amount=Decimal(trade["px"]) * Decimal(trade["sz"]),
-                    fee=fee,
-                )
-                self._order_tracker.process_trade_update(trade_update)
+            all_orders = self._order_tracker.all_fillable_orders
+            for k, v in all_orders.items():
+                await v.get_exchange_order_id()
+            _cli_tracked_orders = [o for o in all_orders.values() if exchange_order_id == o.exchange_order_id]
+            if not _cli_tracked_orders:
+                self.logger().debug(f"Ignoring trade message with id {client_order_id}: not in in_flight_orders.")
+                return
+            tracked_order = _cli_tracked_orders[0]
+        trading_pair_base_coin = tracked_order.base_asset
+        if trade["coin"] == trading_pair_base_coin:
+            position_action = PositionAction.OPEN if trade["dir"].split(" ")[0] == "Open" else PositionAction.CLOSE
+            fee_asset = tracked_order.quote_asset
+            fee = TradeFeeBase.new_perpetual_fee(
+                fee_schema=self.trade_fee_schema(),
+                position_action=position_action,
+                percent_token=fee_asset,
+                flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=fee_asset)]
+            )
+            trade_update: TradeUpdate = TradeUpdate(
+                trade_id=str(trade["tid"]),
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=str(trade["oid"]),
+                trading_pair=tracked_order.trading_pair,
+                fill_timestamp=trade["time"] * 1e-3,
+                fill_price=Decimal(trade["px"]),
+                fill_base_amount=Decimal(trade["sz"]),
+                fill_quote_amount=Decimal(trade["px"]) * Decimal(trade["sz"]),
+                fee=fee,
+            )
+            self._order_tracker.process_trade_update(trade_update)
 
     def _process_order_message(self, order_msg: Dict[str, Any]):
         """
@@ -756,6 +770,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 is_auth_required=True)
             success = False
             msg = ""
+            if set_leverage.get("status") == "err":
+                raise IOError(f"{set_leverage}")
             if set_leverage["status"] == 'ok':
                 success = True
             else:
