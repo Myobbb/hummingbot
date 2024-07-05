@@ -1,20 +1,13 @@
-import hashlib
 import hmac
-import json
 import time
-from collections import OrderedDict
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import hummingbot.connector.exchange.bybit.bybit_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
-from urllib.parse import urlencode
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSRequest
 
-import traceback
-
-RECV_WINDOW = str(5000)
 
 class BybitAuth(AuthBase):
 
@@ -29,11 +22,7 @@ class BybitAuth(AuthBase):
         the required parameter in the request header.
         :param request: the request to be configured for authenticated interaction
         """
-
-        headers = self.add_auth_headers(method=request.method, params=request.params) # I am unsure if params or data is the correct on to use, will come back to this
-        request.headers = {**request.headers, **headers} if request.headers is not None else headers
-
-        return request
+        return self.add_auth_headers(method=request.method, request=request)
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
         """
@@ -44,7 +33,7 @@ class BybitAuth(AuthBase):
 
     def get_referral_code_headers(self):
         """
-        Generates authentication headers required by ByBit
+        Generates referral headers
         :return: a dictionary of auth headers
         """
         headers = {
@@ -52,38 +41,65 @@ class BybitAuth(AuthBase):
         }
         return headers
 
-    def add_auth_headers(self, method:str, params: Optional[Dict[str, Any]]):
-        time_stamp = str(int(time.time() * 10 ** 3))
+    def add_auth_headers(self, method: str, request: Optional[Dict[str, Any]]):
+        """
+        Add authentication headers in request object
+
+        :param method: HTTP method (POST, PUT, GET)
+        :param request: The request to be configured for authenticated interaction
+
+        :return: request object updated with xauth headers
+        """
+        ts = str(int(time.time() * 10 ** 3))
 
         headers = {}
-        headers["X-BAPI-TIMESTAMP"] = str(time_stamp)
+        headers["X-BAPI-TIMESTAMP"] = str(ts)
         headers["X-BAPI-API-KEY"] = self.api_key
-        
-        signature = self._generate_signature(timestamp=time_stamp, method=method, payload=params)
+
+        if method.value == "POST":
+            signature = self._generate_rest_signature(
+                timestamp=ts, method=method, payload=request.data)
+        else:
+            signature = self._generate_rest_signature(
+                timestamp=ts, method=method, payload=request.params)
 
         headers["X-BAPI-SIGN"] = signature
-        headers["X-BAPI-SIGN-TYPE"] = str(2)
-        headers["X-BAPI-RECV-WINDOW"] = str(RECV_WINDOW)
-        headers["Content-Type"] = 'application/json'
+        headers["X-BAPI-SIGN-TYPE"] = str(CONSTANTS.X_API_SIGN_TYPE)
+        headers["X-BAPI-RECV-WINDOW"] = str(CONSTANTS.X_API_RECV_WINDOW)
+        request.headers = {**request.headers, **headers} if request.headers is not None else headers
+        return request
 
-        return headers
+    def _generate_rest_signature(self, timestamp, method: str, payload: Optional[Dict[str, Any]]) -> str:
+        if payload is None:
+            payload = {}
+        if method == RESTMethod.GET:
+            param_str = str(timestamp) + self.api_key + CONSTANTS.X_API_RECV_WINDOW + urlencode(payload)
+        elif method == RESTMethod.POST:
+            param_str = str(timestamp) + self.api_key + CONSTANTS.X_API_RECV_WINDOW + f"{payload}"
+        signature = hmac.new(
+            bytes(self.secret_key, "utf-8"),
+            param_str.encode("utf-8"),
+            digestmod="sha256"
+        ).hexdigest()
+        return signature
 
-    def _generate_signature(self, timestamp, method:str, payload: Optional[Dict[str, Any]]) -> str:
-        if params is None or method != 'GET':
-            params = {}
+    def _generate_ws_signature(self, expires: int):
+        signature = str(hmac.new(
+            bytes(self.secret_key, "utf-8"),
+            bytes(f"GET/realtime{expires}", "utf-8"),
+            digestmod="sha256"
+        ).hexdigest())
+        return signature
 
-        param_str = str(timestamp) + self.api_key + RECV_WINDOW + urlencode(payload)
-        return hmac.new(bytes(self.secret_key, "utf-8"), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    def generate_ws_authentication_message(self):
+    def generate_ws_auth_message(self):
         """
         Generates the authentication message to start receiving messages from
         the 3 private ws channels
         """
-        expires = int((self.time_provider.time() + 10) * 1e3)
-        _val = f'GET/realtime{expires}'
-        signature = hmac.new(self.secret_key.encode("utf8"),
-                             _val.encode("utf8"), hashlib.sha256).hexdigest()
+        # Generate expires.
+        # expires = int((self.time_provider.time() + 10) * 1e3)
+        expires = int((self._time() + 10000) * 1000)
+        signature = self._generate_ws_signature(expires)
         auth_message = {
             "op": "auth",
             "args": [self.api_key, expires, signature]

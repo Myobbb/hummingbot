@@ -4,7 +4,6 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 
-import traceback
 
 class BybitOrderBook(OrderBook):
     @classmethod
@@ -21,10 +20,9 @@ class BybitOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = msg["t"]
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
-            "update_id": ts,
+            "update_id": msg["u"],
             "bids": msg["b"],
             "asks": msg["a"]
         }, timestamp=timestamp)
@@ -43,10 +41,9 @@ class BybitOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = msg["ts"]
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
-            "trading_pair": msg["s"],
-            "update_id": ts,
+            "trading_pair": msg["trading_pair"],
+            "update_id": msg["u"],
             "bids": msg["b"],
             "asks": msg["a"]
         }, timestamp=timestamp)
@@ -63,15 +60,13 @@ class BybitOrderBook(OrderBook):
         :param metadata: a dictionary with extra information to add to the difference data
         :return: a diff message with the changes in the order book notified by the exchange
         """
-        data = msg.get("data")
         if metadata:
             msg.update(metadata)
-        ts = msg.get("ts")
         return OrderBookMessage(OrderBookMessageType.DIFF, {
-            "trading_pair": metadata.get("trading_pair"),
-            "update_id": ts,
-            "bids": data.get("b"),
-            "asks": data.get("a")
+            "trading_pair": msg["trading_pair"],
+            "update_id": msg["u"],
+            "bids": msg["b"],
+            "asks": msg["a"]
         }, timestamp=timestamp)
 
     @classmethod
@@ -84,12 +79,12 @@ class BybitOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = msg["t"]
-        return OrderBookMessage(OrderBookMessageType.TRADE, {
+        trade_msg = OrderBookMessage(OrderBookMessageType.TRADE, {
             "trading_pair": msg["trading_pair"],
-            "trade_type": float(TradeType.BUY.value) if msg["m"] else float(TradeType.SELL.value),
-            "trade_id": ts,
-            "update_id": ts,
+            "trade_type": float(TradeType.BUY.value) if msg["S"] == "BUY" else float(TradeType.SELL.value),
+            "trade_id": msg["i"],
+            "update_id": msg["T"],
             "price": msg["p"],
-            "amount": msg["q"]
-        }, timestamp=ts * 1e-3)
+            "amount": msg["v"]
+        }, timestamp=msg["T"])
+        return trade_msg
