@@ -56,18 +56,18 @@ ORDER_STATE = {
     "NEW": OrderState.OPEN,
     "FILLED": OrderState.FILLED,
     "FILLED": OrderState.PARTIALLY_FILLED,
-    "PENDING_CANCEL": OrderState.OPEN,
+    "NEW": OrderState.OPEN,
     "FILLED": OrderState.CANCELED,
     "CANCELED": OrderState.CANCELED,
-    "REJECTED": OrderState.FAILED,
-    "EXPIRED": OrderState.FAILED,
+    "CANCELED": OrderState.FAILED,
+    "CANCELED": OrderState.FAILED,
 }
 
 # WS Order States
 WS_ORDER_STATE = {
     1: OrderState.OPEN,
     2: OrderState.FILLED,
-    3: OrderState.PARTIALLY_FILLED,
+    3: OrderState.FILLED,
     4: OrderState.CANCELED,
     5: OrderState.OPEN,
 }
