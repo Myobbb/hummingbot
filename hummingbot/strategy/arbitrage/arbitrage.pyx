@@ -48,6 +48,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 2.0,
                     failed_order_tolerance: int = 1,
+                    order_timeout: float = 600.0),
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
                     secondary_to_primary_quote_conversion_rate: Decimal = Decimal("1"),
@@ -85,6 +86,10 @@ cdef class ArbitrageStrategy(StrategyBase):
         self._last_conv_rates_logged = 0
 
         self._hb_app_notification = hb_app_notification
+
+        # New variables for order timeout feature
+        self._order_placement_timestamps = {}
+        self._order_timeout = order_timeout
 
         cdef:
             set all_markets = {
@@ -270,7 +275,6 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """
         Output log for completed buy order.
-
         :param buy_order_completed_event: Order completed event
         """
         cdef:
@@ -278,15 +282,20 @@ cdef class ArbitrageStrategy(StrategyBase):
             object market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(buy_order.order_id)
         if market_trading_pair_tuple is not None:
             self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
+            
+            # Remove the completed order from the _order_placement_timestamps
+            if buy_order.order_id in self._order_placement_timestamps:
+                del self._order_placement_timestamps[buy_order.order_id]
+            
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(logging.INFO,
                                     f"Limit order completed on {market_trading_pair_tuple[0].name}: {buy_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{buy_order.base_asset_amount:.8f} {buy_order.base_asset}-{buy_order.quote_asset} buy limit order completed on {market_trading_pair_tuple[0].name}")
 
+
     cdef c_did_complete_sell_order(self, object sell_order_completed_event):
         """
         Output log for completed sell order.
-
         :param sell_order_completed_event: Order completed event
         """
         cdef:
@@ -294,11 +303,16 @@ cdef class ArbitrageStrategy(StrategyBase):
             object market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(sell_order.order_id)
         if market_trading_pair_tuple is not None:
             self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
+            
+            # Remove the completed order from the _order_placement_timestamps
+            if sell_order.order_id in self._order_placement_timestamps:
+                del self._order_placement_timestamps[sell_order.order_id]
+            
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(logging.INFO,
                                     f"Limit order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} sell limit order completed on {market_trading_pair_tuple[0].name}")
-
+                
     cdef c_did_cancel_order(self, object cancel_event):
         """
         Output log for cancelled order.
@@ -353,7 +367,17 @@ cdef class ArbitrageStrategy(StrategyBase):
         for market_trading_pair_tuple in market_trading_pair_tuples:
             # Do not continue if there are pending limit order
             if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
-                return False
+                for order_id, order in tracked_taker_orders[market_trading_pair_tuple].items():
+                    if order_id not in self._order_placement_timestamps:
+                        self._order_placement_timestamps[order_id] = self._current_timestamp
+                    
+                    if self._current_timestamp - self._order_placement_timestamps[order_id] > self._order_timeout:
+                        self.logger().info(f"Order {order_id} has been pending for more than {self._order_timeout} seconds. Considering it completed.")
+                        del self._order_placement_timestamps[order_id]
+                        del tracked_taker_orders[market_trading_pair_tuple][order_id]
+                    else:
+                        return False
+
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
             if market_trading_pair_tuple in self._last_trade_timestamps and ready_to_trade_time > self._current_timestamp:
