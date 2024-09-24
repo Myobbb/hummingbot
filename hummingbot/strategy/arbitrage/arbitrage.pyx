@@ -470,23 +470,17 @@ cdef class ArbitrageStrategy(StrategyBase):
             # get OrderTypes
             buy_order_type = buy_market_trading_pair_tuple.market.get_taker_order_type()
             sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
-
-            # Set limit order expiration_seconds to _next_trade_delay for connectors that require order expiration for limit orders
-            self.c_buy_with_specific_market(buy_market_trading_pair_tuple, quantized_order_amount,
-                                            order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
-            self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
-                                             order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
-
-            
+        
+            # Place orders and capture order IDs
             buy_order_id = self.c_buy_with_specific_market(buy_market_trading_pair_tuple, quantized_order_amount,
-                                            order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
+                                        order_type=buy_order_type, price=buy_price, expiration_seconds=self._next_trade_delay)
             sell_order_id = self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
-                                             order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
+                                         order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
             
             self.logger().warning(f"Placed buy order {buy_order_id} and sell order {sell_order_id}. Starting timer.")
             self._order_placement_timestamps[buy_order_id] = self._current_timestamp
             self._order_placement_timestamps[sell_order_id] = self._current_timestamp
-    
+        
             self.logger().info(self.format_status())
 
     @staticmethod
