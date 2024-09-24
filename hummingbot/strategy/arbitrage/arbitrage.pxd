@@ -1,9 +1,7 @@
 # distutils: language=c++
-
 from hummingbot.core.data_type.order_book cimport OrderBook
 from hummingbot.strategy.strategy_base cimport StrategyBase
 from libc.stdint cimport int64_t
-
 
 cdef class ArbitrageStrategy(StrategyBase):
     cdef:
@@ -29,6 +27,9 @@ cdef class ArbitrageStrategy(StrategyBase):
         bint _hb_app_notification
         tuple _current_profitability
         double _last_conv_rates_logged
+        # Add the new attributes here
+        dict _order_placement_timestamps
+        float _order_timeout
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair)
     cdef c_process_market_pair(self, object market_pair)
