@@ -27,9 +27,7 @@ as_logger = None
 
 cdef class ArbitrageStrategy(StrategyBase):
 
-    cdef:
-        dict _order_placement_timestamps
-        float _order_timeout
+    
         
     OPTION_LOG_STATUS_REPORT = 1 << 0
     OPTION_LOG_CREATE_ORDER = 1 << 1
