@@ -335,8 +335,8 @@ class MexcExchange(ExchangePyBase):
             else:
                 self._account_available_balances[asset_name] = 0
                 self._account_balances[asset_name] = 0
-                self.logger().warning(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
-                self.logger().warning(f"WS message content: {account}")
+                self.logger().debug(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
+                self.logger().debug(f"WS message content: {account}")
                 
         except Exception as e:
             self.logger().error(
