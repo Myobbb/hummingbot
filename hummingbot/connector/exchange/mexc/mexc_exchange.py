@@ -288,7 +288,7 @@ class MexcExchange(ExchangePyBase):
                 elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
                     self._process_order_message(event_message)
                 elif channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
-                    self._process_balance_message_ws(results)
+                    await self._process_balance_message_ws(results)    #modifed to make a REST API call to get the current correct balance
 
             except asyncio.CancelledError:
                 raise
@@ -297,10 +297,49 @@ class MexcExchange(ExchangePyBase):
                     "Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
 
-    def _process_balance_message_ws(self, account):
-        asset_name = account["a"]
-        self._account_available_balances[asset_name] = Decimal(str(account["f"]))
-        self._account_balances[asset_name] = Decimal(str(account["f"])) + Decimal(str(account["l"]))
+    async def _process_balance_message_ws(self, account):
+        """
+        Process balance update message from websocket and override with REST API value
+        """
+        try:
+            asset_name = account["a"]
+            self.logger().info(f"WS Balance update received for {asset_name}")
+            self.logger().debug(f"WS message content: {account}")
+            
+            # Get the correct balance from REST API for this specific asset
+            account_info = await self._api_get(
+                path_url=CONSTANTS.ACCOUNTS_PATH_URL,
+                is_auth_required=True,
+                headers={"Content-Type": "application/json"})
+            
+            # Find the balance entry for our asset
+            balance_entry = next(
+                (entry for entry in account_info["balances"] if entry["asset"] == asset_name),
+                None
+            )
+            
+            if balance_entry is not None:
+                free_balance = Decimal(str(balance_entry["free"]))
+                locked_balance = Decimal(str(balance_entry["locked"]))
+                total_balance = free_balance + locked_balance
+                
+                # Update the balances
+                self._account_available_balances[asset_name] = free_balance
+                self._account_balances[asset_name] = total_balance
+                
+                self.logger().info(
+                    f"Balance updated for {asset_name}: "
+                    f"Free={free_balance}, "
+                    f"Total={total_balance}"
+                )
+            else:
+                self.logger().warning(f"Could not find REST API balance data for asset {asset_name}")
+                
+        except Exception as e:
+            self.logger().error(
+                f"Error processing balance message for {account.get('a', 'unknown asset')}: {str(e)}",
+                exc_info=True
+            )
 
     def _create_trade_update_with_order_fill_data(
             self,
