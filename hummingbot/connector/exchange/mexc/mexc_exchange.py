@@ -303,7 +303,7 @@ class MexcExchange(ExchangePyBase):
         """
         try:
             asset_name = account["a"]
-            self.logger().info(f"WS Balance update received for {asset_name}")
+            self.logger().debug(f"WS Balance update received for {asset_name}")
             self.logger().debug(f"WS message content: {account}")
             
             # Get the correct balance from REST API for this specific asset
@@ -327,7 +327,7 @@ class MexcExchange(ExchangePyBase):
                 self._account_available_balances[asset_name] = free_balance
                 self._account_balances[asset_name] = total_balance
                 
-                self.logger().info(
+                self.logger().debug(
                     f"Balance updated for {asset_name}: "
                     f"Free={free_balance}, "
                     f"Total={total_balance}"
