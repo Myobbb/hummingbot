@@ -1,0 +1,11 @@
+template_version: 1
+
+strategy: null
+connector: null
+trading_pair: null
+is_buy: null
+target_asset_amount: null
+price_limit: null
+spread: null
+order_refresh_time: null
+price_limit_retry_duration: null
