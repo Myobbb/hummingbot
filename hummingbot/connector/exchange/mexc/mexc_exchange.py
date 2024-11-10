@@ -213,7 +213,13 @@ class MexcExchange(ExchangePyBase):
             error_description = str(e)
             is_server_overloaded = ("status is 503" in error_description
                                     and "Unknown error, please check your request or try again later." in error_description)
-            if is_server_overloaded:
+            is_oversold_error = ("status is 400" in error_description and '"code":30005' in error_description)
+            
+            if is_oversold_error:
+                self.logger().warning(f"Oversold error detected. Triggering balance update.")
+                await self._update_balances()
+                raise  
+            elif is_server_overloaded:
                 o_id = "UNKNOWN"
                 transact_time = self._time_synchronizer.time()
             else:
