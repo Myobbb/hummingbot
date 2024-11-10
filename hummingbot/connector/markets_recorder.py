@@ -361,7 +361,7 @@ class MarketsRecorder:
                         exchange=market
                     )
                 except Exception as e:
-                    self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
+                    self.logger().debug(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
                     fee_in_quote = 0
                 trade_fill_record: TradeFill = TradeFill(
                     config_file_path=self.config_file_path,
