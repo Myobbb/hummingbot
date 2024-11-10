@@ -343,14 +343,14 @@ class MexcExchange(ExchangePyBase):
                     # Asset not found in REST API response - set to 0
                     self._account_available_balances[asset_name] = Decimal("0")
                     self._account_balances[asset_name] = Decimal("0")
-                    self.logger().debug(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
+                    self.logger().info(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
                     
             except Exception as e:
                 # If REST API call fails, fallback to WS data
-                self.logger().debug(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
+                self.logger().info(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
                 self._account_available_balances[asset_name] = Decimal(str(account["f"]))
                 self._account_balances[asset_name] = Decimal(str(account["f"])) + Decimal(str(account["l"]))
-                self.logger().debug(
+                self.logger().info(
                     f"Balance updated from WS for {asset_name}: "
                     f"Free={self._account_available_balances[asset_name]}, "
                     f"Total={self._account_balances[asset_name]}"
