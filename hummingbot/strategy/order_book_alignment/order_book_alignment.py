@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Tuple, Union
 import logging
 import statistics
 
+from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.client.performance import PerformanceMetrics
 
 from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent, OrderExpiredEvent
@@ -53,6 +54,8 @@ class OrderBookAlignment(StrategyPyBase):
         self._price_limit_retry_duration = price_limit_retry_duration
         self._target_asset_amount = target_asset_amount
         self._quantity_remaining = target_asset_amount
+        self._asset_traded = 0
+        self._last_price = 0
         self._asset_amount_per_trade = asset_amount_per_trade
 
         self._order_refresh_interval = order_refresh_time
@@ -62,31 +65,9 @@ class OrderBookAlignment(StrategyPyBase):
 
     def format_status(self) -> str:
         lines: list = []
-        # lines.extend(self.configuration_status_lines())
-        lines.extend([f"  Pending amount: {PerformanceMetrics.smart_round(self._quantity_remaining)} "
+        lines.extend([f"  Progress: {self._asset_traded} "
                       f"of {self._target_asset_amount} [{self._market_info.base_asset}]\n"])
-
-        # filled_trades = self.filled_trades()
-        # average_price = (statistics.mean([trade.price for trade in filled_trades])
-        #                  if filled_trades
-        #                  else Decimal(0))
-        #
-        # lines.extend(["",
-        #               f"  Average filled orders price: "
-        #               f"{PerformanceMetrics.smart_round(average_price)} "
-        #               f"{self._market_info.quote_asset}\n"])
         return "\n".join(lines)
-
-    def filled_trades(self):
-        """
-        Returns a list of all filled trades generated from limit orders with the same trade type the strategy
-        has in its configuration
-        """
-        trade_type = TradeType.BUY if self._is_buy else TradeType.SELL
-        return [trade
-                for trade
-                in self.trades
-                if trade.trade_type == trade_type.name and trade.order_type == OrderType.LIMIT]
 
     def start(self, clock: Clock, timestamp: float):
         self.logger().info("Start OBA strategy")
@@ -99,7 +80,7 @@ class OrderBookAlignment(StrategyPyBase):
             return
 
         # Check if update interval has passed and process strategy
-        if timestamp - self._prev_timestamp < self._order_refresh_interval:
+        if self._order_refresh_interval > 0 and timestamp - self._prev_timestamp < self._order_refresh_interval:
             return
 
         # Check if the strategy is in timeout because the price limit has been reached
@@ -122,6 +103,14 @@ class OrderBookAlignment(StrategyPyBase):
             self.logger().warning(
                 "WARNING: Market are not connected or are down at the moment."
             )
+            return
+
+        # get cached best ask/bid price
+        base_price = self._market_info.market.get_price(self._market_info.trading_pair, not self._is_buy)
+
+        # if best_price == our price -> not recreate order
+        if base_price == self._last_price:
+            self._prev_timestamp = self.current_timestamp
             return
 
         # Cancel active orders if exists
@@ -166,9 +155,11 @@ class OrderBookAlignment(StrategyPyBase):
                         order_type=OrderType.LIMIT,
                         price=quantized_price
                     )
+
+                self._last_price = quantized_price
                 self._quantity_remaining = Decimal(self._quantity_remaining) - quantized_amount
                 self._active_orders[order_id] = {"status": LimitOrderStatus.OPEN, "asset_amount": quantized_amount}
-                self.logger().info(f"Create limit order: {order_id}   Base price: {base_price}   Order price: {quantized_price}")
+                self.logger().info(f"========={quantized_amount}  Create limit order: {order_id}   Base price: {base_price}   Order price: {quantized_price}")
             else:
                 self.logger().info("Not enough balance to place the order. Please check balance.")
         else:
@@ -224,13 +215,16 @@ class OrderBookAlignment(StrategyPyBase):
 
     # Buy order fully completes
     def did_complete_buy_order(self, order_completed_event):
-        self.logger().info(f"Your order {order_completed_event.order_id} has been completed")
+        a = self._active_orders[order_completed_event.order_id]["asset_amount"]
+        self.logger().info(f"========+++ {a}  Your order {order_completed_event.order_id} has been completed")
+        self._asset_traded += self._active_orders[order_completed_event.order_id]["asset_amount"]
         self.remove_order_from_dict(order_completed_event.order_id)
         self._prev_timestamp = self._base_timestamp
 
     # Sell order fully completes
     def did_complete_sell_order(self, order_completed_event):
         self.logger().info(f"Your order {order_completed_event.order_id} has been completed")
+        self._asset_traded += self._active_orders[order_completed_event.order_id]["asset_amount"]
         self.remove_order_from_dict(order_completed_event.order_id)
         self._prev_timestamp = self._base_timestamp
 

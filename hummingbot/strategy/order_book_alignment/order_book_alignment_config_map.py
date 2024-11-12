@@ -83,10 +83,10 @@ order_book_alignment_config_map ={
     "order_refresh_time":
         ConfigVar(key="order_refresh_time",
                   prompt="How often do you want to cancel and replace order in seconds?"
-                         "(Default is 10 seconds) >>> ",
+                         " (Default is 10 seconds. Enter 0 to skip refresh delay.) >>> ",
                   type_str="float",
                   default=10,
-                  validator=lambda v: validate_decimal(v, 0, inclusive=False),
+                  validator=lambda v: validate_decimal(v, 0, inclusive=True),
                   prompt_on_new=True),
     "price_limit_retry_duration":
         ConfigVar(key="price_limit_retry_duration",
