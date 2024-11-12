@@ -11,6 +11,11 @@ def trading_pair_prompt() -> str:
 def target_asset_amount_prompt():
     trading_pair = order_book_alignment_config_map.get("trading_pair").value
     base_token, _ = trading_pair.split("-")
+    return f"What is the total amount of {base_token} to be traded? (Default is 1.0) >>> "
+
+def asset_amount_per_trade_prompt():
+    trading_pair = order_book_alignment_config_map.get("trading_pair").value
+    base_token, _ = trading_pair.split("-")
     return f"What is the amount of {base_token} to be traded every order? (Default is 1.0) >>> "
 
 def validate_trading_pair(value: str) -> Optional[str]:
@@ -54,6 +59,13 @@ order_book_alignment_config_map ={
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, min_value=Decimal("0"), inclusive=False),
                   prompt_on_new=True),
+    "asset_amount_per_trade":
+        ConfigVar(key="asset_amount_per_trade",
+                  prompt=asset_amount_per_trade_prompt,
+                  default=1.0,
+                  type_str="decimal",
+                  validator=lambda v: validate_decimal(v, min_value=Decimal("0"), inclusive=False),
+                  prompt_on_new=True),
     "price_limit":
         ConfigVar(key="price_limit",
                   prompt="What is the price limit for the orders? >>> ",
@@ -62,10 +74,11 @@ order_book_alignment_config_map ={
                   prompt_on_new=True),
     "spread":
         ConfigVar(key="spread",
-                  prompt="How far away from the top orderbook price do you want to place the "
-                         "order? (Enter 0.5 to indicate 0.5%) >>> ",
+                  prompt="How far away from the top orderbook price do you want to place the order?"
+                         " (1.5 to indicate 1.5%; 0 to min price step) >>> ",
                   type_str="decimal",
-                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=False),
+                  default=0,
+                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=True),
                   prompt_on_new=True),
     "order_refresh_time":
         ConfigVar(key="order_refresh_time",
