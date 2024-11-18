@@ -303,70 +303,89 @@ class MexcExchange(ExchangePyBase):
                     "Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
 
+    
+
     async def _process_balance_message_ws(self, account):
-        """
-        Process balance update message from websocket and override with REST API value
-        Skip MX token, use REST API balance when possible, fallback to WS data if needed
-        """
-        try:
-            asset_name = account["a"]
-            
-            # Skip processing for MX token
-            if asset_name == "MX":
-                return
-                
-            self.logger().debug(f"WS Balance update received for {asset_name}")
-            self.logger().debug(f"WS message content: {account}")
-            
-            try:
-                # Try to get the correct balance from REST API
-                account_info = await self._api_get(
-                    path_url=CONSTANTS.ACCOUNTS_PATH_URL,
-                    is_auth_required=True,
-                    headers={"Content-Type": "application/json"})
-                
-                # Find the balance entry for our asset
-                balance_entry = next(
-                    (entry for entry in account_info["balances"] if entry["asset"] == asset_name),
-                    None
-                )
-                
-                if balance_entry is not None:
-                    free_balance = Decimal(str(balance_entry["free"]))
-                    locked_balance = Decimal(str(balance_entry["locked"]))
-                    total_balance = free_balance + locked_balance
-                    
-                    # Update the balances
-                    self._account_available_balances[asset_name] = free_balance
-                    self._account_balances[asset_name] = total_balance
-                    
-                    self.logger().debug(
-                        f"Balance updated from REST API for {asset_name}: "
-                        f"Free={free_balance}, "
-                        f"Total={total_balance}"
-                    )
-                else:
-                    # Asset not found in REST API response - set to 0
-                    self._account_available_balances[asset_name] = Decimal("0")
-                    self._account_balances[asset_name] = Decimal("0")
-                    self.logger().info(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
-                    
-            except Exception as e:
-                # If REST API call fails, fallback to WS data
-                self.logger().info(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
-                self._account_available_balances[asset_name] = Decimal(str(account["f"]))
-                self._account_balances[asset_name] = Decimal(str(account["f"])) + Decimal(str(account["l"]))
-                self.logger().info(
-                    f"Balance updated from WS for {asset_name}: "
-                    f"Free={self._account_available_balances[asset_name]}, "
-                    f"Total={self._account_balances[asset_name]}"
-                )
-                
-        except Exception as e:
-            self.logger().error(
-                f"Error processing balance message for {account.get('a', 'unknown asset')}: {str(e)}",
-                exc_info=True
-            )
+       """
+       Process balance update message from websocket.
+       Only use REST API when needed (no frozen balance or frozen = 0).
+       Skip MX token, and fallback to WS data if REST API fails.
+       """
+       try:
+           asset_name = account["a"]
+           
+           # Skip processing for MX token
+           if asset_name == "MX":
+               return
+               
+           self.logger().debug(f"WS Balance update received for {asset_name}")
+           self.logger().debug(f"WS message content: {account}")
+    
+           # Only use REST API when there's no frozen balance or frozen = 0
+           if "l" not in account or float(account["l"]) == 0:
+               try:
+                   # Try to get the correct balance from REST API
+                   account_info = await self._api_get(
+                       path_url=CONSTANTS.ACCOUNTS_PATH_URL,
+                       is_auth_required=True,
+                       headers={"Content-Type": "application/json"})
+                   
+                   # Find the balance entry for our asset
+                   balance_entry = next(
+                       (entry for entry in account_info["balances"] if entry["asset"] == asset_name),
+                       None
+                   )
+                   
+                   if balance_entry is not None:
+                       free_balance = Decimal(str(balance_entry["free"]))
+                       locked_balance = Decimal(str(balance_entry["locked"]))
+                       total_balance = free_balance + locked_balance
+                       
+                       # Update the balances
+                       self._account_available_balances[asset_name] = free_balance
+                       self._account_balances[asset_name] = total_balance
+                       
+                       self.logger().debug(
+                           f"Balance updated from REST API for {asset_name}: "
+                           f"Free={free_balance}, "
+                           f"Total={total_balance}"
+                       )
+                   else:
+                       # Asset not found in REST API response - set to 0
+                       self._account_available_balances[asset_name] = Decimal("0")
+                       self._account_balances[asset_name] = Decimal("0")
+                       self.logger().info(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
+                   
+               except Exception as e:
+                   # If REST API call fails, fallback to WS data
+                   self.logger().info(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
+                   free = Decimal(str(account["f"]))
+                   frozen = Decimal(str(account["l"])) if "l" in account else Decimal("0")
+                   self._account_available_balances[asset_name] = free
+                   self._account_balances[asset_name] = free + frozen
+                   self.logger().info(
+                       f"Balance updated from WS for {asset_name}: "
+                       f"Free={self._account_available_balances[asset_name]}, "
+                       f"Total={self._account_balances[asset_name]}"
+                   )
+           else:
+               # Use WS data directly when there is frozen balance
+               self.logger().debug(f"Using WS data for {asset_name} due to frozen balance")
+               free = Decimal(str(account["f"]))
+               frozen = Decimal(str(account["l"]))
+               self._account_available_balances[asset_name] = free
+               self._account_balances[asset_name] = free + frozen
+               self.logger().info(
+                   f"Balance updated from WS for {asset_name}: "
+                   f"Free={self._account_available_balances[asset_name]}, "
+                   f"Total={self._account_balances[asset_name]}"
+               )
+               
+       except Exception as e:
+           self.logger().error(
+               f"Error processing balance message for {account.get('a', 'unknown asset')}: {str(e)}",
+               exc_info=True
+           )
 
     def _create_trade_update_with_order_fill_data(
             self,
