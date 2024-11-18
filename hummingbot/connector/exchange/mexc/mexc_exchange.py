@@ -354,16 +354,16 @@ class MexcExchange(ExchangePyBase):
                        # Asset not found in REST API response - set to 0
                        self._account_available_balances[asset_name] = Decimal("0")
                        self._account_balances[asset_name] = Decimal("0")
-                       self.logger().info(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
+                       self.logger().debug(f"Could not find REST API balance data for asset {asset_name}, setting to 0")
                    
                except Exception as e:
                    # If REST API call fails, fallback to WS data
-                   self.logger().info(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
+                   self.logger().debug(f"Failed to get REST API balance for {asset_name}, falling back to WS data: {str(e)}")
                    free = Decimal(str(account["f"]))
                    frozen = Decimal(str(account["l"])) if "l" in account else Decimal("0")
                    self._account_available_balances[asset_name] = free
                    self._account_balances[asset_name] = free + frozen
-                   self.logger().info(
+                   self.logger().debug(
                        f"Balance updated from WS for {asset_name}: "
                        f"Free={self._account_available_balances[asset_name]}, "
                        f"Total={self._account_balances[asset_name]}"
@@ -375,7 +375,7 @@ class MexcExchange(ExchangePyBase):
                frozen = Decimal(str(account["l"]))
                self._account_available_balances[asset_name] = free
                self._account_balances[asset_name] = free + frozen
-               self.logger().info(
+               self.logger().debug(
                    f"Balance updated from WS for {asset_name}: "
                    f"Free={self._account_available_balances[asset_name]}, "
                    f"Total={self._account_balances[asset_name]}"
