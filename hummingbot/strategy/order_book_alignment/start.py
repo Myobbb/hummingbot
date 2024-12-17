@@ -38,12 +38,12 @@ def start(self):
             market_info=MarketTradingPairTuple(*market_info),
             target_asset_amount=target_asset_amount,
             asset_amount_per_trade=asset_amount_per_trade,
-            order_refresh_time=order_refresh_time,
-            place_after_fill_order_delay=place_after_fill_order_delay,
             price_limit=price_limit,
-            is_buy=is_buy,
             spread=spread,
-            price_limit_retry_duration=price_limit_retry_duration
+	    is_buy=is_buy,
+            price_limit_retry_duration=price_limit_retry_duration,
+            order_refresh_time=order_refresh_time,
+	    place_after_fill_order_delay=place_after_fill_order_delay
         )
 
     except Exception as e:
