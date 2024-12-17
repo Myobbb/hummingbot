@@ -34,19 +34,21 @@ class OrderBookAlignment(StrategyPyBase):
         return hws_logger
 
     def __init__(self,
-             market_info: MarketTradingPairTuple,
-             target_asset_amount: Decimal,
-             asset_amount_per_trade: Decimal,
-             price_limit: Decimal,
-             spread: Decimal,
-             is_buy: bool,
-             price_limit_retry_duration: float = 300,
-             order_refresh_time: float = 10.0):
+                 market_info: MarketTradingPairTuple,
+                 target_asset_amount: Decimal,
+                 asset_amount_per_trade: Decimal,
+                 price_limit: Decimal,
+                 spread: Decimal,
+                 is_buy: bool,
+                 price_limit_retry_duration: float = 300,
+                 order_refresh_time: float = 10.0,
+                 place_after_fill_order_delay: float = 0.0):
 
         super().__init__()
         self._market_info = market_info
         self._prev_timestamp = 0
         self._base_timestamp = 0
+        self._last_fill_timestamp = 0  # Track when the last order was filled
         self._is_price_limit_timeout = False
         self._is_buy = is_buy
         self._spread = spread
@@ -57,11 +59,13 @@ class OrderBookAlignment(StrategyPyBase):
         self._asset_traded = 0
         self._last_price = 0
         self._asset_amount_per_trade = asset_amount_per_trade
+        self._place_after_fill_order_delay = place_after_fill_order_delay
 
         self._order_refresh_interval = order_refresh_time
-        self._active_orders = {} # {order_id, Dict(status: LimitOrderStatus, asset_amount: Decimal)}
+        self._active_orders = {}  # {order_id, Dict(status: LimitOrderStatus, asset_amount: Decimal)}
 
         self.add_markets([market_info.market])
+
 
     def format_status(self) -> str:
         lines: list = []
