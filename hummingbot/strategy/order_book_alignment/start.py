@@ -34,18 +34,21 @@ def start(self):
         market_info = [self.markets[connector], trading_pair] + list(assets)
         self.market_trading_pair_tuples = [MarketTradingPairTuple(*market_info)]
 
+        # Create the strategy with parameters in the correct order as defined in the class
         self.strategy = OrderBookAlignment(
             market_info=MarketTradingPairTuple(*market_info),
             target_asset_amount=target_asset_amount,
             asset_amount_per_trade=asset_amount_per_trade,
             price_limit=price_limit,
             spread=spread,
-	    is_buy=is_buy,
-            price_limit_retry_duration=price_limit_retry_duration,
-            order_refresh_time=order_refresh_time,
-	    place_after_fill_order_delay=place_after_fill_order_delay
+            is_buy=is_buy,
+            price_limit_retry_duration=price_limit_retry_duration,  # optional with default 300
+            order_refresh_time=order_refresh_time,                  # optional with default 10.0
+            place_after_fill_order_delay=place_after_fill_order_delay  # optional with default 0.0
         )
 
     except Exception as e:
         self.notify(str(e))
+        self.logger().error("Unknown error during initialization.", exc_info=True)
+
         self.logger().error("Unknown error during initialization.", exc_info=True)
