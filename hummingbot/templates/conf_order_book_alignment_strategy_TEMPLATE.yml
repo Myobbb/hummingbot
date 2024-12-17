@@ -8,5 +8,6 @@ target_asset_amount: null
 asset_amount_per_trade: null
 price_limit: null
 order_refresh_time: null
+place_after_fill_order_delay: null
 price_limit_retry_duration: null
 spread: null
