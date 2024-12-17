@@ -15,6 +15,7 @@ def start(self):
         target_asset_amount = c_map.get("target_asset_amount").value
         asset_amount_per_trade = c_map.get("asset_amount_per_trade").value
         order_refresh_time = c_map.get("order_refresh_time").value
+        place_after_fill_order_delay = c_map.get("place_after_fill_order_delay").value
         price_limit = c_map.get("price_limit").value
         trade_side = c_map.get("is_buy").value
         price_limit_retry_duration = c_map.get("price_limit_retry_duration").value
@@ -38,6 +39,7 @@ def start(self):
             target_asset_amount=target_asset_amount,
             asset_amount_per_trade=asset_amount_per_trade,
             order_refresh_time=order_refresh_time,
+            place_after_fill_order_delay=place_after_fill_order_delay,
             price_limit=price_limit,
             is_buy=is_buy,
             spread=spread,

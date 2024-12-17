@@ -75,10 +75,10 @@ order_book_alignment_config_map ={
     "spread":
         ConfigVar(key="spread",
                   prompt="How far away from the top orderbook price do you want to place the order?"
-                         " (1.5 to indicate 1.5%; 0 to min price step) >>> ",
+                         " (0 to min price step: auto.) >>> ",
                   type_str="decimal",
                   default=0,
-                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=True),
+                  validator=lambda v: validate_decimal(v),
                   prompt_on_new=True),
     "order_refresh_time":
         ConfigVar(key="order_refresh_time",
@@ -86,6 +86,14 @@ order_book_alignment_config_map ={
                          " (Default is 10 seconds. Enter 0 to skip refresh delay.) >>> ",
                   type_str="float",
                   default=10,
+                  validator=lambda v: validate_decimal(v, 0, inclusive=True),
+                  prompt_on_new=True),
+    "place_after_fill_order_delay":
+        ConfigVar(key="place_after_fill_order_delay",
+                  prompt="How many seconds after filling an order do you want to wait before placing a new order?"
+                         " (Default is 0 seconds.) >>> ",
+                  type_str="float",
+                  default=0,
                   validator=lambda v: validate_decimal(v, 0, inclusive=True),
                   prompt_on_new=True),
     "price_limit_retry_duration":
