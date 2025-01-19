@@ -487,7 +487,7 @@ class BybitExchange(ExchangePyBase):
         for coin in balances["result"]["list"][0]["coin"]:
             name = coin["coin"]
             free_balance = Decimal(coin["free"]) if self._account_type == "SPOT" \
-                else Decimal(coin["availableToWithdraw"])
+                else Decimal(coin["walletBalance"])
             balance = Decimal(coin["walletBalance"])
             self._account_available_balances[name] = free_balance
             self._account_balances[name] = Decimal(balance)
