@@ -93,6 +93,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await ws.send(subscribe_trade_request)
             await ws.send(subscribe_orderbook_request)
 
+            # lightweight heartbeat to avoid idle closes
+            try:
+                await ws.send(WSJSONRequest(payload={"method": "PING"}))
+            except Exception:
+                pass
+
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
             raise

@@ -17,10 +17,13 @@ try:
     from hummingbot.connector.exchange.mexc.pb.PrivateAccountV3Api_pb2 import PrivateAccountV3Api
     from hummingbot.connector.exchange.mexc.pb.PrivateDealsV3Api_pb2 import PrivateDealsV3Api
     from hummingbot.connector.exchange.mexc.pb.PrivateOrdersV3Api_pb2 import PrivateOrdersV3Api
+    # Optional wrapper if server sends channel + oneof body
+    from hummingbot.connector.exchange.mexc.pb.PushDataV3ApiWrapper_pb2 import PushDataV3ApiWrapper  # type: ignore
 except Exception:  # allow runtime if protoc not available during some environments
     PrivateAccountV3Api = None
     PrivateDealsV3Api = None
     PrivateOrdersV3Api = None
+    PushDataV3ApiWrapper = None
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -324,6 +327,11 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 # Handle protobuf frames
                 if isinstance(content, (bytes, bytearray)):
                     raw_bytes = bytes(content)
+                    # debug bytes length for diagnostics
+                    try:
+                        self.logger().debug(f"[MEXC PB] received {len(raw_bytes)} bytes")
+                    except Exception:
+                        pass
                     # Try gzip then zlib, else keep raw
                     for decompressor in ("gzip", "zlib"):
                         try:
@@ -337,6 +345,47 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             raw_bytes = bytes(content)
                         else:
                             break
+
+                    # Prefer wrapper decoding if present
+                    if 'PushDataV3ApiWrapper' in globals() and PushDataV3ApiWrapper is not None:
+                        try:
+                            wrapper = PushDataV3ApiWrapper()
+                            wrapper.ParseFromString(raw_bytes)
+                            which = wrapper.WhichOneof("body")
+                            if which == "privateAccount":
+                                acct = wrapper.privateAccount
+                                free = max(0.0, float(getattr(acct, 'balanceAmount', 0) or 0) - float(getattr(acct, 'frozenAmount', 0) or 0))
+                                event = {
+                                    "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+                                    "d": {"a": getattr(acct, 'vcoinName', '').upper(), "f": str(free), "l": str(getattr(acct, 'frozenAmount', '0'))},
+                                    "t": int(getattr(acct, 'time', 0) or int(time.time() * 1000)),
+                                }
+                                await queue.put(event)
+                                self.logger().debug("[MEXC PB] parsed privateAccount via wrapper")
+                                continue
+                            if which == "privateDeals":
+                                d = wrapper.privateDeals
+                                event = {
+                                    "c": CONSTANTS.USER_TRADES_ENDPOINT_NAME,
+                                    "t": int(getattr(d, 'time', 0) or int(time.time() * 1000)),
+                                    "d": {"c": getattr(d, 'clientOrderId', ''), "t": getattr(d, 'tradeId', ''), "v": getattr(d, 'quantity', ''), "a": getattr(d, 'amount', ''), "p": getattr(d, 'price', ''), "T": int(getattr(d, 'time', 0) or int(time.time() * 1000)), "N": getattr(d, 'feeCurrency', ''), "n": getattr(d, 'feeAmount', '')},
+                                }
+                                await queue.put(event)
+                                self.logger().debug("[MEXC PB] parsed privateDeals via wrapper")
+                                continue
+                            if which == "privateOrders":
+                                o = wrapper.privateOrders
+                                event = {
+                                    "c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
+                                    "t": int(getattr(o, 'createTime', 0) or int(time.time() * 1000)),
+                                    "d": {"c": getattr(o, 'clientId', ''), "i": getattr(o, 'id', ''), "s": int(getattr(o, 'status', 0) or 0)},
+                                }
+                                await queue.put(event)
+                                self.logger().debug("[MEXC PB] parsed privateOrders via wrapper")
+                                continue
+                        except Exception:
+                            # fall-through to direct decode
+                            pass
 
                     if PrivateAccountV3Api is not None:
                         # Try account
@@ -361,6 +410,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                     "t": int(d.time) if getattr(d, "time", 0) else int(time.time() * 1000),
                                     "d": {"c": d.clientOrderId, "t": d.tradeId, "v": d.quantity, "a": d.amount, "p": d.price, "T": int(d.time) if getattr(d, "time", 0) else int(time.time() * 1000), "N": d.feeCurrency, "n": d.feeAmount},
                                 })
+                                self.logger().debug("[MEXC PB] parsed privateDeals (direct)")
                                 continue
                         except Exception:
                             pass
@@ -373,6 +423,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                     "t": int(o.createTime) if getattr(o, "createTime", 0) else int(time.time() * 1000),
                                     "d": {"c": o.clientId, "i": o.id, "s": int(o.status) if isinstance(getattr(o, "status", 0), int) else 0},
                                 })
+                                self.logger().debug("[MEXC PB] parsed privateOrders (direct)")
                                 continue
                         except Exception:
                             pass
