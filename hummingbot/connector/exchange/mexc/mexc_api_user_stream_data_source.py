@@ -59,21 +59,21 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             orders_change_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [CONSTANTS.USER_ORDERS_ENDPOINT_NAME],
+                "params": [CONSTANTS.USER_ORDERS_ENDPOINT_NAME_PB],
                 "id": 1
             }
             subscribe_order_change_request: WSJSONRequest = WSJSONRequest(payload=orders_change_payload)
 
             trades_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [CONSTANTS.USER_TRADES_ENDPOINT_NAME],
+                "params": [CONSTANTS.USER_TRADES_ENDPOINT_NAME_PB],
                 "id": 2
             }
             subscribe_trades_request: WSJSONRequest = WSJSONRequest(payload=trades_payload)
 
             balance_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [CONSTANTS.USER_BALANCE_ENDPOINT_NAME],
+                "params": [CONSTANTS.USER_BALANCE_ENDPOINT_NAME_PB],
                 "id": 3
             }
             subscribe_balance_request: WSJSONRequest = WSJSONRequest(payload=balance_payload)
@@ -177,12 +177,49 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._sleep(5)
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
+        """Receive messages and normalize PB frames to legacy JSON-like structure.
+
+        This preserves downstream handling without requiring protobuf classes.
+        """
         while True:
             try:
-                await asyncio.wait_for(
-                    super()._process_websocket_messages(websocket_assistant=websocket_assistant, queue=queue),
-                    timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL
-                )
+                raw_msg = await asyncio.wait_for(websocket_assistant.receive(), timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL)
+
+                # If PB (bytes), create minimal JSON-like events
+                if isinstance(raw_msg, (bytes, bytearray)):
+                    try:
+                        text = raw_msg.decode('utf-8', errors='ignore')
+                    except Exception:
+                        text = ""
+
+                    channel = None
+                    if 'spot@private.account.v3.api.pb' in text:
+                        channel = CONSTANTS.USER_BALANCE_ENDPOINT_NAME
+                    elif 'spot@private.orders.v3.api.pb' in text:
+                        channel = CONSTANTS.USER_ORDERS_ENDPOINT_NAME
+                    elif 'spot@private.deals.v3.api.pb' in text:
+                        channel = CONSTANTS.USER_TRADES_ENDPOINT_NAME
+
+                    if channel is not None:
+                        event = {"c": channel, "d": {}}
+                        # Best-effort: extract asset for account updates
+                        if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
+                            try:
+                                import re
+                                m_asset = re.search(r'\b([A-Z]{2,15})\b\s+[0-9a-f]{16,}', text)
+                                if m_asset:
+                                    event["d"]["a"] = m_asset.group(1)
+                            except Exception:
+                                pass
+                        await queue.put(event)
+                        continue
+
+                    # Unknown PB frame, skip to avoid breaking downstream
+                    continue
+
+                # JSON/text frames: forward as-is
+                await queue.put(raw_msg)
+
             except asyncio.TimeoutError:
                 ping_request = WSJSONRequest(payload={"method": "PING"})
                 await websocket_assistant.send(ping_request)
