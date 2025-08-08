@@ -10,6 +10,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+from . import pb_decode
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -204,16 +205,44 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         channel = CONSTANTS.USER_TRADES_ENDPOINT_NAME
 
                     if channel is not None:
-                        event = {"c": channel, "d": {}}
+                        # If we have protobuf decoders, use them to map to legacy JSON 'd'
+                        decoded_d = None
+                        if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
+                            decoded_d = pb_decode.parse_account_pb(content)
+                        elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
+                            decoded_d = pb_decode.parse_orders_pb(content)
+                        elif channel == CONSTANTS.USER_TRADES_ENDPOINT_NAME:
+                            decoded_d = pb_decode.parse_deals_pb(content)
+
+                        if decoded_d is not None:
+                            await queue.put({"c": channel, "d": decoded_d})
+                            continue
+
+                        # Fallback when PB decode not available: REST-backed balance snapshot for account channel
                         if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
                             try:
-                                import re
-                                m_asset = re.search(r'\b([A-Z]{2,15})\b\s+[0-9a-f]{16,}', text)
-                                if m_asset:
-                                    event["d"]["a"] = m_asset.group(1)
+                                rest = await self._api_factory.get_rest_assistant()
+                                account_info = await rest.execute_request(
+                                    url=web_utils.private_rest_url(path_url=CONSTANTS.ACCOUNTS_PATH_URL, domain=self._domain),
+                                    method=RESTMethod.GET,
+                                    is_auth_required=True,
+                                    headers={"Content-Type": "application/json"},
+                                )
+                                for bal in account_info.get("balances", []):
+                                    event = {
+                                        "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+                                        "d": {
+                                            "a": bal.get("asset"),
+                                            "f": bal.get("free", "0"),
+                                            "l": bal.get("locked", "0"),
+                                        },
+                                    }
+                                    await queue.put(event)
                             except Exception:
-                                pass
-                        await queue.put(event)
+                                await queue.put({"c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME, "d": {}})
+                            continue
+
+                        # Orders/deals fallback not implemented here (to avoid malformed events)
                         continue
 
                     # Unknown PB frame: ignore to avoid breaking downstream
