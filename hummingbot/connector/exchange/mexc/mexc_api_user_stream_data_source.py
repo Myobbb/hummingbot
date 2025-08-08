@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict, Any
 
 from hummingbot.connector.exchange.mexc import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
 from hummingbot.connector.exchange.mexc.mexc_auth import MexcAuth
@@ -10,6 +10,16 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+
+# Protobuf messages (vendored)
+try:
+    from hummingbot.connector.exchange.mexc.pb.PrivateAccountV3Api_pb2 import PrivateAccountV3Api
+    from hummingbot.connector.exchange.mexc.pb.PrivateDealsV3Api_pb2 import PrivateDealsV3Api
+    from hummingbot.connector.exchange.mexc.pb.PrivateOrdersV3Api_pb2 import PrivateOrdersV3Api
+except Exception:  # pragma: no cover - allow runtime without PB for environments lacking protoc
+    PrivateAccountV3Api = None
+    PrivateDealsV3Api = None
+    PrivateOrdersV3Api = None
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -177,10 +187,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._sleep(5)
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
-        """Receive messages and normalize PB frames to legacy JSON-like structure.
-
-        This preserves downstream handling without requiring protobuf classes.
-        """
+        """Receive messages and normalize PB frames to unified JSON-like structure expected downstream."""
         while True:
             try:
                 raw = await asyncio.wait_for(websocket_assistant.receive(), timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL)
@@ -190,68 +197,80 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
                 # Handle bytes: PB frames
                 if isinstance(content, (bytes, bytearray)):
-                    try:
-                        text = content.decode('utf-8', errors='ignore')
-                    except Exception:
-                        text = ""
+                    # Parse protobuf if classes are available
+                    if PrivateAccountV3Api is not None:
+                        # We cannot know channel from raw bytes; server usually prefixes with a JSON header in a separate frame.
+                        # Strategy: try parse in order; if parsing fails, try next.
+                        parsed_any: Optional[Dict[str, Any]] = None
 
-                    # Minimal parsers for PB text frames (no proto dependency)
-                    def _parse_balance_pb(message_text: str):
+                        # Balance
                         try:
-                            import re
-                            asset_match = re.search(r'vcoinName:\s*"([^"]+)"', message_text)
-                            bal_match = re.search(r'balanceAmount:\s*"([0-9.]+)"', message_text)
-                            frozen_match = re.search(r'frozenAmount:\s*"([0-9.]+)"', message_text)
-                            if not asset_match or not bal_match:
-                                return None
-                            asset = asset_match.group(1).upper()
-                            balance_amount = float(bal_match.group(1))
-                            frozen_amount = float(frozen_match.group(1)) if frozen_match else 0.0
-                            free_amount = max(0.0, balance_amount - frozen_amount)
-                            return {
-                                "a": asset,
-                                "f": str(free_amount),
-                                "l": str(frozen_amount),
-                            }
-                        except Exception:
-                            return None
-
-                    # Detect channel from PB marker and parse minimally when possible
-                    if 'spot@private.account.v3.api.pb' in text:
-                        parsed = _parse_balance_pb(text)
-                        if parsed is not None:
-                            event = {"c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME, "d": parsed}
-                            await queue.put(event)
-                            continue
-                        # Fallback to REST snapshot if minimal parsing failed
-                        try:
-                            rest = await self._api_factory.get_rest_assistant()
-                            account_info = await rest.execute_request(
-                                url=web_utils.private_rest_url(path_url=CONSTANTS.ACCOUNTS_PATH_URL, domain=self._domain),
-                                method=RESTMethod.GET,
-                                is_auth_required=True,
-                                headers={"Content-Type": "application/json"},
-                            )
-                            for bal in account_info.get("balances", []):
+                            msg = PrivateAccountV3Api()
+                            msg.ParseFromString(content)
+                            # If required fields empty, this may be a wrong type
+                            if msg.vcoinName:
+                                free = max(0.0, float(msg.balanceAmount or 0) - float(msg.frozenAmount or 0))
                                 event = {
                                     "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
                                     "d": {
-                                        "a": bal.get("asset"),
-                                        "f": bal.get("free", "0"),
-                                        "l": bal.get("locked", "0"),
+                                        "a": msg.vcoinName.upper(),
+                                        "f": str(free),
+                                        "l": str(msg.frozenAmount or "0"),
+                                    },
+                                    "t": int(msg.time) if msg.time else int(time.time() * 1000),
+                                }
+                                await queue.put(event)
+                                continue
+                        except Exception:
+                            pass
+
+                        # Deals
+                        try:
+                            dmsg = PrivateDealsV3Api()
+                            dmsg.ParseFromString(content)
+                            if dmsg.tradeId or dmsg.clientOrderId or dmsg.orderId:
+                                event = {
+                                    "c": CONSTANTS.USER_TRADES_ENDPOINT_NAME,
+                                    "t": int(dmsg.time) if dmsg.time else int(time.time() * 1000),
+                                    "d": {
+                                        "c": dmsg.clientOrderId,
+                                        "t": dmsg.tradeId,
+                                        "v": dmsg.quantity,
+                                        "a": dmsg.amount,
+                                        "p": dmsg.price,
+                                        "T": int(dmsg.time) if dmsg.time else int(time.time() * 1000),
+                                        "N": dmsg.feeCurrency,
+                                        "n": dmsg.feeAmount,
+                                    },
+                                    # include symbol if provided in future proto revs
+                                }
+                                await queue.put(event)
+                                continue
+                        except Exception:
+                            pass
+
+                        # Orders
+                        try:
+                            omsg = PrivateOrdersV3Api()
+                            omsg.ParseFromString(content)
+                            if omsg.id or omsg.clientId:
+                                event = {
+                                    "c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
+                                    "t": int(omsg.createTime) if omsg.createTime else int(time.time() * 1000),
+                                    "d": {
+                                        "c": omsg.clientId,
+                                        "i": omsg.id,
+                                        # Map numeric status to same codes used by WS_ORDER_STATE lookup in exchange
+                                        # We pass numeric status; mexc_exchange maps via CONSTANTS.WS_ORDER_STATE
+                                        "s": int(omsg.status) if isinstance(omsg.status, int) else 0,
                                     },
                                 }
                                 await queue.put(event)
+                                continue
                         except Exception:
                             pass
-                        continue
 
-                    # Orders/Deals PB: keep lightweight behavior (no parse) to avoid malformed events
-                    if 'spot@private.orders.v3.api.pb' in text or 'spot@private.deals.v3.api.pb' in text:
-                        # Intentionally skip enqueueing; downstream polling and REST backups will handle updates
-                        continue
-
-                    # Unknown PB frame: ignore to avoid breaking downstream
+                    # If protobuf classes not available or failed, ignore bytes frame
                     continue
 
                 # If it's str JSON, parse to dict

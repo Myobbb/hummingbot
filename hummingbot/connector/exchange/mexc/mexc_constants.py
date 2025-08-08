@@ -8,8 +8,8 @@ MAX_ORDER_ID_LEN = 32
 
 # Base URL
 REST_URL = "https://api.mexc.{}/api/"
-WSS_URL = "wss://wbs-api.mexc.{}/ws"
-#ws://wbs-api.mexc.com/ws
+WSS_URL = "ws://wbs-api.mexc.{}/ws"
+# Example: ws://wbs-api.mexc.com/ws
 PUBLIC_API_VERSION = "v3"
 PRIVATE_API_VERSION = "v3"
 
