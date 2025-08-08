@@ -35,6 +35,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
+        self._manage_listen_key_task: Optional[asyncio.Task] = None
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -138,16 +139,20 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self._listen_key_initialized_event.set()
                     self._last_listen_key_ping_ts = int(time.time())
 
-                if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
+                elapsed = now - self._last_listen_key_ping_ts
+                if elapsed >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
                     success: bool = await self._ping_listen_key()
                     if not success:
-                        self.logger().error("Error occurred renewing listen key ...")
-                        break
-                    else:
-                        self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
-                        self._last_listen_key_ping_ts = int(time.time())
+                        # Do not stop the loop; retry soon to avoid key expiration
+                        self.logger().warning("Failed to refresh MEXC listen key; will retry in 60s")
+                        await self._sleep(60)
+                        continue
+                    self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
+                    self._last_listen_key_ping_ts = int(time.time())
                 else:
-                    await self._sleep(self.LISTEN_KEY_KEEP_ALIVE_INTERVAL)
+                    # Sleep only the remaining time until next keep-alive
+                    remaining = max(1, self.LISTEN_KEY_KEEP_ALIVE_INTERVAL - elapsed)
+                    await self._sleep(remaining)
         finally:
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
