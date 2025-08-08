@@ -183,12 +183,15 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         while True:
             try:
-                raw_msg = await asyncio.wait_for(websocket_assistant.receive(), timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL)
+                raw = await asyncio.wait_for(websocket_assistant.receive(), timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL)
 
-                # If PB (bytes), create minimal JSON-like events
-                if isinstance(raw_msg, (bytes, bytearray)):
+                # Unwrap WSResponse to its data payload if present
+                content = getattr(raw, 'data', raw)
+
+                # Handle bytes: PB frames
+                if isinstance(content, (bytes, bytearray)):
                     try:
-                        text = raw_msg.decode('utf-8', errors='ignore')
+                        text = content.decode('utf-8', errors='ignore')
                     except Exception:
                         text = ""
 
@@ -202,7 +205,6 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
                     if channel is not None:
                         event = {"c": channel, "d": {}}
-                        # Best-effort: extract asset for account updates
                         if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
                             try:
                                 import re
@@ -214,11 +216,27 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         await queue.put(event)
                         continue
 
-                    # Unknown PB frame, skip to avoid breaking downstream
+                    # Unknown PB frame: ignore to avoid breaking downstream
                     continue
 
-                # JSON/text frames: forward as-is
-                await queue.put(raw_msg)
+                # If it's str JSON, parse to dict
+                if isinstance(content, str):
+                    try:
+                        import json
+                        parsed = json.loads(content)
+                        await queue.put(parsed)
+                        continue
+                    except Exception:
+                        # Not JSON; ignore
+                        continue
+
+                # If it's already a dict, forward
+                if isinstance(content, dict):
+                    await queue.put(content)
+                    continue
+
+                # Otherwise, ignore unknown payload types
+                continue
 
             except asyncio.TimeoutError:
                 ping_request = WSJSONRequest(payload={"method": "PING"})
