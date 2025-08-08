@@ -111,6 +111,19 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         self.logger().info("Successfully connected to user stream")
 
+        # Start lightweight heartbeat loop for private WS
+        async def _hb():
+            try:
+                while True:
+                    await asyncio.sleep(self.HEARTBEAT_TIME_INTERVAL)
+                    try:
+                        await ws.send(WSJSONRequest(payload={"method": "PING"}))
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                return
+        safe_ensure_future(_hb())
+
         return ws
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
@@ -123,21 +136,30 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             orders_change_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [f"{CONSTANTS.USER_ORDERS_ENDPOINT_NAME}.pb"],
+                "params": [
+                    f"{CONSTANTS.USER_ORDERS_ENDPOINT_NAME}.pb",
+                    f"{CONSTANTS.USER_ORDERS_ENDPOINT_NAME}"
+                ],
                 "id": 1
             }
             subscribe_order_change_request: WSJSONRequest = WSJSONRequest(payload=orders_change_payload)
 
             trades_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [f"{CONSTANTS.USER_TRADES_ENDPOINT_NAME}.pb"],
+                "params": [
+                    f"{CONSTANTS.USER_TRADES_ENDPOINT_NAME}.pb",
+                    f"{CONSTANTS.USER_TRADES_ENDPOINT_NAME}"
+                ],
                 "id": 2
             }
             subscribe_trades_request: WSJSONRequest = WSJSONRequest(payload=trades_payload)
 
             balance_payload = {
                 "method": "SUBSCRIPTION",
-                "params": [f"{CONSTANTS.USER_BALANCE_ENDPOINT_NAME}.pb"],
+                "params": [
+                    f"{CONSTANTS.USER_BALANCE_ENDPOINT_NAME}.pb",
+                    f"{CONSTANTS.USER_BALANCE_ENDPOINT_NAME}"
+                ],
                 "id": 3
             }
             subscribe_balance_request: WSJSONRequest = WSJSONRequest(payload=balance_payload)
