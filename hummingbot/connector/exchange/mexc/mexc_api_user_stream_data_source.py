@@ -55,7 +55,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._get_ws_assistant()
-        url = f"{CONSTANTS.WSS_URL.format(self._domain)}?listenKey={self._current_listen_key}"
+        url = f"{CONSTANTS.WS_PRIVATE_URL.format(self._domain)}?listenKey={self._current_listen_key}"
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         return ws
 
@@ -195,8 +195,29 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 # Unwrap WSResponse to its data payload if present
                 content = getattr(raw, 'data', raw)
 
+                # Server PING messages (JSON)
+                if isinstance(content, dict) and content.get("method") == "PING":
+                    pong = WSJSONRequest(payload={"method": "PONG"})
+                    await websocket_assistant.send(pong)
+                    continue
+
                 # Handle bytes: PB frames
                 if isinstance(content, (bytes, bytearray)):
+                    # Attempt decompression (gzip or zlib) if necessary
+                    raw_bytes = bytes(content)
+                    for decompress in ("gzip", "zlib"):
+                        try:
+                            if decompress == "gzip":
+                                import gzip
+                                raw_bytes = gzip.decompress(raw_bytes)
+                            else:
+                                import zlib
+                                raw_bytes = zlib.decompress(raw_bytes)
+                        except Exception:
+                            # keep original
+                            raw_bytes = bytes(content)
+                        else:
+                            break
                     # Parse protobuf if classes are available
                     if PrivateAccountV3Api is not None:
                         # We cannot know channel from raw bytes; server usually prefixes with a JSON header in a separate frame.
@@ -206,7 +227,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         # Balance
                         try:
                             msg = PrivateAccountV3Api()
-                            msg.ParseFromString(content)
+                            msg.ParseFromString(raw_bytes)
                             # If required fields empty, this may be a wrong type
                             if msg.vcoinName:
                                 free = max(0.0, float(msg.balanceAmount or 0) - float(msg.frozenAmount or 0))
@@ -227,7 +248,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         # Deals
                         try:
                             dmsg = PrivateDealsV3Api()
-                            dmsg.ParseFromString(content)
+                            dmsg.ParseFromString(raw_bytes)
                             if dmsg.tradeId or dmsg.clientOrderId or dmsg.orderId:
                                 event = {
                                     "c": CONSTANTS.USER_TRADES_ENDPOINT_NAME,
@@ -252,7 +273,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         # Orders
                         try:
                             omsg = PrivateOrdersV3Api()
-                            omsg.ParseFromString(content)
+                            omsg.ParseFromString(raw_bytes)
                             if omsg.id or omsg.clientId:
                                 event = {
                                     "c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
