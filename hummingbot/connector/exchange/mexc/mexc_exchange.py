@@ -283,7 +283,8 @@ class MexcExchange(ExchangePyBase):
         ]
         async for event_message in self._iter_user_event_queue():
             try:
-                channel: str = event_message.get("c", None)
+                # Support both JSON and PB (converted upstream in data source)
+                channel: str = event_message.get("c") or event_message.get("channel")
                 results: Dict[str, Any] = event_message.get("d", {})
                 if "code" not in event_message and channel not in user_channels:
                     self.logger().error(
