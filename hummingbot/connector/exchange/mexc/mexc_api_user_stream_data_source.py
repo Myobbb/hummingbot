@@ -195,41 +195,60 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     except Exception:
                         text = ""
 
-                    channel = None
+                    # Minimal parsers for PB text frames (no proto dependency)
+                    def _parse_balance_pb(message_text: str):
+                        try:
+                            import re
+                            asset_match = re.search(r'vcoinName:\s*"([^"]+)"', message_text)
+                            bal_match = re.search(r'balanceAmount:\s*"([0-9.]+)"', message_text)
+                            frozen_match = re.search(r'frozenAmount:\s*"([0-9.]+)"', message_text)
+                            if not asset_match or not bal_match:
+                                return None
+                            asset = asset_match.group(1).upper()
+                            balance_amount = float(bal_match.group(1))
+                            frozen_amount = float(frozen_match.group(1)) if frozen_match else 0.0
+                            free_amount = max(0.0, balance_amount - frozen_amount)
+                            return {
+                                "a": asset,
+                                "f": str(free_amount),
+                                "l": str(frozen_amount),
+                            }
+                        except Exception:
+                            return None
+
+                    # Detect channel from PB marker and parse minimally when possible
                     if 'spot@private.account.v3.api.pb' in text:
-                        channel = CONSTANTS.USER_BALANCE_ENDPOINT_NAME
-                    elif 'spot@private.orders.v3.api.pb' in text:
-                        channel = CONSTANTS.USER_ORDERS_ENDPOINT_NAME
-                    elif 'spot@private.deals.v3.api.pb' in text:
-                        channel = CONSTANTS.USER_TRADES_ENDPOINT_NAME
-
-                    if channel is not None:
-                        # No external protobuf dependency: use REST-backed balance snapshot for account/orders
-                        if channel in (CONSTANTS.USER_BALANCE_ENDPOINT_NAME, CONSTANTS.USER_ORDERS_ENDPOINT_NAME):
-                            try:
-                                rest = await self._api_factory.get_rest_assistant()
-                                account_info = await rest.execute_request(
-                                    url=web_utils.private_rest_url(path_url=CONSTANTS.ACCOUNTS_PATH_URL, domain=self._domain),
-                                    method=RESTMethod.GET,
-                                    is_auth_required=True,
-                                    headers={"Content-Type": "application/json"},
-                                )
-                                for bal in account_info.get("balances", []):
-                                    event = {
-                                        "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
-                                        "d": {
-                                            "a": bal.get("asset"),
-                                            "f": bal.get("free", "0"),
-                                            "l": bal.get("locked", "0"),
-                                        },
-                                    }
-                                    await queue.put(event)
-                            except Exception:
-                                # Do not enqueue empty balance events; skip to avoid KeyErrors downstream
-                                pass
+                        parsed = _parse_balance_pb(text)
+                        if parsed is not None:
+                            event = {"c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME, "d": parsed}
+                            await queue.put(event)
                             continue
+                        # Fallback to REST snapshot if minimal parsing failed
+                        try:
+                            rest = await self._api_factory.get_rest_assistant()
+                            account_info = await rest.execute_request(
+                                url=web_utils.private_rest_url(path_url=CONSTANTS.ACCOUNTS_PATH_URL, domain=self._domain),
+                                method=RESTMethod.GET,
+                                is_auth_required=True,
+                                headers={"Content-Type": "application/json"},
+                            )
+                            for bal in account_info.get("balances", []):
+                                event = {
+                                    "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+                                    "d": {
+                                        "a": bal.get("asset"),
+                                        "f": bal.get("free", "0"),
+                                        "l": bal.get("locked", "0"),
+                                    },
+                                }
+                                await queue.put(event)
+                        except Exception:
+                            pass
+                        continue
 
-                        # Deals fallback not implemented here (to avoid malformed events)
+                    # Orders/Deals PB: keep lightweight behavior (no parse) to avoid malformed events
+                    if 'spot@private.orders.v3.api.pb' in text or 'spot@private.deals.v3.api.pb' in text:
+                        # Intentionally skip enqueueing; downstream polling and REST backups will handle updates
                         continue
 
                     # Unknown PB frame: ignore to avoid breaking downstream
