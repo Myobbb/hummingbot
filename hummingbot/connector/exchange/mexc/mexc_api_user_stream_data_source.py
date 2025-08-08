@@ -10,7 +10,6 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
-from . import pb_decode
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -205,21 +204,8 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         channel = CONSTANTS.USER_TRADES_ENDPOINT_NAME
 
                     if channel is not None:
-                        # If we have protobuf decoders, use them to map to legacy JSON 'd'
-                        decoded_d = None
-                        if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
-                            decoded_d = pb_decode.parse_account_pb(content)
-                        elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
-                            decoded_d = pb_decode.parse_orders_pb(content)
-                        elif channel == CONSTANTS.USER_TRADES_ENDPOINT_NAME:
-                            decoded_d = pb_decode.parse_deals_pb(content)
-
-                        if decoded_d is not None:
-                            await queue.put({"c": channel, "d": decoded_d})
-                            continue
-
-                        # Fallback when PB decode not available: REST-backed balance snapshot for account channel
-                        if channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
+                        # No external protobuf dependency: use REST-backed balance snapshot for account/orders
+                        if channel in (CONSTANTS.USER_BALANCE_ENDPOINT_NAME, CONSTANTS.USER_ORDERS_ENDPOINT_NAME):
                             try:
                                 rest = await self._api_factory.get_rest_assistant()
                                 account_info = await rest.execute_request(
@@ -243,7 +229,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                 pass
                             continue
 
-                        # Orders/deals fallback not implemented here (to avoid malformed events)
+                        # Deals fallback not implemented here (to avoid malformed events)
                         continue
 
                     # Unknown PB frame: ignore to avoid breaking downstream
