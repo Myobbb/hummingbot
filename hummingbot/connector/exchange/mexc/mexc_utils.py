@@ -49,4 +49,4 @@ class MexcConfigMap(BaseConnectorConfigMap):
     model_config = ConfigDict(title="mexc")
 
 
-KEYS = MexcConfigMap.model_construct()
+KEYS = MexcConfigMap.construct()
