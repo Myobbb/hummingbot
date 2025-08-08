@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
-    HEARTBEAT_TIME_INTERVAL = 30.0
+    HEARTBEAT_TIME_INTERVAL = 25.0
     TRADE_STREAM_ID = 1
     DIFF_STREAM_ID = 2
     ONE_HOUR = 60 * 60
@@ -113,6 +113,18 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         await ws.connect(ws_url=CONSTANTS.WSS_URL.format(self._domain),
                          ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        # start a background heartbeat loop
+        async def _hb():
+            try:
+                while True:
+                    await asyncio.sleep(self.HEARTBEAT_TIME_INTERVAL)
+                    try:
+                        await ws.send(WSJSONRequest(payload={"method": "PING"}))
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                return
+        asyncio.create_task(_hb())
         return ws
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
