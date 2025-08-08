@@ -16,10 +16,12 @@ try:
     from hummingbot.connector.exchange.mexc.pb.PrivateAccountV3Api_pb2 import PrivateAccountV3Api
     from hummingbot.connector.exchange.mexc.pb.PrivateDealsV3Api_pb2 import PrivateDealsV3Api
     from hummingbot.connector.exchange.mexc.pb.PrivateOrdersV3Api_pb2 import PrivateOrdersV3Api
+    from hummingbot.connector.exchange.mexc.pb.PushDataV3ApiWrapper_pb2 import PushDataV3ApiWrapper
 except Exception:  # pragma: no cover - allow runtime without PB for environments lacking protoc
     PrivateAccountV3Api = None
     PrivateDealsV3Api = None
     PrivateOrdersV3Api = None
+    PushDataV3ApiWrapper = None
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -218,80 +220,67 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             raw_bytes = bytes(content)
                         else:
                             break
-                    # Parse protobuf if classes are available
-                    if PrivateAccountV3Api is not None:
-                        # We cannot know channel from raw bytes; server usually prefixes with a JSON header in a separate frame.
-                        # Strategy: try parse in order; if parsing fails, try next.
-                        parsed_any: Optional[Dict[str, Any]] = None
-
-                        # Balance
+                    # Prefer wrapper decoding (channel + oneof body) if available
+                    if PushDataV3ApiWrapper is not None:
                         try:
-                            msg = PrivateAccountV3Api()
-                            msg.ParseFromString(raw_bytes)
-                            # If required fields empty, this may be a wrong type
+                            wrapper = PushDataV3ApiWrapper()
+                            wrapper.ParseFromString(raw_bytes)
+                            which = wrapper.WhichOneof("body")
+                            if which == "privateAccount":
+                                acct = wrapper.privateAccount
+                                free = max(0.0, float(acct.balanceAmount or 0) - float(acct.frozenAmount or 0))
+                                await queue.put({
+                                    "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+                                    "d": {"a": acct.vcoinName.upper(), "f": str(free), "l": str(acct.frozenAmount or "0")},
+                                    "t": int(acct.time) if acct.time else int(time.time() * 1000),
+                                })
+                                continue
+                            if which == "privateDeals":
+                                d = wrapper.privateDeals
+                                await queue.put({
+                                    "c": CONSTANTS.USER_TRADES_ENDPOINT_NAME,
+                                    "t": int(d.time) if d.time else int(time.time() * 1000),
+                                    "d": {"c": d.clientOrderId, "t": d.tradeId, "v": d.quantity, "a": d.amount, "p": d.price, "T": int(d.time) if d.time else int(time.time() * 1000), "N": d.feeCurrency, "n": d.feeAmount},
+                                })
+                                continue
+                            if which == "privateOrders":
+                                o = wrapper.privateOrders
+                                await queue.put({
+                                    "c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
+                                    "t": int(o.createTime) if o.createTime else int(time.time() * 1000),
+                                    "d": {"c": o.clientId, "i": o.id, "s": int(o.status) if isinstance(o.status, int) else 0},
+                                })
+                                continue
+                        except Exception:
+                            # fall through to direct parsing
+                            pass
+
+                    # Fallback: try direct parsing by message type
+                    if PrivateAccountV3Api is not None:
+                        try:
+                            msg = PrivateAccountV3Api(); msg.ParseFromString(raw_bytes)
                             if msg.vcoinName:
                                 free = max(0.0, float(msg.balanceAmount or 0) - float(msg.frozenAmount or 0))
-                                event = {
-                                    "c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
-                                    "d": {
-                                        "a": msg.vcoinName.upper(),
-                                        "f": str(free),
-                                        "l": str(msg.frozenAmount or "0"),
-                                    },
-                                    "t": int(msg.time) if msg.time else int(time.time() * 1000),
-                                }
-                                await queue.put(event)
+                                await queue.put({"c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME, "d": {"a": msg.vcoinName.upper(), "f": str(free), "l": str(msg.frozenAmount or "0")}, "t": int(msg.time) if msg.time else int(time.time() * 1000)})
                                 continue
                         except Exception:
                             pass
-
-                        # Deals
                         try:
-                            dmsg = PrivateDealsV3Api()
-                            dmsg.ParseFromString(raw_bytes)
+                            dmsg = PrivateDealsV3Api(); dmsg.ParseFromString(raw_bytes)
                             if dmsg.tradeId or dmsg.clientOrderId or dmsg.orderId:
-                                event = {
-                                    "c": CONSTANTS.USER_TRADES_ENDPOINT_NAME,
-                                    "t": int(dmsg.time) if dmsg.time else int(time.time() * 1000),
-                                    "d": {
-                                        "c": dmsg.clientOrderId,
-                                        "t": dmsg.tradeId,
-                                        "v": dmsg.quantity,
-                                        "a": dmsg.amount,
-                                        "p": dmsg.price,
-                                        "T": int(dmsg.time) if dmsg.time else int(time.time() * 1000),
-                                        "N": dmsg.feeCurrency,
-                                        "n": dmsg.feeAmount,
-                                    },
-                                    # include symbol if provided in future proto revs
-                                }
-                                await queue.put(event)
+                                await queue.put({"c": CONSTANTS.USER_TRADES_ENDPOINT_NAME, "t": int(dmsg.time) if dmsg.time else int(time.time() * 1000), "d": {"c": dmsg.clientOrderId, "t": dmsg.tradeId, "v": dmsg.quantity, "a": dmsg.amount, "p": dmsg.price, "T": int(dmsg.time) if dmsg.time else int(time.time() * 1000), "N": dmsg.feeCurrency, "n": dmsg.feeAmount}})
                                 continue
                         except Exception:
                             pass
-
-                        # Orders
                         try:
-                            omsg = PrivateOrdersV3Api()
-                            omsg.ParseFromString(raw_bytes)
+                            omsg = PrivateOrdersV3Api(); omsg.ParseFromString(raw_bytes)
                             if omsg.id or omsg.clientId:
-                                event = {
-                                    "c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
-                                    "t": int(omsg.createTime) if omsg.createTime else int(time.time() * 1000),
-                                    "d": {
-                                        "c": omsg.clientId,
-                                        "i": omsg.id,
-                                        # Map numeric status to same codes used by WS_ORDER_STATE lookup in exchange
-                                        # We pass numeric status; mexc_exchange maps via CONSTANTS.WS_ORDER_STATE
-                                        "s": int(omsg.status) if isinstance(omsg.status, int) else 0,
-                                    },
-                                }
-                                await queue.put(event)
+                                await queue.put({"c": CONSTANTS.USER_ORDERS_ENDPOINT_NAME, "t": int(omsg.createTime) if omsg.createTime else int(time.time() * 1000), "d": {"c": omsg.clientId, "i": omsg.id, "s": int(omsg.status) if isinstance(omsg.status, int) else 0}})
                                 continue
                         except Exception:
                             pass
 
-                    # If protobuf classes not available or failed, ignore bytes frame
+                    # If nothing matched, ignore this frame
                     continue
 
                 # If it's str JSON, parse to dict
