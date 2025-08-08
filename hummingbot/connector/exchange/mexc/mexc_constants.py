@@ -8,8 +8,8 @@ MAX_ORDER_ID_LEN = 32
 
 # Base URL
 REST_URL = "https://api.mexc.{}/api/"
-# Private/user streams: ws:// per provided requirement
-WSS_URL = "ws://wbs-api.mexc.{}/ws"
+# Use TLS for stability (reference implementation and your script use wss)
+WSS_URL = "wss://wbs-api.mexc.{}/ws"
 
 PUBLIC_API_VERSION = "v3"
 PRIVATE_API_VERSION = "v3"
