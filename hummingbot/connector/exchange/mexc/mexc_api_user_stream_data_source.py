@@ -431,21 +431,40 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     # Unknown bytes frame, ignore
                     continue
 
-                # JSON frames (acks etc.)
+                # JSON frames (acks, wrapper, or plain events)
                 if isinstance(content, str):
                     import json
                     try:
                         data = json.loads(content)
                         if not isinstance(data, dict):
                             continue
-                        # acks or errors are ignored
-                        if "code" in data:
+                        # Respond to server ping if sent as JSON string
+                        if data.get("method") == "PING":
+                            await websocket_assistant.send(WSJSONRequest(payload={"method": "PONG"}))
                             continue
-                        if ("c" not in data and "channel" not in data) or "d" not in data:
+                        # Ignore explicit error codes
+                        if "code" in data and data.get("code") != 0:
+                            self.logger().debug(f"[MEXC JSON] ignoring error/ack: {data}")
                             continue
-                        await queue.put(data)
+                        # If server uses 'channel' and 'data', normalize to our 'c'/'d'
+                        if "channel" in data and "c" not in data:
+                            normalized = {
+                                "c": data.get("channel"),
+                                "d": data.get("data", data.get("d", {})),
+                            }
+                            if "t" in data:
+                                normalized["t"] = data["t"]
+                            await queue.put(normalized)
+                            continue
+                        # Already in expected format
+                        if ("c" in data) and ("d" in data):
+                            await queue.put(data)
+                            continue
+                        # Otherwise, log for diagnostics
+                        self.logger().debug(f"[MEXC JSON] unrecognized payload: {data}")
                         continue
                     except Exception:
+                        # not JSON
                         continue
 
                 if isinstance(content, dict):
