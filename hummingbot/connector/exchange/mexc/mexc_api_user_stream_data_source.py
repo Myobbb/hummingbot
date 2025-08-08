@@ -239,7 +239,8 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                     }
                                     await queue.put(event)
                             except Exception:
-                                await queue.put({"c": CONSTANTS.USER_BALANCE_ENDPOINT_NAME, "d": {}})
+                                # Do not enqueue empty balance events; skip to avoid KeyErrors downstream
+                                pass
                             continue
 
                         # Orders/deals fallback not implemented here (to avoid malformed events)
@@ -253,6 +254,13 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     try:
                         import json
                         parsed = json.loads(content)
+                        # Ignore subscription acks or malformed events
+                        if not isinstance(parsed, dict):
+                            continue
+                        if 'code' in parsed:
+                            continue
+                        if ('c' not in parsed and 'channel' not in parsed) or 'd' not in parsed:
+                            continue
                         await queue.put(parsed)
                         continue
                     except Exception:
