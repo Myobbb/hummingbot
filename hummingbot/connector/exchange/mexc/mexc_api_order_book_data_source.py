@@ -75,6 +75,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_params.append(f"spot@public.deals.v3.api@{symbol}")
+                # subscribe to .pb aggregated depth stream for better stability if supported
                 depth_params.append(f"spot@public.increase.depth.v3.api@{symbol}")
             payload = {
                 "method": "SUBSCRIPTION",
