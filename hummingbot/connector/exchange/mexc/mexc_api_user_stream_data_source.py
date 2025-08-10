@@ -185,23 +185,38 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
             wrapper = PBPush.PushDataV3ApiWrapper()
             wrapper.ParseFromString(payload)
             channel = wrapper.channel
+            symbol = getattr(wrapper, 'symbol', '') or ''
             # Orders
             if wrapper.HasField('privateOrders'):
                 body = wrapper.privateOrders
                 event = {
                     "c": channel,
+                    "s": symbol,
                     "t": int(getattr(body, 'createTime', 0) or 0),
                     "d": {
                         "i": str(getattr(body, 'id', '')),
                         "c": str(getattr(body, 'clientId', '')),
                         "p": str(getattr(body, 'price', '')),
+                        # Original requested quantities and amounts
                         "v": str(getattr(body, 'quantity', '')),
+                        "V": str(getattr(body, 'quantity', '')),
                         "a": str(getattr(body, 'amount', '')),
+                        "A": str(getattr(body, 'amount', '')),
+                        # Cumulative filled quantities/amounts
+                        "cv": str(getattr(body, 'cumulativeQuantity', '')),
+                        "ca": str(getattr(body, 'cumulativeAmount', '')),
+                        # Average price
                         "ap": str(getattr(body, 'avgPrice', '')),
+                        # Order attributes
                         "ot": int(getattr(body, 'orderType', 0)),
                         "tt": int(getattr(body, 'tradeType', 0)),
+                        # Duplicate under 'S' to match our current connector mapping
+                        "S": int(getattr(body, 'tradeType', 0)),
                         "m": bool(getattr(body, 'isMaker', False)),
+                        # Status (numeric, aligns with our ORDER_STATUS_MAP)
                         "s": int(getattr(body, 'status', 0)),
+                        # Order creation time for downstream timestamping
+                        "O": int(getattr(body, 'createTime', 0) or 0),
                     }
                 }
                 return event
@@ -210,17 +225,22 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 body = wrapper.privateDeals
                 event = {
                     "c": channel,
+                    "s": symbol,
                     "t": int(getattr(body, 'time', 0) or 0),
                     "d": {
+                        # Trade id used as our execution id (orderId uses separate mapping)
+                        "t": str(getattr(body, 'tradeId', '')),
                         "p": str(getattr(body, 'price', '')),
                         "v": str(getattr(body, 'quantity', '')),
                         "a": str(getattr(body, 'amount', '')),
                         "S": int(getattr(body, 'tradeType', 0)),
+                        # order id and client order id
                         "i": str(getattr(body, 'orderId', '')),
                         "c": str(getattr(body, 'clientOrderId', '')),
                         "n": str(getattr(body, 'feeAmount', '')),
                         "N": str(getattr(body, 'feeCurrency', '')),
-                        "t": int(getattr(body, 'time', 0) or 0),
+                        # Trade timestamp
+                        "T": int(getattr(body, 'time', 0) or 0),
                     }
                 }
                 return event
@@ -230,6 +250,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 # Map to what _process_balance_message_ws expects: keys "a" (asset), "f" (free), "l" (frozen)
                 event = {
                     "c": channel,
+                    "s": symbol,
                     "t": int(getattr(body, 'time', 0) or 0),
                     "d": {
                         "a": str(getattr(body, 'vcoinName', '')),
@@ -257,6 +278,34 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     if event_dict:
                         await queue.put(event_dict)
                         continue
+                # Normalize JSON dicts to include expected fields (e.g., ensure 'T' exists for trade fills)
+                if isinstance(data, dict):
+                    try:
+                        channel = data.get('c') or data.get('channel') or ''
+                        payload = data.get('d') or data.get('data') or {}
+                        if isinstance(payload, dict) and ('private.deals' in str(channel)):
+                            if 'T' not in payload:
+                                # Prefer explicit 'time' if present
+                                if 'time' in payload:
+                                    try:
+                                        payload['T'] = int(payload.get('time') or 0)
+                                    except Exception:
+                                        payload['T'] = 0
+                                # Fallback: if lowercase 't' looks numeric, mirror it
+                                elif 't' in payload and str(payload.get('t', '')).isdigit():
+                                    try:
+                                        payload['T'] = int(payload.get('t') or 0)
+                                    except Exception:
+                                        payload['T'] = 0
+                                # Leave as-is otherwise; consumer may handle missing timestamp
+                            # Write back normalized payload
+                            if 'd' in data:
+                                data['d'] = payload
+                            elif 'data' in data:
+                                data['data'] = payload
+                    except Exception:
+                        # Non-fatal; forward raw data
+                        pass
                 await queue.put(data)
             except asyncio.TimeoutError:
                 ping_request = WSJSONRequest(payload={"method": "ping"})
