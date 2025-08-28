@@ -403,9 +403,22 @@ class HtxExchange(ExchangePyBase):
         if not self._account_id:
             await self._update_account_id()
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        # HTX MARKET order semantics:
+        # - buy-market expects QUOTE notional in "amount"
+        # - sell-market expects BASE amount in "amount"
+        api_amount: Decimal = amount
+        if order_type is OrderType.MARKET and trade_type is TradeType.BUY:
+            effective_price: Decimal = price
+            if effective_price is None or effective_price.is_nan() or effective_price == s_decimal_0:
+                effective_price = self.get_price(trading_pair, True)
+            notional = amount * effective_price
+            trading_rule = self._trading_rules[trading_pair]
+            quote_increment = Decimal(trading_rule.min_quote_amount_increment)
+            # round down to nearest increment
+            api_amount = (notional // quote_increment) * quote_increment
         params = {
             "account-id": self._account_id,
-            "amount": f"{amount}",
+            "amount": f"{api_amount}",
             "client-order-id": order_id,
             "symbol": exchange_symbol,
             "type": f"{side}-{order_type_str}",
