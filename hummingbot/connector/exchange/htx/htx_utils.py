@@ -6,6 +6,8 @@ from pydantic import ConfigDict, Field, SecretStr
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+
 CENTRALIZED = True
 EXAMPLE_PAIR = "ETH-USDT"
 
