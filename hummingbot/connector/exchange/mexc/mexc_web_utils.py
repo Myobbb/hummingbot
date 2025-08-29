@@ -1,6 +1,6 @@
 from typing import Callable, Optional
 
-import hummingbot.connector.exchange.mexc.mexc_constants as CONSTANTS
+from . import mexc_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.connector.utils import TimeSynchronizerRESTPreProcessor
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler

@@ -316,11 +316,15 @@ class PerformanceMetrics:
         self.cur_base_ratio_pct = self.divide(self.cur_base_bal * self.cur_price,
                                               (self.cur_base_bal * self.cur_price) + self.cur_quote_bal)
 
+        # Compute normally to avoid breaking dependent fields, then force PnL/returns to zero
         self.hold_value = (self.start_base_bal * self.cur_price) + self.start_quote_bal
         self.cur_value = (self.cur_base_bal * self.cur_price) + self.cur_quote_bal
         self._calculate_trade_pnl(buys, sells)
 
         await self._calculate_fees(quote, trades)
 
-        self.total_pnl = self.trade_pnl - self.fee_in_quote
-        self.return_pct = self.divide(self.total_pnl, self.hold_value)
+        # Force-disable P&L and return% at the root level
+        self.trade_pnl = s_decimal_0
+        self.fee_in_quote = s_decimal_0
+        self.total_pnl = s_decimal_0
+        self.return_pct = s_decimal_0
