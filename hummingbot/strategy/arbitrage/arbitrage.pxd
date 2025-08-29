@@ -7,18 +7,12 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef:
         list _market_pairs
         bint _all_markets_ready
-        dict _order_id_to_market
         object _min_profitability
-        object _max_order_size
-        object _min_order_size
         double _status_report_interval
         double _last_timestamp
         dict _last_trade_timestamps
         double _next_trade_delay
-        set _sell_markets
-        set _buy_markets
         int64_t _logging_options
-        object _exchange_rate_conversion
         int _failed_order_tolerance
         bint _cool_off_logged
         bint _use_oracle_conversion_rate

@@ -12,7 +12,6 @@ from hummingbot.connector.exchange_base cimport ExchangeBase
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.market_order import MarketOrder
-from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.strategy.strategy_base import StrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -20,7 +19,6 @@ from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketP
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.client.performance import PerformanceMetrics
 
-NaN = float("nan")
 s_decimal_0 = Decimal(0)
 as_logger = None
 
@@ -65,12 +63,12 @@ cdef class ArbitrageStrategy(StrategyBase):
         :param failed_order_tolerance: number of failed orders to force stop the strategy when exceeded
         :param use_oracle_conversion_rate: Enables the use of the Oracle to get the price in ETH of each quote token to
         compare the trading pairs in between markets.
-        If true the Oracle will be used. If false the reates will be fetched from uniswap. The default is false.
+        If true the Oracle will be used. If false the rates will be fetched from Uniswap. The default is false.
         :param secondary_to_primary_base_conversion_rate: Conversion rate of base token between markets. The default is 1
         :param secondary_to_primary_quote_conversion_rate: Conversion rate of quote token between markets. The default is 1
         :param hb_app_notification: Enables sending notifications to the client application. The default is false.
         """
-        if len(market_pairs) < 0:
+        if len(market_pairs) <= 0:
             raise ValueError(f"market_pairs must not be empty.")
         self._logging_options = logging_options
         self._market_pairs = market_pairs
@@ -108,7 +106,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         return self._min_profitability
 
     @property
-    def use_oracle_conversion_rate(self) -> Decimal:
+    def use_oracle_conversion_rate(self) -> bool:
         return self._use_oracle_conversion_rate
 
     @property
@@ -120,11 +118,11 @@ cdef class ArbitrageStrategy(StrategyBase):
         return self._sb_order_tracker.tracked_market_orders
 
     @property
-    def tracked_limit_orders_data_frame(self) -> List[pd.DataFrame]:
+    def tracked_limit_orders_data_frame(self) -> pd.DataFrame:
         return self._sb_order_tracker.tracked_limit_orders_data_frame
 
     @property
-    def tracked_market_orders_data_frame(self) -> List[pd.DataFrame]:
+    def tracked_market_orders_data_frame(self) -> pd.DataFrame:
         return self._sb_order_tracker.tracked_market_orders_data_frame
 
     def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
@@ -258,7 +256,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                         self.logger().warning(f"Markets are not ready. No arbitrage trading is permitted.")
                     return
                 else:
-                    if self.OPTION_LOG_STATUS_REPORT:
+                    if should_report_warnings:
                         self.logger().info(f"Markets are ready. Trading started.")
 
             if not all([market.network_status is NetworkStatus.CONNECTED for market in self._sb_markets]):
@@ -453,7 +451,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         volume_in_USD = quantized_order_amount * sell_price
         
-        #filtering min order amount below $1.1   
+        # filter small notional orders (USD)
         if volume_in_USD < 10:
             #self.log_with_clock(logging.INFO,
             #                        f"volume_in_USD is below 1.1: {volume_in_USD}, quantized_order_amount: {quantized_order_amount}, sell_price: {sell_price}")
@@ -485,7 +483,8 @@ cdef class ArbitrageStrategy(StrategyBase):
             self._order_placement_timestamps[buy_order_id] = self._current_timestamp
             self._order_placement_timestamps[sell_order_id] = self._current_timestamp
         
-            self.logger().info(self.format_status())
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.logger().info(self.format_status())
 
     @staticmethod
     def find_profitable_arbitrage_orders(min_profitability: Decimal,
@@ -506,18 +505,6 @@ cdef class ArbitrageStrategy(StrategyBase):
         elif market_info == self._market_pairs[0].second:
             _, _, quote_rate, _, _, base_rate = self.get_second_to_first_conversion_rate()
             return quote_rate / base_rate
-            # if not self._use_oracle_conversion_rate:
-            #     return self._secondary_to_primary_quote_conversion_rate / self._secondary_to_primary_base_conversion_rate
-            # else:
-            #     quote_rate = Decimal("1")
-            #     if self._market_pairs[0].second.quote_asset != self._market_pairs[0].first.quote_asset:
-            #         quote_pair = f"{self._market_pairs[0].second.quote_asset}-{self._market_pairs[0].first.quote_asset}"
-            #         quote_rate = RateOracle.get_instance().rate(quote_pair)
-            #     base_rate = Decimal("1")
-            #     if self._market_pairs[0].second.base_asset != self._market_pairs[0].first.base_asset:
-            #         base_pair = f"{self._market_pairs[0].second.base_asset}-{self._market_pairs[0].first.base_asset}"
-            #         base_rate = RateOracle.get_instance().rate(base_pair)
-            #     return quote_rate / base_rate
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_trading_pair_tuple, object sell_market_trading_pair_tuple):
         """
@@ -545,15 +532,13 @@ cdef class ArbitrageStrategy(StrategyBase):
             object sell_fee
             object total_sell_flat_fees
             object total_buy_flat_fees
-            object quantized_profitable_base_amount
             object net_sell_proceeds
             object net_buy_costs
             object buy_market_quote_balance
             object sell_market_base_balance
             ExchangeBase buy_market = buy_market_trading_pair_tuple.market
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
-            OrderBook buy_order_book = buy_market_trading_pair_tuple.order_book
-            OrderBook sell_order_book = sell_market_trading_pair_tuple.order_book
+            # Order books are accessed through iterators when needed
 
         buy_market_conversion_rate = self.market_conversion_rate(buy_market_trading_pair_tuple)
         sell_market_conversion_rate = self.market_conversion_rate(sell_market_trading_pair_tuple)
