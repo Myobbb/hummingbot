@@ -858,11 +858,12 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     async def _update_trading_rules(self):
         exchange_info = await self._make_trading_rules_request()
+        # Ensure the symbol map is refreshed before formatting rules so newly listed symbols don't cause KeyError
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
         trading_rules_list = await self._format_trading_rules(exchange_info)
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
 
     async def _api_get(self, *args, **kwargs):
         kwargs["method"] = RESTMethod.GET

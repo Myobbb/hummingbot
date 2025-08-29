@@ -245,7 +245,14 @@ class MexcExchange(ExchangePyBase):
         retval = []
         for rule in filter(mexc_utils.is_exchange_information_valid, trading_pair_rules):
             try:
-                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("symbol"))
+                symbol = rule.get("symbol")
+                # New symbols may appear after the connector started; guard against missing mapping
+                try:
+                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                except KeyError:
+                    self.logger().warning(
+                        f"Skipping trading rule for unknown symbol {symbol}. Symbol map not updated yet.")
+                    continue
                 min_order_size = Decimal(rule.get("baseSizePrecision"))
                 min_price_inc = Decimal(f"1e-{rule['quotePrecision']}")
                 min_amount_inc = Decimal(f"1e-{rule['baseAssetPrecision']}")
@@ -258,7 +265,8 @@ class MexcExchange(ExchangePyBase):
                                 min_notional_size=min_notional))
 
             except Exception:
-                self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
+                # Avoid noisy stacktraces for benign background issues
+                self.logger().warning(f"Error parsing the trading pair rule {rule}. Skipping.")
         return retval
 
     async def _status_polling_loop_fetch_updates(self):

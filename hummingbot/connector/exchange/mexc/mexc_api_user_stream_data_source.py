@@ -17,7 +17,8 @@ if TYPE_CHECKING:
 
 
 class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
-    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800  # Recommended to Ping/Update listen key to keep connection alive
+    # Refresh slightly earlier than the documented 30 minutes to avoid edge expirations
+    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1500  # 25 minutes
     HEARTBEAT_TIME_INTERVAL = 30.0
 
     _logger: Optional[HummingbotLogger] = None
@@ -37,6 +38,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
         self._manage_listen_key_task: Optional[asyncio.Task] = None
+        self._ws_assistant: Optional[WSAssistant] = None
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -46,6 +48,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._get_ws_assistant()
+        self._ws_assistant = ws
         # Try new endpoint first, then fallback
         url_new = f"{CONSTANTS.WSS_API_URL.format(self._domain)}?listenKey={self._current_listen_key}"
         url_legacy = f"{CONSTANTS.WSS_URL.format(self._domain)}?listenKey={self._current_listen_key}"
@@ -124,6 +127,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
             )
 
             if "code" in data:
+                # MEXC returns {code,msg} on errors (e.g., expired/invalid listen key)
                 self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {data}")
                 return False
 
@@ -149,12 +153,33 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 if elapsed >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
                     success: bool = await self._ping_listen_key()
                     if not success:
-                        # Do not stop the loop; retry soon to avoid key expiration
-                        self.logger().warning("Failed to refresh MEXC listen key; will retry in 60s")
-                        await self._sleep(60)
-                        continue
-                    self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
-                    self._last_listen_key_ping_ts = int(time.time())
+                        # Quick retries to avoid accidental expiry due to transient errors
+                        retries = 0
+                        while not success and retries < 3:
+                            await self._sleep(5)
+                            success = await self._ping_listen_key()
+                            retries += 1
+                        if not success:
+                            # Recreate listen key and proactively reconnect WS to minimize downtime
+                            try:
+                                new_key = await self._get_listen_key()
+                                old_key = self._current_listen_key
+                                self._current_listen_key = new_key
+                                self._last_listen_key_ping_ts = int(time.time())
+                                self.logger().warning(
+                                    f"Recreated MEXC listen key (old={old_key}, new={new_key}); reconnecting websocket")
+                                if self._ws_assistant is not None:
+                                    await self._ws_assistant.disconnect()
+                                # After disconnect, the tracker will reconnect using the new key
+                                continue
+                            except Exception as e:
+                                self.logger().error(f"Failed to recreate MEXC listen key after refresh failures: {e}")
+                                # Try again soon
+                                await self._sleep(10)
+                                continue
+                    else:
+                        self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
+                        self._last_listen_key_ping_ts = int(time.time())
                 else:
                     # Sleep only the remaining time until next keep-alive
                     remaining = max(1, self.LISTEN_KEY_KEEP_ALIVE_INTERVAL - elapsed)
