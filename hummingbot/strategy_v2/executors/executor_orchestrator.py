@@ -613,10 +613,8 @@ class ExecutorOrchestrator:
                 position.connector_name, position.trading_pair, PriceType.MidPrice)
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
-            # Update report with position data
-            report.realized_pnl_quote += position_summary.realized_pnl_quote - position_summary.cum_fees_quote
+            # Update report with position data (exclude fees/PnL as they are disabled)
             report.volume_traded += position_summary.volume_traded_quote
-            report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
             positions_summary.append(position_summary)
 
         # Set the positions summary (don't use dynamic attribute)
