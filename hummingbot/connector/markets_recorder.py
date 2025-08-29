@@ -430,13 +430,8 @@ class MarketsRecorder:
                                                         timestamp=timestamp,
                                                         status=event_type.name)
                 try:
-                    fee_in_quote = evt.trade_fee.fee_amount_in_token(
-                        trading_pair=evt.trading_pair,
-                        price=evt.price,
-                        order_amount=evt.amount,
-                        token=quote_asset,
-                        exchange=market
-                    )
+                    # Fees are disabled; store zero fee to avoid rate lookups
+                    fee_in_quote = Decimal("0")
                 except Exception as e:
                     self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
                     fee_in_quote = 0
