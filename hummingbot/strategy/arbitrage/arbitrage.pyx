@@ -282,7 +282,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             
             if buy_order.order_id in self._order_placement_timestamps:
                 time_elapsed = self._current_timestamp - self._order_placement_timestamps[buy_order.order_id]
-                self.logger().warning(f"Buy order {buy_order.order_id} completed after {time_elapsed:.2f} seconds.")
+                self.logger().info(f"Buy order {buy_order.order_id} completed after {time_elapsed:.2f} seconds.")
                 del self._order_placement_timestamps[buy_order.order_id]
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
@@ -299,7 +299,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             
             if sell_order.order_id in self._order_placement_timestamps:
                 time_elapsed = self._current_timestamp - self._order_placement_timestamps[sell_order.order_id]
-                self.logger().warning(f"Sell order {sell_order.order_id} completed after {time_elapsed:.2f} seconds.")
+                self.logger().info(f"Sell order {sell_order.order_id} completed after {time_elapsed:.2f} seconds.")
                 del self._order_placement_timestamps[sell_order.order_id]
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
@@ -364,14 +364,17 @@ cdef class ArbitrageStrategy(StrategyBase):
                 for order_id, order in tracked_taker_orders[market_trading_pair_tuple].items():
                     if order_id not in self._order_placement_timestamps:
                         self._order_placement_timestamps[order_id] = self._current_timestamp
-                        self.logger().warning(f"New pending order detected: {order_id}. Starting timer.")
+                        self.logger().info(f"New pending order detected: {order_id}. Starting timer.")
 
                     time_elapsed = self._current_timestamp - self._order_placement_timestamps[order_id]
                     if time_elapsed > self._order_timeout:
                         self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds, which exceeds the {self._order_timeout} second timeout. Considering it completed.")
                         keys_to_remove.append(order_id)
                     else:
-                        self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
+                        if time_elapsed > 10:
+                            self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
+                        else:
+                            self.logger().info(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
                         return False
 
                 for order_id in keys_to_remove:
@@ -479,7 +482,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             sell_order_id = self.c_sell_with_specific_market(sell_market_trading_pair_tuple, quantized_order_amount,
                                          order_type=sell_order_type, price=sell_price, expiration_seconds=self._next_trade_delay)
             
-            self.logger().warning(f"Placed buy order {buy_order_id} and sell order {sell_order_id}. Starting timer.")
+            self.logger().info(f"Placed buy order {buy_order_id} and sell order {sell_order_id}. Starting timer.")
             self._order_placement_timestamps[buy_order_id] = self._current_timestamp
             self._order_placement_timestamps[sell_order_id] = self._current_timestamp
         

@@ -145,6 +145,16 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await ws.send(subscribe_orderbook_request)
 
                 self.logger().info("Subscribed to public order book and trade channels...")
+            # Kick off periodic application ping to keep the connection active
+            try:
+                await ws.send(WSJSONRequest(payload={
+                    "time": int(self._time()),
+                    "channel": "spot.ping",
+                    "event": "",
+                    "payload": [],
+                }))
+            except Exception:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -152,6 +162,9 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        # Ignore application-level pong to avoid misrouting
+        if event_message.get("channel") == CONSTANTS.PONG_CHANNEL_NAME:
+            return ""
         channel = ""
         if event_message.get("error") is not None:
             err_msg = event_message.get("error", {}).get("message", event_message.get("error"))
