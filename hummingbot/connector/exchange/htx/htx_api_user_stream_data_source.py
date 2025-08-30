@@ -119,10 +119,18 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
         async for ws_response in websocket_assistant.iter_messages():
             data = ws_response.data
-            if data["action"] == "ping":
-                pong_request = WSJSONRequest(payload={"action": "pong", "data": data["data"]})
-                await websocket_assistant.send(request=pong_request)
-            elif data["action"] == "sub":
+            action = data.get("action")
+            if action == "ping":
+                payload_data = data.get("data")
+                if isinstance(payload_data, dict) and "ts" in payload_data:
+                    pong_payload = {"action": "pong", "data": {"ts": payload_data.get("ts")}}
+                else:
+                    pong_payload = {"action": "pong"}
+                await websocket_assistant.send(request=WSJSONRequest(payload=pong_payload))
+            elif action == "pong":
+                # No-op
+                continue
+            elif action == "sub":
                 if data.get("code") != 200:
                     raise ValueError(f"Error subscribing to topic: {data.get('ch')} ({data})")
             else:
