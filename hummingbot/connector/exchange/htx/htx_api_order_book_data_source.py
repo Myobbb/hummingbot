@@ -33,7 +33,15 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        # Try preferred AWS endpoint first; fall back to legacy public URL on handshake errors
+        try:
+            await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        except Exception:
+            try:
+                await ws.connect(ws_url=getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL),
+                                 ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+            except Exception:
+                raise
 
         return ws
 

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -25,11 +26,13 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._trading_pairs = trading_pairs
+        self._ping_task: Optional[asyncio.Task] = None
         super().__init__()
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WS_PRIVATE_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        # Prefer AWS private WS endpoint. Disable underlying WS heartbeat to avoid double keepalive with JSON ping.
+        await ws.connect(ws_url=CONSTANTS.WS_PRIVATE_URL, ping_timeout=None)
         return ws
 
     async def _authenticate_client(self, ws: WSAssistant):
@@ -91,11 +94,27 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                             websocket_assistant)
                 await self._subscribe_topic(CONSTANTS.HTX_ORDER_UPDATE_TOPIC.format(exchange_symbol),
                                             websocket_assistant)
+            # Start JSON-level ping keepalive
+            if self._ping_task is None or self._ping_task.done():
+                self._ping_task = asyncio.create_task(self._json_ping_loop(websocket_assistant))
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger().error("Unexpected error occurred subscribing to private user streams...", exc_info=True)
             raise
+
+    async def _json_ping_loop(self, websocket_assistant: WSAssistant):
+        try:
+            while True:
+                await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                try:
+                    ts = int(time.time() * 1000)
+                    ping_req: WSJSONRequest = WSJSONRequest(payload={"action": "ping", "data": {"ts": ts}})
+                    await websocket_assistant.send(request=ping_req)
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            return
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
         async for ws_response in websocket_assistant.iter_messages():

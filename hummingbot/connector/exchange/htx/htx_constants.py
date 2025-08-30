@@ -9,11 +9,15 @@ DOMAIN = ""
 MAX_CLIENT_ORDER_ID_LENGTH = 64
 
 
-REST_URL = "https://api.huobi.pro"
-WS_PUBLIC_URL = "wss://api.huobi.pro/ws"
-WS_PRIVATE_URL = "wss://api.huobi.pro/ws/v2"
+# Prefer AWS REST endpoint (runs on AWS servers)
+REST_URL = "https://api-aws.huobi.pro"
+# Prefer AWS WS endpoints per HTX guidance; fall back to legacy if needed
+WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
+WS_PUBLIC_URL_FALLBACK = "wss://api.huobi.pro/ws"
+WS_PRIVATE_URL = "wss://api-aws.huobi.pro/ws/v2"
 
-WS_HEARTBEAT_TIME_INTERVAL = 5  # seconds
+# Slightly higher heartbeat to reduce churn but stay well under idle timeouts
+WS_HEARTBEAT_TIME_INTERVAL = 10  # seconds
 
 # Websocket event types
 TRADE_CHANNEL_SUFFIX = "trade.detail"
