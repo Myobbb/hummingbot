@@ -361,15 +361,18 @@ cdef class ArbitrageStrategy(StrategyBase):
         """
         cdef:
             double time_left
-            dict tracked_taker_orders = self._sb_order_tracker.c_get_limit_orders()
-            tracked_market_orders_local = self._sb_order_tracker.c_get_market_orders()
-            if tracked_market_orders_local:
-                # in-place merge to avoid building large temporaries; orders are grouped by market pair tuple
-                for _mkt_pair, _orders in tracked_market_orders_local.items():
-                    if _mkt_pair in tracked_taker_orders:
-                        tracked_taker_orders[_mkt_pair].update(_orders)
-                    else:
-                        tracked_taker_orders[_mkt_pair] = dict(_orders)
+            dict tracked_taker_orders
+            dict tracked_market_orders_local
+
+        tracked_taker_orders = self._sb_order_tracker.c_get_limit_orders()
+        tracked_market_orders_local = self._sb_order_tracker.c_get_market_orders()
+        if tracked_market_orders_local:
+            # in-place merge to avoid building large temporaries; orders are grouped by market pair tuple
+            for _mkt_pair, _orders in tracked_market_orders_local.items():
+                if _mkt_pair in tracked_taker_orders:
+                    tracked_taker_orders[_mkt_pair].update(_orders)
+                else:
+                    tracked_taker_orders[_mkt_pair] = dict(_orders)
 
         for market_trading_pair_tuple in market_trading_pair_tuples:
             if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
