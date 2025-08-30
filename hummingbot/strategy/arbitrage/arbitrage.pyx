@@ -466,7 +466,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         if quantized_order_amount:
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                 self.log_with_clock(logging.INFO,
-                                    f"Executing limit order buy of {buy_market_trading_pair_tuple.trading_pair} "
+                                    f"Executing market order buy of {buy_market_trading_pair_tuple.trading_pair} "
                                     f"at {buy_market_trading_pair_tuple.market.name} "
                                     f"and sell of {sell_market_trading_pair_tuple.trading_pair} "
                                     f"at {sell_market_trading_pair_tuple.market.name} "
@@ -539,6 +539,10 @@ cdef class ArbitrageStrategy(StrategyBase):
             object net_buy_costs
             object buy_market_quote_balance
             object sell_market_base_balance
+            object vwap_buy_cost = s_decimal_0
+            object vwap_sell_proceeds = s_decimal_0
+            object remaining_amount
+            object step_take
             ExchangeBase buy_market = buy_market_trading_pair_tuple.market
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
             # Order books are accessed through iterators when needed
@@ -635,6 +639,22 @@ cdef class ArbitrageStrategy(StrategyBase):
                              'bid_price', 'ask_price', 'step_amount']
                 ).to_string()
             )
+
+        # Replace marginal prices with VWAP for the chosen amount using already traversed book steps
+        if best_profitable_order_amount > 0 and len(profitable_orders) > 0:
+            remaining_amount = best_profitable_order_amount
+            vwap_buy_cost = s_decimal_0
+            vwap_sell_proceeds = s_decimal_0
+            for b_price_adjusted, a_price_adjusted, b_price_raw, a_price_raw, step_amount in profitable_orders:
+                if remaining_amount <= 0:
+                    break
+                step_take = step_amount if step_amount <= remaining_amount else remaining_amount
+                vwap_buy_cost += a_price_raw * step_take
+                vwap_sell_proceeds += b_price_raw * step_take
+                remaining_amount -= step_take
+            if best_profitable_order_amount > 0:
+                bid_price = vwap_sell_proceeds / best_profitable_order_amount
+                ask_price = vwap_buy_cost / best_profitable_order_amount
 
         return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
 

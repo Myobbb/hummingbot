@@ -210,6 +210,8 @@ class GateIoExchange(ExchangePyBase):
                 "time_in_force": "ioc",
             })
             if trade_type.name.lower() == 'buy':
+                # For market buy, Gate expects quote currency amount.
+                # Use the strategy-provided price when available; fallback to VWAP only if price is NaN.
                 if price.is_nan():
                     price = self.get_price_for_volume(
                         trading_pair,
