@@ -188,17 +188,8 @@ class MexcExchange(ExchangePyBase):
             price_str = f"{price:f}"
             api_params["price"] = price_str
         else:
-            if trade_type == TradeType.BUY:
-                if price.is_nan():
-                    price = self.get_price_for_volume(
-                        trading_pair,
-                        True,
-                        amount
-                    ).result_price
-                del api_params['quantity']
-                api_params.update({
-                    "quoteOrderQty": f"{price * amount:f}",
-                })
+            # MARKET orders: submit base quantity directly; do not convert to quoteOrderQty
+            pass
         if order_type == OrderType.LIMIT:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
 

@@ -343,8 +343,10 @@ class HtxExchange(ExchangePyBase):
                 await self._sleep(5.0)
 
     async def _process_order_update(self, msg: Dict[str, Any]):
-        client_order_id = msg["clientOrderId"]
-        order_status = msg["orderStatus"]
+        client_order_id = msg.get("clientOrderId")
+        if client_order_id is None:
+            return
+        order_status = msg.get("orderStatus")
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
             order_update = OrderUpdate(
@@ -356,7 +358,9 @@ class HtxExchange(ExchangePyBase):
             self._order_tracker.process_order_update(order_update=order_update)
 
     async def _process_trade_event(self, trade_event: Dict[str, Any]):
-        client_order_id = trade_event["clientOrderId"]
+        client_order_id = trade_event.get("clientOrderId")
+        if client_order_id is None:
+            return
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
 
         if tracked_order:
