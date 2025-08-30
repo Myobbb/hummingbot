@@ -452,6 +452,17 @@ class MexcExchange(ExchangePyBase):
             self.logger().debug(f"Ignoring order message with id {client_order_id}: not in in_flight_orders.")
             return
 
+        # or MEXC MARKET BUY, align denominator with exchange-reported cumulative base (cv)
+        try:
+            if tracked_order.trade_type is TradeType.BUY and tracked_order.order_type is OrderType.MARKET:
+                cv = order_msg.get("cv")
+                if cv is not None:
+                    cum_base = Decimal(str(cv))
+                    if cum_base > tracked_order.amount:
+                        tracked_order.amount = cum_base
+        except Exception:
+            pass
+
         order_update = self._create_order_update_with_order_status_data(order_status=raw_msg, order=tracked_order)
         self._order_tracker.process_order_update(order_update=order_update)
 
