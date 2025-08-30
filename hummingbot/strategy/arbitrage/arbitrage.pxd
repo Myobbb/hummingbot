@@ -24,15 +24,12 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Add the new attributes here
         dict _order_placement_timestamps
         float _order_timeout
-        # Throttle logs for long-pending orders to cut per-tick overhead
-        dict _pending_order_last_log_ts
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair)
     cdef c_process_market_pair(self, object market_pair)
     cdef c_process_market_pair_inner(self, object buy_market_trading_pair, object sell_market_trading_pair)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_trading_pair, object sell_market_trading_pair)
     cdef bint c_ready_for_new_orders(self, list market_trading_pairs)
-    cdef tuple c_find_best_profitable_amount_stream(self, object buy_market_trading_pair_tuple, object sell_market_trading_pair_tuple)
 
 cdef list c_find_profitable_arbitrage_orders(object min_profitability,
                                              object buy_market_trading_pair_tuple,

@@ -91,7 +91,6 @@ cdef class ArbitrageStrategy(StrategyBase):
         # New variables for order timeout feature
         self._order_placement_timestamps = {}
         self._order_timeout = order_timeout
-        self._pending_order_last_log_ts = {}
 
         cdef:
             set all_markets = {
@@ -285,15 +284,11 @@ cdef class ArbitrageStrategy(StrategyBase):
                 time_elapsed = self._current_timestamp - self._order_placement_timestamps[buy_order.order_id]
                 self.logger().info(f"Buy order {buy_order.order_id} completed after {time_elapsed:.2f} seconds.")
                 del self._order_placement_timestamps[buy_order.order_id]
-            if buy_order.order_id in self._pending_order_last_log_ts:
-                del self._pending_order_last_log_ts[buy_order.order_id]
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(logging.INFO,
                                     f"Limit buy order completed on {market_trading_pair_tuple[0].name}: {buy_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{buy_order.base_asset_amount:.8f} {buy_order.base_asset}-{buy_order.quote_asset} buy limit order completed on {market_trading_pair_tuple[0].name}")
-            # Ensure the order is no longer tracked as a market order
-            self._sb_order_tracker.c_stop_tracking_market_order(market_trading_pair_tuple, buy_order.order_id)
     
     cdef c_did_complete_sell_order(self, object sell_order_completed_event):
         cdef:
@@ -306,15 +301,11 @@ cdef class ArbitrageStrategy(StrategyBase):
                 time_elapsed = self._current_timestamp - self._order_placement_timestamps[sell_order.order_id]
                 self.logger().info(f"Sell order {sell_order.order_id} completed after {time_elapsed:.2f} seconds.")
                 del self._order_placement_timestamps[sell_order.order_id]
-            if sell_order.order_id in self._pending_order_last_log_ts:
-                del self._pending_order_last_log_ts[sell_order.order_id]
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(logging.INFO,
                                     f"Limit sell order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
                 self.notify_hb_app_with_timestamp(f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} sell limit order completed on {market_trading_pair_tuple[0].name}")
-            # Ensure the order is no longer tracked as a market order
-            self._sb_order_tracker.c_stop_tracking_market_order(market_trading_pair_tuple, sell_order.order_id)
                 
     cdef c_did_cancel_order(self, object cancel_event):
         """
@@ -365,18 +356,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         """
         cdef:
             double time_left
-            dict tracked_taker_orders
-            dict tracked_market_orders_local
-
-        tracked_taker_orders = self._sb_order_tracker.c_get_limit_orders()
-        tracked_market_orders_local = self._sb_order_tracker.c_get_market_orders()
-        if tracked_market_orders_local:
-            # in-place merge to avoid building large temporaries; orders are grouped by market pair tuple
-            for _mkt_pair, _orders in tracked_market_orders_local.items():
-                if _mkt_pair in tracked_taker_orders:
-                    tracked_taker_orders[_mkt_pair].update(_orders)
-                else:
-                    tracked_taker_orders[_mkt_pair] = dict(_orders)
+            dict tracked_taker_orders = {**self._sb_order_tracker.c_get_limit_orders(), ** self._sb_order_tracker.c_get_market_orders()}
 
         for market_trading_pair_tuple in market_trading_pair_tuples:
             if len(tracked_taker_orders.get(market_trading_pair_tuple, {})) > 0:
@@ -391,27 +371,17 @@ cdef class ArbitrageStrategy(StrategyBase):
                         self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds, which exceeds the {self._order_timeout} second timeout. Considering it completed.")
                         keys_to_remove.append(order_id)
                     else:
-                        # throttle frequent per-tick logs to reduce overhead
-                        last_log_ts = self._pending_order_last_log_ts.get(order_id, 0)
-                        if self._current_timestamp - last_log_ts >= 2:
-                            if time_elapsed > 10:
-                                self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
-                            else:
-                                self.logger().info(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
-                            self._pending_order_last_log_ts[order_id] = self._current_timestamp
+                        if time_elapsed > 10:
+                            self.logger().warning(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
+                        else:
+                            self.logger().info(f"Order {order_id} has been pending for {time_elapsed:.2f} seconds. Waiting for completion or timeout.")
                         return False
 
                 for order_id in keys_to_remove:
                     if order_id in self._order_placement_timestamps:
                         del self._order_placement_timestamps[order_id]
-                    if order_id in self._pending_order_last_log_ts:
-                        del self._pending_order_last_log_ts[order_id]
                     # Notify the order tracker that this order should be considered completed
-                    order_obj = tracked_taker_orders.get(market_trading_pair_tuple, {}).get(order_id)
-                    if isinstance(order_obj, MarketOrder):
-                        self._sb_order_tracker.c_stop_tracking_market_order(market_trading_pair_tuple, order_id)
-                    else:
-                        self._sb_order_tracker.c_stop_tracking_limit_order(market_trading_pair_tuple, order_id)
+                    self._sb_order_tracker.c_stop_tracking_limit_order(market_trading_pair_tuple, order_id)
 
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
@@ -475,7 +445,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             ExchangeBase buy_market = buy_market_trading_pair_tuple.market
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
 
-        best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount_stream(
+        best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount(
             buy_market_trading_pair_tuple, sell_market_trading_pair_tuple
         )
         quantized_buy_amount = buy_market.c_quantize_order_amount(buy_market_trading_pair_tuple.trading_pair, Decimal(best_amount))
@@ -515,8 +485,9 @@ cdef class ArbitrageStrategy(StrategyBase):
             self.logger().info(f"Placed buy order {buy_order_id} and sell order {sell_order_id}. Starting timer.")
             self._order_placement_timestamps[buy_order_id] = self._current_timestamp
             self._order_placement_timestamps[sell_order_id] = self._current_timestamp
-
-            # Avoid rendering full status report here; it's expensive and delays next tick
+        
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.logger().info(self.format_status())
 
     @staticmethod
     def find_profitable_arbitrage_orders(min_profitability: Decimal,
@@ -684,122 +655,6 @@ cdef class ArbitrageStrategy(StrategyBase):
             if best_profitable_order_amount > 0:
                 bid_price = vwap_sell_proceeds / best_profitable_order_amount
                 ask_price = vwap_buy_cost / best_profitable_order_amount
-
-        return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
-
-    cdef tuple c_find_best_profitable_amount_stream(self, object buy_market_trading_pair_tuple, object sell_market_trading_pair_tuple):
-        """
-        Optimized variant that reduces repeated balance lookups and logging overhead, while
-        still computing a precise VWAP for the chosen amount.
-        """
-        cdef:
-            object total_bid_value_adjusted = s_decimal_0
-            object total_ask_value_adjusted = s_decimal_0
-            object total_previous_step_base_amount = s_decimal_0
-            object best_profitable_order_amount = s_decimal_0
-            object best_profitable_order_profitability = s_decimal_0
-            object buy_fee
-            object sell_fee
-            object total_sell_flat_fees
-            object total_buy_flat_fees
-            object net_sell_proceeds
-            object net_buy_costs
-            object buy_market_quote_balance
-            object sell_market_base_balance
-            object bid_price_raw
-            object ask_price_raw
-            object bid_price_adjusted
-            object ask_price_adjusted
-            object step_amount
-            object vwap_buy_cost = s_decimal_0
-            object vwap_sell_proceeds = s_decimal_0
-            ExchangeBase buy_market = buy_market_trading_pair_tuple.market
-            ExchangeBase sell_market = sell_market_trading_pair_tuple.market
-
-        buy_market_conversion_rate = self.market_conversion_rate(buy_market_trading_pair_tuple)
-        sell_market_conversion_rate = self.market_conversion_rate(sell_market_trading_pair_tuple)
-
-        # Use the iterator form but process in a single pass building minimal state
-        profitable_orders = c_find_profitable_arbitrage_orders(self._min_profitability,
-                                                               buy_market_trading_pair_tuple,
-                                                               sell_market_trading_pair_tuple,
-                                                               buy_market_conversion_rate,
-                                                               sell_market_conversion_rate)
-
-        # Cache balances once for the current tick to avoid repeated connector calls during step iteration
-        buy_market_quote_balance_cached = buy_market.c_get_available_balance(buy_market_trading_pair_tuple.quote_asset)
-        sell_market_base_balance_cached = sell_market.c_get_available_balance(sell_market_trading_pair_tuple.base_asset)
-
-        for bid_price_adjusted, ask_price_adjusted, bid_price_raw, ask_price_raw, step_amount in profitable_orders:
-            buy_fee = buy_market.c_get_fee(
-                buy_market_trading_pair_tuple.base_asset,
-                buy_market_trading_pair_tuple.quote_asset,
-                buy_market_trading_pair_tuple.market.get_taker_order_type(),
-                TradeType.BUY,
-                total_previous_step_base_amount + step_amount,
-                ask_price_raw
-            )
-            sell_fee = sell_market.c_get_fee(
-                sell_market_trading_pair_tuple.base_asset,
-                sell_market_trading_pair_tuple.quote_asset,
-                sell_market_trading_pair_tuple.market.get_taker_order_type(),
-                TradeType.SELL,
-                total_previous_step_base_amount + step_amount,
-                bid_price_raw
-            )
-
-            total_buy_flat_fees = self.c_sum_flat_fees(buy_market_trading_pair_tuple.quote_asset, buy_fee.flat_fees)
-            total_sell_flat_fees = self.c_sum_flat_fees(sell_market_trading_pair_tuple.quote_asset, sell_fee.flat_fees)
-
-            total_bid_value_adjusted += bid_price_adjusted * step_amount
-            total_ask_value_adjusted += ask_price_adjusted * step_amount
-
-            net_sell_proceeds = total_bid_value_adjusted * (1 - sell_fee.percent) - total_sell_flat_fees
-            net_buy_costs = total_ask_value_adjusted * (1 + buy_fee.percent) + total_buy_flat_fees
-
-            profitability = net_sell_proceeds / net_buy_costs
-
-            if profitability > (1 + self._min_profitability):
-                best_profitable_order_amount = total_previous_step_base_amount + step_amount
-                best_profitable_order_profitability = profitability
-
-            buy_market_quote_balance = buy_market_quote_balance_cached
-            sell_market_base_balance = sell_market_base_balance_cached
-
-            if (buy_market_quote_balance < net_buy_costs or
-                    sell_market_base_balance < (total_previous_step_base_amount + step_amount)):
-                if profitability < (1 + self._min_profitability):
-                    break
-                buy_market_adjusted_order_size = ((buy_market_quote_balance / ask_price_raw - total_buy_flat_fees) /
-                                                  (1 + buy_fee.percent))
-                best_profitable_order_amount = min(sell_market_base_balance, buy_market_adjusted_order_size)
-                best_profitable_order_profitability = profitability
-                # compute VWAP for final chosen amount using aggregated proceeds/costs so far
-                break
-
-            # accumulate VWAP components progressively for the selected best amount; we will finish later
-            vwap_buy_cost += ask_price_raw * step_amount
-            vwap_sell_proceeds += bid_price_raw * step_amount
-            total_previous_step_base_amount += step_amount
-
-        if best_profitable_order_amount > 0 and total_previous_step_base_amount > 0:
-            # If we broke early due to balance, best_profitable_order_amount may be <= total_previous_step_base_amount
-            # Compute precise VWAP for the best amount by trimming the last step proportionally if needed
-            remaining_amount = best_profitable_order_amount
-            vwap_buy_cost_final = s_decimal_0
-            vwap_sell_proceeds_final = s_decimal_0
-            for bid_price_adjusted, ask_price_adjusted, bid_price_raw, ask_price_raw, step_amount in profitable_orders:
-                if remaining_amount <= 0:
-                    break
-                step_take = step_amount if step_amount <= remaining_amount else remaining_amount
-                vwap_buy_cost_final += ask_price_raw * step_take
-                vwap_sell_proceeds_final += bid_price_raw * step_take
-                remaining_amount -= step_take
-            bid_price = vwap_sell_proceeds_final / best_profitable_order_amount
-            ask_price = vwap_buy_cost_final / best_profitable_order_amount
-        else:
-            bid_price = s_decimal_0
-            ask_price = s_decimal_0
 
         return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
 

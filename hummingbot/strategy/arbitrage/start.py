@@ -41,7 +41,8 @@ def start(self):
     self.strategy = ArbitrageStrategy()
     self.strategy.init_params(market_pairs=[self.market_pair],
                               min_profitability=min_profitability,
-                              logging_options=(ArbitrageStrategy.OPTION_LOG_ORDER_COMPLETED),
+                              logging_options=(ArbitrageStrategy.OPTION_LOG_STATUS_REPORT |
+                                               ArbitrageStrategy.OPTION_LOG_ORDER_COMPLETED),
                               use_oracle_conversion_rate=use_oracle_conversion_rate,
                               secondary_to_primary_base_conversion_rate=secondary_to_primary_base_conversion_rate,
                               secondary_to_primary_quote_conversion_rate=secondary_to_primary_quote_conversion_rate,
