@@ -30,17 +30,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.ORDERBOOK_CHANNEL_SUFFIX
         self._trade_messages_queue_key = CONSTANTS.TRADE_CHANNEL_SUFFIX
         self._api_factory = api_factory
-        self._last_ws_message_sent_timestamp = 0
-        # HTX expects JSON ping/pong on public WS as well; use the same interval
-        self._ping_interval = CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        # Disable protocol-level ping frames; HTX public WS expects JSON ping/pong only.
-        # Provide headers to explicitly allow compression
-        ws_headers = {"Accept-Encoding": "gzip, deflate", "User-Agent": "hummingbot-htx-connector"}
-        # Always use AWS-hosted public WS endpoint per HTX docs
-        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
+        # Always use AWS-hosted public WS endpoint; disable protocol-level ping (we reply to JSON ping only)
+        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=None)
 
         return ws
 
@@ -136,9 +130,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 })
                 await ws.send(subscribe_orderbook_request)
-                await asyncio.sleep(0.2)
                 await ws.send(subscribe_trade_request)
-                await asyncio.sleep(0.2)
             self.logger().info("Subscribed to public orderbook and trade channels...")
         except asyncio.CancelledError:
             raise
@@ -188,42 +180,4 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pong_request = WSJSONRequest(payload={"pong": event_message["ping"]})
             await websocket_assistant.send(request=pong_request)
 
-    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
-        while True:
-            try:
-                # Base proactive ping on last received frame to avoid unnecessary pings under high traffic
-                seconds_until_next_ping = max(1.0, self._ping_interval - (self._time() - websocket_assistant.last_recv_time))
-                ws_response = await asyncio.wait_for(websocket_assistant.receive(), timeout=seconds_until_next_ping)
-                if ws_response is None:
-                    break
-                data: Dict[str, Any] = ws_response.data
-                if data is not None:
-                    channel: str = self._channel_originating_message(event_message=data)
-                    valid_channels = self._get_messages_queue_keys()
-                    if channel in valid_channels:
-                        self._message_queue[channel].put_nowait(data)
-                    else:
-                        await self._process_message_for_unknown_channel(
-                            event_message=data, websocket_assistant=websocket_assistant
-                        )
-            except asyncio.TimeoutError:
-                # Send JSON ping for public WS
-                ping_payload = {"ping": int(self._time() * 1000)}
-                await websocket_assistant.send(request=WSJSONRequest(payload=ping_payload))
-                self._last_ws_message_sent_timestamp = self._time()
-                # If no frames for too long, reconnect
-                if (self._time() - websocket_assistant.last_recv_time) > 45:
-                    await websocket_assistant.disconnect()
-                    break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise
-
-    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        # Small backoff to avoid rapid reconnect storms
-        try:
-            await self._sleep(2.0)
-        except Exception:
-            pass
-        await super()._on_order_stream_interruption(websocket_assistant)
+    # Use base class message loop; we only respond to JSON pings in _process_message_for_unknown_channel

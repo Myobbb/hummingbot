@@ -88,12 +88,8 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         try:
             await self._authenticate_client(websocket_assistant)
             await self._subscribe_topic(CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC, websocket_assistant)
-            for trading_pair in self._trading_pairs:
-                exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                await self._subscribe_topic(CONSTANTS.HTX_TRADE_DETAILS_TOPIC.format(exchange_symbol),
-                                            websocket_assistant)
-                await self._subscribe_topic(CONSTANTS.HTX_ORDER_UPDATE_TOPIC.format(exchange_symbol),
-                                            websocket_assistant)
+            await self._subscribe_topic("trade.clearing#*#0", websocket_assistant)
+            await self._subscribe_topic("orders#*", websocket_assistant)
         except asyncio.CancelledError:
             raise
         except Exception:
