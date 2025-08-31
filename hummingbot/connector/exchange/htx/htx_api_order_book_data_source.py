@@ -33,19 +33,23 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ws_message_sent_timestamp = 0
         # HTX expects JSON ping/pong on public WS as well; use the same interval
         self._ping_interval = CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
+        # Alternate between primary and fallback endpoints on reconnects to mitigate transient regional issues
+        self._use_fallback_ws = False
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        # Try preferred AWS endpoint first; fall back to legacy public URL on handshake errors
         # Disable protocol-level ping frames; HTX public WS expects JSON ping/pong only.
+        # Provide headers to explicitly allow compression
+        ws_headers = {"Accept-Encoding": "gzip, deflate", "User-Agent": "hummingbot-htx-connector"}
+        ws_url = getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL) if self._use_fallback_ws else CONSTANTS.WS_PUBLIC_URL
         try:
-            await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=None)
+            await ws.connect(ws_url=ws_url, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
         except Exception:
-            try:
-                await ws.connect(ws_url=getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL),
-                                 ping_timeout=None)
-            except Exception:
-                raise
+            # Try alternate endpoint immediately on connect failure
+            alt_url = CONSTANTS.WS_PUBLIC_URL if self._use_fallback_ws else getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL)
+            await ws.connect(ws_url=alt_url, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
+            # Flip the flag so next reconnect starts with the working endpoint
+            self._use_fallback_ws = not self._use_fallback_ws
 
         return ws
 
@@ -141,7 +145,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 })
                 await ws.send(subscribe_orderbook_request)
+                await asyncio.sleep(0.2)
                 await ws.send(subscribe_trade_request)
+                await asyncio.sleep(0.2)
             self.logger().info("Subscribed to public orderbook and trade channels...")
         except asyncio.CancelledError:
             raise
@@ -194,7 +200,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         while True:
             try:
-                seconds_until_next_ping = max(1.0, self._ping_interval - (self._time() - self._last_ws_message_sent_timestamp))
+                # Base proactive ping on last received frame to avoid unnecessary pings under high traffic
+                seconds_until_next_ping = max(1.0, self._ping_interval - (self._time() - websocket_assistant.last_recv_time))
                 ws_response = await asyncio.wait_for(websocket_assistant.receive(), timeout=seconds_until_next_ping)
                 if ws_response is None:
                     break
@@ -221,3 +228,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception:
                 raise
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        # Alternate endpoint choice after each disconnect to mitigate regional issues or sticky load balancers
+        self._use_fallback_ws = not self._use_fallback_ws
+        # Small backoff to avoid rapid reconnect storms on 1003
+        try:
+            await self._sleep(2.0)
+        except Exception:
+            pass
+        await super()._on_order_stream_interruption(websocket_assistant)

@@ -178,7 +178,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                 await self._sleep(10)
                                 continue
                     else:
-                        self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
+                        #self.logger().debug(f"Refreshed listen key {self._current_listen_key}.")
                         self._last_listen_key_ping_ts = int(time.time())
                 else:
                     # Sleep only the remaining time until next keep-alive
