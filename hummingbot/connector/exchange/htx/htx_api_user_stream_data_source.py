@@ -25,6 +25,8 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._trading_pairs = trading_pairs
+        self._last_ws_message_sent_timestamp = 0
+        self._ping_interval = CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
         super().__init__()
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
@@ -99,21 +101,47 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
             raise
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
-        async for ws_response in websocket_assistant.iter_messages():
-            data = ws_response.data
-            action = data.get("action")
-            if action == "ping":
-                payload_data = data.get("data")
-                if isinstance(payload_data, dict) and "ts" in payload_data:
-                    pong_payload = {"action": "pong", "data": {"ts": payload_data.get("ts")}}
+        while True:
+            try:
+                seconds_until_next_ping = max(1.0, self._ping_interval - (self._time() - self._last_ws_message_sent_timestamp))
+                ws_response: WSResponse = await asyncio.wait_for(websocket_assistant.receive(), timeout=seconds_until_next_ping)
+                if ws_response is None:
+                    # Connection was closed; let outer loop reconnect
+                    break
+                data = ws_response.data
+                action = data.get("action")
+                if action == "ping":
+                    payload_data = data.get("data")
+                    if isinstance(payload_data, dict) and "ts" in payload_data:
+                        pong_payload = {"action": "pong", "data": {"ts": payload_data.get("ts")}}
+                    else:
+                        pong_payload = {"action": "pong"}
+                    await websocket_assistant.send(request=WSJSONRequest(payload=pong_payload))
+                elif action == "pong":
+                    # No-op
+                    continue
+                elif action == "sub":
+                    if data.get("code") != 200:
+                        raise ValueError(f"Error subscribing to topic: {data.get('ch')} ({data})")
                 else:
-                    pong_payload = {"action": "pong"}
-                await websocket_assistant.send(request=WSJSONRequest(payload=pong_payload))
-            elif action == "pong":
-                # No-op
-                continue
-            elif action == "sub":
-                if data.get("code") != 200:
-                    raise ValueError(f"Error subscribing to topic: {data.get('ch')} ({data})")
-            else:
-                queue.put_nowait(data)
+                    queue.put_nowait(data)
+            except asyncio.TimeoutError:
+                # Send JSON ping proactively
+                ping_payload = {"action": "ping", "data": {"ts": int(self._time() * 1000)}}
+                await websocket_assistant.send(request=WSJSONRequest(payload=ping_payload))
+                self._last_ws_message_sent_timestamp = self._time()
+                # Health check: if no frames for too long, force reconnect
+                if (self._time() - websocket_assistant.last_recv_time) > 45:
+                    await websocket_assistant.disconnect()
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Any other error - break to trigger reconnect by caller
+                raise
+
+    async def _send_ping(self, websocket_assistant: WSAssistant):
+        # Override to use JSON ping instead of protocol-level ping frames
+        ping_payload = {"action": "ping", "data": {"ts": int(self._time() * 1000)}}
+        await websocket_assistant.send(request=WSJSONRequest(payload=ping_payload))
+        self._last_ws_message_sent_timestamp = self._time()
