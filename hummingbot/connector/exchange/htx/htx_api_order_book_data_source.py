@@ -33,23 +33,14 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ws_message_sent_timestamp = 0
         # HTX expects JSON ping/pong on public WS as well; use the same interval
         self._ping_interval = CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
-        # Alternate between primary and fallback endpoints on reconnects to mitigate transient regional issues
-        self._use_fallback_ws = False
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         # Disable protocol-level ping frames; HTX public WS expects JSON ping/pong only.
         # Provide headers to explicitly allow compression
         ws_headers = {"Accept-Encoding": "gzip, deflate", "User-Agent": "hummingbot-htx-connector"}
-        ws_url = getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL) if self._use_fallback_ws else CONSTANTS.WS_PUBLIC_URL
-        try:
-            await ws.connect(ws_url=ws_url, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
-        except Exception:
-            # Try alternate endpoint immediately on connect failure
-            alt_url = CONSTANTS.WS_PUBLIC_URL if self._use_fallback_ws else getattr(CONSTANTS, "WS_PUBLIC_URL_FALLBACK", CONSTANTS.WS_PUBLIC_URL)
-            await ws.connect(ws_url=alt_url, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
-            # Flip the flag so next reconnect starts with the working endpoint
-            self._use_fallback_ws = not self._use_fallback_ws
+        # Always use AWS-hosted public WS endpoint per HTX docs
+        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=None, message_timeout=60, ws_headers=ws_headers, max_msg_size=64 * 1024 * 1024)
 
         return ws
 
@@ -230,9 +221,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        # Alternate endpoint choice after each disconnect to mitigate regional issues or sticky load balancers
-        self._use_fallback_ws = not self._use_fallback_ws
-        # Small backoff to avoid rapid reconnect storms on 1003
+        # Small backoff to avoid rapid reconnect storms
         try:
             await self._sleep(2.0)
         except Exception:

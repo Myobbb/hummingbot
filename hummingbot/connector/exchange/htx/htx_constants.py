@@ -9,7 +9,7 @@ DOMAIN = ""
 MAX_CLIENT_ORDER_ID_LENGTH = 64
 
 
-# Prefer AWS REST endpoint (runs on AWS servers)
+# Prefer AWS REST endpoint
 REST_URL = "https://api-aws.huobi.pro"
 # Prefer AWS WS endpoints per HTX guidance; fall back to legacy if needed
 WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
