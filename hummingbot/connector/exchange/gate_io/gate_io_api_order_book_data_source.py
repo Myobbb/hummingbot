@@ -99,7 +99,11 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
         timestamp: float = (diff_data["t"]) * 1e-3
         update_id: int = diff_data["u"]
 
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=diff_data["s"])
+        # For Order Book V2, "s" can be a stream identifier like "ob.BTC_USDT.50".
+        # Extract the exchange symbol accordingly, falling back to raw value if format differs.
+        stream_name = str(diff_data.get("s", ""))
+        ex_symbol = stream_name.split(".")[1] if "." in stream_name else stream_name
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
 
         order_book_message_content = {
             "trading_pair": trading_pair,
@@ -137,7 +141,7 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "time": int(self._time()),
                     "channel": CONSTANTS.ORDERS_UPDATE_ENDPOINT_NAME,
                     "event": "subscribe",
-                    "payload": [symbol, "100ms"]
+                    "payload": [f"ob.{symbol}.{CONSTANTS.ORDER_BOOK_V2_LEVEL}"]
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
 
