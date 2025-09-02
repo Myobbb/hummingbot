@@ -11,7 +11,7 @@ from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSJSONRequest
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
 
-# Default to AWS host; specific hosts are picked dynamically per URL where possible
+# Default to AWS host for HTTPS; specific hosts are picked dynamically per URL where possible
 HTX_HOST_NAME = "api-aws.huobi.pro"
 
 

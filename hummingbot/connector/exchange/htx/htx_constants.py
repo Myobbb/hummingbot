@@ -9,12 +9,10 @@ DOMAIN = ""
 MAX_CLIENT_ORDER_ID_LENGTH = 64
 
 
-# Prefer AWS REST endpoint
+# Default to non-AWS endpoints per HTX docs, with AWS as fallback
 REST_URL = "https://api-aws.huobi.pro"
-# Prefer AWS WS endpoints per HTX guidance; fall back to legacy if needed
-WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
-WS_PUBLIC_URL_FALLBACK = "wss://api.huobi.pro/ws"
-WS_PRIVATE_URL = "wss://api-aws.huobi.pro/ws/v2"
+WS_PUBLIC_URL = "wss://api.huobi.pro/ws"
+WS_PRIVATE_URL = "wss://api.huobi.pro/ws/v2"
 
 # Slightly higher heartbeat to reduce churn but stay well under idle timeouts
 WS_HEARTBEAT_TIME_INTERVAL = 10  # seconds
