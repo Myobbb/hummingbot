@@ -98,26 +98,7 @@ class HtxExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
-    def get_fee(
-        self,
-        base_currency: str,
-        quote_currency: str,
-        order_type: OrderType,
-        order_side: TradeType,
-        amount: Decimal,
-        price: Decimal = s_decimal_NaN,
-        is_maker: Optional[bool] = None,
-    ):
-        return build_trade_fee(
-            self.name,
-            is_maker,
-            base_currency=base_currency,
-            quote_currency=quote_currency,
-            order_type=order_type,
-            order_side=order_side,
-            amount=amount,
-            price=price,
-        )
+    # Use base class get_fee -> _get_fee path; no need to override get_fee here
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # API documentation does not clarify the error message for timestamp related problems
@@ -463,11 +444,13 @@ class HtxExchange(ExchangePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        path_url = CONSTANTS.MOST_RECENT_TRADE_URL
+        # Use per-symbol last trade endpoint matching HTX format
+        path_url = CONSTANTS.LAST_TRADE_URL
         params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair)}
-        resp_json = await self._api_get(
-            path_url=path_url,
-            params=params,
-        )
-        resp_record = resp_json["tick"]["data"][0]
-        return float(resp_record["price"])
+        resp_json = await self._api_get(path_url=path_url, params=params)
+        # Format: { status: "ok", ch: "market.symbol.trade.detail", tick: { data: [ { price, ... } ] } }
+        tick = resp_json.get("tick", {})
+        data = tick.get("data", [])
+        if not data:
+            raise ValueError(f"No last trade data for {trading_pair}")
+        return float(data[0].get("price"))

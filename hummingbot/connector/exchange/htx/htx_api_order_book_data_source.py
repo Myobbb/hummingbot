@@ -30,12 +30,14 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.ORDERBOOK_CHANNEL_SUFFIX
         self._trade_messages_queue_key = CONSTANTS.TRADE_CHANNEL_SUFFIX
         self._api_factory = api_factory
+        self._public_ws_ping_task: Optional[asyncio.Task] = None
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         # Always use AWS-hosted public WS endpoint; disable protocol-level ping (we reply to JSON ping only)
         await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=None)
-
+        # Start proactive JSON ping loop and health checks
+        self._start_public_ws_ping(ws)
         return ws
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
@@ -181,3 +183,44 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await websocket_assistant.send(request=pong_request)
 
     # Use base class message loop; we only respond to JSON pings in _process_message_for_unknown_channel
+
+    def _start_public_ws_ping(self, websocket_assistant: WSAssistant):
+        async def _ping_loop():
+            try:
+                while True:
+                    await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                    try:
+                        # Send JSON ping proactively to keep intermediaries alive
+                        ping_payload = {"ping": int(self._time() * 1000)}
+                        await websocket_assistant.send(request=WSJSONRequest(payload=ping_payload))
+                    except Exception:
+                        # Any send error: break to let outer loop reconnect
+                        break
+                    # If no frames have been received for a while, force reconnect
+                    try:
+                        if (self._time() - websocket_assistant.last_recv_time) > 45:
+                            await websocket_assistant.disconnect()
+                            break
+                    except Exception:
+                        # If assistant is gone, exit
+                        break
+            except asyncio.CancelledError:
+                return
+
+        # Cancel previous loop if any
+        if self._public_ws_ping_task is not None and not self._public_ws_ping_task.done():
+            self._public_ws_ping_task.cancel()
+        self._public_ws_ping_task = asyncio.create_task(_ping_loop())
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        # Stop ping loop and disconnect
+        try:
+            if self._public_ws_ping_task is not None and not self._public_ws_ping_task.done():
+                self._public_ws_ping_task.cancel()
+                try:
+                    await self._public_ws_ping_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            self._public_ws_ping_task = None
+        await super()._on_order_stream_interruption(websocket_assistant)

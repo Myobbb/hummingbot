@@ -88,7 +88,7 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         try:
             await self._authenticate_client(websocket_assistant)
             await self._subscribe_topic(CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC, websocket_assistant)
-            await self._subscribe_topic("trade.clearing#*#0", websocket_assistant)
+            await self._subscribe_topic("trade.clearing#*", websocket_assistant)
             await self._subscribe_topic("orders#*", websocket_assistant)
         except asyncio.CancelledError:
             raise

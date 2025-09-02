@@ -24,7 +24,6 @@ TRADE_CHANNEL_SUFFIX = "trade.detail"
 ORDERBOOK_CHANNEL_SUFFIX = "depth.step0"
 
 TRADE_INFO_URL = "/v1/settings/common/market-symbols"
-MOST_RECENT_TRADE_URL = "/market/tickers"
 DEPTH_URL = "/market/depth"
 LAST_TRADE_URL = "/market/trade"
 
@@ -40,7 +39,7 @@ BATCH_CANCEL_URL = "/v1/order/orders/batchcancel"
 
 HTX_ACCOUNT_UPDATE_TOPIC = "accounts.update#2"
 HTX_ORDER_UPDATE_TOPIC = "orders#{}"
-HTX_TRADE_DETAILS_TOPIC = "trade.clearing#{}#0"
+HTX_TRADE_DETAILS_TOPIC = "trade.clearing#{}"
 
 HTX_SUBSCRIBE_TOPICS = {HTX_ORDER_UPDATE_TOPIC, HTX_ACCOUNT_UPDATE_TOPIC, HTX_TRADE_DETAILS_TOPIC}
 
@@ -55,7 +54,6 @@ RATE_LIMITS = [
     RateLimit(WS_CONNECTION_LIMIT_ID, limit=50, time_interval=1),
     RateLimit(WS_REQUEST_LIMIT_ID, limit=10, time_interval=1),
     RateLimit(limit_id=TRADE_INFO_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=MOST_RECENT_TRADE_URL, limit=10, time_interval=1),
     RateLimit(limit_id=DEPTH_URL, limit=10, time_interval=1),
     RateLimit(limit_id=LAST_TRADE_URL, limit=10, time_interval=1),
     RateLimit(limit_id=SERVER_TIME_URL, limit=10, time_interval=1),
