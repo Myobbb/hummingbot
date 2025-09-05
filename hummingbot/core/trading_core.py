@@ -550,8 +550,7 @@ class TradingCore:
             # Stop rate oracle
             RateOracle.get_instance().stop()
 
-            # Clean up strategy components
-            self.strategy = None
+            # Preserve the strategy instance to avoid unloading on stop; just mark as not running
             self.strategy_task = None
             self.kill_switch = None
             self._strategy_running = False

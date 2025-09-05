@@ -3,7 +3,6 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from . import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
-from .pb import PushDataV3ApiWrapper_pb2 as PBPush
 from .mexc_order_book import MexcOrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -127,9 +126,6 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # Convert PB bytes into JSON-like dict if needed
-        if isinstance(raw_message, (bytes, bytearray)):
-            raw_message = self._decode_pb_envelope_to_event_dict(raw_message)
         if isinstance(raw_message, dict) and "code" not in raw_message:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message.get("s", ""))
             for single_msg in raw_message.get('d', {}).get('deals', []):
@@ -138,9 +134,6 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # Convert PB bytes into JSON-like dict if needed
-        if isinstance(raw_message, (bytes, bytearray)):
-            raw_message = self._decode_pb_envelope_to_event_dict(raw_message)
         if isinstance(raw_message, dict) and "code" not in raw_message:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message.get("s", ""))
             order_book_message: OrderBookMessage = MexcOrderBook.diff_message_from_exchange(
@@ -148,95 +141,11 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(order_book_message)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
-        # Accept both JSON dict and PB bytes
-        parsed = event_message
-        if isinstance(event_message, (bytes, bytearray)):
-            parsed = self._decode_pb_envelope_to_event_dict(event_message)
         channel = ""
-        if isinstance(parsed, dict) and "code" not in parsed:
-            event_type = parsed.get("c", "")
+        if isinstance(event_message, dict) and "code" not in event_message:
+            event_type = event_message.get("c", "") or event_message.get("channel", "")
             if (CONSTANTS.DIFF_EVENT_TYPE in event_type) or ("aggre.depth" in event_type) or ("depth" in event_type):
                 channel = self._diff_messages_queue_key
             else:
                 channel = self._trade_messages_queue_key
         return channel
-
-    def _decode_pb_envelope_to_event_dict(self, payload: bytes) -> Dict[str, Any]:
-        """Decode a PB wrapper payload into the JSON-like event dict our parsers expect."""
-        try:
-            wrapper = PBPush.PushDataV3ApiWrapper()
-            wrapper.ParseFromString(payload)
-            channel = wrapper.channel
-            symbol = getattr(wrapper, 'symbol', '') or ''
-            # choose createTime if available, else sendTime, else now
-            create_time = getattr(wrapper, 'createTime', 0) or 0
-            send_time = getattr(wrapper, 'sendTime', 0) or 0
-            ts = int(create_time or send_time or time.time() * 1000)
-
-            # Depth (aggregated)
-            if wrapper.HasField('publicAggreDepths'):
-                body = wrapper.publicAggreDepths
-                event = {
-                    "c": channel,
-                    "s": symbol,
-                    "t": ts,
-                    "d": {
-                        "r": getattr(body, 'toVersion', ''),
-                        "bids": [{"p": it.price, "v": it.quantity} for it in getattr(body, 'bids', [])],
-                        "asks": [{"p": it.price, "v": it.quantity} for it in getattr(body, 'asks', [])],
-                    },
-                }
-                return event
-
-            # Depth (increase)
-            if wrapper.HasField('publicIncreaseDepths'):
-                body = wrapper.publicIncreaseDepths
-                event = {
-                    "c": channel,
-                    "s": symbol,
-                    "t": ts,
-                    "d": {
-                        "r": getattr(body, 'version', ''),
-                        "bids": [{"p": it.price, "v": it.quantity} for it in getattr(body, 'bids', [])],
-                        "asks": [{"p": it.price, "v": it.quantity} for it in getattr(body, 'asks', [])],
-                    },
-                }
-                return event
-
-            # Trades (aggregated)
-            if wrapper.HasField('publicAggreDeals'):
-                body = wrapper.publicAggreDeals
-                deals = [{
-                    "p": it.price,
-                    "v": it.quantity,
-                    "S": int(getattr(it, 'tradeType', 0)),
-                    "t": int(getattr(it, 'time', ts)),
-                } for it in getattr(body, 'deals', [])]
-                event = {
-                    "c": channel,
-                    "s": symbol,
-                    "t": ts,
-                    "d": {"deals": deals},
-                }
-                return event
-
-            # Trades (plain)
-            if wrapper.HasField('publicDeals'):
-                body = wrapper.publicDeals
-                deals = [{
-                    "p": it.price,
-                    "v": it.quantity,
-                    "S": int(getattr(it, 'tradeType', 0)),
-                    "t": int(getattr(it, 'time', ts)),
-                } for it in getattr(body, 'deals', [])]
-                event = {
-                    "c": channel,
-                    "s": symbol,
-                    "t": ts,
-                    "d": {"deals": deals},
-                }
-                return event
-        except Exception:
-            # If decoding fails, return empty dict so caller ignores
-            self.logger().debug("Failed to decode PB payload", exc_info=True)
-        return {}

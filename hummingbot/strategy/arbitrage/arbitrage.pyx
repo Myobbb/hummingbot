@@ -154,9 +154,9 @@ cdef class ArbitrageStrategy(StrategyBase):
     def log_conversion_rates(self):
         quote_pair, quote_rate_source, quote_rate, base_pair, base_rate_source, base_rate = \
             self.get_second_to_first_conversion_rate()
-        if quote_pair.split("-")[0] != quote_pair.split("-")[1]:
+        if quote_pair.split("-")[0] != quote_pair.split("-")[1] and quote_rate != Decimal("1"):
             self.logger().info(f"{quote_pair} ({quote_rate_source}) conversion rate: {PerformanceMetrics.smart_round(quote_rate)}")
-        if base_pair.split("-")[0] != base_pair.split("-")[1]:
+        if base_pair.split("-")[0] != base_pair.split("-")[1] and base_rate != Decimal("1"):
             self.logger().info(f"{base_pair} ({base_rate_source}) conversion rate: {PerformanceMetrics.smart_round(base_rate)}")
 
     def oracle_status_df(self):
@@ -382,6 +382,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                         del self._order_placement_timestamps[order_id]
                     # Notify the order tracker that this order should be considered completed
                     self._sb_order_tracker.c_stop_tracking_limit_order(market_trading_pair_tuple, order_id)
+                    self._sb_order_tracker.c_stop_tracking_market_order(market_trading_pair_tuple, order_id)
 
             # Wait for the cool off interval before the next trade, so wallet balance is up to date
             ready_to_trade_time = self._last_trade_timestamps.get(market_trading_pair_tuple, 0) + self._next_trade_delay
