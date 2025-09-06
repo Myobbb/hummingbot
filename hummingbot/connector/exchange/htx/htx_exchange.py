@@ -37,6 +37,8 @@ class HtxExchange(ExchangePyBase):
         htx_secret_key: str,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
+        htx_account_id: Optional[str] = None,
+        **_: Any,
     ):
         self.htx_api_key = htx_api_key
         self.htx_secret_key = htx_secret_key
@@ -48,7 +50,8 @@ class HtxExchange(ExchangePyBase):
         # Prefer user-provided account id from config/env if available (improves private balances topic precision)
         try:
             import os
-            cfg_id = getattr(client_config_map, "htx_account_id", None)
+            # Highest precedence: explicit ctor argument
+            cfg_id = htx_account_id if (isinstance(htx_account_id, (str, int)) and str(htx_account_id).strip()) else getattr(client_config_map, "htx_account_id", None)
             if isinstance(cfg_id, (str, int)) and str(cfg_id).strip():
                 self._account_id = str(cfg_id).strip()
                 self._account_id_from_config = True
