@@ -34,12 +34,25 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        # Enable protocol-level heartbeat; we still respond to server JSON pings when received
-        await ws.connect(
-            ws_url=CONSTANTS.WS_PUBLIC_URL,
-            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
-            message_timeout=60,
-        )
+        # Enable protocol-level heartbeat; throttle connects and tune timeouts/headers/sizes
+        throttler = getattr(self._api_factory, "throttler", None)
+        if throttler is not None:
+            async with throttler.execute_task(CONSTANTS.WS_CONNECTION_LIMIT_ID):
+                await ws.connect(
+                    ws_url=CONSTANTS.WS_PUBLIC_URL,
+                    ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+                    message_timeout=45,
+                    ws_headers={"Accept-Encoding": "gzip"},
+                    max_msg_size=16 * 1024 * 1024,
+                )
+        else:
+            await ws.connect(
+                ws_url=CONSTANTS.WS_PUBLIC_URL,
+                ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+                message_timeout=45,
+                ws_headers={"Accept-Encoding": "gzip"},
+                max_msg_size=16 * 1024 * 1024,
+            )
         return ws
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
@@ -148,7 +161,12 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().debug(f"WS subscribe orderbook: market.{exchange_symbol}.depth.step0")
                 except Exception:
                     pass
-                await ws.send(subscribe_orderbook_request)
+                throttler = getattr(self._api_factory, "throttler", None)
+                if throttler is not None:
+                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                        await ws.send(subscribe_orderbook_request)
+                else:
+                    await ws.send(subscribe_orderbook_request)
                 # Adaptive stagger with small jitter to reduce 1003 closes under load
                 try:
                     import random
@@ -161,7 +179,12 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().debug(f"WS subscribe trade: market.{exchange_symbol}.trade.detail")
                 except Exception:
                     pass
-                await ws.send(subscribe_trade_request)
+                throttler = getattr(self._api_factory, "throttler", None)
+                if throttler is not None:
+                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                        await ws.send(subscribe_trade_request)
+                else:
+                    await ws.send(subscribe_trade_request)
                 try:
                     import random
                     n = max(1, len(self._trading_pairs))
