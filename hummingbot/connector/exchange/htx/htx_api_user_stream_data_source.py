@@ -91,11 +91,8 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
             account_topic = CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC
             try:
                 account_id = getattr(self._connector, "_account_id", "")
-                if not account_id:
-                    # Fetch and cache account id
-                    await self._connector._update_account_id()
-                    account_id = getattr(self._connector, "_account_id", "")
-                if account_id:
+                # Only trust account id provided by config/env. If not explicitly set, use default #2.
+                if account_id and getattr(self._connector, "_account_id_from_config", False):
                     account_topic = f"accounts.update#{account_id}"
             except Exception:
                 account_topic = CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC

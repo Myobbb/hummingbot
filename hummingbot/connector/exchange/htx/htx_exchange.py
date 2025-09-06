@@ -43,6 +43,7 @@ class HtxExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._trading_required = trading_required
         self._account_id = ""
+        self._account_id_from_config = False
         super().__init__(client_config_map=client_config_map)
         # Prefer user-provided account id from config/env if available (improves private balances topic precision)
         try:
@@ -50,10 +51,12 @@ class HtxExchange(ExchangePyBase):
             cfg_id = getattr(client_config_map, "htx_account_id", None)
             if isinstance(cfg_id, (str, int)) and str(cfg_id).strip():
                 self._account_id = str(cfg_id).strip()
+                self._account_id_from_config = True
             else:
                 env_id = os.getenv("HTX_ACCOUNT_ID", "").strip()
                 if env_id:
                     self._account_id = env_id
+                    self._account_id_from_config = True
         except Exception:
             pass
 
