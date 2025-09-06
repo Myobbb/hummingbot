@@ -119,8 +119,12 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
+            # Allow connection to settle before sending subscriptions
+            await asyncio.sleep(0.5)
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                # HTX WS expects lowercase symbols in channel names per docs
+                exchange_symbol = exchange_symbol.lower()
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.depth.step0",
                     "id": str(uuid.uuid4())
@@ -130,7 +134,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 })
                 await ws.send(subscribe_orderbook_request)
+                # Stagger subscriptions slightly to avoid WS rate limits and 1003 closes
+                await asyncio.sleep(0.3)
                 await ws.send(subscribe_trade_request)
+                await asyncio.sleep(0.3)
             self.logger().info("Subscribed to public orderbook and trade channels...")
         except asyncio.CancelledError:
             raise

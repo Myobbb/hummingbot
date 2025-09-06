@@ -151,9 +151,13 @@ class ConnectorManager:
         existing_pairs = connector.trading_pairs
         all_pairs = list(set(existing_pairs + trading_pairs))
 
-        # Remove and recreate
+        # Remove and recreate, preserving trading_required if available
         self.remove_connector(connector_name)
-        self.create_connector(connector_name, all_pairs)
+        try:
+            trading_required = bool(getattr(connector, "is_trading_required", True))
+        except Exception:
+            trading_required = True
+        self.create_connector(connector_name, all_pairs, trading_required)
 
         return True
 
