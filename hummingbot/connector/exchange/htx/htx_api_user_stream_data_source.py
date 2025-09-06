@@ -87,8 +87,22 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         try:
             await self._authenticate_client(websocket_assistant)
-            await self._subscribe_topic(CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC, websocket_assistant)
+            # Prefer precise accountId for balances when available
+            account_topic = CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC
+            try:
+                account_id = getattr(self._connector, "_account_id", "")
+                if not account_id:
+                    # Fetch and cache account id
+                    await self._connector._update_account_id()
+                    account_id = getattr(self._connector, "_account_id", "")
+                if account_id:
+                    account_topic = f"accounts.update#{account_id}"
+            except Exception:
+                account_topic = CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC
+            await self._subscribe_topic(account_topic, websocket_assistant)
+            await asyncio.sleep(0.2)
             await self._subscribe_topic("trade.clearing#*", websocket_assistant)
+            await asyncio.sleep(0.2)
             await self._subscribe_topic("orders#*", websocket_assistant)
         except asyncio.CancelledError:
             raise

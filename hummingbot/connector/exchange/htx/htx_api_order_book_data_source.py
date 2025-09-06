@@ -35,7 +35,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         # Enable protocol-level heartbeat; we still respond to server JSON pings when received
-        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        await ws.connect(
+            ws_url=CONSTANTS.WS_PUBLIC_URL,
+            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+            message_timeout=60,
+        )
         return ws
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
@@ -139,6 +143,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "sub": f"market.{exchange_symbol}.trade.detail",
                     "id": str(uuid.uuid4())
                 })
+                # Debug minimal: indicate which symbol is being subscribed
+                try:
+                    self.logger().debug(f"WS subscribe orderbook: market.{exchange_symbol}.depth.step0")
+                except Exception:
+                    pass
                 await ws.send(subscribe_orderbook_request)
                 # Adaptive stagger with small jitter to reduce 1003 closes under load
                 try:
@@ -148,6 +157,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await asyncio.sleep(delay)
                 except Exception:
                     await asyncio.sleep(0.35)
+                try:
+                    self.logger().debug(f"WS subscribe trade: market.{exchange_symbol}.trade.detail")
+                except Exception:
+                    pass
                 await ws.send(subscribe_trade_request)
                 try:
                     import random
@@ -204,5 +217,33 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if "ping" in event_message:
             pong_request = WSJSONRequest(payload={"pong": event_message["ping"]})
             await websocket_assistant.send(request=pong_request)
+            return
+        # Huobi/HTX public WS may reply with sub acks or errors in v1 schema
+        try:
+            status = event_message.get("status")
+            if status == "ok" and ("subbed" in event_message or "rep" in event_message):
+                try:
+                    ch = event_message.get("subbed") or event_message.get("rep")
+                    if ch:
+                        self.logger().debug(f"WS subscribed ack: {ch}")
+                except Exception:
+                    pass
+                return
+            if status == "error" or ("err-code" in event_message or "err-msg" in event_message):
+                self.logger().warning(
+                    "WS subscription error",
+                    extra={
+                        "event": event_message,
+                    }
+                )
+                # Best-effort: disconnect to trigger clean resubscribe when server rejects channels
+                try:
+                    await websocket_assistant.disconnect()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            # Swallow parsing issues; leave message to base handler if needed
+            pass
         
     # Use base class message loop; protocol-level ping handles liveness
