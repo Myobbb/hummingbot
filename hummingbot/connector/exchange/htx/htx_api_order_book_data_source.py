@@ -119,8 +119,14 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
-            # Allow connection to settle before sending subscriptions
-            await asyncio.sleep(0.5)
+            # Allow connection to settle with small randomized jitter to avoid synchronized bursts
+            try:
+                import random
+                base_delay = 0.5
+                jitter = random.uniform(0.1, 0.3)
+                await asyncio.sleep(base_delay + jitter)
+            except Exception:
+                await asyncio.sleep(0.6)
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 # HTX WS expects lowercase symbols in channel names per docs
@@ -134,10 +140,22 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 })
                 await ws.send(subscribe_orderbook_request)
-                # Stagger subscriptions slightly to avoid WS rate limits and 1003 closes
-                await asyncio.sleep(0.3)
+                # Adaptive stagger with small jitter to reduce 1003 closes under load
+                try:
+                    import random
+                    n = max(1, len(self._trading_pairs))
+                    delay = min(1.0, 0.25 + 0.02 * n) + random.uniform(0.05, 0.2)
+                    await asyncio.sleep(delay)
+                except Exception:
+                    await asyncio.sleep(0.35)
                 await ws.send(subscribe_trade_request)
-                await asyncio.sleep(0.3)
+                try:
+                    import random
+                    n = max(1, len(self._trading_pairs))
+                    delay = min(1.0, 0.25 + 0.02 * n) + random.uniform(0.05, 0.2)
+                    await asyncio.sleep(delay)
+                except Exception:
+                    await asyncio.sleep(0.35)
             self.logger().info("Subscribed to public orderbook and trade channels...")
         except asyncio.CancelledError:
             raise
