@@ -132,6 +132,20 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     continue
                 elif action == "sub":
                     if data.get("code") != 200:
+                        ch = data.get("ch", "")
+                        msg = data.get("message", "")
+                        # If account-specific balances topic is invalid, fallback to default #2 once
+                        try:
+                            if ch.startswith("accounts.update#"):
+                                fallback = CONSTANTS.HTX_ACCOUNT_UPDATE_TOPIC
+                                self.logger().warning(
+                                    f"Balances topic rejected: {ch} (code={data.get('code')}, msg={msg}); "
+                                    f"falling back to {fallback}"
+                                )
+                                await self._subscribe_topic(fallback, websocket_assistant)
+                                continue
+                        except Exception:
+                            pass
                         raise ValueError(f"Error subscribing to topic: {data.get('ch')} ({data})")
                 else:
                     queue.put_nowait(data)
