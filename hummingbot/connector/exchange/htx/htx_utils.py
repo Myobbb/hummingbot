@@ -54,7 +54,7 @@ class HtxConfigMap(BaseConnectorConfigMap):
             "prompt": "Enter your HTX account id (optional)",
             "is_secure": False,
             "is_connect_key": False,
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         }
     )
     model_config = ConfigDict(title="htx")
