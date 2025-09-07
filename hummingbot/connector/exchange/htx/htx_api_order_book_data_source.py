@@ -120,8 +120,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         rest_assistant = await self._api_factory.get_rest_assistant()
         url = public_rest_url(CONSTANTS.DEPTH_URL)
         exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        # Use step0 (no aggregation) and request 50 levels to match WS depth.size_step0.50
-        params: Dict = {"symbol": exchange_symbol, "type": "step0", "depth": 50}
+        # when type is set to "step0", the default value of "depth" is 150
+        params: Dict = {"symbol": exchange_symbol, "type": "step0"}
         snapshot_data = await rest_assistant.execute_request(
             url=url,
             params=params,
@@ -154,7 +154,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # HTX WS expects lowercase symbols in channel names per docs
                 exchange_symbol = exchange_symbol.lower()
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest({
-                    "sub": f"market.{exchange_symbol}.depth.size_step0.50",
+                    "sub": f"market.{exchange_symbol}.depth.step0",
                     "id": str(uuid.uuid4())
                 })
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest({
@@ -163,7 +163,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 })
                 # Debug minimal: indicate which symbol is being subscribed
                 try:
-                    self.logger().debug(f"WS subscribe orderbook: market.{exchange_symbol}.depth.size_step0.50")
+                    self.logger().debug(f"WS subscribe orderbook: market.{exchange_symbol}.depth.step0")
                 except Exception:
                     pass
                 throttler = getattr(self._api_factory, "throttler", None)
