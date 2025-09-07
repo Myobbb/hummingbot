@@ -34,7 +34,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        # Disable protocol-level heartbeat (use JSON ping/pong only); add small pre-connect jitter; throttle connects and tune timeouts/headers/sizes
+        # Enable protocol-level heartbeat (10s) and also reply to server JSON pings; add small pre-connect jitter; throttle connects and tune timeouts/headers/sizes
         try:
             import random
             await asyncio.sleep(0.2 + random.uniform(0.0, 0.4))
@@ -45,7 +45,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             async with throttler.execute_task(CONSTANTS.WS_CONNECTION_LIMIT_ID):
                 await ws.connect(
                     ws_url=CONSTANTS.WS_PUBLIC_URL,
-                    ping_timeout=None,
+                    ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
                     message_timeout=45,
                     ws_headers={"Accept-Encoding": "gzip"},
                     max_msg_size=16 * 1024 * 1024,
@@ -53,7 +53,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         else:
             await ws.connect(
                 ws_url=CONSTANTS.WS_PUBLIC_URL,
-                ping_timeout=None,
+                ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
                 message_timeout=45,
                 ws_headers={"Accept-Encoding": "gzip"},
                 max_msg_size=16 * 1024 * 1024,
