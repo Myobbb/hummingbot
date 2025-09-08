@@ -389,18 +389,66 @@ cdef class ArbitrageStrategy(StrategyBase):
             self.log_with_clock(logging.INFO,
                                f"Order canceled on {market_trading_pair_tuple[0].name}: {order_id}")
 
-    @cython.cdivision(True)
-    cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair) nogil:
+    @cython.cdivision(True)  
+    cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair):
         """Fast profitability calculation using cached rates and doubles"""
         cdef:
-            double market_1_bid = market_pair.first.get_price(False)
-            double market_1_ask = market_pair.first.get_price(True)
-            double market_2_bid = self._cached_market_rate * market_pair.second.get_price(False)
-            double market_2_ask = self._cached_market_rate * market_pair.second.get_price(True)
-            double prof_buy_2_sell_1 = market_1_bid / market_2_ask - 1.0
-            double prof_buy_1_sell_2 = market_2_bid / market_1_ask - 1.0
+            # CRITICAL: Only DECLARE variables here, do NOT initialize them!
+            object temp_price  # Temporary holder for price objects
+            double market_1_bid
+            double market_1_ask
+            double market_2_bid
+            double market_2_ask
+            double prof_buy_2_sell_1
+            double prof_buy_1_sell_2
+            pair[double, double] result
             
-        return pair[double, double](prof_buy_2_sell_1, prof_buy_1_sell_2)
+        # NOW we can assign values (outside the cdef block)
+        
+        # Get first market bid
+        temp_price = market_pair.first.get_price(False)
+        if temp_price is not None:
+            market_1_bid = float(temp_price)
+        else:
+            market_1_bid = 0.0
+        
+        # Get first market ask
+        temp_price = market_pair.first.get_price(True)
+        if temp_price is not None:
+            market_1_ask = float(temp_price)
+        else:
+            market_1_ask = 0.0
+        
+        # Get second market bid
+        temp_price = market_pair.second.get_price(False)
+        if temp_price is not None:
+            market_2_bid = self._cached_market_rate * float(temp_price)
+        else:
+            market_2_bid = 0.0
+        
+        # Get second market ask  
+        temp_price = market_pair.second.get_price(True)
+        if temp_price is not None:
+            market_2_ask = self._cached_market_rate * float(temp_price)
+        else:
+            market_2_ask = 0.0
+        
+        # Calculate profitability with division protection
+        if market_2_ask > EPSILON:
+            prof_buy_2_sell_1 = (market_1_bid / market_2_ask) - 1.0
+        else:
+            prof_buy_2_sell_1 = -1.0
+            
+        if market_1_ask > EPSILON:
+            prof_buy_1_sell_2 = (market_2_bid / market_1_ask) - 1.0
+        else:
+            prof_buy_1_sell_2 = -1.0
+            
+        # Build return value
+        result.first = prof_buy_2_sell_1
+        result.second = prof_buy_1_sell_2
+        
+        return result
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair):
         """Calculate arbitrage profitability with Decimal precision"""
