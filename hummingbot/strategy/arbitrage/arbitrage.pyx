@@ -1,5 +1,4 @@
 # distutils: language=c++
-# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: cdivision=True
 # cython: boundscheck=False
 # cython: wraparound=False
@@ -13,6 +12,7 @@ from libc.math cimport fabs
 from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
 from libcpp.pair cimport pair
+from cython.operator cimport dereference, preincrement
 cimport cython
 
 from hummingbot.connector.exchange_base import ExchangeBase
