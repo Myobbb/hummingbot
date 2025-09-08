@@ -642,18 +642,18 @@ cdef class ArbitrageStrategy(StrategyBase):
                     self.logger().info("Insufficient balance or no profitable amount found")
                 return
             
-        # Quantize amounts
-        quantized_buy_amount = buy_market.c_quantize_order_amount(
-            buy_market_trading_pair_tuple.trading_pair, best_amount)
-        quantized_sell_amount = sell_market.c_quantize_order_amount(
-            sell_market_trading_pair_tuple.trading_pair, best_amount)
-        quantized_order_amount = min(quantized_buy_amount, quantized_sell_amount)
-        
-        # Check minimum order size
-        volume_usd = float(quantized_order_amount * sell_price)
-        if volume_usd < MIN_ORDER_USD:
-            return
+            # Quantize amounts
+            quantized_buy_amount = buy_market.c_quantize_order_amount(
+                buy_market_trading_pair_tuple.trading_pair, best_amount)
+            quantized_sell_amount = sell_market.c_quantize_order_amount(
+                sell_market_trading_pair_tuple.trading_pair, best_amount)
+            quantized_order_amount = min(quantized_buy_amount, quantized_sell_amount)
             
+            # Check minimum order size
+            volume_usd = float(quantized_order_amount * sell_price)
+            if volume_usd < MIN_ORDER_USD:
+                return
+                
             if quantized_order_amount > s_decimal_0:
                 if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                     self.log_with_clock(logging.INFO,
@@ -661,29 +661,29 @@ cdef class ArbitrageStrategy(StrategyBase):
                         f"@ {buy_market_trading_pair_tuple.market.name}, "
                         f"sell @ {sell_market_trading_pair_tuple.market.name}, "
                         f"profitability: {float(best_profitability - 1) * 100:.2f}%")
+                
+                # Get order types
+                buy_order_type = buy_market_trading_pair_tuple.market.get_taker_order_type()
+                sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
             
-            # Get order types
-            buy_order_type = buy_market_trading_pair_tuple.market.get_taker_order_type()
-            sell_order_type = sell_market_trading_pair_tuple.market.get_taker_order_type()
-        
-            # Place orders
-            buy_order_id = self.c_buy_with_specific_market(
-                buy_market_trading_pair_tuple, quantized_order_amount,
-                order_type=buy_order_type, price=buy_price, 
-                expiration_seconds=self._next_trade_delay)
-            sell_order_id = self.c_sell_with_specific_market(
-                sell_market_trading_pair_tuple, quantized_order_amount,
-                order_type=sell_order_type, price=sell_price, 
-                expiration_seconds=self._next_trade_delay)
-            
-            # Track order timestamps
-            buy_order_id_str = buy_order_id.encode('utf-8')
-            sell_order_id_str = sell_order_id.encode('utf-8')
-            self._order_timestamps_cpp[buy_order_id_str] = self._current_timestamp
-            self._order_timestamps_cpp[sell_order_id_str] = self._current_timestamp
-            
+                # Place orders
+                buy_order_id = self.c_buy_with_specific_market(
+                    buy_market_trading_pair_tuple, quantized_order_amount,
+                    order_type=buy_order_type, price=buy_price, 
+                    expiration_seconds=self._next_trade_delay)
+                sell_order_id = self.c_sell_with_specific_market(
+                    sell_market_trading_pair_tuple, quantized_order_amount,
+                    order_type=sell_order_type, price=sell_price, 
+                    expiration_seconds=self._next_trade_delay)
+                
+                # Track order timestamps
+                buy_order_id_str = buy_order_id.encode('utf-8')
+                sell_order_id_str = sell_order_id.encode('utf-8')
+                self._order_timestamps_cpp[buy_order_id_str] = self._current_timestamp
+                self._order_timestamps_cpp[sell_order_id_str] = self._current_timestamp
+                
                 self.logger().info(f"Orders placed: buy={buy_order_id}, sell={sell_order_id}")
-            
+                
                 if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                     self.logger().info(self.format_status())
                     
