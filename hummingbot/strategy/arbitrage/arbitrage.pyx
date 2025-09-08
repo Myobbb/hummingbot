@@ -387,19 +387,26 @@ cdef class ArbitrageStrategy(StrategyBase):
         if market_trading_pair_tuple is not None:
             self.log_with_clock(logging.INFO,
                                f"Order canceled on {market_trading_pair_tuple[0].name}: {order_id}")
-
+                               
     @cython.cdivision(True)
     cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair) nogil:
         """Fast profitability calculation using cached rates and doubles"""
-        cdef:
-            double market_1_bid = market_pair.first.get_price(False)
-            double market_1_ask = market_pair.first.get_price(True)
-            double market_2_bid = self._cached_market_rate * market_pair.second.get_price(False)
-            double market_2_ask = self._cached_market_rate * market_pair.second.get_price(True)
-            double prof_buy_2_sell_1 = market_1_bid / market_2_ask - 1.0
-            double prof_buy_1_sell_2 = market_2_bid / market_1_ask - 1.0
-            
-        return pair[double, double](prof_buy_2_sell_1, prof_buy_1_sell_2)
+        cdef double market_1_bid, market_1_ask, market_2_bid, market_2_ask
+        cdef double prof_buy_2_sell_1, prof_buy_1_sell_2
+
+        # Acquire GIL to access Python attributes and methods
+        with gil:
+            market_1_bid = <double> market_pair.first.get_price(False)
+            market_1_ask = <double> market_pair.first.get_price(True)
+            market_2_bid = <double> (self._cached_market_rate * market_pair.second.get_price(False))
+            market_2_ask = <double> (self._cached_market_rate * market_pair.second.get_price(True))
+
+        # Now we’re safe to compute without GIL
+        prof_buy_2_sell_1 = market_1_bid / market_2_ask - 1.0
+        prof_buy_1_sell_2 = market_2_bid / market_1_ask - 1.0
+
+    return pair[double, double](prof_buy_2_sell_1, prof_buy_1_sell_2)
+
 
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair):
         """Calculate arbitrage profitability with Decimal precision"""
