@@ -661,12 +661,11 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Use fast path when possible
         conversion_rate = self.c_get_cached_market_rate(sell_market_trading_pair_tuple)
         
-        best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price = 
-            self.c_find_best_profitable_amount_fast_no_fees(
-                buy_market_trading_pair_tuple,
-                sell_market_trading_pair_tuple,
-                1.0,
-                conversion_rate if fabs(conversion_rate - 1.0) >= EPSILON else 1.0)
+        best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price = self.c_find_best_profitable_amount_fast_no_fees(
+            buy_market_trading_pair_tuple,
+            sell_market_trading_pair_tuple,
+            1.0,
+            conversion_rate if fabs(conversion_rate - 1.0) >= EPSILON else 1.0)
 
         return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
 
