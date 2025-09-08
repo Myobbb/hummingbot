@@ -278,8 +278,8 @@ cdef class ArbitrageStrategy(StrategyBase):
             super().notify_hb_app(msg)
 
     @cython.cdivision(True)
-    cdef bint c_all_markets_ready(self) nogil:
-        """Check if all markets are ready (nogil for performance)"""
+    cdef bint c_all_markets_ready(self):
+        """Check if all markets are ready"""
         # Note: In real implementation, this would need GIL for market.ready check
         # Simplified for demonstration
         return self._all_markets_ready
