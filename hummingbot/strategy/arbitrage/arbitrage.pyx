@@ -1,4 +1,6 @@
 # distutils: language=c++
+# distutils: extra_compile_args=-Wno-psabi
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: cdivision=True
 # cython: boundscheck=False
 # cython: wraparound=False
@@ -32,9 +34,11 @@ cdef:
     object s_decimal_0 = Decimal(0)
     object s_decimal_1 = Decimal(1)
     double RATE_CACHE_DURATION = 10.0  # Cache conversion rates for 10 seconds
-    double ORDERBOOK_CACHE_DURATION = 0.1  # Cache orderbook for 100ms
     double MIN_ORDER_USD = 10.0  # Minimum order size in USD
     double EPSILON = 1e-10  # Small value for float comparisons
+    double RATE_LOG_INTERVAL = 300.0  # Log conversion rates every 5 minutes
+    double ORDER_WARNING_DELAY = 10.0  # Warn if order pending longer than this
+    int MAX_TRACKED_ORDERS = 1000  # Maximum tracked orders to prevent memory leaks
 
 as_logger = None
 
@@ -103,21 +107,24 @@ cdef class ArbitrageStrategy(StrategyBase):
         self._cached_quote_rate = 1.0
         self._cached_market_rate = 1.0
         self._last_rate_update = 0
-        self._last_orderbook_snapshot = 0
-        self._cached_buy_orderbook = None
-        self._cached_sell_orderbook = None
         # Top-of-book cache
         self._tob_first_bid = 0.0
         self._tob_first_ask = 0.0
         self._tob_second_bid = 0.0
         self._tob_second_ask = 0.0
         self._tob_timestamp = -1.0
+        # Memory management
+        self._last_cleanup_timestamp = 0
+        self._max_tracked_orders = MAX_TRACKED_ORDERS
         
         # Notifications
         self._hb_app_notification = hb_app_notification
         
         # Clear C++ map for order timestamps
         self._order_timestamps_cpp.clear()
+        
+        # Validate configuration
+        self._validate_configuration()
 
         # Add markets
         cdef set all_markets = {
@@ -126,6 +133,17 @@ cdef class ArbitrageStrategy(StrategyBase):
             for market in [market_pair.first.market, market_pair.second.market]
         }
         self.c_add_markets(list(all_markets))
+    
+    cdef void _validate_configuration(self):
+        """Validate strategy configuration parameters"""
+        if self._min_profitability < Decimal("-1"):
+            raise ValueError("min_profitability cannot be less than -100%")
+        if self._order_timeout <= 0:
+            raise ValueError("order_timeout must be positive")
+        if self._failed_order_tolerance < 0:
+            raise ValueError("failed_order_tolerance cannot be negative")
+        if self._next_trade_delay < 0:
+            raise ValueError("next_trade_delay cannot be negative")
 
     @property
     def min_profitability(self) -> Decimal:
@@ -185,8 +203,10 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef double c_get_cached_market_rate(self, object market_info):
         """Get cached market conversion rate"""
+        # Primary market always has rate 1.0
         if market_info == self._market_pairs[0].first:
             return 1.0
+        # Secondary market uses cached conversion rate
         return self._cached_market_rate
 
     cdef void c_update_top_of_book_cache(self, object market_pair):
@@ -199,18 +219,20 @@ cdef class ArbitrageStrategy(StrategyBase):
         self._tob_second_ask = float(market_pair.second.get_price(True))
         self._tob_timestamp = self._current_timestamp
 
-    def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
+    def get_second_to_first_conversion_rate(self) -> Tuple[str, str, Decimal, str, str, Decimal]:
         """Get conversion rates from secondary to primary market"""
         self.c_update_cached_rates()
         
-        quote_pair = f"{self._market_pairs[0].second.quote_asset}-{self._market_pairs[0].first.quote_asset}"
-        base_pair = f"{self._market_pairs[0].second.base_asset}-{self._market_pairs[0].first.base_asset}"
+        first_market = self._market_pairs[0].first
+        second_market = self._market_pairs[0].second
         
-        quote_rate_source = "oracle" if self._use_oracle_conversion_rate else "fixed"
-        base_rate_source = "oracle" if self._use_oracle_conversion_rate else "fixed"
+        quote_pair = f"{second_market.quote_asset}-{first_market.quote_asset}"
+        base_pair = f"{second_market.base_asset}-{first_market.base_asset}"
         
-        return (quote_pair, quote_rate_source, Decimal(str(self._cached_quote_rate)),
-                base_pair, base_rate_source, Decimal(str(self._cached_base_rate)))
+        rate_source = "oracle" if self._use_oracle_conversion_rate else "fixed"
+        
+        return (quote_pair, rate_source, Decimal(str(self._cached_quote_rate)),
+                base_pair, rate_source, Decimal(str(self._cached_base_rate)))
 
     def log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
@@ -248,43 +270,66 @@ cdef class ArbitrageStrategy(StrategyBase):
             list lines = []
             list warning_lines = []
             
-        for market_pair in self._market_pairs:
-            warning_lines.extend(self.network_warning([market_pair.first, market_pair.second]))
+        try:
+            for market_pair in self._market_pairs:
+                warning_lines.extend(self.network_warning([market_pair.first, market_pair.second]))
 
-            markets_df = self.market_status_data_frame([market_pair.first, market_pair.second])
-            lines.extend(["", "  Markets:"] + ["    " + line for line in str(markets_df).split("\n")])
+                markets_df = self.market_status_data_frame([market_pair.first, market_pair.second])
+                lines.extend(["", "  Markets:"] + ["    " + line for line in str(markets_df).split("\n")])
 
-            oracle_df = self.oracle_status_df()
-            if not oracle_df.empty:
-                lines.extend(["", "  Rate conversion:"] + ["    " + line for line in str(oracle_df).split("\n")])
+                # Show conversion rates if using oracle
+                if self._use_oracle_conversion_rate:
+                    oracle_df = self.oracle_status_df()
+                    if not oracle_df.empty:
+                        lines.extend(["", "  Rate conversion:"] + ["    " + line for line in str(oracle_df).split("\n")])
 
-            assets_df = self.wallet_balance_data_frame([market_pair.first, market_pair.second])
-            lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
+                assets_df = self.wallet_balance_data_frame([market_pair.first, market_pair.second])
+                lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
 
-            # Use fast profitability values for display
-            lines.extend(
-                ["", "  Profitability (without fees):"] +
-                [f"    Buy {market_pair.first.market.name}, sell {market_pair.second.market.name}: "
-                 f"{round(self._current_profitability_fast.first * 100, 4)}%"] +
-                [f"    Buy {market_pair.second.market.name}, sell {market_pair.first.market.name}: "
-                 f"{round(self._current_profitability_fast.second * 100, 4)}%"])
+                # Show profitability with better formatting
+                lines.extend(["", "  Profitability (without fees):"])
+                
+                # Direction 1: Buy first market, sell second market
+                prof1 = self._current_profitability_fast.first * 100
+                lines.append(f"    {market_pair.first.trading_pair} → {market_pair.second.trading_pair}: {prof1:+.4f}%")
+                
+                # Direction 2: Buy second market, sell first market  
+                prof2 = self._current_profitability_fast.second * 100
+                lines.append(f"    {market_pair.second.trading_pair} → {market_pair.first.trading_pair}: {prof2:+.4f}%")
 
-            tracked_limit_orders = self.tracked_limit_orders
-            tracked_market_orders = self.tracked_market_orders
+                # Show pending orders
+                tracked_limit_orders = self.tracked_limit_orders
+                tracked_market_orders = self.tracked_market_orders
 
-            if tracked_limit_orders or tracked_market_orders:
-                if tracked_limit_orders:
-                    lines.extend(["", "  Pending limit orders:"] +
-                                ["    " + line for line in str(self.tracked_limit_orders_data_frame).split("\n")])
-                if tracked_market_orders:
-                    lines.extend(["    " + line for line in str(self.tracked_market_orders_data_frame).split("\n")])
-            else:
-                lines.extend(["", "  No pending orders."])
+                if tracked_limit_orders or tracked_market_orders:
+                    lines.extend(["", "  Pending orders:"])
+                    total_orders = len(tracked_limit_orders) + len(tracked_market_orders)
+                    lines.append(f"    Total: {total_orders} ({len(tracked_limit_orders)} limit, {len(tracked_market_orders)} market)")
+                    
+                    # Show order details if not too many
+                    if total_orders <= 10:
+                        if tracked_limit_orders:
+                            lines.extend(["    " + line for line in str(self.tracked_limit_orders_data_frame).split("\n")])
+                        if tracked_market_orders:
+                            lines.extend(["    " + line for line in str(self.tracked_market_orders_data_frame).split("\n")])
+                else:
+                    lines.extend(["", "  No pending orders."])
+                    
+                # Add memory stats if verbose logging
+                if self._logging_options & self.OPTION_LOG_FULL_PROFITABILITY_STEP:
+                    mem_stats = self.get_memory_stats()
+                    lines.extend(["", "  Memory stats:",
+                                f"    Tracked orders: {mem_stats['tracked_orders']}/{mem_stats['max_orders']}",
+                                f"    Cache age: {mem_stats['cache_age']:.1f}s"])
 
-            warning_lines.extend(self.balance_warning([market_pair.first, market_pair.second]))
+                warning_lines.extend(self.balance_warning([market_pair.first, market_pair.second]))
 
-        if warning_lines:
-            lines.extend(["", "  *** WARNINGS ***"] + warning_lines)
+            if warning_lines:
+                lines.extend(["", "  *** WARNINGS ***"] + warning_lines)
+                
+        except Exception as e:
+            lines.append(f"  Error formatting status: {e}")
+            self.logger().error("Error in format_status", exc_info=True)
 
         return "\n".join(lines)
 
@@ -334,8 +379,12 @@ cdef class ArbitrageStrategy(StrategyBase):
             for market_pair in self._market_pairs:
                 self.c_process_market_pair(market_pair)
                 
-            # Log conversion rates every 5 minutes
-            if self._use_oracle_conversion_rate and self._last_conv_rates_logged + 300 < timestamp:
+            # Periodic cleanup (every 60 seconds)
+            if self._current_timestamp - self._last_cleanup_timestamp > 60.0:
+                self.c_cleanup_old_orders()
+                
+                # Log conversion rates periodically
+            if self._use_oracle_conversion_rate and self._last_conv_rates_logged + RATE_LOG_INTERVAL < timestamp:
                 self.log_conversion_rates()
                 self._last_conv_rates_logged = timestamp
                 
@@ -351,22 +400,26 @@ cdef class ArbitrageStrategy(StrategyBase):
             double time_elapsed
             
         if market_trading_pair_tuple is None:
+            self.logger().warning(f"Buy order {buy_order.order_id} completed but market pair not found")
             return
             
-        self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
-        
-        # Check and log order completion time
-        if self._order_timestamps_cpp.find(order_id_str) != self._order_timestamps_cpp.end():
-            time_elapsed = self._current_timestamp - self._order_timestamps_cpp[order_id_str]
-            self.logger().info(f"Buy order {buy_order.order_id} completed in {time_elapsed:.2f}s")
-            self._order_timestamps_cpp.erase(order_id_str)
-        
-        if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
-            self.log_with_clock(logging.INFO,
-                               f"Buy order completed on {market_trading_pair_tuple[0].name}: {buy_order.order_id}")
-            self.notify_hb_app_with_timestamp(
-                f"{buy_order.base_asset_amount:.8f} {buy_order.base_asset}-{buy_order.quote_asset} "
-                f"buy completed on {market_trading_pair_tuple[0].name}")
+        try:
+            self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
+            
+            # Check and log order completion time
+            if self._order_timestamps_cpp.find(order_id_str) != self._order_timestamps_cpp.end():
+                time_elapsed = self._current_timestamp - self._order_timestamps_cpp[order_id_str]
+                self.logger().info(f"Buy order {buy_order.order_id} completed in {time_elapsed:.2f}s")
+                self._order_timestamps_cpp.erase(order_id_str)
+            
+            if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
+                self.log_with_clock(logging.INFO,
+                                   f"Buy order completed on {market_trading_pair_tuple[0].name}: {buy_order.order_id}")
+                self.notify_hb_app_with_timestamp(
+                    f"{buy_order.base_asset_amount:.8f} {buy_order.base_asset}-{buy_order.quote_asset} "
+                    f"buy completed on {market_trading_pair_tuple[0].name}")
+        except Exception as e:
+            self.logger().error(f"Error handling buy order completion: {e}", exc_info=True)
     
     cdef c_did_complete_sell_order(self, object sell_order_completed_event):
         """Handle sell order completion"""
@@ -377,22 +430,26 @@ cdef class ArbitrageStrategy(StrategyBase):
             double time_elapsed
             
         if market_trading_pair_tuple is None:
+            self.logger().warning(f"Sell order {sell_order.order_id} completed but market pair not found")
             return
             
-        self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
-        
-        # Check and log order completion time
-        if self._order_timestamps_cpp.find(order_id_str) != self._order_timestamps_cpp.end():
-            time_elapsed = self._current_timestamp - self._order_timestamps_cpp[order_id_str]
-            self.logger().info(f"Sell order {sell_order.order_id} completed in {time_elapsed:.2f}s")
-            self._order_timestamps_cpp.erase(order_id_str)
-        
-        if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
-            self.log_with_clock(logging.INFO,
-                               f"Sell order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
-            self.notify_hb_app_with_timestamp(
-                f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} "
-                f"sell completed on {market_trading_pair_tuple[0].name}")
+        try:
+            self._last_trade_timestamps[market_trading_pair_tuple] = self._current_timestamp
+            
+            # Check and log order completion time
+            if self._order_timestamps_cpp.find(order_id_str) != self._order_timestamps_cpp.end():
+                time_elapsed = self._current_timestamp - self._order_timestamps_cpp[order_id_str]
+                self.logger().info(f"Sell order {sell_order.order_id} completed in {time_elapsed:.2f}s")
+                self._order_timestamps_cpp.erase(order_id_str)
+            
+            if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
+                self.log_with_clock(logging.INFO,
+                                   f"Sell order completed on {market_trading_pair_tuple[0].name}: {sell_order.order_id}")
+                self.notify_hb_app_with_timestamp(
+                    f"{sell_order.base_asset_amount:.8f} {sell_order.base_asset}-{sell_order.quote_asset} "
+                    f"sell completed on {market_trading_pair_tuple[0].name}")
+        except Exception as e:
+            self.logger().error(f"Error handling sell order completion: {e}", exc_info=True)
                 
     cdef c_did_cancel_order(self, object cancel_event):
         """Handle order cancellation"""
@@ -408,24 +465,21 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair):
         """Fast profitability calculation using cached rates and doubles"""
         cdef:
-            double market_1_bid
-            double market_1_ask
-            double market_2_bid
-            double market_2_ask
+            double market_1_bid = self._tob_first_bid
+            double market_1_ask = self._tob_first_ask
+            double market_2_bid = self._cached_market_rate * self._tob_second_bid
+            double market_2_ask = self._cached_market_rate * self._tob_second_ask
             double prof_buy_2_sell_1
             double prof_buy_1_sell_2
-        if self._tob_timestamp == self._current_timestamp:
-            market_1_bid = self._tob_first_bid
-            market_1_ask = self._tob_first_ask
-            market_2_bid = self._cached_market_rate * self._tob_second_bid
-            market_2_ask = self._cached_market_rate * self._tob_second_ask
-        else:
-            market_1_bid = float(market_pair.first.get_price(False))
-            market_1_ask = float(market_pair.first.get_price(True))
-            market_2_bid = self._cached_market_rate * float(market_pair.second.get_price(False))
-            market_2_ask = self._cached_market_rate * float(market_pair.second.get_price(True))
 
+        # Ensure we have valid prices
+        if market_1_bid <= 0 or market_1_ask <= 0 or market_2_bid <= 0 or market_2_ask <= 0:
+            return pair[double, double](0.0, 0.0)
+
+        # Calculate profitability for both directions
+        # Direction 1: Buy on market 2, sell on market 1
         prof_buy_2_sell_1 = market_1_bid / market_2_ask - 1.0
+        # Direction 2: Buy on market 1, sell on market 2
         prof_buy_1_sell_2 = market_2_bid / market_1_ask - 1.0
 
         return pair[double, double](prof_buy_2_sell_1, prof_buy_1_sell_2)
@@ -476,7 +530,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                         keys_to_remove.append((market_trading_pair_tuple, order_id))
                     else:
                         # Still waiting for order
-                        log_level = logging.WARNING if time_elapsed > 10 else logging.INFO
+                        log_level = logging.WARNING if time_elapsed > ORDER_WARNING_DELAY else logging.INFO
                         self.log_with_clock(log_level,
                                           f"Order {order_id} pending for {time_elapsed:.2f}s")
                         return False
@@ -505,7 +559,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                             f"(timeout: {self._order_timeout}s)")
                         keys_to_remove.append((market_trading_pair_tuple, order_id))
                     else:
-                        log_level = logging.WARNING if time_elapsed > 10 else logging.INFO
+                        log_level = logging.WARNING if time_elapsed > ORDER_WARNING_DELAY else logging.INFO
                         self.log_with_clock(log_level,
                                           f"Order {order_id} pending for {time_elapsed:.2f}s")
                         return False
@@ -550,7 +604,15 @@ cdef class ArbitrageStrategy(StrategyBase):
             self._current_profitability_fast.second < self._min_profitability_float):
             return
         
-        # Calculate precise profitability for execution using cached doubles (no fees)
+        # Log profitability if verbose logging enabled
+        if self._logging_options & self.OPTION_LOG_PROFITABILITY_STEP:
+            self.logger().debug(
+                f"Profitability: buy {market_pair.first.trading_pair} sell {market_pair.second.trading_pair}: "
+                f"{self._current_profitability_fast.first:.4%}, "
+                f"buy {market_pair.second.trading_pair} sell {market_pair.first.trading_pair}: "
+                f"{self._current_profitability_fast.second:.4%}")
+        
+        # Calculate precise profitability for execution
         self._current_profitability = self.c_calculate_arbitrage_top_order_profitability(market_pair)
 
         # Execute the more profitable direction
@@ -561,7 +623,7 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef c_process_market_pair_inner(self, object buy_market_trading_pair_tuple, 
                                      object sell_market_trading_pair_tuple):
-        """Execute arbitrage trades"""
+        """Execute arbitrage trades with enhanced error handling"""
         cdef:
             object best_amount, best_profitability, sell_price, buy_price
             object quantized_buy_amount, quantized_sell_amount, quantized_order_amount
@@ -570,12 +632,15 @@ cdef class ArbitrageStrategy(StrategyBase):
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
             string buy_order_id_str, sell_order_id_str
 
-        # Find best profitable amount
-        best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount(
-            buy_market_trading_pair_tuple, sell_market_trading_pair_tuple)
-        
-        if best_amount <= s_decimal_0:
-            return
+        try:
+            # Find best profitable amount
+            best_amount, best_profitability, sell_price, buy_price = self.c_find_best_profitable_amount(
+                buy_market_trading_pair_tuple, sell_market_trading_pair_tuple)
+            
+            if best_amount <= s_decimal_0:
+                if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
+                    self.logger().info("Insufficient balance or no profitable amount found")
+                return
             
         # Quantize amounts
         quantized_buy_amount = buy_market.c_quantize_order_amount(
@@ -589,13 +654,13 @@ cdef class ArbitrageStrategy(StrategyBase):
         if volume_usd < MIN_ORDER_USD:
             return
             
-        if quantized_order_amount > s_decimal_0:
-            if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
-                self.log_with_clock(logging.INFO,
-                    f"Executing arbitrage: buy {quantized_order_amount:.8f} {buy_market_trading_pair_tuple.trading_pair} "
-                    f"@ {buy_market_trading_pair_tuple.market.name}, "
-                    f"sell @ {sell_market_trading_pair_tuple.market.name}, "
-                    f"profitability: {float(best_profitability - 1) * 100:.2f}%")
+            if quantized_order_amount > s_decimal_0:
+                if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
+                    self.log_with_clock(logging.INFO,
+                        f"Executing arbitrage: buy {quantized_order_amount:.8f} {buy_market_trading_pair_tuple.trading_pair} "
+                        f"@ {buy_market_trading_pair_tuple.market.name}, "
+                        f"sell @ {sell_market_trading_pair_tuple.market.name}, "
+                        f"profitability: {float(best_profitability - 1) * 100:.2f}%")
             
             # Get order types
             buy_order_type = buy_market_trading_pair_tuple.market.get_taker_order_type()
@@ -617,10 +682,16 @@ cdef class ArbitrageStrategy(StrategyBase):
             self._order_timestamps_cpp[buy_order_id_str] = self._current_timestamp
             self._order_timestamps_cpp[sell_order_id_str] = self._current_timestamp
             
-            self.logger().info(f"Orders placed: buy={buy_order_id}, sell={sell_order_id}")
-        
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.logger().info(self.format_status())
+                self.logger().info(f"Orders placed: buy={buy_order_id}, sell={sell_order_id}")
+            
+                if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                    self.logger().info(self.format_status())
+                    
+        except Exception as e:
+            self.logger().error(
+                f"Error executing arbitrage between {buy_market_trading_pair_tuple.market.name} "
+                f"and {sell_market_trading_pair_tuple.market.name}: {e}", 
+                exc_info=True)
 
     @staticmethod
     def find_profitable_arbitrage_orders(min_profitability: Decimal,
@@ -645,36 +716,29 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_trading_pair_tuple, 
                                             object sell_market_trading_pair_tuple):
-        """Find best profitable amount streaming over books, no fees, with balance checks"""
+        """Find best profitable amount with balance checks"""
         cdef:
-            object best_profitable_order_amount = s_decimal_0
-            object best_profitable_order_profitability = s_decimal_0
-            object bid_price = s_decimal_0
-            object ask_price = s_decimal_0
             double conversion_rate
-            ExchangeBase buy_market = buy_market_trading_pair_tuple.market
-            ExchangeBase sell_market = sell_market_trading_pair_tuple.market
-
-        # Update cached rates
+            
+        # Update cached rates if needed
         self.c_update_cached_rates()
         
-        # Use fast path when possible
+        # Get appropriate conversion rate
         conversion_rate = self.c_get_cached_market_rate(sell_market_trading_pair_tuple)
         
-        best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price = self.c_find_best_profitable_amount_fast_no_fees(
+        # Use fast implementation
+        return self.c_find_best_profitable_amount_fast_no_fees(
             buy_market_trading_pair_tuple,
             sell_market_trading_pair_tuple,
-            1.0,
-            conversion_rate if fabs(conversion_rate - 1.0) >= EPSILON else 1.0)
-
-        return best_profitable_order_amount, best_profitable_order_profitability, bid_price, ask_price
+            1.0,  # Buy market always has conversion rate 1.0
+            conversion_rate)
 
     cdef tuple c_find_best_profitable_amount_fast_no_fees(self,
                                                          object buy_market_trading_pair_tuple,
                                                          object sell_market_trading_pair_tuple,
                                                          double buy_conversion_rate,
                                                          double sell_conversion_rate):
-        """One-pass streaming amount finder without fees; applies balances and min profitability."""
+        """Optimized amount finder with balance checks and min profitability filter"""
         cdef:
             double min_prof_threshold = 1.0 + self._min_profitability_float
             double total_base = 0.0
@@ -694,6 +758,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             object current_ask = None
             ExchangeBase buy_market = buy_market_trading_pair_tuple.market
             ExchangeBase sell_market = sell_market_trading_pair_tuple.market
+            bint has_profitable_amount = False
 
         # Read balances once per tick as doubles
         buy_quote_bal = float(buy_market.c_get_available_balance(buy_market_trading_pair_tuple.quote_asset))
@@ -777,6 +842,40 @@ cdef class ArbitrageStrategy(StrategyBase):
     def ready_for_new_orders(self, market_pair):
         return self.c_ready_for_new_orders(market_pair)
     
+    cdef void c_cleanup_old_orders(self):
+        """Clean up old order tracking data to prevent memory leaks"""
+        cdef:
+            double cutoff_time = self._current_timestamp - (self._order_timeout * 2)
+            list keys_to_remove = []
+            string order_id_str
+            object order_id
+            
+        # Check both limit and market orders for cleanup
+        all_orders = {}
+        for market_pair, orders in self._sb_order_tracker.c_get_limit_orders().items():
+            all_orders.update(orders)
+        for market_pair, orders in self._sb_order_tracker.c_get_market_orders().items():
+            all_orders.update(orders)
+            
+        # Find tracked orders that are no longer in order tracker
+        for order_id in list(all_orders.keys()):
+            order_id_str = order_id.encode('utf-8')
+            if self._order_timestamps_cpp.find(order_id_str) != self._order_timestamps_cpp.end():
+                if self._order_timestamps_cpp[order_id_str] < cutoff_time:
+                    keys_to_remove.append(order_id_str)
+                    
+        # Clean up old entries
+        for order_id_str in keys_to_remove:
+            self._order_timestamps_cpp.erase(order_id_str)
+            
+        # Log if we have too many tracked orders
+        if self._order_timestamps_cpp.size() > self._max_tracked_orders:
+            self.logger().warning(
+                f"Order tracking exceeds limit: {self._order_timestamps_cpp.size()}/{self._max_tracked_orders}. "
+                f"Consider reducing order frequency or increasing timeout.")
+                
+        self._last_cleanup_timestamp = self._current_timestamp
+
     def get_memory_stats(self) -> dict:
         """Get memory usage statistics"""
         cdef size_t tracked_count = self._order_timestamps_cpp.size()

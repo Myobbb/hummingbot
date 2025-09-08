@@ -31,9 +31,9 @@ cdef class ArbitrageStrategy(StrategyBase):
         double _cached_quote_rate
         double _cached_market_rate
         double _last_rate_update
-        double _last_orderbook_snapshot
-        object _cached_buy_orderbook
-        object _cached_sell_orderbook
+        # Memory management
+        double _last_cleanup_timestamp
+        int _max_tracked_orders
         # Top-of-book cache for current tick (raw prices)
         double _tob_first_bid
         double _tob_first_ask
@@ -47,6 +47,8 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef void c_update_cached_rates(self)
     cdef void c_update_top_of_book_cache(self, object market_pair)
     cdef double c_get_cached_market_rate(self, object market_info)
+    cdef void _validate_configuration(self)
+    cdef void c_cleanup_old_orders(self)
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair)
     cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair)
     cdef c_process_market_pair(self, object market_pair)
