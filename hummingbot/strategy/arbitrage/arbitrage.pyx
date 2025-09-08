@@ -3,7 +3,6 @@
 # cython: boundscheck=False
 # cython: wraparound=False
 
-from libcpp.utility cimport pair
 
 
 import logging
@@ -182,9 +181,21 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef double c_get_cached_market_rate(self, object market_info) nogil:
         """Get cached market conversion rate (nogil for thread safety)"""
-        if market_info == self._market_pairs[0].first:
-            return 1.0
-        return self._cached_market_rate
+        cdef double rate
+        cdef object py_rate
+
+        # Acquire GIL for Python operations (indexing, attribute access, comparison)
+        with gil:
+            if market_info == self._market_pairs[0].first:
+                py_rate = 1.0
+            else:
+                py_rate = self._cached_market_rate
+
+            # Convert to C double while still holding the GIL
+            rate = <double> py_rate
+
+        return rate
+
 
     def get_second_to_first_conversion_rate(self) -> Tuple[str, Decimal, str, Decimal]:
         """Get conversion rates from secondary to primary market"""
