@@ -37,11 +37,11 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Single C++ map for order timestamps (removed Python dict redundancy)
         unordered_map[string, double] _order_timestamps_cpp
 
-    cdef bint c_all_markets_ready(self) nogil
+    cdef bint c_all_markets_ready(self)
     cdef void c_update_cached_rates(self)
-    cdef double c_get_cached_market_rate(self, object market_info) nogil
+    cdef double c_get_cached_market_rate(self, object market_info)
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair)
-    cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair) nogil
+    cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair)
     cdef c_process_market_pair(self, object market_pair)
     cdef c_process_market_pair_inner(self, object buy_market_trading_pair, object sell_market_trading_pair)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_trading_pair, object sell_market_trading_pair)
