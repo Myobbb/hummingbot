@@ -34,11 +34,18 @@ cdef class ArbitrageStrategy(StrategyBase):
         double _last_orderbook_snapshot
         object _cached_buy_orderbook
         object _cached_sell_orderbook
+        # Top-of-book cache for current tick (raw prices)
+        double _tob_first_bid
+        double _tob_first_ask
+        double _tob_second_bid
+        double _tob_second_ask
+        double _tob_timestamp
         # Single C++ map for order timestamps (removed Python dict redundancy)
         unordered_map[string, double] _order_timestamps_cpp
 
     cdef bint c_all_markets_ready(self)
     cdef void c_update_cached_rates(self)
+    cdef void c_update_top_of_book_cache(self, object market_pair)
     cdef double c_get_cached_market_rate(self, object market_info)
     cdef tuple c_calculate_arbitrage_top_order_profitability(self, object market_pair)
     cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair)
@@ -49,6 +56,11 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef c_did_complete_buy_order(self, object buy_order_completed_event)
     cdef c_did_complete_sell_order(self, object sell_order_completed_event)
     cdef c_did_cancel_order(self, object cancel_event)
+    cdef tuple c_find_best_profitable_amount_fast_no_fees(self,
+                                                         object buy_market_trading_pair_tuple,
+                                                         object sell_market_trading_pair_tuple,
+                                                         double buy_conversion_rate,
+                                                         double sell_conversion_rate)
 
 # Optimized version when no conversion is required (fast path)
 cdef list c_find_profitable_arbitrage_orders_fast(double min_profitability,
