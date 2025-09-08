@@ -392,10 +392,10 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef pair[double, double] c_calculate_profitability_fast(self, object market_pair):
         """Fast profitability calculation using cached rates and doubles"""
         cdef:
-            double market_1_bid = market_pair.first.get_price(False)
-            double market_1_ask = market_pair.first.get_price(True)
-            double market_2_bid = self._cached_market_rate * market_pair.second.get_price(False)
-            double market_2_ask = self._cached_market_rate * market_pair.second.get_price(True)
+            double market_1_bid = float(market_pair.first.get_price(False))
+            double market_1_ask = float(market_pair.first.get_price(True))
+            double market_2_bid = self._cached_market_rate * float(market_pair.second.get_price(False))
+            double market_2_ask = self._cached_market_rate * float(market_pair.second.get_price(True))
             double prof_buy_2_sell_1 = market_1_bid / market_2_ask - 1.0
             double prof_buy_1_sell_2 = market_2_bid / market_1_ask - 1.0
             
