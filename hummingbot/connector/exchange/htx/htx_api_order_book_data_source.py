@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -31,180 +32,222 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._trade_messages_queue_key = CONSTANTS.TRADE_CHANNEL_SUFFIX
         self._api_factory = api_factory
         
+        # Keep-alive tracking
+        self._last_ping_timestamp = 0
+        self._last_pong_timestamp = 0
+        self._ping_interval = 20  # HTX recommends 20-30 seconds
+        self._pong_timeout = 10  # If no pong received within 10s, reconnect
+        
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        # Enable protocol-level heartbeat (10s) and also reply to server JSON pings; add small pre-connect jitter; throttle connects and tune timeouts/headers/sizes
-        try:
-            import random
-            await asyncio.sleep(0.2 + random.uniform(0.0, 0.4))
-        except Exception:
-            pass
+        
+        # Add small jitter to avoid connection storms
+        import random
+        await asyncio.sleep(random.uniform(0.1, 0.5))
+        
         throttler = getattr(self._api_factory, "throttler", None)
+        
+        # Important: Set ping_timeout to None to handle ping/pong manually
+        # HTX uses JSON ping/pong, not WebSocket protocol ping/pong
+        connection_params = {
+            "ws_url": CONSTANTS.WS_PUBLIC_URL,
+            "ping_timeout": None,  # Disable protocol-level ping, use JSON ping instead
+            "message_timeout": 60,
+            "ws_headers": {
+                "Accept-Encoding": "gzip",
+            },
+            "max_msg_size": 32 * 1024 * 1024,
+        }
+        
         if throttler is not None:
             async with throttler.execute_task(CONSTANTS.WS_CONNECTION_LIMIT_ID):
-                await ws.connect(
-                    ws_url=CONSTANTS.WS_PUBLIC_URL,
-                    ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
-                    message_timeout=45,
-                    ws_headers={"Accept-Encoding": "gzip"},
-                    max_msg_size=16 * 1024 * 1024,
-                )
+                await ws.connect(**connection_params)
         else:
-            await ws.connect(
-                ws_url=CONSTANTS.WS_PUBLIC_URL,
-                ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
-                message_timeout=45,
-                ws_headers={"Accept-Encoding": "gzip"},
-                max_msg_size=16 * 1024 * 1024,
-            )
+            await ws.connect(**connection_params)
+        
+        # Reset ping/pong tracking
+        self._last_ping_timestamp = 0
+        self._last_pong_timestamp = time.time()
+        
         return ws
 
-    async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
-        return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
-
-    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+    async def listen_for_subscriptions(self):
         """
-        Suppressing call to this function as the orderbook snapshots are handled by
-        listen_for_order_book_diffs() for Htx
+        Override to add keep-alive monitoring task
         """
-        pass
+        ws = None
+        while True:
+            try:
+                ws = await self._connected_websocket_assistant()
+                await self._subscribe_channels(ws)
+                
+                # Create tasks for message processing and keep-alive
+                message_processor_task = asyncio.create_task(
+                    self._process_websocket_messages(websocket_assistant=ws, queue=self._message_queue)
+                )
+                keep_alive_task = asyncio.create_task(
+                    self._keep_alive_loop(ws)
+                )
+                
+                # Wait for either task to complete (likely due to disconnection)
+                done, pending = await asyncio.wait(
+                    [message_processor_task, keep_alive_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel the other task
+                for task in pending:
+                    task.cancel()
+                
+                # Re-raise any exceptions from completed tasks
+                for task in done:
+                    task.result()
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(
+                    f"Unexpected error with WebSocket connection. Retrying after 5 seconds... Error: {e}",
+                    exc_info=True
+                )
+                await self._sleep(5.0)
+            finally:
+                if ws is not None:
+                    await ws.disconnect()
 
-    def snapshot_message_from_exchange(self,
-                                       msg: Dict[str, Any],
-                                       metadata: Optional[Dict] = None) -> OrderBookMessage:
-
+    async def _keep_alive_loop(self, ws: WSAssistant):
         """
-        Creates a snapshot message with the order book snapshot message
-        :param msg: the response from the exchange when requesting the order book snapshot
-        :param timestamp: the snapshot timestamp
-        :param metadata: a dictionary with extra information to add to the snapshot data
-        :return: a snapshot message with the snapshot information received from the exchange
+        Dedicated task for sending periodic pings and monitoring connection health
         """
-        if metadata:
-            msg.update(metadata)
-        msg_ts = msg["tick"]["ts"] * 1e-3
-        content = {
-            "trading_pair": msg["trading_pair"],
-            "update_id": msg["tick"]["ts"],
-            "bids": msg["tick"].get("bids", []),
-            "asks": msg["tick"].get("asks", [])
-        }
-
-        return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
-
-    def trade_message_from_exchange(self,
-                                    msg: Dict[str, Any],
-                                    metadata: Dict[str, Any] = None) -> OrderBookMessage:
-        """
-        Creates a trade message with the information from the trade event sent by the exchange
-        :param msg: the trade event details sent by the exchange
-        :param metadata: a dictionary with extra information to add to trade message
-        :return: a trade message with the details of the trade as provided by the exchange
-        """
-        if metadata:
-            msg.update(metadata)
-
-        msg_ts = int(round(msg["ts"] / 1e3))
-        content = {
-            "trading_pair": msg["trading_pair"],
-            "trade_type": float(TradeType.BUY.value) if msg["direction"] == "buy" else float(TradeType.SELL.value),
-            "trade_id": msg["id"],
-            "update_id": msg["ts"],
-            "amount": msg["amount"],
-            "price": msg["price"]
-        }
-        return OrderBookMessage(OrderBookMessageType.TRADE, content, timestamp=msg_ts)
-
-    async def _request_new_orderbook_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        url = public_rest_url(CONSTANTS.DEPTH_URL)
-        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        # when type is set to "step0", the default value of "depth" is 150
-        params: Dict = {"symbol": exchange_symbol, "type": "step0"}
-        snapshot_data = await rest_assistant.execute_request(
-            url=url,
-            params=params,
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.DEPTH_URL,
-        )
-        return snapshot_data
-
-    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        snapshot: Dict[str, Any] = await self._request_new_orderbook_snapshot(trading_pair)
-        snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
-            msg=snapshot,
-            metadata={"trading_pair": trading_pair},
-        )
-
-        return snapshot_msg
+        while True:
+            try:
+                await asyncio.sleep(self._ping_interval)
+                
+                # Check if we need to send a ping
+                current_time = time.time()
+                
+                # Check pong timeout
+                if self._last_ping_timestamp > 0:
+                    time_since_ping = current_time - self._last_ping_timestamp
+                    time_since_pong = current_time - self._last_pong_timestamp
+                    
+                    if time_since_ping > self._pong_timeout and time_since_pong > self._pong_timeout:
+                        self.logger().warning(
+                            f"No pong received for {time_since_pong:.1f}s, disconnecting..."
+                        )
+                        await ws.disconnect()
+                        break
+                
+                # Send ping
+                ping_payload = {"ping": int(current_time * 1000)}
+                ping_request = WSJSONRequest(payload=ping_payload)
+                
+                await ws.send(request=ping_request)
+                self._last_ping_timestamp = current_time
+                
+                self.logger().debug(f"Sent ping at {current_time}")
+                
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Error in keep-alive loop: {e}")
+                break
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
-            # Allow connection to settle with small randomized jitter to avoid synchronized bursts
-            try:
-                import random
-                base_delay = 0.5
-                jitter = random.uniform(0.1, 0.3)
-                await asyncio.sleep(base_delay + jitter)
-            except Exception:
-                await asyncio.sleep(0.6)
+            # Wait for connection to stabilize
+            await asyncio.sleep(1.0)
+            
+            subscription_requests = []
+            
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                # HTX WS expects lowercase symbols in channel names per docs
+                # HTX requires lowercase symbols in channel names
                 exchange_symbol = exchange_symbol.lower()
-                subscribe_orderbook_request: WSJSONRequest = WSJSONRequest({
+                
+                # Prepare subscription requests
+                subscription_requests.append({
                     "sub": f"market.{exchange_symbol}.depth.step0",
                     "id": str(uuid.uuid4())
                 })
-                subscribe_trade_request: WSJSONRequest = WSJSONRequest({
+                subscription_requests.append({
                     "sub": f"market.{exchange_symbol}.trade.detail",
                     "id": str(uuid.uuid4())
                 })
-                # Debug minimal: indicate which symbol is being subscribed
-                try:
-                    self.logger().debug(f"WS subscribe orderbook: market.{exchange_symbol}.depth.step0")
-                except Exception:
-                    pass
-                throttler = getattr(self._api_factory, "throttler", None)
+            
+            # Send subscriptions with proper rate limiting
+            throttler = getattr(self._api_factory, "throttler", None)
+            
+            for request_data in subscription_requests:
+                subscribe_request = WSJSONRequest(request_data)
+                
+                self.logger().debug(f"Subscribing to: {request_data['sub']}")
+                
                 if throttler is not None:
                     async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
-                        await ws.send(subscribe_orderbook_request)
+                        await ws.send(subscribe_request)
                 else:
-                    await ws.send(subscribe_orderbook_request)
-                # Adaptive stagger with small jitter to reduce 1003 closes under load
-                try:
-                    import random
-                    n = max(1, len(self._trading_pairs))
-                    delay = min(1.0, 0.25 + 0.02 * n) + random.uniform(0.05, 0.2)
-                    await asyncio.sleep(delay)
-                except Exception:
-                    await asyncio.sleep(0.35)
-                try:
-                    self.logger().debug(f"WS subscribe trade: market.{exchange_symbol}.trade.detail")
-                except Exception:
-                    pass
-                throttler = getattr(self._api_factory, "throttler", None)
-                if throttler is not None:
-                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
-                        await ws.send(subscribe_trade_request)
-                else:
-                    await ws.send(subscribe_trade_request)
-                try:
-                    import random
-                    n = max(1, len(self._trading_pairs))
-                    delay = min(1.0, 0.25 + 0.02 * n) + random.uniform(0.05, 0.2)
-                    await asyncio.sleep(delay)
-                except Exception:
-                    await asyncio.sleep(0.35)
+                    await ws.send(subscribe_request)
+                
+                # Important: Add delay between subscriptions to avoid overwhelming the server
+                # HTX may close connection with 1003 if subscriptions are sent too fast
+                await asyncio.sleep(0.5)
+            
             self.logger().info("Subscribed to public orderbook and trade channels...")
+            
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...", exc_info=True
+                "Unexpected error occurred subscribing to order book trading and delta streams...", 
+                exc_info=True
             )
             raise
+
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
+        """
+        Override the base implementation to handle messages properly
+        """
+        async for ws_response in websocket_assistant.iter_messages():
+            try:
+                data = ws_response.data
+                
+                # Handle subscription confirmation/error
+                if "status" in data:
+                    if data["status"] == "ok":
+                        # Subscription successful
+                        if "subbed" in data:
+                            self.logger().debug(f"Successfully subscribed to {data['subbed']}")
+                        continue
+                    elif data["status"] == "error":
+                        self.logger().error(f"Subscription error: {data}")
+                        continue
+                
+                # Handle ping/pong at message processing level too
+                if "ping" in data:
+                    pong_payload = {"pong": data["ping"]}
+                    pong_request = WSJSONRequest(payload=pong_payload)
+                    await websocket_assistant.send(request=pong_request)
+                    self.logger().debug(f"Responded to ping with pong: {data['ping']}")
+                    continue
+                
+                if "pong" in data:
+                    self._last_pong_timestamp = time.time()
+                    self.logger().debug(f"Received pong: {data['pong']}")
+                    continue
+                
+                # Process actual channel data
+                channel = self._channel_originating_message(data)
+                if channel == self._diff_messages_queue_key:
+                    await self._parse_order_book_diff_message(data, queue)
+                elif channel == self._trade_messages_queue_key:
+                    await self._parse_trade_message(data, queue)
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error in message processing", exc_info=True)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = event_message.get("ch", "")
@@ -213,11 +256,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             retval = self._trade_messages_queue_key
         if channel.endswith(self._diff_messages_queue_key):
             retval = self._diff_messages_queue_key
-
         return retval
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-
         ex_symbol = raw_message["ch"].split(".")[1]
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
         for data in raw_message["tick"]["data"]:
@@ -238,40 +279,62 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         message_queue.put_nowait(snapshot_msg)
 
-    async def _process_message_for_unknown_channel(
-        self, event_message: Dict[str, Any], websocket_assistant: WSAssistant
-    ):
-        # Public WS heartbeat: respond to server JSON ping only
-        if "ping" in event_message:
-            pong_request = WSJSONRequest(payload={"pong": event_message["ping"]})
-            await websocket_assistant.send(request=pong_request)
-            return
-        # Huobi/HTX public WS may reply with sub acks or errors in v1 schema
-        try:
-            status = event_message.get("status")
-            if status == "ok" and ("subbed" in event_message or "rep" in event_message):
-                try:
-                    ch = event_message.get("subbed") or event_message.get("rep")
-                    if ch:
-                        self.logger().debug(f"WS subscribed ack: {ch}")
-                except Exception:
-                    pass
-                return
-            if status == "error" or ("err-code" in event_message or "err-msg" in event_message):
-                self.logger().warning(
-                    "WS subscription error",
-                    extra={
-                        "event": event_message,
-                    }
-                )
-                # Best-effort: disconnect to trigger clean resubscribe when server rejects channels
-                try:
-                    await websocket_assistant.disconnect()
-                except Exception:
-                    pass
-                return
-        except Exception:
-            # Swallow parsing issues; leave message to base handler if needed
-            pass
-        
-    # Use base class message loop; protocol-level ping handles liveness
+    async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
+        return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
+
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        HTX WebSocket provides snapshots through the depth channel, not separate REST calls
+        """
+        pass
+
+    def snapshot_message_from_exchange(self,
+                                       msg: Dict[str, Any],
+                                       metadata: Optional[Dict] = None) -> OrderBookMessage:
+        if metadata:
+            msg.update(metadata)
+        msg_ts = msg["tick"]["ts"] * 1e-3
+        content = {
+            "trading_pair": msg["trading_pair"],
+            "update_id": msg["tick"]["ts"],
+            "bids": msg["tick"].get("bids", []),
+            "asks": msg["tick"].get("asks", [])
+        }
+        return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
+
+    def trade_message_from_exchange(self,
+                                    msg: Dict[str, Any],
+                                    metadata: Dict[str, Any] = None) -> OrderBookMessage:
+        if metadata:
+            msg.update(metadata)
+        msg_ts = int(round(msg["ts"] / 1e3))
+        content = {
+            "trading_pair": msg["trading_pair"],
+            "trade_type": float(TradeType.BUY.value) if msg["direction"] == "buy" else float(TradeType.SELL.value),
+            "trade_id": msg["id"],
+            "update_id": msg["ts"],
+            "amount": msg["amount"],
+            "price": msg["price"]
+        }
+        return OrderBookMessage(OrderBookMessageType.TRADE, content, timestamp=msg_ts)
+
+    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        rest_assistant = await self._api_factory.get_rest_assistant()
+        url = public_rest_url(CONSTANTS.DEPTH_URL)
+        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        params: Dict = {"symbol": exchange_symbol, "type": "step0"}
+        snapshot_data = await rest_assistant.execute_request(
+            url=url,
+            params=params,
+            method=RESTMethod.GET,
+            throttler_limit_id=CONSTANTS.DEPTH_URL,
+        )
+        return snapshot_data
+
+    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
+        snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
+            msg=snapshot,
+            metadata={"trading_pair": trading_pair},
+        )
+        return snapshot_msg

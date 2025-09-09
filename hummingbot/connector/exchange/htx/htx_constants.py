@@ -15,7 +15,7 @@ WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
 WS_PRIVATE_URL = "wss://api-aws.huobi.pro/ws/v2"
 
 # Slightly higher heartbeat to reduce churn but stay well under idle timeouts
-WS_HEARTBEAT_TIME_INTERVAL = 10  # seconds
+WS_HEARTBEAT_TIME_INTERVAL = 20  # seconds
 
 # Websocket event types
 TRADE_CHANNEL_SUFFIX = "trade.detail"
