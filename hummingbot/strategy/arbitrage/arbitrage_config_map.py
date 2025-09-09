@@ -42,15 +42,23 @@ def secondary_market_on_validated(value: str):
 
 
 def update_oracle_settings(value: str):
+    """Update oracle settings based on configuration"""
     c_map = arbitrage_config_map
+    
+    # Ensure all required values are present
     if not (c_map["use_oracle_conversion_rate"].value is not None and
             c_map["primary_market_trading_pair"].value is not None and
             c_map["secondary_market_trading_pair"].value is not None):
         return
+    
     use_oracle = parse_cvar_value(c_map["use_oracle_conversion_rate"], c_map["use_oracle_conversion_rate"].value)
     first_base, first_quote = c_map["primary_market_trading_pair"].value.split("-")
     second_base, second_quote = c_map["secondary_market_trading_pair"].value.split("-")
-    if use_oracle and (first_base != second_base or first_quote != second_quote):
+    
+    # Check if assets differ
+    assets_differ = first_base != second_base or first_quote != second_quote
+    
+    if use_oracle and assets_differ:
         settings.required_rate_oracle = True
         settings.rate_oracle_pairs = []
         if first_base != second_base:
@@ -58,6 +66,7 @@ def update_oracle_settings(value: str):
         if first_quote != second_quote:
             settings.rate_oracle_pairs.append(f"{second_quote}-{first_quote}")
     else:
+        # Either not using oracle or assets match - no oracle needed
         settings.required_rate_oracle = False
         settings.rate_oracle_pairs = []
 

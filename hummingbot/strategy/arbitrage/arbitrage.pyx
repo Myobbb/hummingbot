@@ -7,7 +7,6 @@
 
 import logging
 from decimal import Decimal
-import pandas as pd
 from typing import List, Tuple, Optional
 from libc.stdint cimport int64_t
 from libc.math cimport fabs
@@ -18,7 +17,7 @@ cimport cython
 
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.connector.exchange_base cimport ExchangeBase
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import TradeType, OrderType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.market_order import MarketOrder
 from hummingbot.core.network_iterator import NetworkStatus
@@ -26,7 +25,6 @@ from hummingbot.strategy.strategy_base import StrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketPair
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-from hummingbot.client.performance import PerformanceMetrics
 
 # Constants - Now configurable via init_params
 cdef:
@@ -36,6 +34,10 @@ cdef:
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
     double EPSILON = 1e-10
     double RATE_LOG_INTERVAL = 300.0
+
+# NaN constants for price defaults
+NaN = float("nan")
+s_decimal_nan = Decimal("NaN")
 
 as_logger = None
 
@@ -50,8 +52,7 @@ cdef class ArbitrageStrategy(StrategyBase):
     OPTION_LOG_CREATE_ORDER = 1 << 1
     OPTION_LOG_ORDER_COMPLETED = 1 << 2
     OPTION_LOG_PROFITABILITY_STEP = 1 << 3
-    OPTION_LOG_FULL_PROFITABILITY_STEP = 1 << 4
-    OPTION_LOG_INSUFFICIENT_ASSET = 1 << 5
+    OPTION_LOG_INSUFFICIENT_ASSET = 1 << 4
     OPTION_LOG_ALL = 0xfffffffffffffff
 
     @classmethod
@@ -67,7 +68,6 @@ cdef class ArbitrageStrategy(StrategyBase):
                     logging_options: int = OPTION_LOG_ORDER_COMPLETED,
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 3.0,
-                    failed_order_tolerance: int = 1,
                     order_timeout: float = 600.0,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
@@ -113,6 +113,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         else:
             self._fixed_base_rate = 1.0
             self._fixed_quote_rate = 1.0
+        
         
         # Cache initialization
         self._cached_base_rate = 1.0
@@ -161,6 +162,11 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
+        # Fast path: If not using oracle and rates are 1.0, skip all calculations
+        if not self._use_oracle_conversion_rate:
+            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
+                return 1.0
+        
         cdef double current_time = self._current_timestamp
         
         # Update cache if expired
@@ -171,6 +177,16 @@ cdef class ArbitrageStrategy(StrategyBase):
     
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple):
         """Conversion to express sell market prices in buy market quote units."""
+        # Fast path: if assets match, no conversion needed
+        if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
+            buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
+            return 1.0
+            
+        # Fast path: if not using oracle and rates are 1:1
+        if not self._use_oracle_conversion_rate:
+            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
+                return 1.0
+        
         cdef double base_conv = 1.0
         cdef double quote_conv = 1.0
         cdef object primary_first = self._market_pairs[0].first
@@ -183,7 +199,7 @@ cdef class ArbitrageStrategy(StrategyBase):
                 base_conv = self.c_get_conversion_rate(True)
             elif (buy_market_tuple.base_asset == primary_second.base_asset and
                   sell_market_tuple.base_asset == primary_first.base_asset):
-                base_conv = 1.0 / self.c_get_conversion_rate(True)
+                base_conv = 1.0 / self.c_get_conversion_rate(True) if self.c_get_conversion_rate(True) != 0 else 0.0
             else:
                 base_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
@@ -195,12 +211,12 @@ cdef class ArbitrageStrategy(StrategyBase):
                 quote_conv = self.c_get_conversion_rate(False)
             elif (buy_market_tuple.quote_asset == primary_second.quote_asset and
                   sell_market_tuple.quote_asset == primary_first.quote_asset):
-                quote_conv = 1.0 / self.c_get_conversion_rate(False)
+                quote_conv = 1.0 / self.c_get_conversion_rate(False) if self.c_get_conversion_rate(False) != 0 else 0.0
             else:
                 quote_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
 
-        return quote_conv / base_conv
+        return quote_conv / base_conv if base_conv != 0 else 0.0
     
     cdef void c_update_conversion_rates(self):
         """Update cached conversion rates efficiently"""
@@ -322,7 +338,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         return True
 
-    cdef void c_handle_order_completion(self, object order_event, bint is_buy):
+    cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
         """Unified order completion handler"""
         cdef:
             str order_id = order_event.order_id
@@ -424,7 +440,8 @@ cdef class ArbitrageStrategy(StrategyBase):
                 f"{market_pair.second.trading_pair}→{market_pair.first.trading_pair}: "
                 f"{self._current_profitability.second:.4%}")
         
-        # Execute the more profitable direction
+        # Execute the more profitable direction immediately
+        # CRITICAL: No delays here - execute as soon as opportunity is spotted
         if self._current_profitability.second > self._current_profitability.first:
             self.c_execute_arbitrage(market_pair.first, market_pair.second)
         else:
@@ -438,22 +455,38 @@ cdef class ArbitrageStrategy(StrategyBase):
             double bid2 = float(market_pair.second.get_price(False))
             double ask2 = float(market_pair.second.get_price(True))
             double conv_rate = 1.0
+            bint needs_conversion = False
             
-        # Apply conversion if needed
+        # Sanity check - prices must be positive
+        if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
+            return pair[double, double](0.0, 0.0)
+            
+        # Check if conversion is needed
         if (market_pair.first.quote_asset != market_pair.second.quote_asset or
             market_pair.first.base_asset != market_pair.second.base_asset):
-            conv_rate = self.c_get_conversion_rate(False) / self.c_get_conversion_rate(True)
+            # Only calculate conversion if not using fixed 1:1 rates
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+                needs_conversion = True
+        
+        # Apply conversion only if needed
+        if needs_conversion:
             bid2 *= conv_rate
             ask2 *= conv_rate
         
-        # Calculate profitability
-        cdef double prof1 = (bid1 / ask2 - 1.0) if ask2 > 0 else 0.0
-        cdef double prof2 = (bid2 / ask1 - 1.0) if ask1 > 0 else 0.0
+        # Calculate profitability without fees (fees considered in execution)
+        # Direction 1: Buy from market2, sell to market1
+        cdef double prof1 = (bid1 / ask2 - 1.0) if ask2 > 0 else -1.0
+        # Direction 2: Buy from market1, sell to market2  
+        cdef double prof2 = (bid2 / ask1 - 1.0) if ask1 > 0 else -1.0
         
         return pair[double, double](prof1, prof2)
 
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple) except *:
-        """Execute arbitrage trade"""
+        """
+        Execute arbitrage trade
+
+        """
         cdef:
             tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
             double amount = <double>result[0]
@@ -485,6 +518,8 @@ cdef class ArbitrageStrategy(StrategyBase):
             return
         
         if quantized_amount > Decimal("0"):
+            # Log timing for latency monitoring
+            cdef double order_start_time = self._current_timestamp
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                 self.log_with_clock(
                     logging.INFO,
@@ -492,23 +527,44 @@ cdef class ArbitrageStrategy(StrategyBase):
                     f"@ {buy_market.name}, sell @ {sell_market.name}, "
                     f"profitability: {profitability * 100:.2f}%")
             
-            # Place orders
+            # CRITICAL: Place both orders with minimal latency
+            # The price is passed even for market orders as some connectors use it
+            # to calculate the correct amount (especially for quote currency market orders)
+            
+            # Pre-calculate all parameters to minimize latency between orders
+            cdef object buy_order_type = buy_market.get_taker_order_type()
+            cdef object sell_order_type = sell_market.get_taker_order_type()
+            cdef object buy_price_decimal = Decimal(str(buy_price))
+            cdef object sell_price_decimal = Decimal(str(sell_price))
+            
+            # Execute both orders in rapid succession
+            # This is the best we can do in Cython without async support
+            # The actual network calls happen inside the exchange connectors
             buy_order_id = self.c_buy_with_specific_market(
                 buy_market_tuple, quantized_amount,
-                order_type=buy_market.get_taker_order_type(),
-                price=Decimal(str(buy_price)),
+                order_type=buy_order_type,
+                price=buy_price_decimal,
                 expiration_seconds=self._next_trade_delay)
+            
+            # Immediately place the sell order - minimal delay
             sell_order_id = self.c_sell_with_specific_market(
                 sell_market_tuple, quantized_amount,
-                order_type=sell_market.get_taker_order_type(),
-                price=Decimal(str(sell_price)),
+                order_type=sell_order_type,
+                price=sell_price_decimal,
                 expiration_seconds=self._next_trade_delay)
             
             # Track orders
             buy_id_str = buy_order_id.encode('utf-8')
             sell_id_str = sell_order_id.encode('utf-8')
-            self._order_timestamps[buy_id_str] = self._current_timestamp
-            self._order_timestamps[sell_id_str] = self._current_timestamp
+            self._order_timestamps[buy_id_str] = order_start_time
+            self._order_timestamps[sell_id_str] = order_start_time
+            
+            # Log order placement latency for monitoring
+            cdef double placement_latency = self._current_timestamp - order_start_time
+            if placement_latency > 0.1:  # Log if latency exceeds 100ms
+                self.logger().warning(
+                    f"High order placement latency detected: {placement_latency:.3f}s. "
+                    f"Consider colocating servers or optimizing network connectivity.")
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - simplified and optimized"""
@@ -519,10 +575,16 @@ cdef class ArbitrageStrategy(StrategyBase):
             double sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
             double conv_rate = 1.0
             
-        # Get conversion rate if needed
+        # Early exit if no balance
+        if buy_quote_balance <= 0 or sell_base_balance <= 0:
+            return (0.0, 0.0, 0.0, 0.0)
+            
+        # Get conversion rate only if assets differ
         if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
             buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+            # Skip if using fixed 1:1 rates
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
         
         # Find profitable orders
         profitable_orders = c_find_profitable_arbitrage_orders(
@@ -542,39 +604,38 @@ cdef class ArbitrageStrategy(StrategyBase):
             double total_proceeds = 0.0
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
+            double remaining_quote, remaining_base
             
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
-            amount = float(amount)
+            # Calculate remaining capacity
+            remaining_quote = buy_quote_balance - total_cost
+            remaining_base = sell_base_balance - total_base
             
-            # Check if we can afford this step
-            if total_cost + ask_adj * amount > buy_quote_balance:
-                # Partial amount we can afford
-                remaining_quote = buy_quote_balance - total_cost
-                if remaining_quote > 0 and ask_adj > 0:
-                    amount = min(amount, remaining_quote / ask_adj)
-                else:
-                    break
-                    
-            if total_base + amount > sell_base_balance:
-                # Partial amount we can sell
-                amount = min(amount, sell_base_balance - total_base)
-                if amount <= 0:
-                    break
+            # Early exit if no capacity left
+            if remaining_quote <= EPSILON or remaining_base <= EPSILON:
+                break
+                
+            # Adjust amount to available capacity
+            if ask_adj > 0:
+                amount = min(amount, remaining_quote / ask_adj, remaining_base)
+            else:
+                amount = min(amount, remaining_base)
+                
+            if amount <= EPSILON:
+                continue
             
+            # Update totals
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
             total_proceeds_orig += orig_bid * amount
-            
-            # Stop if we've exhausted balances
-            if total_cost >= buy_quote_balance or total_base >= sell_base_balance:
-                break
         
-        if total_base > 0 and total_cost > 0:
+        # Calculate results
+        if total_base > EPSILON and total_cost > EPSILON:
             avg_bid_adj = total_proceeds / total_base
             avg_bid_orig = total_proceeds_orig / total_base
             avg_ask = total_cost / total_base
-            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > 0 else 0.0
+            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
             return (total_base, profitability, avg_bid_orig, avg_ask)
         
         return (0.0, 0.0, 0.0, 0.0)
@@ -585,6 +646,11 @@ cdef class ArbitrageStrategy(StrategyBase):
             double cutoff = self._current_timestamp - (self._order_timeout * 2)
             list to_remove = []
             string order_id_str
+            double timestamp
+            
+        # Only clean up if we have orders to check
+        if self._order_timestamps.size() == 0:
+            return
             
         # Find old entries
         for order_id_str, timestamp in self._order_timestamps:
@@ -601,6 +667,11 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
+        # Skip logging if rates are exactly 1:1
+        if (fabs(self._cached_base_rate - 1.0) <= EPSILON and 
+            fabs(self._cached_quote_rate - 1.0) <= EPSILON):
+            return
+            
         if fabs(self._cached_base_rate - 1.0) > EPSILON:
             self.logger().info(f"Base conversion rate: {self._cached_base_rate:.6f}")
         if fabs(self._cached_quote_rate - 1.0) > EPSILON:
@@ -623,18 +694,21 @@ cdef list c_find_profitable_arbitrage_orders(
         double bid_leftover = 0.0
         double ask_leftover = 0.0
         double bid_price, ask_price
+        double orig_bid_price, orig_ask_price
         double min_prof_threshold = 1.0 + min_profitability
         bint needs_conversion = (fabs(buy_conversion_rate - 1.0) > EPSILON or 
                                 fabs(sell_conversion_rate - 1.0) > EPSILON)
         object current_bid = None
         object current_ask = None
         list profitable_orders = []
+        int orders_found = 0
+        int max_orders = 100  # Limit number of orders for performance
 
     bid_it = sell_market_tuple.order_book_bid_entries()
     ask_it = buy_market_tuple.order_book_ask_entries()
 
     try:
-        while True:
+        while orders_found < max_orders:
             # Advance iterators efficiently
             if bid_leftover <= EPSILON and ask_leftover <= EPSILON:
                 current_bid = next(bid_it)
@@ -648,19 +722,31 @@ cdef list c_find_profitable_arbitrage_orders(
                 current_bid = next(bid_it)
                 bid_leftover = float(current_bid.amount)
 
-            # Get prices with optional conversion
-            if needs_conversion:
-                bid_price = float(current_bid.price) * sell_conversion_rate
-                ask_price = float(current_ask.price) * buy_conversion_rate
-            else:
-                # Fast path - no conversion (99% of cases)
-                bid_price = float(current_bid.price)
-                ask_price = float(current_ask.price)
+            # Store original prices
+            orig_bid_price = float(current_bid.price)
+            orig_ask_price = float(current_ask.price)
             
-            # Check profitability
+            # Apply conversion if needed
+            if needs_conversion:
+                bid_price = orig_bid_price * sell_conversion_rate
+                ask_price = orig_ask_price * buy_conversion_rate
+            else:
+                # Fast path - no conversion
+                bid_price = orig_bid_price
+                ask_price = orig_ask_price
+            
+            # Early exit conditions
             if bid_price <= ask_price:
                 break
+            if ask_price <= EPSILON:  # Avoid division by zero
+                break
             if bid_price / ask_price < min_prof_threshold:
+                break
+            
+            # Additional sanity checks for real-world robustness
+            if bid_price <= 0 or ask_price <= 0:
+                break
+            if orig_bid_price <= 0 or orig_ask_price <= 0:
                 break
 
             step_amount = min(bid_leftover, ask_leftover)
@@ -671,10 +757,11 @@ cdef list c_find_profitable_arbitrage_orders(
             profitable_orders.append((
                 bid_price,
                 ask_price,
-                float(current_bid.price),
-                float(current_ask.price),
+                orig_bid_price,
+                orig_ask_price,
                 step_amount))
-
+            
+            orders_found += 1
             ask_leftover -= step_amount
             bid_leftover -= step_amount
 
