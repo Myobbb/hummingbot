@@ -65,9 +65,9 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple)
     
     # Trading logic
-    cdef c_process_market_pair(self, object market_pair) except *
+    cdef c_process_market_pair(self, object market_pair)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
-    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple) except *
+    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
     
     # Event handlers - unified

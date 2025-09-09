@@ -482,7 +482,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         return pair[double, double](prof1, prof2)
 
-    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple) except *:
+    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple):
         """
         Execute arbitrage trade
 
@@ -517,9 +517,17 @@ cdef class ArbitrageStrategy(StrategyBase):
         if volume_usd < self._min_order_usd:
             return
         
+        # Declare all variables before the if block (Cython requirement)
+        cdef double order_start_time
+        cdef object buy_order_type
+        cdef object sell_order_type
+        cdef object buy_price_decimal
+        cdef object sell_price_decimal
+        cdef double placement_latency
+        
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
-            cdef double order_start_time = self._current_timestamp
+            order_start_time = self._current_timestamp
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                 self.log_with_clock(
                     logging.INFO,
@@ -532,10 +540,10 @@ cdef class ArbitrageStrategy(StrategyBase):
             # to calculate the correct amount (especially for quote currency market orders)
             
             # Pre-calculate all parameters to minimize latency between orders
-            cdef object buy_order_type = buy_market.get_taker_order_type()
-            cdef object sell_order_type = sell_market.get_taker_order_type()
-            cdef object buy_price_decimal = Decimal(str(buy_price))
-            cdef object sell_price_decimal = Decimal(str(sell_price))
+            buy_order_type = buy_market.get_taker_order_type()
+            sell_order_type = sell_market.get_taker_order_type()
+            buy_price_decimal = Decimal(str(buy_price))
+            sell_price_decimal = Decimal(str(sell_price))
             
             # Execute both orders in rapid succession
             # This is the best we can do in Cython without async support
@@ -560,7 +568,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             self._order_timestamps[sell_id_str] = order_start_time
             
             # Log order placement latency for monitoring
-            cdef double placement_latency = self._current_timestamp - order_start_time
+            placement_latency = self._current_timestamp - order_start_time
             if placement_latency > 0.1:  # Log if latency exceeds 100ms
                 self.logger().warning(
                     f"High order placement latency detected: {placement_latency:.3f}s. "
