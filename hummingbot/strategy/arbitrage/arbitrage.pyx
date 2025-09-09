@@ -353,8 +353,8 @@ cdef class ArbitrageStrategy(StrategyBase):
                         if time_elapsed > self._order_timeout:
                             self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s")
                             self._order_timestamps.erase(order_id_str)
-                            # Cancel timed out order
-                            market_tuple.market.c_cancel(order_id)
+                            # Cancel timed out order - use regular method, not c_ version
+                            market_tuple.market.cancel(order_id)
                         else:
                             # Still waiting
                             if time_elapsed > self._order_warning_delay:
