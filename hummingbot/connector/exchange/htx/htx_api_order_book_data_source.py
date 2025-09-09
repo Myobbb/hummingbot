@@ -260,7 +260,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             retval = self._diff_messages_queue_key
         return retval
 
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue):
         ex_symbol = raw_message["ch"].split(".")[1]
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
         for data in raw_message["tick"]["data"]:
@@ -270,7 +270,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             message_queue.put_nowait(trade_message)
 
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue):
         msg_channel = raw_message["ch"]
         order_book_symbol = msg_channel.split(".")[1]
         snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
