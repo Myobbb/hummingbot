@@ -564,7 +564,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
-            total_proceeds_orig += float(orig_bid) * amount
+            total_proceeds_orig += orig_bid * amount
             
             # Stop if we've exhausted balances
             if total_cost >= buy_quote_balance or total_base >= sell_base_balance:
