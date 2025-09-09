@@ -513,10 +513,10 @@ cdef class ArbitrageStrategy(StrategyBase):
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - simplified and optimized"""
         cdef:
-            double buy_quote_balance = float(buy_market_tuple.market.c_get_available_balance(
-                buy_market_tuple.quote_asset))
-            double sell_base_balance = float(sell_market_tuple.market.c_get_available_balance(
-                sell_market_tuple.base_asset))
+            ExchangeBase buy_market = buy_market_tuple.market
+            ExchangeBase sell_market = sell_market_tuple.market
+            double buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+            double sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
             double conv_rate = 1.0
             
         # Get conversion rate if needed
