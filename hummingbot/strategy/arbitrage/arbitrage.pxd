@@ -33,7 +33,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         double _last_rate_update
         # Memory management
         double _last_cleanup_timestamp
-        int _max_tracked_orders
+        size_t _max_tracked_orders
         # Top-of-book cache for current tick (raw prices)
         double _tob_first_bid
         double _tob_first_ask

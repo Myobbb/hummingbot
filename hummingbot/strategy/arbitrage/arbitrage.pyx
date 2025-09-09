@@ -38,7 +38,7 @@ cdef:
     double EPSILON = 1e-10  # Small value for float comparisons
     double RATE_LOG_INTERVAL = 300.0  # Log conversion rates every 5 minutes
     double ORDER_WARNING_DELAY = 10.0  # Warn if order pending longer than this
-    int MAX_TRACKED_ORDERS = 1000  # Maximum tracked orders to prevent memory leaks
+    size_t MAX_TRACKED_ORDERS = 1000  # Maximum tracked orders to prevent memory leaks
 
 as_logger = None
 
