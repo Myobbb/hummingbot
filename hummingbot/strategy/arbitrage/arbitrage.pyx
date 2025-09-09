@@ -353,8 +353,8 @@ cdef class ArbitrageStrategy(StrategyBase):
                         if time_elapsed > self._order_timeout:
                             self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s")
                             self._order_timestamps.erase(order_id_str)
-                            # Cancel timed out order - use regular method, not c_ version
-                            market_tuple.market.cancel(order_id)
+                            # Cancel timed out order via helper to ensure proper tracking
+                            self.c_cancel_order(market_tuple, order_id)
                         else:
                             # Still waiting
                             if time_elapsed > self._order_warning_delay:
@@ -463,11 +463,13 @@ cdef class ArbitrageStrategy(StrategyBase):
             buy_order_id = self.c_buy_with_specific_market(
                 buy_market_tuple, quantized_amount,
                 order_type=buy_market.get_taker_order_type(),
-                price=Decimal(str(buy_price)))
+                price=Decimal(str(buy_price)),
+                expiration_seconds=self._next_trade_delay)
             sell_order_id = self.c_sell_with_specific_market(
                 sell_market_tuple, quantized_amount,
                 order_type=sell_market.get_taker_order_type(),
-                price=Decimal(str(sell_price)))
+                price=Decimal(str(sell_price)),
+                expiration_seconds=self._next_trade_delay)
             
             # Track orders
             buy_id_str = buy_order_id.encode('utf-8')
