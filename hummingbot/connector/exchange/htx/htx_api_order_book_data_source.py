@@ -207,9 +207,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             raise
 
-    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue):
         """
         Override the base implementation to handle messages properly
+        Note: 'queue' is a defaultdict of queues, not a single queue
         """
         async for ws_response in websocket_assistant.iter_messages():
             try:
@@ -241,10 +242,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 # Process actual channel data
                 channel = self._channel_originating_message(data)
-                if channel == self._diff_messages_queue_key:
-                    await self._parse_order_book_diff_message(data, queue)
-                elif channel == self._trade_messages_queue_key:
-                    await self._parse_trade_message(data, queue)
+                if channel:
+                    # IMPORTANT: queue is a defaultdict, get the specific queue for this channel
+                    channel_queue = queue[channel]
+                    if channel == self._diff_messages_queue_key:
+                        await self._parse_order_book_diff_message(data, channel_queue)
+                    elif channel == self._trade_messages_queue_key:
+                        await self._parse_trade_message(data, channel_queue)
                     
             except asyncio.CancelledError:
                 raise
