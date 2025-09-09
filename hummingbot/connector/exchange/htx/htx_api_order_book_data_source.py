@@ -102,7 +102,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 # Re-raise any exceptions from completed tasks
                 for task in done:
-                    task.result()
+                    exception = task.exception()
+                    if exception:
+                        raise exception
                     
             except asyncio.CancelledError:
                 raise
