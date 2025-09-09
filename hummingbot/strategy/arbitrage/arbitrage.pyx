@@ -169,6 +169,39 @@ cdef class ArbitrageStrategy(StrategyBase):
         
         return self._cached_base_rate if is_base_asset else self._cached_quote_rate
     
+    cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple):
+        """Conversion to express sell market prices in buy market quote units."""
+        cdef double base_conv = 1.0
+        cdef double quote_conv = 1.0
+        cdef object primary_first = self._market_pairs[0].first
+        cdef object primary_second = self._market_pairs[0].second
+
+        # Base asset conversion (sell base -> buy base)
+        if buy_market_tuple.base_asset != sell_market_tuple.base_asset:
+            if (buy_market_tuple.base_asset == primary_first.base_asset and
+                sell_market_tuple.base_asset == primary_second.base_asset):
+                base_conv = self.c_get_conversion_rate(True)
+            elif (buy_market_tuple.base_asset == primary_second.base_asset and
+                  sell_market_tuple.base_asset == primary_first.base_asset):
+                base_conv = 1.0 / self.c_get_conversion_rate(True)
+            else:
+                base_conv = float(RateOracle.get_instance().get_pair_rate(
+                    f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
+
+        # Quote asset conversion (sell quote -> buy quote)
+        if buy_market_tuple.quote_asset != sell_market_tuple.quote_asset:
+            if (buy_market_tuple.quote_asset == primary_first.quote_asset and
+                sell_market_tuple.quote_asset == primary_second.quote_asset):
+                quote_conv = self.c_get_conversion_rate(False)
+            elif (buy_market_tuple.quote_asset == primary_second.quote_asset and
+                  sell_market_tuple.quote_asset == primary_first.quote_asset):
+                quote_conv = 1.0 / self.c_get_conversion_rate(False)
+            else:
+                quote_conv = float(RateOracle.get_instance().get_pair_rate(
+                    f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
+
+        return quote_conv / base_conv
+    
     cdef void c_update_conversion_rates(self):
         """Update cached conversion rates efficiently"""
         if not self._use_oracle_conversion_rate:
@@ -489,7 +522,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Get conversion rate if needed
         if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
             buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            conv_rate = self.c_get_conversion_rate(False) / self.c_get_conversion_rate(True)
+            conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
         
         # Find profitable orders
         profitable_orders = c_find_profitable_arbitrage_orders(
@@ -507,7 +540,8 @@ cdef class ArbitrageStrategy(StrategyBase):
             double total_base = 0.0
             double total_cost = 0.0
             double total_proceeds = 0.0
-            double bid_adj, ask_adj, amount
+            double total_proceeds_orig = 0.0
+            double bid_adj, ask_adj, orig_bid, orig_ask, amount
             
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             amount = float(amount)
@@ -530,16 +564,18 @@ cdef class ArbitrageStrategy(StrategyBase):
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
+            total_proceeds_orig += float(orig_bid) * amount
             
             # Stop if we've exhausted balances
             if total_cost >= buy_quote_balance or total_base >= sell_base_balance:
                 break
         
         if total_base > 0 and total_cost > 0:
-            avg_bid = total_proceeds / total_base
+            avg_bid_adj = total_proceeds / total_base
+            avg_bid_orig = total_proceeds_orig / total_base
             avg_ask = total_cost / total_base
-            profitability = (avg_bid / avg_ask - 1.0) if avg_ask > 0 else 0.0
-            return (total_base, profitability, avg_bid, avg_ask)
+            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > 0 else 0.0
+            return (total_base, profitability, avg_bid_orig, avg_ask)
         
         return (0.0, 0.0, 0.0, 0.0)
 
