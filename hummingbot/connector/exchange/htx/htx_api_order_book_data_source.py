@@ -38,8 +38,16 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Keep-alive tracking for stable connections
         self._last_ping_timestamp = 0
         self._last_pong_timestamp = 0
-        self._ping_interval = 20  # HTX recommends 20-30 seconds for JSON ping
+        self._ping_interval = 30  # Rely on server pings; only monitor liveness
         self._pong_timeout = 10
+
+        # Public WS endpoint rotation (primary AWS, fallback CN)
+        self._ws_urls = [CONSTANTS.WS_PUBLIC_URL, "wss://api.huobi.pro/ws"]
+        self._ws_url_index = 0
+
+        # Reconnect management
+        self._reconnect_attempts = 0
+        self._consecutive_1003_closes = 0
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -55,8 +63,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         
         # IMPORTANT: Set ping_timeout=None to disable protocol-level ping
         # HTX uses JSON ping/pong, not WebSocket protocol ping/pong
+        # Use current URL in rotation list
+        ws_url = self._ws_urls[self._ws_url_index % len(self._ws_urls)]
         connection_params = {
-            "ws_url": CONSTANTS.WS_PUBLIC_URL,
+            "ws_url": ws_url,
             "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
             "message_timeout": 60,
             "ws_headers": {"Accept-Encoding": "gzip"},
@@ -117,11 +127,25 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                # Examine last close code if available
+                try:
+                    last_code = getattr(ws, "last_close_code", None)
+                    if last_code == 1003:
+                        self._consecutive_1003_closes += 1
+                        # Rotate endpoint after each 1003
+                        self._ws_url_index = (self._ws_url_index + 1) % len(self._ws_urls)
+                    else:
+                        self._consecutive_1003_closes = 0
+                except Exception:
+                    pass
+
+                self._reconnect_attempts += 1
+                backoff = min(60.0, 5.0 * (2 ** min(4, self._reconnect_attempts // 3)))
                 self.logger().error(
-                    f"Unexpected error with WebSocket connection. Retrying after 5 seconds... Error: {e}",
+                    f"Unexpected error with WebSocket connection. Retrying after {backoff:.0f} seconds... Error: {e}",
                     exc_info=True
                 )
-                await self._sleep(5.0)
+                await self._sleep(backoff)
             finally:
                 if ws is not None:
                     await ws.disconnect()
@@ -184,28 +208,27 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception:
                 self.logger().error("Unexpected error in message processing", exc_info=True)
+                # If server indicates policy violation (1003), rotate endpoint for next reconnect
+                try:
+                    last_code = getattr(websocket_assistant, "last_close_code", None)
+                    if last_code == 1003:
+                        self._ws_url_index = (self._ws_url_index + 1) % len(self._ws_urls)
+                        self.logger().warning(f"Rotating HTX public WS endpoint due to 1003 close. Next URL index: {self._ws_url_index}")
+                except Exception:
+                    pass
 
     async def _keep_alive_loop(self, ws: WSAssistant):
         while True:
             try:
                 await asyncio.sleep(self._ping_interval)
 
-                # Public WS (/ws, market data v1) expects classic ping format
-                ts = int(time.time() * 1000)
-                ping_payload = {"ping": ts}
-                ping_request = WSJSONRequest(payload=ping_payload)
-
-                await ws.send(request=ping_request)
-
-                # Don't check for pong timeout explicitly for public WS
-                # Any incoming frame is treated as liveness
+                # Do not proactively ping; rely on server ping/pong for v1 market WS.
+                # Only monitor inactivity and recycle the connection if needed.
                 now = time.time()
-                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 120:
-                    self.logger.warning(f"No messages received for {now - self._last_pong_timestamp:.0f}s")
-                    if (now - self._last_pong_timestamp) > 180:
-                        self.logger.error("Inactivity threshold exceeded, disconnecting")
-                        await ws.disconnect()
-                        break
+                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 180:
+                    self.logger.error("Inactivity threshold exceeded, disconnecting")
+                    await ws.disconnect()
+                    break
 
             except Exception as e:
                 self.logger().error(f"Error in keep-alive loop: {e}")
@@ -308,7 +331,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(subscribe_orderbook_request)
                 
                 # IMPORTANT: Delay between subscriptions to avoid 1003 error
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 
                 # Subscribe to trades
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest({
@@ -325,7 +348,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(subscribe_trade_request)
                 
                 # Delay before next trading pair
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 
             self.logger().info("Subscribed to public orderbook and trade channels...")
             
