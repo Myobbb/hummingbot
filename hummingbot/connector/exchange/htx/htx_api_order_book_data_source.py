@@ -189,16 +189,16 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 await asyncio.sleep(self._ping_interval)
-                
-                # HTX expects this exact format
+
+                # Public WS (/ws, market data v1) expects classic ping format
                 ts = int(time.time() * 1000)
-                ping_payload = {"action": "ping", "data": {"ts": ts}}
+                ping_payload = {"ping": ts}
                 ping_request = WSJSONRequest(payload=ping_payload)
-                
+
                 await ws.send(request=ping_request)
-                
-                # Don't check for pong timeout - HTX doesn't send explicit pongs
-                # The connection will fail naturally if truly dead
+
+                # Don't check for pong timeout explicitly for public WS
+                # Any incoming frame is treated as liveness
                 now = time.time()
                 if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 120:
                     self.logger.warning(f"No messages received for {now - self._last_pong_timestamp:.0f}s")
@@ -206,7 +206,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         self.logger.error("Inactivity threshold exceeded, disconnecting")
                         await ws.disconnect()
                         break
-                    
+
             except Exception as e:
                 self.logger().error(f"Error in keep-alive loop: {e}")
                 break
