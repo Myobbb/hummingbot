@@ -129,6 +129,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         async for ws_response in websocket_assistant.iter_messages():
             try:
+                # Any message from server proves connection is alive
+                self._last_pong_timestamp = time.time()
+                
                 data = ws_response.data
                 
                 # First check if this is a channel message we care about
@@ -140,7 +143,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 else:
                     # Not a recognized channel, handle control messages
                     await self._process_message_for_unknown_channel(data, websocket_assistant)
-                    
+                        
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -156,6 +159,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 current_time = time.time()
                 
+                """
                 # Check if we need to reconnect due to no pong
                 if self._last_ping_timestamp > 0:
                     time_since_ping = current_time - self._last_ping_timestamp
@@ -167,6 +171,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         )
                         await ws.disconnect()
                         break
+                """
                 
                 # Send JSON ping
                 ping_payload = {"ping": int(current_time * 1000)}
