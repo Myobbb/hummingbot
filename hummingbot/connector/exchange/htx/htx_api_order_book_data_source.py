@@ -1,6 +1,9 @@
 import asyncio
 import uuid
 import time
+import json
+import gzip
+import zlib
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -132,7 +135,40 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Any message from server proves connection is alive
                 self._last_pong_timestamp = time.time()
                 
+                # HTX may send compressed frames - handle them
                 data = ws_response.data
+                
+                # If data is already a dict, use it directly
+                if isinstance(data, dict):
+                    pass  # Already decoded by websocket assistant
+                else:
+                    # Try to decode compressed/binary frames
+                    import gzip
+                    import zlib
+                    
+                    if isinstance(data, (bytes, bytearray)):
+                        # Try gzip first
+                        try:
+                            text = gzip.decompress(data).decode("utf-8")
+                            data = json.loads(text)
+                        except:
+                            # Try zlib
+                            try:
+                                text = zlib.decompress(data, wbits=16 + zlib.MAX_WBITS).decode("utf-8")
+                                data = json.loads(text)
+                            except:
+                                # Try raw deflate
+                                try:
+                                    text = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode("utf-8")
+                                    data = json.loads(text)
+                                except:
+                                    # Fallback to plain utf-8
+                                    try:
+                                        text = data.decode("utf-8")
+                                        data = json.loads(text)
+                                    except:
+                                        self.logger.error("Unable to decode frame")
+                                        continue
                 
                 # First check if this is a channel message we care about
                 channel = self._channel_originating_message(data)
@@ -150,45 +186,27 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().error("Unexpected error in message processing", exc_info=True)
 
     async def _keep_alive_loop(self, ws: WSAssistant):
-        """
-        Send periodic JSON pings to keep the connection alive.
-        """
         while True:
             try:
                 await asyncio.sleep(self._ping_interval)
                 
-                current_time = time.time()
-                
-                """
-                # Check if we need to reconnect due to no pong
-                if self._last_ping_timestamp > 0:
-                    time_since_ping = current_time - self._last_ping_timestamp
-                    time_since_pong = current_time - self._last_pong_timestamp
-                    
-                    if time_since_ping > self._pong_timeout and time_since_pong > self._pong_timeout:
-                        self.logger().warning(
-                            f"No pong received for {time_since_pong:.1f}s, disconnecting..."
-                        )
-                        await ws.disconnect()
-                        break
-                """
-                
-                # Send JSON ping
-                ping_payload = {"ping": int(current_time * 1000)}
+                # HTX expects this exact format
+                ts = int(time.time() * 1000)
+                ping_payload = {"action": "ping", "data": {"ts": ts}}
                 ping_request = WSJSONRequest(payload=ping_payload)
                 
-                throttler = getattr(self._api_factory, "throttler", None)
-                if throttler is not None:
-                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
-                        await ws.send(request=ping_request)
-                else:
-                    await ws.send(request=ping_request)
-                    
-                self._last_ping_timestamp = current_time
-                self.logger().debug(f"Sent ping at {current_time}")
+                await ws.send(request=ping_request)
                 
-            except asyncio.CancelledError:
-                raise
+                # Don't check for pong timeout - HTX doesn't send explicit pongs
+                # The connection will fail naturally if truly dead
+                now = time.time()
+                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 120:
+                    self.logger.warning(f"No messages received for {now - self._last_pong_timestamp:.0f}s")
+                    if (now - self._last_pong_timestamp) > 180:
+                        self.logger.error("Inactivity threshold exceeded, disconnecting")
+                        await ws.disconnect()
+                        break
+                    
             except Exception as e:
                 self.logger().error(f"Error in keep-alive loop: {e}")
                 break
@@ -364,24 +382,23 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         message_queue.put_nowait(snapshot_msg)
 
-    async def _process_message_for_unknown_channel(
-        self, event_message: Dict[str, Any], websocket_assistant: WSAssistant
-    ):
-        """
-        Handle control messages like ping/pong and subscription confirmations.
-        """
-        self.logger().debug(f"Unknown channel message: {event_message}")
-        # Handle ping/pong
+    async def _process_message_for_unknown_channel(self, event_message: Dict[str, Any], websocket_assistant: WSAssistant):
+        # Server may send ping - respond immediately
         if "ping" in event_message:
-            pong_payload = {"pong": event_message["ping"]}
+            # Echo back the timestamp
+            ts = event_message.get("ping")
+            pong_payload = {"pong": ts} if ts else {"pong": int(time.time() * 1000)}
             pong_request = WSJSONRequest(payload=pong_payload)
             await websocket_assistant.send(request=pong_request)
-            self.logger().debug(f"Responded to ping with pong: {event_message['ping']}")
             return
-            
-        if "pong" in event_message:
-            self._last_pong_timestamp = time.time()
-            self.logger().debug(f"Received pong: {event_message['pong']}")
+        
+        # HTX v2 format
+        action = event_message.get("action")
+        if action == "ping":
+            # Respond with pong echoing the timestamp
+            ts = (event_message.get("data") or {}).get("ts")
+            pong = {"action": "pong", "data": {"ts": ts} if ts else {}}
+            await websocket_assistant.send(WSJSONRequest(payload=pong))
             return
         
         # Handle subscription confirmations and errors
