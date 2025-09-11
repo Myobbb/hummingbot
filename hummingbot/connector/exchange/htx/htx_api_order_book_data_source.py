@@ -61,8 +61,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         connection_params = {
             "ws_url": ws_url,
             "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
-            # If supported by the assistant/underlying client, also disable protocol ping interval
-            "ping_interval": None,
             "message_timeout": 60,
             "ws_headers": {"Accept-Encoding": "gzip"},
             "max_msg_size": 32 * 1024 * 1024,
