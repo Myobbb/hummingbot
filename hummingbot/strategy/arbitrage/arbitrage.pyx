@@ -155,15 +155,6 @@ cdef class ArbitrageStrategy(StrategyBase):
     def tracked_market_orders(self) -> List[Tuple[ExchangeBase, MarketOrder]]:
         return self._sb_order_tracker.tracked_market_orders
 
-    cdef bint c_needs_conversion(self):
-        """Check if conversion is needed - centralized logic"""
-        if not self._use_oracle_conversion_rate:
-            return self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0
-        
-        market_pair = self._market_pairs[0]
-        return (market_pair.first.base_asset != market_pair.second.base_asset or
-                market_pair.first.quote_asset != market_pair.second.quote_asset)
-
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
         # Fast path: no conversion needed
