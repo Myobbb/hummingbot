@@ -26,7 +26,7 @@ from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketPair
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 
-# Constants
+# Constants - Now configurable via init_params
 cdef:
     double DEFAULT_MIN_ORDER_USD = 10.0
     double DEFAULT_RATE_CACHE_DURATION = 10.0
@@ -34,6 +34,10 @@ cdef:
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
     double EPSILON = 1e-10
     double RATE_LOG_INTERVAL = 300.0
+
+# NaN constants for price defaults
+NaN = float("nan")
+s_decimal_nan = Decimal("NaN")
 
 as_logger = None
 
@@ -110,6 +114,7 @@ cdef class ArbitrageStrategy(StrategyBase):
             self._fixed_base_rate = 1.0
             self._fixed_quote_rate = 1.0
         
+        
         # Cache initialization
         self._cached_base_rate = 1.0
         self._cached_quote_rate = 1.0
@@ -157,9 +162,10 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
-        # Fast path: no conversion needed
-        if not self.c_needs_conversion():
-            return 1.0
+        # Fast path: If not using oracle and rates are 1.0, skip all calculations
+        if not self._use_oracle_conversion_rate:
+            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
+                return 1.0
         
         cdef double current_time = self._current_timestamp
         
@@ -175,10 +181,11 @@ cdef class ArbitrageStrategy(StrategyBase):
         if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
             buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
             return 1.0
-        
-        # Fast path: no conversion configured
-        if not self.c_needs_conversion():
-            return 1.0
+            
+        # Fast path: if not using oracle and rates are 1:1
+        if not self._use_oracle_conversion_rate:
+            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
+                return 1.0
         
         cdef double base_conv = 1.0
         cdef double quote_conv = 1.0
@@ -257,8 +264,8 @@ cdef class ArbitrageStrategy(StrategyBase):
                 lines.extend(["", "  Profitability (without fees):"])
                 prof1 = self._current_profitability.first * 100
                 prof2 = self._current_profitability.second * 100
-                lines.append(f"    {market_pair.first.trading_pair} → {market_pair.second.trading_pair}: {prof1:+.4f}%")
-                lines.append(f"    {market_pair.second.trading_pair} → {market_pair.first.trading_pair}: {prof2:+.4f}%")
+                lines.append(f"    {market_pair.first.trading_pair} â†’ {market_pair.second.trading_pair}: {prof1:+.4f}%")
+                lines.append(f"    {market_pair.second.trading_pair} â†’ {market_pair.first.trading_pair}: {prof2:+.4f}%")
 
                 # Show pending orders
                 if self.tracked_limit_orders or self.tracked_market_orders:
@@ -405,12 +412,12 @@ cdef class ArbitrageStrategy(StrategyBase):
                             # Force removal from tracker to unblock trading
                             self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            continue  # Skip to next order
-                        
-                        # Still waiting - warn if delayed
-                        if time_elapsed > self._order_warning_delay:
-                            self.logger().warning(f"Order {order_id} pending for {time_elapsed:.2f}s")
-                        return False
+                            continue  # Skip to next order, don't return False for this timed-out orde
+                        else:
+                            # Still waiting
+                            if time_elapsed > self._order_warning_delay:
+                                self.logger().warning(f"Order {order_id} pending for {time_elapsed:.2f}s")
+                            return False
             
             # Check cool-off period
             if market_tuple in self._last_trade_timestamps:
@@ -437,12 +444,13 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Log if verbose
         if self._logging_options & self.OPTION_LOG_PROFITABILITY_STEP:
             self.logger().debug(
-                f"Profitability: {market_pair.first.trading_pair}→{market_pair.second.trading_pair}: "
+                f"Profitability: {market_pair.first.trading_pair}â†’{market_pair.second.trading_pair}: "
                 f"{self._current_profitability.first:.4%}, "
-                f"{market_pair.second.trading_pair}→{market_pair.first.trading_pair}: "
+                f"{market_pair.second.trading_pair}â†’{market_pair.first.trading_pair}: "
                 f"{self._current_profitability.second:.4%}")
         
         # Execute the more profitable direction immediately
+        # CRITICAL: No delays here - execute as soon as opportunity is spotted
         if self._current_profitability.second > self._current_profitability.first:
             self.c_execute_arbitrage(market_pair.first, market_pair.second)
         else:
@@ -456,14 +464,22 @@ cdef class ArbitrageStrategy(StrategyBase):
             double bid2 = float(market_pair.second.get_price(False))
             double ask2 = float(market_pair.second.get_price(True))
             double conv_rate = 1.0
+            bint needs_conversion = False
             
         # Sanity check - prices must be positive
         if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
             return pair[double, double](0.0, 0.0)
             
-        # Get conversion rate if needed
-        if self.c_needs_conversion():
-            conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+        # Check if conversion is needed
+        if (market_pair.first.quote_asset != market_pair.second.quote_asset or
+            market_pair.first.base_asset != market_pair.second.base_asset):
+            # Only calculate conversion if not using fixed 1:1 rates
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+                needs_conversion = True
+        
+        # Apply conversion only if needed
+        if needs_conversion:
             bid2 *= conv_rate
             ask2 *= conv_rate
         
@@ -476,7 +492,10 @@ cdef class ArbitrageStrategy(StrategyBase):
         return pair[double, double](prof1, prof2)
 
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple):
-        """Execute arbitrage trade"""
+        """
+        Execute arbitrage trade
+
+        """
         cdef:
             tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
             double amount = <double>result[0]
@@ -507,8 +526,17 @@ cdef class ArbitrageStrategy(StrategyBase):
         if volume_usd < self._min_order_usd:
             return
         
+        # Declare all variables before the if block (Cython requirement)
+        cdef double order_start_time
+        cdef object buy_order_type
+        cdef object sell_order_type
+        cdef object buy_price_decimal
+        cdef object sell_price_decimal
+        cdef double placement_latency
+        
         if quantized_amount > Decimal("0"):
-            # Log order creation
+            # Log timing for latency monitoring
+            order_start_time = self._current_timestamp
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                 self.log_with_clock(
                     logging.INFO,
@@ -516,27 +544,44 @@ cdef class ArbitrageStrategy(StrategyBase):
                     f"@ {buy_market.name}, sell @ {sell_market.name}, "
                     f"profitability: {profitability * 100:.2f}%")
             
-            # Place both orders
+            # CRITICAL: Place both orders with minimal latency
+            # The price is passed even for market orders as some connectors use it
+            # to calculate the correct amount (especially for quote currency market orders)
+            
+            # Pre-calculate all parameters to minimize latency between orders
             buy_order_type = buy_market.get_taker_order_type()
             sell_order_type = sell_market.get_taker_order_type()
+            buy_price_decimal = Decimal(str(buy_price))
+            sell_price_decimal = Decimal(str(sell_price))
             
+            # Execute both orders in rapid succession
+            # This is the best we can do in Cython without async support
+            # The actual network calls happen inside the exchange connectors
             buy_order_id = self.c_buy_with_specific_market(
                 buy_market_tuple, quantized_amount,
                 order_type=buy_order_type,
-                price=Decimal(str(buy_price)),
+                price=buy_price_decimal,
                 expiration_seconds=self._next_trade_delay)
             
+            # Immediately place the sell order - minimal delay
             sell_order_id = self.c_sell_with_specific_market(
                 sell_market_tuple, quantized_amount,
                 order_type=sell_order_type,
-                price=Decimal(str(sell_price)),
+                price=sell_price_decimal,
                 expiration_seconds=self._next_trade_delay)
             
             # Track orders
             buy_id_str = buy_order_id.encode('utf-8')
             sell_id_str = sell_order_id.encode('utf-8')
-            self._order_timestamps[buy_id_str] = self._current_timestamp
-            self._order_timestamps[sell_id_str] = self._current_timestamp
+            self._order_timestamps[buy_id_str] = order_start_time
+            self._order_timestamps[sell_id_str] = order_start_time
+            
+            # Log order placement latency for monitoring
+            placement_latency = self._current_timestamp - order_start_time
+            if placement_latency > 0.1:  # Log if latency exceeds 100ms
+                self.logger().warning(
+                    f"High order placement latency detected: {placement_latency:.3f}s. "
+                    f"Consider colocating servers or optimizing network connectivity.")
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - simplified and optimized"""
@@ -550,10 +595,13 @@ cdef class ArbitrageStrategy(StrategyBase):
         # Early exit if no balance
         if buy_quote_balance <= 0 or sell_base_balance <= 0:
             return (0.0, 0.0, 0.0, 0.0)
-        
-        # Get conversion rate if needed
-        if self.c_needs_conversion():
-            conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+            
+        # Get conversion rate only if assets differ
+        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
+            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
+            # Skip if using fixed 1:1 rates
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
         
         # Find profitable orders
         profitable_orders = c_find_profitable_arbitrage_orders(
@@ -636,6 +684,11 @@ cdef class ArbitrageStrategy(StrategyBase):
 
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
+        # Skip logging if rates are exactly 1:1
+        if (fabs(self._cached_base_rate - 1.0) <= EPSILON and 
+            fabs(self._cached_quote_rate - 1.0) <= EPSILON):
+            return
+            
         if fabs(self._cached_base_rate - 1.0) > EPSILON:
             self.logger().info(f"Base conversion rate: {self._cached_base_rate:.6f}")
         if fabs(self._cached_quote_rate - 1.0) > EPSILON:
