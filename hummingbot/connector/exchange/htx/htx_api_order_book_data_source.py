@@ -49,6 +49,15 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._reconnect_attempts = 0
         self._consecutive_1003_closes = 0
 
+        # Tester-inspired liveness tracking
+        self._channel_last_seen_ts: Dict[str, float] = {}
+        self._channel_first_data_seen: set = set()
+        self._channel_stale_reported: set = set()
+        self._last_server_ping_ts: float = 0.0
+        # Per-channel silence thresholds (seconds)
+        self._per_channel_timeout = 45.0
+        self._per_channel_timeout_with_heartbeat = 360.0
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         
@@ -199,6 +208,15 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 if channel:
                     # This is a data message, put it in the appropriate queue
+                    # Update per-channel liveness using the actual channel name from payload
+                    try:
+                        ch_name = data.get("ch")
+                        if ch_name:
+                            self._channel_last_seen_ts[ch_name] = time.time()
+                            self._channel_first_data_seen.add(ch_name)
+                            self._channel_stale_reported.discard(ch_name)
+                    except Exception:
+                        pass
                     self._message_queue[channel].put_nowait(data)
                 else:
                     # Not a recognized channel, handle control messages
@@ -229,6 +247,22 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger.error("Inactivity threshold exceeded, disconnecting")
                     await ws.disconnect()
                     break
+
+                # Per-channel silence warnings (tester behavior)
+                try:
+                    threshold = self._per_channel_timeout
+                    if (now - self._last_server_ping_ts) <= self._per_channel_timeout:
+                        threshold = self._per_channel_timeout_with_heartbeat
+                    for ch_name, ts in list(self._channel_last_seen_ts.items()):
+                        if ch_name in self._channel_first_data_seen and ch_name not in self._channel_stale_reported:
+                            if (now - ts) > threshold:
+                                silent_for = int(now - ts)
+                                self.logger().warning(
+                                    f"per-channel silence detected; ch={ch_name} silent_for={silent_for}s"
+                                )
+                                self._channel_stale_reported.add(ch_name)
+                except Exception:
+                    pass
 
             except Exception as e:
                 self.logger().error(f"Error in keep-alive loop: {e}")
@@ -413,6 +447,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pong_payload = {"pong": ts} if ts else {"pong": int(time.time() * 1000)}
             pong_request = WSJSONRequest(payload=pong_payload)
             await websocket_assistant.send(request=pong_request)
+            # Record last server ping for liveness gating
+            self._last_server_ping_ts = time.time()
             return
         
         # HTX v2 format
@@ -422,6 +458,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             ts = (event_message.get("data") or {}).get("ts")
             pong = {"action": "pong", "data": {"ts": ts} if ts else {}}
             await websocket_assistant.send(WSJSONRequest(payload=pong))
+            self._last_server_ping_ts = time.time()
             return
         
         # Handle subscription confirmations and errors
