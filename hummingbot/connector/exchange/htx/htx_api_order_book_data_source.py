@@ -2,8 +2,6 @@ import asyncio
 import uuid
 import time
 import json
-import gzip
-import zlib
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -41,22 +39,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ping_interval = 30  # Rely on server pings; only monitor liveness
         self._pong_timeout = 10
 
-        # Public WS endpoint rotation (primary AWS, fallback CN)
-        self._ws_urls = [CONSTANTS.WS_PUBLIC_URL, "wss://api.huobi.pro/ws"]
-        self._ws_url_index = 0
-
-        # Reconnect management
+        # Reconnect backoff tracking
         self._reconnect_attempts = 0
-        self._consecutive_1003_closes = 0
 
-        # Tester-inspired liveness tracking
-        self._channel_last_seen_ts: Dict[str, float] = {}
-        self._channel_first_data_seen: set = set()
-        self._channel_stale_reported: set = set()
-        self._last_server_ping_ts: float = 0.0
-        # Per-channel silence thresholds (seconds)
-        self._per_channel_timeout = 45.0
-        self._per_channel_timeout_with_heartbeat = 360.0
+        # No per-channel silence tracking (keep minimal state)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -70,13 +56,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         throttler = getattr(self._api_factory, "throttler", None)
         
-        # IMPORTANT: Set ping_timeout=None to disable protocol-level ping
-        # HTX uses JSON ping/pong, not WebSocket protocol ping/pong
-        # Use current URL in rotation list
-        ws_url = self._ws_urls[self._ws_url_index % len(self._ws_urls)]
+        # IMPORTANT: Disable protocol-level ping; HTX uses JSON ping/pong
+        ws_url = CONSTANTS.WS_PUBLIC_URL
         connection_params = {
             "ws_url": ws_url,
             "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
+            # If supported by the assistant/underlying client, also disable protocol ping interval
+            "ping_interval": None,
             "message_timeout": 60,
             "ws_headers": {"Accept-Encoding": "gzip"},
             "max_msg_size": 32 * 1024 * 1024,
@@ -136,18 +122,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Examine last close code if available
-                try:
-                    last_code = getattr(ws, "last_close_code", None)
-                    if last_code == 1003:
-                        self._consecutive_1003_closes += 1
-                        # Rotate endpoint after each 1003
-                        self._ws_url_index = (self._ws_url_index + 1) % len(self._ws_urls)
-                    else:
-                        self._consecutive_1003_closes = 0
-                except Exception:
-                    pass
-
                 self._reconnect_attempts += 1
                 backoff = min(60.0, 5.0 * (2 ** min(4, self._reconnect_attempts // 3)))
                 self.logger().error(
@@ -168,55 +142,17 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Any message from server proves connection is alive
                 self._last_pong_timestamp = time.time()
                 
-                # HTX may send compressed frames - handle them
+                # Data should already be decompressed/parsed by WS post-processor (gzip) and assistant
                 data = ws_response.data
-                
-                # If data is already a dict, use it directly
-                if isinstance(data, dict):
-                    pass  # Already decoded by websocket assistant
-                else:
-                    # Try to decode compressed/binary frames
-                    import gzip
-                    import zlib
-                    
-                    if isinstance(data, (bytes, bytearray)):
-                        # Try gzip first
-                        try:
-                            text = gzip.decompress(data).decode("utf-8")
-                            data = json.loads(text)
-                        except:
-                            # Try zlib
-                            try:
-                                text = zlib.decompress(data, wbits=16 + zlib.MAX_WBITS).decode("utf-8")
-                                data = json.loads(text)
-                            except:
-                                # Try raw deflate
-                                try:
-                                    text = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode("utf-8")
-                                    data = json.loads(text)
-                                except:
-                                    # Fallback to plain utf-8
-                                    try:
-                                        text = data.decode("utf-8")
-                                        data = json.loads(text)
-                                    except:
-                                        self.logger.error("Unable to decode frame")
-                                        continue
+                if not isinstance(data, dict):
+                    # Ignore non-JSON frames to avoid extra branching here
+                    continue
                 
                 # First check if this is a channel message we care about
                 channel = self._channel_originating_message(data)
                 
                 if channel:
                     # This is a data message, put it in the appropriate queue
-                    # Update per-channel liveness using the actual channel name from payload
-                    try:
-                        ch_name = data.get("ch")
-                        if ch_name:
-                            self._channel_last_seen_ts[ch_name] = time.time()
-                            self._channel_first_data_seen.add(ch_name)
-                            self._channel_stale_reported.discard(ch_name)
-                    except Exception:
-                        pass
                     self._message_queue[channel].put_nowait(data)
                 else:
                     # Not a recognized channel, handle control messages
@@ -226,14 +162,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception:
                 self.logger().error("Unexpected error in message processing", exc_info=True)
-                # If server indicates policy violation (1003), rotate endpoint for next reconnect
-                try:
-                    last_code = getattr(websocket_assistant, "last_close_code", None)
-                    if last_code == 1003:
-                        self._ws_url_index = (self._ws_url_index + 1) % len(self._ws_urls)
-                        self.logger().warning(f"Rotating HTX public WS endpoint due to 1003 close. Next URL index: {self._ws_url_index}")
-                except Exception:
-                    pass
+                # Keep minimal behavior on errors
 
     async def _keep_alive_loop(self, ws: WSAssistant):
         while True:
@@ -248,21 +177,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.disconnect()
                     break
 
-                # Per-channel silence warnings (tester behavior)
-                try:
-                    threshold = self._per_channel_timeout
-                    if (now - self._last_server_ping_ts) <= self._per_channel_timeout:
-                        threshold = self._per_channel_timeout_with_heartbeat
-                    for ch_name, ts in list(self._channel_last_seen_ts.items()):
-                        if ch_name in self._channel_first_data_seen and ch_name not in self._channel_stale_reported:
-                            if (now - ts) > threshold:
-                                silent_for = int(now - ts)
-                                self.logger().warning(
-                                    f"per-channel silence detected; ch={ch_name} silent_for={silent_for}s"
-                                )
-                                self._channel_stale_reported.add(ch_name)
-                except Exception:
-                    pass
+                # Per-channel silence detection disabled for minimal behavior
 
             except Exception as e:
                 self.logger().error(f"Error in keep-alive loop: {e}")
@@ -381,8 +296,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 else:
                     await ws.send(subscribe_trade_request)
                 
-                # Delay before next trading pair
-                await asyncio.sleep(1.0)
+
                 
             self.logger().info("Subscribed to public orderbook and trade channels...")
             
@@ -447,8 +361,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pong_payload = {"pong": ts} if ts else {"pong": int(time.time() * 1000)}
             pong_request = WSJSONRequest(payload=pong_payload)
             await websocket_assistant.send(request=pong_request)
-            # Record last server ping for liveness gating
-            self._last_server_ping_ts = time.time()
+            # Record server ping receipt
             return
         
         # HTX v2 format
@@ -458,7 +371,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             ts = (event_message.get("data") or {}).get("ts")
             pong = {"action": "pong", "data": {"ts": ts} if ts else {}}
             await websocket_assistant.send(WSJSONRequest(payload=pong))
-            self._last_server_ping_ts = time.time()
+            # Record server ping receipt
             return
         
         # Handle subscription confirmations and errors
