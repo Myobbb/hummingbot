@@ -315,13 +315,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 eval_lines = []
                 for t in unique_tuples:
                     a = t.base_asset
-                    if self._buy_in_completed_by_asset.get(a, False):
-                        continue
                     try:
                         bid = float(t.get_price(False))
                         base_bal = float(t.market.c_get_available_balance(t.base_asset))
                         value_quote = base_bal * bid
-                        status = "pending" if value_quote < self._buy_in_target_usd else "completed"
+                        status = "pending" if value_quote < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False) else "completed"
                         eval_lines.append(
                             f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
                     except Exception:
