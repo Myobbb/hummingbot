@@ -332,6 +332,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object best_sell = None
             tuple best_result
             double best_profitability = 0.0
+            dict quote_bal
+            dict base_bal
+            object t
+            list snapshot
+            tuple res
 
         try:
             # Check market readiness
@@ -339,9 +344,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return
 
             # Build per-tuple balance cache
-            cdef dict quote_bal = {}
-            cdef dict base_bal = {}
-            cdef object t
+            quote_bal = {}
+            base_bal = {}
             for mp in self._market_pairs:
                 for t in [mp.first, mp.second]:
                     if t not in quote_bal:
@@ -350,8 +354,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                         base_bal[t] = float(t.market.c_get_available_balance(t.base_asset))
 
             # Evaluate all pairs using cached balances and build snapshot for status
-            cdef list snapshot = []
-            cdef tuple res
+            snapshot = []
             for market_pair in self._market_pairs:
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
                     continue
