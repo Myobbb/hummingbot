@@ -313,24 +313,27 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Buy-in evaluation (debug): match buy-in math per market tuple (base_balance * bid), before completion
             if self._buy_in_enabled:
                 eval_lines = []
+                # Config summary
+                lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"])
                 for t in unique_tuples:
                     a = t.base_asset
+                    # Safe reads; if any read fails, use 0.0 defaults
+                    bid = 0.0
+                    base_bal = 0.0
                     try:
                         bid = float(t.get_price(False))
-                        base_bal = float(t.market.c_get_available_balance(t.base_asset))
-                        value_quote = base_bal * bid
-                        status = "pending" if value_quote < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False) else "completed"
-                        eval_lines.append(
-                            f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
                     except Exception:
-                        pass
-                # Always render a section if buy-in enabled, even if no lines computed
-                lines.append("")
+                        bid = 0.0
+                    try:
+                        base_bal = float(t.market.c_get_available_balance(t.base_asset))
+                    except Exception:
+                        base_bal = 0.0
+                    value_quote = base_bal * bid
+                    status = "pending" if (value_quote < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
+                    eval_lines.append(
+                        f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
                 lines.append("  Buy-in evaluation:")
-                if eval_lines:
-                    lines.extend(eval_lines)
-                else:
-                    lines.append("    (no assets to evaluate or all completed)")
+                lines.extend(eval_lines)
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
