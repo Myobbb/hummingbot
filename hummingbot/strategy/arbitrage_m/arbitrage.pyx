@@ -157,6 +157,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if self._next_trade_delay < 0:
             raise ValueError("next_trade_delay cannot be negative")
 
+    
+
     @property
     def min_profitability(self) -> Decimal:
         return Decimal(str(self._min_profitability))
@@ -422,11 +424,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
             elif self._buy_in_enabled and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
-                for market_pair in self._market_pairs:
-                    if self._buy_in_completed_by_asset.get(market_pair.first.base_asset, False):
-                        continue
-                    if self.c_handle_buy_in(market_pair.first, market_pair.second):
-                        break
+                if any(not self._buy_in_completed_by_asset.get(mp.first.base_asset, False) for mp in self._market_pairs):
+                    for market_pair in self._market_pairs:
+                        if self._buy_in_completed_by_asset.get(market_pair.first.base_asset, False):
+                            continue
+                        if self.c_handle_buy_in(market_pair.first, market_pair.second):
+                            break
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
@@ -807,7 +810,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double current_value_quote = base_bal * last_bid
         if current_value_quote >= self._buy_in_target_usd:
             self._buy_in_completed_by_asset[asset_key] = True
-            pass
             return False
 
         # Require quote balance to spend and a minimal edge
@@ -836,8 +838,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         buy_price = <double>res[3]
 
         if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
-            return False
-        if best_amount <= 0:
             return False
 
         # Place only the buy leg on buy market
@@ -885,7 +885,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         current_value_quote = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
         if current_value_quote >= self._buy_in_target_usd:
             self._buy_in_completed_by_asset[asset_key] = True
-            pass
 
         return True
 
