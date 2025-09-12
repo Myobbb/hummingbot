@@ -287,6 +287,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
             assets_df = self.wallet_balance_data_frame(unique_tuples)
             lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
+            # Build a quick lookup map from the same frame to ensure consistency with what's displayed
+            balance_map = {}
+            try:
+                for rec in assets_df.to_dict("records"):
+                    # Expected columns: Exchange, Asset, Available Balance
+                    exch = str(rec.get("Exchange", ""))
+                    asset_name = str(rec.get("Asset", ""))
+                    avail = rec.get("Available Balance", 0)
+                    try:
+                        balance_map[(exch, asset_name)] = float(avail)
+                    except Exception:
+                        balance_map[(exch, asset_name)] = 0.0
+            except Exception:
+                balance_map = {}
 
             # Profitability snapshot (buy first -> sell second for each ordered pair)
             lines.extend(["", "  Profitability snapshot (without fees):"])
@@ -319,15 +333,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     a = t.base_asset
                     # Safe reads; if any read fails, use 0.0 defaults
                     bid = 0.0
-                    base_bal = 0.0
+                    base_bal = balance_map.get((t.market.name, a), 0.0)
                     try:
                         bid = float(t.get_price(False))
                     except Exception:
                         bid = 0.0
-                    try:
-                        base_bal = float(t.market.c_get_available_balance(t.base_asset))
-                    except Exception:
-                        base_bal = 0.0
                     value_quote = base_bal * bid
                     status = "pending" if (value_quote < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
                     eval_lines.append(
