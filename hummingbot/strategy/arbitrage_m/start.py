@@ -40,7 +40,15 @@ def start(self):
         secondary_to_primary_quote_conversion_rate = arbitrage_m_config_map["secondary_to_primary_quote_conversion_rate"].value
         buy_in_enabled = arbitrage_m_config_map.get("buy_in_enabled").value
         buy_in_target_usdt = arbitrage_m_config_map.get("buy_in_target_usdt").value
-        buy_in_min_profitability = arbitrage_m_config_map.get("buy_in_min_profitability").value / Decimal("100")
+        buy_in_min_profitability_val = arbitrage_m_config_map.get("buy_in_min_profitability").value
+        # Fallbacks when importing older/partial configs
+        if buy_in_enabled is None:
+            buy_in_enabled = True
+        if buy_in_target_usdt is None:
+            buy_in_target_usdt = Decimal("100")
+        if buy_in_min_profitability_val is None:
+            buy_in_min_profitability_val = Decimal("0.5")
+        buy_in_min_profitability = buy_in_min_profitability_val / Decimal("100")
         raw_additional = arbitrage_m_config_map.get("additional_markets").value or ""
         additional = _parse_additional_markets(raw_additional)
         
