@@ -11,8 +11,14 @@ secondary_market: null
 primary_market_trading_pair: null
 secondary_market_trading_pair: null
 
-# Optional: future multi-market extension (list of extra markets)
-# additional_markets: ""
+# Optional: future multi-market extension
+# You may provide either a comma-separated string or a YAML list. Examples:
+# additional_markets: "mexc:SLF-USDT, htx:SLF-USDT"
+# additional_markets:
+#   - "mexc:SLF-USDT"
+#   - "htx:SLF-USDT"
+# If left empty, only the two primary markets are used.
+additional_markets: ""
 
 # Profitability target (%) required to trade
 min_profitability: null

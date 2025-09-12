@@ -7,11 +7,15 @@ from hummingbot.strategy.arbitrage_m.arbitrage import ArbitrageMStrategy
 from hummingbot.strategy.arbitrage_m.arbitrage_config_map import arbitrage_m_config_map
 
 
-def _parse_additional_markets(raw: str) -> List[Tuple[str, str]]:
+def _parse_additional_markets(raw) -> List[Tuple[str, str]]:
     items: List[Tuple[str, str]] = []
     if not raw:
         return items
-    for part in [p.strip() for p in raw.split(",") if p.strip()]:
+    if isinstance(raw, list):
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    for part in parts:
         if ":" not in part:
             continue
         conn, pair = part.split(":", 1)
