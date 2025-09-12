@@ -324,8 +324,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
                     except Exception:
                         pass
+                # Always render a section if buy-in enabled, even if no lines computed
+                lines.append("")
+                lines.append("  Buy-in evaluation:")
                 if eval_lines:
-                    lines.extend(["", "  Buy-in evaluation:"] + eval_lines)
+                    lines.extend(eval_lines)
+                else:
+                    lines.append("    (no assets to evaluate or all completed)")
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
