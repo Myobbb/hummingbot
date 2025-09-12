@@ -283,11 +283,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
             lines.extend(["", "  Profitability snapshot (without fees):"])
             for mp in self._market_pairs:
                 prof = self.c_calculate_profitability(mp)
-                prof_buy_sell = prof.second * 100  # buy first, sell second
+                prof_buy_sell = prof[1] * 100  # buy first, sell second
                 prof_lines.append(
                     f"    buy-{mp.first.market.name} sell-{mp.second.market.name}: {prof_buy_sell:+.4f}%")
-                if prof.second > best_prof:
-                    best_prof = prof.second
+                if prof[1] > best_prof:
+                    best_prof = prof[1]
                     best_pair = mp
 
             if prof_lines:
