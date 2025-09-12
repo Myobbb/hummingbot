@@ -1025,8 +1025,6 @@ cdef list c_find_profitable_arbitrage_orders(
                 ask_price = orig_ask_price
             
             # Early exit conditions
-            if bid_price <= ask_price:
-                break
             if ask_price <= EPSILON:  # Avoid division by zero
                 break
             if bid_price / ask_price < min_prof_threshold:
