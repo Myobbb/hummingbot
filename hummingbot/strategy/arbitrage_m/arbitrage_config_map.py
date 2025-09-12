@@ -78,6 +78,22 @@ def update_oracle_settings(value: str):
         settings.rate_oracle_pairs = []
 
 
+def additional_markets_on_validated(value: str):
+    """Add any connectors from additional_markets into required_exchanges."""
+    if not value:
+        return
+    try:
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        for part in parts:
+            if ":" in part:
+                conn, _pair = part.split(":", 1)
+                conn = conn.strip().lower()
+                if conn:
+                    required_exchanges.add(conn)
+    except Exception:
+        # best-effort; don't block config flow on parse issues
+        pass
+
 arbitrage_m_config_map = {
     "strategy": ConfigVar(
         key="strategy",
@@ -116,9 +132,10 @@ arbitrage_m_config_map = {
     "additional_markets": ConfigVar(
         key="additional_markets",
         prompt=additional_markets_prompt,
-        prompt_on_new=False,
+        prompt_on_new=True,
         default="",
         type_str="str",
+        on_validated=additional_markets_on_validated,
     ),
     "min_profitability": ConfigVar(
         key="min_profitability",
