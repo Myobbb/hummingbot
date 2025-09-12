@@ -310,25 +310,24 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in status (only if enabled and not completed)
+            # Buy-in evaluation (debug): match buy-in math per market tuple (base_balance * bid), before completion
             if self._buy_in_enabled:
-                buyin_lines = []
-                for mp in self._market_pairs:
-                    for t in [mp.first, mp.second]:
-                        asset = t.base_asset
-                        if self._buy_in_completed_by_asset.get(asset, False):
-                            continue
-                        try:
-                            bid = float(t.get_price(False))
-                            base_bal = float(t.market.c_get_available_balance(t.base_asset))
-                            value_quote = base_bal * bid
-                            if value_quote < self._buy_in_target_usd:
-                                buyin_lines.append(
-                                    f"    buy-in pending {asset} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f}")
-                        except Exception:
-                            pass
-                if buyin_lines:
-                    lines.extend(["", "  Buy-in status:"] + buyin_lines)
+                eval_lines = []
+                for t in unique_tuples:
+                    a = t.base_asset
+                    if self._buy_in_completed_by_asset.get(a, False):
+                        continue
+                    try:
+                        bid = float(t.get_price(False))
+                        base_bal = float(t.market.c_get_available_balance(t.base_asset))
+                        value_quote = base_bal * bid
+                        status = "pending" if value_quote < self._buy_in_target_usd else "completed"
+                        eval_lines.append(
+                            f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
+                    except Exception:
+                        pass
+                if eval_lines:
+                    lines.extend(["", "  Buy-in evaluation:"] + eval_lines)
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
