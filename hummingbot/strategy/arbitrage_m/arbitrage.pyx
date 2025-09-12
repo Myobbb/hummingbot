@@ -419,6 +419,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
                 if not self._buy_in_completed_by_asset.get(best_sell.base_asset, False):
                     self.c_handle_buy_in(best_sell, best_buy)
+            elif self._buy_in_enabled and best_buy is None:
+                # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
+                # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
+                for market_pair in self._market_pairs:
+                    if self._buy_in_completed_by_asset.get(market_pair.first.base_asset, False):
+                        continue
+                    if self.c_handle_buy_in(market_pair.first, market_pair.second):
+                        break
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
@@ -825,8 +833,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return False
 
         # Place only the buy leg on buy market
-        cdef object order_type = buy_market_tuple.market.get_taker_order_type()
+        cdef object order_type = market.get_taker_order_type()
         cdef object quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(best_amount)))
+        # Ensure not exceeding available quote after quantization
+        cdef double max_affordable = 0.0
+        if buy_price > 0:
+            max_affordable = float(market.c_get_available_balance(buy_market_tuple.quote_asset)) / buy_price
+        if float(quantized_amount) > max_affordable:
+            quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
         if quantized_amount <= Decimal("0"):
             return False
 
