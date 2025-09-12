@@ -1,7 +1,7 @@
 import asyncio
 import uuid
 import time
-import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -43,17 +43,25 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._reconnect_attempts = 0
 
         # No per-channel silence tracking (keep minimal state)
+        self._suppress_reconnect_logs = False
+
+    def _is_ws_close_code_1003_exception(self, exc: Exception) -> bool:
+        """
+        Return True if the given exception string indicates a WebSocket closed event with code 1003.
+        We match the diagnostic message produced by the shared WS connection layer.
+        """
+        try:
+            text = str(exc)
+        except Exception:
+            return False
+        if "Close code = 1003" in text:
+            return True
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        return bool(match and match.group(1) == "1003")
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        
-        # Add small jitter to avoid connection storms
-        try:
-            import random
-            await asyncio.sleep(0.2 + random.uniform(0.0, 0.4))
-        except Exception:
-            await asyncio.sleep(0.3)
-            
+
         throttler = getattr(self._api_factory, "throttler", None)
         
         # IMPORTANT: Disable protocol-level ping; HTX uses JSON ping/pong
@@ -121,12 +129,16 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception as e:
                 self._reconnect_attempts += 1
-                backoff = min(60.0, 5.0 * (2 ** min(4, self._reconnect_attempts // 3)))
-                self.logger().error(
-                    f"Unexpected error with WebSocket connection. Retrying after {backoff:.0f} seconds... Error: {e}",
-                    exc_info=True
-                )
-                await self._sleep(backoff)
+                # Silence disconnect/reconnect logs for WS close code 1003
+                if not self._is_ws_close_code_1003_exception(e):
+                    self.logger().error(
+                        f"Unexpected error with WebSocket connection. Retrying... Error: {e}",
+                        exc_info=True
+                    )
+                else:
+                    # Flag next subscription cycle to avoid logging reconnection spam
+                    self._suppress_reconnect_logs = True
+                # No backoff; reconnect immediately
             finally:
                 if ws is not None:
                     await ws.disconnect()
@@ -158,7 +170,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
+                # Silence logs for WS close code 1003 and re-raise to allow outer loop to handle reconnection
+                if self._is_ws_close_code_1003_exception(e):
+                    raise
                 self.logger().error("Unexpected error in message processing", exc_info=True)
                 # Keep minimal behavior on errors
 
@@ -171,7 +186,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Only monitor inactivity and recycle the connection if needed.
                 now = time.time()
                 if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 180:
-                    self.logger.error("Inactivity threshold exceeded, disconnecting")
+                    self.logger().error("Inactivity threshold exceeded, disconnecting")
                     await ws.disconnect()
                     break
 
@@ -254,9 +269,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Subscribe to orderbook and trade channels with proper rate limiting.
         """
         try:
-            # Allow connection to settle
-            await asyncio.sleep(0.5)
-            
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 # HTX WS expects lowercase symbols in channel names
@@ -268,7 +280,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 })
                 
-                self.logger().debug(f"Subscribing to orderbook: market.{exchange_symbol}.depth.step0")
+                if not self._suppress_reconnect_logs:
+                    self.logger().debug(f"Subscribing to orderbook: market.{exchange_symbol}.depth.step0")
                 
                 throttler = getattr(self._api_factory, "throttler", None)
                 if throttler is not None:
@@ -276,17 +289,15 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         await ws.send(subscribe_orderbook_request)
                 else:
                     await ws.send(subscribe_orderbook_request)
-                
-                # IMPORTANT: Delay between subscriptions to avoid 1003 error
-                await asyncio.sleep(1.0)
-                
+
                 # Subscribe to trades
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.trade.detail",
                     "id": str(uuid.uuid4())
                 })
                 
-                self.logger().debug(f"Subscribing to trades: market.{exchange_symbol}.trade.detail")
+                if not self._suppress_reconnect_logs:
+                    self.logger().debug(f"Subscribing to trades: market.{exchange_symbol}.trade.detail")
                 
                 if throttler is not None:
                     async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
@@ -295,8 +306,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(subscribe_trade_request)
                 
 
-                
-            self.logger().info("Subscribed to public orderbook and trade channels...")
+            if not self._suppress_reconnect_logs:
+                self.logger().info("Subscribed to public orderbook and trade channels...")
             
         except asyncio.CancelledError:
             raise
@@ -378,6 +389,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if status == "ok" and ("subbed" in event_message or "rep" in event_message):
                 ch = event_message.get("subbed") or event_message.get("rep")
                 if ch:
+                    # Clear suppression once we have a successful subscription ack
+                    if self._suppress_reconnect_logs:
+                        self._suppress_reconnect_logs = False
                     self.logger().debug(f"Successfully subscribed to: {ch}")
                 return
                 
