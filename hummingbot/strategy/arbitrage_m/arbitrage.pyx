@@ -789,7 +789,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         """
         cdef:
             str pair = buy_market_tuple.trading_pair
-            object market = buy_market_tuple.market
+            ExchangeBase market = buy_market_tuple.market #object market = buy_market_tuple.market
             double base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
             double best_amount
@@ -813,7 +813,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Require quote balance to spend and a minimal edge
         if quote_bal <= 0:
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.logger().info(f"Buy-in skipped on {pair}: no quote balance to spend")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: no quote balance to spend")
             return False
 
         # Determine shortfall in quote units, and compute best buy-only amount using both books for price edge
@@ -831,7 +831,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.logger().info(f"Buy-in skipped on {pair}: amount={best_amount:.8f}, prof={best_prof*100:.3f}% < min={self._buy_in_min_profitability*100:.3f}%")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: amount={best_amount:.8f}, prof={best_prof*100:.3f}% < min={self._buy_in_min_profitability*100:.3f}%")
             return False
         if best_amount <= 0:
             return False
@@ -847,7 +847,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
         if quantized_amount <= Decimal("0"):
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.logger().info(f"Buy-in skipped on {pair}: quantized amount is zero after affordability check")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: quantized amount is zero after affordability check")
             return False
 
         buy_order_id = self.c_buy_with_specific_market(
