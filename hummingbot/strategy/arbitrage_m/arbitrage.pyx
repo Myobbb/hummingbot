@@ -389,7 +389,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
                     continue
 
-                best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
+                try:
+                    best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
+                except Exception:
+                    # Order books may not be initialized yet right after start/reload; skip this pair this tick
+                    if should_report:
+                        self.logger().warning(
+                            f"Order books not ready for {market_pair.first.trading_pair} on {market_pair.first.market.name} or {market_pair.second.market.name}; skipping")
+                    continue
                 if best_result[0] <= 0:
                     continue
 
@@ -417,10 +424,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 # and also try the reversed pairing in case that direction offers cheaper buys.
                 if not self._buy_in_completed_by_asset.get(best_buy.base_asset, False):
                     # Attempt with current best direction
-                    self.c_handle_buy_in(best_buy, best_sell)
+                    try:
+                        self.c_handle_buy_in(best_buy, best_sell)
+                    except Exception:
+                        if should_report:
+                            self.logger().warning(
+                                f"Buy-in skipped: order books not ready for {best_buy.trading_pair} or {best_sell.trading_pair}")
                 # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
                 if not self._buy_in_completed_by_asset.get(best_sell.base_asset, False):
-                    self.c_handle_buy_in(best_sell, best_buy)
+                    try:
+                        self.c_handle_buy_in(best_sell, best_buy)
+                    except Exception:
+                        if should_report:
+                            self.logger().warning(
+                                f"Buy-in skipped: order books not ready for {best_sell.trading_pair} or {best_buy.trading_pair}")
             elif self._buy_in_enabled and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
@@ -428,8 +445,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     for market_pair in self._market_pairs:
                         if self._buy_in_completed_by_asset.get(market_pair.first.base_asset, False):
                             continue
-                        if self.c_handle_buy_in(market_pair.first, market_pair.second):
-                            break
+                        try:
+                            if self.c_handle_buy_in(market_pair.first, market_pair.second):
+                                break
+                        except Exception:
+                            if should_report:
+                                self.logger().warning(
+                                    f"Buy-in skipped: order books not ready for {market_pair.first.trading_pair} or {market_pair.second.trading_pair}")
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
