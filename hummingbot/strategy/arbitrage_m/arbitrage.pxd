@@ -33,8 +33,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         dict _last_trade_timestamps
         double _last_cleanup_timestamp
         double _last_conv_rates_logged
-        # Cached profitability snapshot for status
-        list _last_prof_snapshot
         
         # Conversion configuration
         bint _use_oracle_conversion_rate
@@ -71,11 +69,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
-    cdef tuple c_find_best_profitable_amount_cached(self,
-                                                    object buy_market_tuple,
-                                                    object sell_market_tuple,
-                                                    double buy_quote_balance,
-                                                    double sell_base_balance)
     
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *

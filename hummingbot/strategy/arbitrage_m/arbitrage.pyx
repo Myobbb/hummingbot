@@ -122,7 +122,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Profitability tracking
         self._current_profitability = pair[double, double](0.0, 0.0)
-        self._last_prof_snapshot = []
         
         # Notifications
         self._hb_app_notification = hb_app_notification
@@ -280,14 +279,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
             assets_df = self.wallet_balance_data_frame(unique_tuples)
             lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
 
-            # Profitability snapshot (buy first -> sell second), using cached snapshot
+            # Profitability snapshot (buy first -> sell second for each ordered pair)
             lines.extend(["", "  Profitability snapshot (without fees):"])
-            for prof_val, mp in self._last_prof_snapshot:
-                prof_buy_sell = prof_val * 100
+            for mp in self._market_pairs:
+                prof = self.c_calculate_profitability(mp)
+                prof_buy_sell = prof[1] * 100  # buy first, sell second
                 prof_lines.append(
                     f"    buy-{mp.first.market.name} sell-{mp.second.market.name}: {prof_buy_sell:+.4f}%")
-                if prof_val > best_prof:
-                    best_prof = prof_val
+                if prof[1] > best_prof:
+                    best_prof = prof[1]
                     best_pair = mp
 
             if prof_lines:
@@ -332,51 +332,25 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object best_sell = None
             tuple best_result
             double best_profitability = 0.0
-            dict quote_bal
-            dict base_bal
-            object t
-            list snapshot
-            tuple res
 
         try:
             # Check market readiness
             if not self.c_check_markets_ready(should_report):
                 return
 
-            # Build per-tuple balance cache
-            quote_bal = {}
-            base_bal = {}
-            for mp in self._market_pairs:
-                for t in [mp.first, mp.second]:
-                    if t not in quote_bal:
-                        quote_bal[t] = float(t.market.c_get_available_balance(t.quote_asset))
-                    if t not in base_bal:
-                        base_bal[t] = float(t.market.c_get_available_balance(t.base_asset))
-
-            # Evaluate all pairs using cached balances and build snapshot for status
-            snapshot = []
+            # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
                     continue
 
-                res = self.c_find_best_profitable_amount_cached(
-                    market_pair.first,
-                    market_pair.second,
-                    <double>quote_bal.get(market_pair.first, 0.0),
-                    <double>base_bal.get(market_pair.second, 0.0)
-                )
-                if res[0] <= 0:
+                best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
+                if best_result[0] <= 0:
                     continue
-                snapshot.append((res[1], market_pair))
 
-                if res[1] > best_profitability:
-                    best_profitability = <double>res[1]
+                if best_result[1] > best_profitability:
+                    best_profitability = <double>best_result[1]
                     best_buy = market_pair.first
                     best_sell = market_pair.second
-
-            # Keep top N for status
-            snapshot.sort(key=lambda x: x[0], reverse=True)
-            self._last_prof_snapshot = snapshot[:12]
 
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
@@ -733,66 +707,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
             return (total_base, profitability, avg_bid_orig, avg_ask)
         
-        return (0.0, 0.0, 0.0, 0.0)
-
-    cdef tuple c_find_best_profitable_amount_cached(self,
-                                                    object buy_market_tuple,
-                                                    object sell_market_tuple,
-                                                    double buy_quote_balance,
-                                                    double sell_base_balance):
-        """Same as c_find_best_profitable_amount but reuses provided balances."""
-        cdef:
-            double conv_rate = 1.0
-
-        if buy_quote_balance <= 0 or sell_base_balance <= 0:
-            return (0.0, 0.0, 0.0, 0.0)
-
-        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
-            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
-                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
-
-        profitable_orders = c_find_profitable_arbitrage_orders(
-            self._min_profitability,
-            buy_market_tuple,
-            sell_market_tuple,
-            1.0,
-            conv_rate)
-
-        if not profitable_orders:
-            return (0.0, 0.0, 0.0, 0.0)
-
-        cdef:
-            double total_base = 0.0
-            double total_cost = 0.0
-            double total_proceeds = 0.0
-            double total_proceeds_orig = 0.0
-            double bid_adj, ask_adj, orig_bid, orig_ask, amount
-            double remaining_quote, remaining_base
-
-        for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
-            remaining_quote = buy_quote_balance - total_cost
-            remaining_base = sell_base_balance - total_base
-            if remaining_quote <= EPSILON or remaining_base <= EPSILON:
-                break
-            if ask_adj > 0:
-                amount = min(amount, remaining_quote / ask_adj, remaining_base)
-            else:
-                amount = min(amount, remaining_base)
-            if amount <= EPSILON:
-                continue
-            total_base += amount
-            total_cost += ask_adj * amount
-            total_proceeds += bid_adj * amount
-            total_proceeds_orig += orig_bid * amount
-
-        if total_base > EPSILON and total_cost > EPSILON:
-            avg_bid_adj = total_proceeds / total_base
-            avg_bid_orig = total_proceeds_orig / total_base
-            avg_ask = total_cost / total_base
-            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
-            return (total_base, profitability, avg_bid_orig, avg_ask)
-
         return (0.0, 0.0, 0.0, 0.0)
 
     cdef void c_cleanup_old_orders(self):
