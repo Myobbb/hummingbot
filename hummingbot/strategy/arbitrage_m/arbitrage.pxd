@@ -75,6 +75,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef c_process_market_pair(self, object market_pair)
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple)
     cdef void c_log_buy_in_status_once(self)
+    cdef tuple c_find_best_buyin_amount(self,
+                                        object buy_market_tuple,
+                                        object sell_market_tuple,
+                                        double buy_quote_balance,
+                                        double max_spend_quote)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
