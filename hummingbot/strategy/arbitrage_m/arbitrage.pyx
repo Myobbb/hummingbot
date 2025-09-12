@@ -836,8 +836,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         buy_price = <double>res[3]
 
         if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: amount={best_amount:.8f}, prof={best_prof*100:.3f}% < min={self._buy_in_min_profitability*100:.3f}%")
             return False
         if best_amount <= 0:
             return False
