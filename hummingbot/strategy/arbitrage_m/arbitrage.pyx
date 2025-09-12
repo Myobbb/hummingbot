@@ -136,7 +136,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._buy_in_enabled = buy_in_enabled
         self._buy_in_target_usd = buy_in_target_usd
         self._buy_in_min_profitability = buy_in_min_profitability
-        self._buy_in_completed_by_pair = {}
+        self._buy_in_completed_by_asset = {}
+        self._buy_in_initial_logged_by_asset = {}
+        self._buy_in_completion_logged_by_asset = {}
         
         # Validate and add markets
         self._validate_configuration()
@@ -347,6 +349,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if not self.c_check_markets_ready(should_report):
                 return
 
+            # Log initial buy-in status once per base asset if enabled
+            if self._buy_in_enabled:
+                self.c_log_buy_in_status_once()
+
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
@@ -363,18 +369,22 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
-                # If buy-in is enabled, allow buy to proceed when base below target and profit >= buy-in threshold
                 if self._buy_in_enabled:
-                    if self.c_handle_buy_in(best_buy, best_sell):
-                        # buy-in executed; skip regular arbitrage this tick
-                        pass
+                    # Quick skip if buy-in already completed for this base asset (zero overhead)
+                    if not self._buy_in_completed_by_asset.get(best_buy.base_asset, False):
+                        if self.c_handle_buy_in(best_buy, best_sell):
+                            # buy-in executed; skip regular arbitrage this tick
+                            pass
+                        else:
+                            self.c_execute_arbitrage(best_buy, best_sell)
                     else:
                         self.c_execute_arbitrage(best_buy, best_sell)
                 else:
                     self.c_execute_arbitrage(best_buy, best_sell)
             elif self._buy_in_enabled and best_buy is not None and best_sell is not None:
                 # Not enough edge for normal arbitrage, but check buy-in threshold separately
-                if best_profitability >= self._buy_in_min_profitability:
+                if (best_profitability >= self._buy_in_min_profitability and
+                    not self._buy_in_completed_by_asset.get(best_buy.base_asset, False)):
                     self.c_handle_buy_in(best_buy, best_sell)
 
             # Periodic maintenance
@@ -732,7 +742,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple):
         """
-        If base asset holdings on buy_market_tuple are below target (in quote units), place a market buy
+        If base asset holdings on buy_market_tuple are below target (in that market's quote units), place a taker buy
         using the same amount-finding logic as arbitrage execution, gated by a separate buy-in profitability.
         Returns True if a buy-in was placed; False otherwise.
         """
@@ -746,22 +756,33 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double sell_price
             double buy_price
             tuple res
+            str asset_key = buy_market_tuple.base_asset
 
-        if pair in self._buy_in_completed_by_pair and self._buy_in_completed_by_pair[pair]:
+        if asset_key in self._buy_in_completed_by_asset and self._buy_in_completed_by_asset[asset_key]:
             return False
 
-        # Evaluate current base value vs target (approx using last price)
+        # Evaluate current base value vs target (approx using current bid; units: quote asset of buy market)
         cdef double last_bid = float(buy_market_tuple.get_price(False))
-        cdef double current_value_usd = base_bal * last_bid
-        if current_value_usd >= self._buy_in_target_usd:
-            self._buy_in_completed_by_pair[pair] = True
+        cdef double current_value_quote = base_bal * last_bid
+        if current_value_quote >= self._buy_in_target_usd:
+            self._buy_in_completed_by_asset[asset_key] = True
+            if not self._buy_in_completion_logged_by_asset.get(asset_key, False):
+                self.logger().info(f"Buy-in target reached for {asset_key}: value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f}")
+                self._buy_in_completion_logged_by_asset[asset_key] = True
             return False
 
         # Require quote balance to spend and a minimal edge
         if quote_bal <= 0:
             return False
 
-        res = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
+        # Determine shortfall in quote units, and compute best buy-only amount using both books for price edge
+        cdef double shortfall = max(self._buy_in_target_usd - current_value_quote, 0.0)
+        res = self.c_find_best_buyin_amount(
+            buy_market_tuple,
+            sell_market_tuple,
+            quote_bal,
+            shortfall
+        )
         best_amount = <double>res[0]
         best_prof = <double>res[1]
         sell_price = <double>res[2]
@@ -769,11 +790,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
             return False
-
-        # Adjust amount to not exceed target shortfall
-        cdef double shortfall = max(self._buy_in_target_usd - current_value_usd, 0.0)
-        if buy_price > 0:
-            best_amount = min(best_amount, shortfall / buy_price)
         if best_amount <= 0:
             return False
 
@@ -795,11 +811,105 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
         # Check if target reached after placing
-        current_value_usd = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
-        if current_value_usd >= self._buy_in_target_usd:
-            self._buy_in_completed_by_pair[pair] = True
+        # Refresh bid for completion check
+        last_bid = float(buy_market_tuple.get_price(False))
+        current_value_quote = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
+        if current_value_quote >= self._buy_in_target_usd:
+            self._buy_in_completed_by_asset[asset_key] = True
+            if not self._buy_in_completion_logged_by_asset.get(asset_key, False):
+                self.logger().info(f"Buy-in target reached for {asset_key}: value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f}")
+                self._buy_in_completion_logged_by_asset[asset_key] = True
 
         return True
+
+    cdef tuple c_find_best_buyin_amount(self,
+                                        object buy_market_tuple,
+                                        object sell_market_tuple,
+                                        double buy_quote_balance,
+                                        double max_spend_quote):
+        """
+        Compute best buy-only amount using cross-market price edge, ignoring sell-side base balance limits.
+        Caps spend by both available quote balance and provided max_spend_quote.
+        Returns (amount_base, profitability, avg_sell_price_orig, avg_buy_price).
+        """
+        cdef:
+            double conv_rate = 1.0
+            double spend_cap = min(buy_quote_balance, max_spend_quote)
+        if spend_cap <= EPSILON:
+            return (0.0, 0.0, 0.0, 0.0)
+
+        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
+            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+
+        profitable_orders = c_find_profitable_arbitrage_orders(
+            self._min_profitability,
+            buy_market_tuple,
+            sell_market_tuple,
+            1.0,
+            conv_rate)
+
+        if not profitable_orders:
+            return (0.0, 0.0, 0.0, 0.0)
+
+        cdef:
+            double total_base = 0.0
+            double total_cost = 0.0
+            double total_proceeds = 0.0
+            double total_proceeds_orig = 0.0
+            double bid_adj, ask_adj, orig_bid, orig_ask, amount
+            double remaining_quote
+
+        for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
+            remaining_quote = spend_cap - total_cost
+            if remaining_quote <= EPSILON:
+                break
+            if ask_adj > 0:
+                amount = min(amount, remaining_quote / ask_adj)
+            if amount <= EPSILON:
+                continue
+            total_base += amount
+            total_cost += ask_adj * amount
+            total_proceeds += bid_adj * amount
+            total_proceeds_orig += orig_bid * amount
+
+        if total_base > EPSILON and total_cost > EPSILON:
+            avg_bid_adj = total_proceeds / total_base
+            avg_bid_orig = total_proceeds_orig / total_base
+            avg_ask = total_cost / total_base
+            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
+            return (total_base, profitability, avg_bid_orig, avg_ask)
+
+        return (0.0, 0.0, 0.0, 0.0)
+
+    cdef void c_log_buy_in_status_once(self):
+        """Log initial buy-in status once per base asset (value vs target)."""
+        cdef object t
+        cdef str asset
+        cdef double bid
+        cdef double base_bal
+        cdef double value_quote
+        for mp in self._market_pairs:
+            for t in [mp.first, mp.second]:
+                asset = t.base_asset
+                if self._buy_in_initial_logged_by_asset.get(asset, False):
+                    continue
+                if self._buy_in_completed_by_asset.get(asset, False):
+                    # already met elsewhere, mark as logged to avoid noise
+                    self._buy_in_initial_logged_by_asset[asset] = True
+                    continue
+                try:
+                    bid = float(t.get_price(False))
+                    base_bal = float(t.market.c_get_available_balance(t.base_asset))
+                    value_quote = base_bal * bid
+                    if value_quote < self._buy_in_target_usd:
+                        self.logger().info(
+                            f"Buy-in pending for {asset}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f}")
+                    self._buy_in_initial_logged_by_asset[asset] = True
+                except Exception:
+                    # don't block tick on logging
+                    self._buy_in_initial_logged_by_asset[asset] = True
 
     cdef void c_cleanup_old_orders(self):
         """Clean up old order tracking data"""
