@@ -411,10 +411,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 else:
                     self.c_execute_arbitrage(best_buy, best_sell)
             elif self._buy_in_enabled and best_buy is not None and best_sell is not None:
-                # Not enough edge for normal arbitrage, but check buy-in threshold separately
-                if (best_profitability >= self._buy_in_min_profitability and
-                    not self._buy_in_completed_by_asset.get(best_buy.base_asset, False)):
+                # Not enough edge for normal arbitrage. Still try buy-in using its own threshold,
+                # and also try the reversed pairing in case that direction offers cheaper buys.
+                if not self._buy_in_completed_by_asset.get(best_buy.base_asset, False):
+                    # Attempt with current best direction
                     self.c_handle_buy_in(best_buy, best_sell)
+                # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
+                if not self._buy_in_completed_by_asset.get(best_sell.base_asset, False):
+                    self.c_handle_buy_in(best_sell, best_buy)
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
@@ -868,8 +872,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
                 conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
 
+        # Use buy-in profitability threshold here (not the main arbitrage threshold)
         profitable_orders = c_find_profitable_arbitrage_orders(
-            self._min_profitability,
+            self._buy_in_min_profitability,
             buy_market_tuple,
             sell_market_tuple,
             1.0,
