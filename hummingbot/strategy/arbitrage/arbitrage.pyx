@@ -28,7 +28,7 @@ from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 
 # Constants - Now configurable via init_params
 cdef:
-    double DEFAULT_MIN_ORDER_USD = 10.0
+    double DEFAULT_MIN_ORDER_USD = 15.0
     double DEFAULT_RATE_CACHE_DURATION = 10.0
     double DEFAULT_ORDER_WARNING_DELAY = 10.0
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000

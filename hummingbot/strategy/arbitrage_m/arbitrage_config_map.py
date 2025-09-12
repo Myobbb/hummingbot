@@ -100,6 +100,31 @@ arbitrage_m_config_map = {
         prompt="",
         default="arbitrage_m"
     ),
+    # Optional buy-in module
+    "buy_in_enabled": ConfigVar(
+        key="buy_in_enabled",
+        type_str="bool",
+        prompt="Enable initial buy-in if base asset holdings are below target? (Yes/No)",
+        prompt_on_new=True,
+        default=True,
+        validator=lambda v: validate_bool(v),
+    ),
+    "buy_in_target_usdt": ConfigVar(
+        key="buy_in_target_usdt",
+        prompt="Target base asset value to accumulate (in quote units, e.g., USDT) >>> ",
+        prompt_on_new=True,
+        default=Decimal("100"),
+        validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
+        type_str="decimal",
+    ),
+    "buy_in_min_profitability": ConfigVar(
+        key="buy_in_min_profitability",
+        prompt="Minimum cross-market edge (%) required to trigger buy-in (e.g., 0.5) >>> ",
+        prompt_on_new=True,
+        default=Decimal("0.5"),
+        validator=lambda v: validate_decimal(v, Decimal(-100), Decimal("100"), inclusive=True),
+        type_str="decimal",
+    ),
     "primary_market": ConfigVar(
         key="primary_market",
         prompt="Enter your primary spot connector >>> ",

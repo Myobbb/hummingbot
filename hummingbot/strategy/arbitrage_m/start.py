@@ -34,6 +34,9 @@ def start(self):
         use_oracle_conversion_rate = arbitrage_m_config_map.get("use_oracle_conversion_rate").value
         secondary_to_primary_base_conversion_rate = arbitrage_m_config_map["secondary_to_primary_base_conversion_rate"].value
         secondary_to_primary_quote_conversion_rate = arbitrage_m_config_map["secondary_to_primary_quote_conversion_rate"].value
+        buy_in_enabled = arbitrage_m_config_map.get("buy_in_enabled").value
+        buy_in_target_usdt = arbitrage_m_config_map.get("buy_in_target_usdt").value
+        buy_in_min_profitability = arbitrage_m_config_map.get("buy_in_min_profitability").value / Decimal("100")
         raw_additional = arbitrage_m_config_map.get("additional_markets").value or ""
         additional = _parse_additional_markets(raw_additional)
         
@@ -105,7 +108,11 @@ def start(self):
             use_oracle_conversion_rate=use_oracle_conversion_rate,
             secondary_to_primary_base_conversion_rate=secondary_to_primary_base_conversion_rate,
             secondary_to_primary_quote_conversion_rate=secondary_to_primary_quote_conversion_rate,
-            hb_app_notification=True
+            hb_app_notification=True,
+            # buy-in params
+            buy_in_enabled=bool(buy_in_enabled),
+            buy_in_target_usd=float(buy_in_target_usdt),
+            buy_in_min_profitability=float(buy_in_min_profitability)
         )
         
         self.logger().info(f"arbitrage_m started with {len(tuples)} markets and {len(market_pairs)} ordered pairs")

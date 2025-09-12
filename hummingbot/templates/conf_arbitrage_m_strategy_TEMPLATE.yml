@@ -24,5 +24,10 @@ use_oracle_conversion_rate: null
 secondary_to_primary_base_conversion_rate: null
 secondary_to_primary_quote_conversion_rate: null
 
+# Optional buy-in module
+buy_in_enabled: null
+buy_in_target_usdt: null
+buy_in_min_profitability: null
+
 # For details, see docs for arbitrage; arbitrage_m behaves the same initially
 

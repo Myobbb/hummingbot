@@ -46,6 +46,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Current profitability
         pair[double, double] _current_profitability
+        # Buy-in params/state
+        bint _buy_in_enabled
+        double _buy_in_target_usd
+        double _buy_in_min_profitability
+        dict _buy_in_completed_by_pair  # key: trading_pair -> bool
         
         # Notifications
         bint _hb_app_notification
@@ -66,6 +71,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     
     # Trading logic
     cdef c_process_market_pair(self, object market_pair)
+    cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)

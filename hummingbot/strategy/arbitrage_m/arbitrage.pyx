@@ -28,7 +28,7 @@ from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 
 # Constants - Now configurable via init_params
 cdef:
-    double DEFAULT_MIN_ORDER_USD = 10.0
+    double DEFAULT_MIN_ORDER_USD = 15.0
     double DEFAULT_RATE_CACHE_DURATION = 10.0
     double DEFAULT_ORDER_WARNING_DELAY = 10.0
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
@@ -76,7 +76,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     min_order_usd: float = DEFAULT_MIN_ORDER_USD,
                     rate_cache_duration: float = DEFAULT_RATE_CACHE_DURATION,
                     order_warning_delay: float = DEFAULT_ORDER_WARNING_DELAY,
-                    max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS):
+                    max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
+                    buy_in_enabled: bool = True,
+                    buy_in_target_usd: float = 100.0,
+                    buy_in_min_profitability: float = 0.005):
         """Initialize arbitrage strategy with configurable parameters"""
         
         if not market_pairs:
@@ -128,6 +131,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Clear order tracking
         self._order_timestamps.clear()
+
+        # Buy-in params/state
+        self._buy_in_enabled = buy_in_enabled
+        self._buy_in_target_usd = buy_in_target_usd
+        self._buy_in_min_profitability = buy_in_min_profitability
+        self._buy_in_completed_by_pair = {}
         
         # Validate and add markets
         self._validate_configuration()
@@ -354,7 +363,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
-                self.c_execute_arbitrage(best_buy, best_sell)
+                # If buy-in is enabled, allow buy to proceed when base below target and profit >= buy-in threshold
+                if self._buy_in_enabled:
+                    if self.c_handle_buy_in(best_buy, best_sell):
+                        # buy-in executed; skip regular arbitrage this tick
+                        pass
+                    else:
+                        self.c_execute_arbitrage(best_buy, best_sell)
+                else:
+                    self.c_execute_arbitrage(best_buy, best_sell)
+            elif self._buy_in_enabled and best_buy is not None and best_sell is not None:
+                # Not enough edge for normal arbitrage, but check buy-in threshold separately
+                if best_profitability >= self._buy_in_min_profitability:
+                    self.c_handle_buy_in(best_buy, best_sell)
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
@@ -708,6 +729,77 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return (total_base, profitability, avg_bid_orig, avg_ask)
         
         return (0.0, 0.0, 0.0, 0.0)
+
+    cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple):
+        """
+        If base asset holdings on buy_market_tuple are below target (in quote units), place a market buy
+        using the same amount-finding logic as arbitrage execution, gated by a separate buy-in profitability.
+        Returns True if a buy-in was placed; False otherwise.
+        """
+        cdef:
+            str pair = buy_market_tuple.trading_pair
+            object market = buy_market_tuple.market
+            double base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
+            double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
+            double best_amount
+            double best_prof
+            double sell_price
+            double buy_price
+            tuple res
+
+        if pair in self._buy_in_completed_by_pair and self._buy_in_completed_by_pair[pair]:
+            return False
+
+        # Evaluate current base value vs target (approx using last price)
+        cdef double last_bid = float(buy_market_tuple.get_price(False))
+        cdef double current_value_usd = base_bal * last_bid
+        if current_value_usd >= self._buy_in_target_usd:
+            self._buy_in_completed_by_pair[pair] = True
+            return False
+
+        # Require quote balance to spend and a minimal edge
+        if quote_bal <= 0:
+            return False
+
+        res = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
+        best_amount = <double>res[0]
+        best_prof = <double>res[1]
+        sell_price = <double>res[2]
+        buy_price = <double>res[3]
+
+        if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
+            return False
+
+        # Adjust amount to not exceed target shortfall
+        cdef double shortfall = max(self._buy_in_target_usd - current_value_usd, 0.0)
+        if buy_price > 0:
+            best_amount = min(best_amount, shortfall / buy_price)
+        if best_amount <= 0:
+            return False
+
+        # Place only the buy leg on buy market
+        cdef object order_type = buy_market_tuple.market.get_taker_order_type()
+        cdef object quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(best_amount)))
+        if quantized_amount <= Decimal("0"):
+            return False
+
+        buy_order_id = self.c_buy_with_specific_market(
+            buy_market_tuple,
+            quantized_amount,
+            order_type=order_type,
+            price=Decimal(str(buy_price)),
+            expiration_seconds=self._next_trade_delay)
+
+        # Track order timestamp for housekeeping
+        cdef string buy_id_str = buy_order_id.encode('utf-8')
+        self._order_timestamps[buy_id_str] = self._current_timestamp
+
+        # Check if target reached after placing
+        current_value_usd = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
+        if current_value_usd >= self._buy_in_target_usd:
+            self._buy_in_completed_by_pair[pair] = True
+
+        return True
 
     cdef void c_cleanup_old_orders(self):
         """Clean up old order tracking data"""
