@@ -249,39 +249,67 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef:
             list lines = []
             list warning_lines = []
-            
+            list unique_tuples = []
+            set seen_keys = set()
+            object t
+            object mp
+            tuple prof
+            double prof_buy_sell
+            double best_prof = -1.0
+            object best_pair = None
+            list prof_lines = []
+            tuple key
+
         try:
-            for market_pair in self._market_pairs:
-                warning_lines.extend(self.network_warning([market_pair.first, market_pair.second]))
+            # Aggregate unique market tuples across all ordered pairs
+            for mp in self._market_pairs:
+                for t in [mp.first, mp.second]:
+                    key = (t.market.name, t.trading_pair)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        unique_tuples.append(t)
 
-                markets_df = self.market_status_data_frame([market_pair.first, market_pair.second])
-                lines.extend(["", "  Markets:"] + ["    " + line for line in str(markets_df).split("\n")])
+            # Warnings for network and balances
+            warning_lines.extend(self.network_warning(unique_tuples))
 
-                assets_df = self.wallet_balance_data_frame([market_pair.first, market_pair.second])
-                lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
+            # Markets and assets snapshots
+            markets_df = self.market_status_data_frame(unique_tuples)
+            lines.extend(["", "  Markets:"] + ["    " + line for line in str(markets_df).split("\n")])
 
-                # Show profitability
-                lines.extend(["", "  Profitability (without fees):"])
-                # Direction 1: buy from second, sell to first
-                prof1 = self._current_profitability.first * 100
-                # Direction 2: buy from first, sell to second
-                prof2 = self._current_profitability.second * 100
+            assets_df = self.wallet_balance_data_frame(unique_tuples)
+            lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
+
+            # Profitability snapshot (buy first -> sell second for each ordered pair)
+            lines.extend(["", "  Profitability snapshot (without fees):"])
+            for mp in self._market_pairs:
+                prof = self.c_calculate_profitability(mp)
+                prof_buy_sell = prof.second * 100  # buy first, sell second
+                prof_lines.append(
+                    f"    buy-{mp.first.market.name} sell-{mp.second.market.name}: {prof_buy_sell:+.4f}%")
+                if prof.second > best_prof:
+                    best_prof = prof.second
+                    best_pair = mp
+
+            if prof_lines:
+                # Limit output if too many pairs
+                max_lines = 12
+                lines.extend(prof_lines[:max_lines])
+                if len(prof_lines) > max_lines:
+                    lines.append(f"    ... and {len(prof_lines) - max_lines} more pairs")
+
+            if best_pair is not None:
                 lines.append(
-                    f"    buy-{market_pair.second.market.name} sell-{market_pair.first.market.name}: {prof1:+.4f}%"
-                )
-                lines.append(
-                    f"    buy-{market_pair.first.market.name} sell-{market_pair.second.market.name}: {prof2:+.4f}%"
-                )
+                    f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-                # Show pending orders
-                if self.tracked_limit_orders or self.tracked_market_orders:
-                    lines.extend(["", "  Pending orders:"])
-                    total = len(self.tracked_limit_orders) + len(self.tracked_market_orders)
-                    lines.append(f"    Total: {total}")
-                else:
-                    lines.extend(["", "  No pending orders."])
+            # Pending orders
+            if self.tracked_limit_orders or self.tracked_market_orders:
+                lines.extend(["", "  Pending orders:"])
+                total = len(self.tracked_limit_orders) + len(self.tracked_market_orders)
+                lines.append(f"    Total: {total}")
+            else:
+                lines.extend(["", "  No pending orders."])
 
-                warning_lines.extend(self.balance_warning([market_pair.first, market_pair.second]))
+            warning_lines.extend(self.balance_warning(unique_tuples))
 
             if warning_lines:
                 lines.extend(["", "  *** WARNINGS ***"] + warning_lines)
