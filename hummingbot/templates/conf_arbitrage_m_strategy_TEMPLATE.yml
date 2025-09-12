@@ -1,0 +1,28 @@
+########################################
+###   Arbitrage_m strategy config     ###
+########################################
+
+template_version: 1
+strategy: null
+
+# Required parameters (backward-compatible with 2-market mode)
+primary_market: null
+secondary_market: null
+primary_market_trading_pair: null
+secondary_market_trading_pair: null
+
+# Optional: future multi-market extension (list of extra markets)
+# additional_markets: ""
+
+# Profitability target (%) required to trade
+min_profitability: null
+
+# Whether to use rate oracle on unmatched trading pairs
+use_oracle_conversion_rate: null
+
+# Fixed conversion rates when oracle is disabled
+secondary_to_primary_base_conversion_rate: null
+secondary_to_primary_quote_conversion_rate: null
+
+# For details, see docs for arbitrage; arbitrage_m behaves the same initially
+

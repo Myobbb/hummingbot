@@ -23,7 +23,7 @@ from hummingbot.core.data_type.market_order import MarketOrder
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.strategy.strategy_base import StrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
-from hummingbot.strategy.arbitrage.arbitrage_market_pair import ArbitrageMarketPair
+from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 
 # Constants - Now configurable via init_params
@@ -42,7 +42,7 @@ s_decimal_nan = Decimal("NaN")
 as_logger = None
 
 
-cdef class ArbitrageStrategy(StrategyBase):
+cdef class ArbitrageMStrategy(StrategyBase):
     """
     Optimized arbitrage strategy with clean, uniform implementation.
     Uses doubles internally for performance, converts to Decimal only for external APIs.
@@ -63,7 +63,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         return as_logger
 
     def init_params(self,
-                    market_pairs: List[ArbitrageMarketPair],
+                    market_pairs: List[ArbitrageMMarketPair],
                     min_profitability: Decimal,
                     logging_options: int = OPTION_LOG_ORDER_COMPLETED,
                     status_report_interval: float = 60.0,
@@ -292,7 +292,7 @@ cdef class ArbitrageStrategy(StrategyBase):
         return "\n".join(lines)
 
     cdef c_tick(self, double timestamp):
-        """Main strategy tick - simplified and optimized"""
+        """Main strategy tick - scan all ordered pairs and execute the best one"""
         StrategyBase.c_tick(self, timestamp)
 
         cdef:
@@ -300,27 +300,45 @@ cdef class ArbitrageStrategy(StrategyBase):
             int64_t last_tick = <int64_t>(self._last_timestamp // self._status_report_interval)
             bint should_report = ((current_tick > last_tick) and
                                   (self._logging_options & self.OPTION_LOG_STATUS_REPORT))
-        
+            object best_buy = None
+            object best_sell = None
+            tuple best_result
+            double best_profitability = 0.0
+
         try:
             # Check market readiness
             if not self.c_check_markets_ready(should_report):
                 return
-            
-            # Process each market pair
+
+            # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
-                self.c_process_market_pair(market_pair)
-            
+                if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
+                    continue
+
+                best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
+                if best_result[0] <= 0:
+                    continue
+
+                if best_result[1] > best_profitability:
+                    best_profitability = <double>best_result[1]
+                    best_buy = market_pair.first
+                    best_sell = market_pair.second
+
+            # Execute only the globally best profitable opportunity
+            if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
+                self.c_execute_arbitrage(best_buy, best_sell)
+
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
                 self.c_cleanup_old_orders()
                 self._last_cleanup_timestamp = timestamp
-                
+
             # Log conversion rates periodically if using oracle
             if (self._use_oracle_conversion_rate and 
                 timestamp - self._last_conv_rates_logged > RATE_LOG_INTERVAL):
                 self.c_log_conversion_rates()
                 self._last_conv_rates_logged = timestamp
-                
+
         finally:
             self._last_timestamp = timestamp
 
