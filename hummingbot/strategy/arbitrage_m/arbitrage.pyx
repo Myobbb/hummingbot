@@ -818,6 +818,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Determine shortfall in quote units, and compute best buy-only amount using both books for price edge
         cdef double shortfall = max(self._buy_in_target_usd - current_value_quote, 0.0)
+        # If the remaining shortfall is below the minimum order notional, consider buy-in complete
+        if shortfall > 0 and shortfall < self._min_order_usd:
+            self._buy_in_completed_by_asset[asset_key] = True
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: shortfall {shortfall:.6f} < min notional {self._min_order_usd:.6f}")
+            return False
         res = self.c_find_best_buyin_amount(
             buy_market_tuple,
             sell_market_tuple,
@@ -848,6 +854,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if quantized_amount <= Decimal("0"):
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: quantized amount is zero after affordability check")
+            return False
+
+        # Enforce minimum notional like normal arbitrage orders
+        cdef double volume_usd = float(quantized_amount) * buy_price
+        if volume_usd < self._min_order_usd:
+            # If we cannot place a valid minimum-size order and the remaining shortfall is under min notional,
+            # mark buy-in as complete to avoid retrying tiny remainders.
+            if shortfall < self._min_order_usd:
+                self._buy_in_completed_by_asset[asset_key] = True
+                if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                    self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: remaining notional {shortfall:.6f} < min {self._min_order_usd:.6f}")
+                return False
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
             return False
 
         buy_order_id = self.c_buy_with_specific_market(
