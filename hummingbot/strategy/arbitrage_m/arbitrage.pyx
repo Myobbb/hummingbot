@@ -137,8 +137,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._buy_in_target_usd = buy_in_target_usd
         self._buy_in_min_profitability = buy_in_min_profitability
         self._buy_in_completed_by_asset = {}
-        self._buy_in_initial_logged_by_asset = {}
-        self._buy_in_completion_logged_by_asset = {}
         
         # Validate and add markets
         self._validate_configuration()
@@ -312,6 +310,26 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
+            # Buy-in status (only if enabled and not completed)
+            if self._buy_in_enabled:
+                buyin_lines = []
+                for mp in self._market_pairs:
+                    for t in [mp.first, mp.second]:
+                        asset = t.base_asset
+                        if self._buy_in_completed_by_asset.get(asset, False):
+                            continue
+                        try:
+                            bid = float(t.get_price(False))
+                            base_bal = float(t.market.c_get_available_balance(t.base_asset))
+                            value_quote = base_bal * bid
+                            if value_quote < self._buy_in_target_usd:
+                                buyin_lines.append(
+                                    f"    buy-in pending {asset} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f}")
+                        except Exception:
+                            pass
+                if buyin_lines:
+                    lines.extend(["", "  Buy-in status:"] + buyin_lines)
+
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
                 lines.extend(["", "  Pending orders:"])
@@ -348,10 +366,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Check market readiness
             if not self.c_check_markets_ready(should_report):
                 return
-
-            # Log initial buy-in status once per base asset if enabled
-            if self._buy_in_enabled:
-                self.c_log_buy_in_status_once()
 
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
@@ -766,9 +780,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double current_value_quote = base_bal * last_bid
         if current_value_quote >= self._buy_in_target_usd:
             self._buy_in_completed_by_asset[asset_key] = True
-            if not self._buy_in_completion_logged_by_asset.get(asset_key, False):
-                self.logger().info(f"Buy-in target reached for {asset_key}: value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f}")
-                self._buy_in_completion_logged_by_asset[asset_key] = True
+            pass
             return False
 
         # Require quote balance to spend and a minimal edge
@@ -816,9 +828,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         current_value_quote = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
         if current_value_quote >= self._buy_in_target_usd:
             self._buy_in_completed_by_asset[asset_key] = True
-            if not self._buy_in_completion_logged_by_asset.get(asset_key, False):
-                self.logger().info(f"Buy-in target reached for {asset_key}: value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f}")
-                self._buy_in_completion_logged_by_asset[asset_key] = True
+            pass
 
         return True
 
@@ -883,33 +893,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         return (0.0, 0.0, 0.0, 0.0)
 
-    cdef void c_log_buy_in_status_once(self):
-        """Log initial buy-in status once per base asset (value vs target)."""
-        cdef object t
-        cdef str asset
-        cdef double bid
-        cdef double base_bal
-        cdef double value_quote
-        for mp in self._market_pairs:
-            for t in [mp.first, mp.second]:
-                asset = t.base_asset
-                if self._buy_in_initial_logged_by_asset.get(asset, False):
-                    continue
-                if self._buy_in_completed_by_asset.get(asset, False):
-                    # already met elsewhere, mark as logged to avoid noise
-                    self._buy_in_initial_logged_by_asset[asset] = True
-                    continue
-                try:
-                    bid = float(t.get_price(False))
-                    base_bal = float(t.market.c_get_available_balance(t.base_asset))
-                    value_quote = base_bal * bid
-                    if value_quote < self._buy_in_target_usd:
-                        self.logger().info(
-                            f"Buy-in pending for {asset}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f}")
-                    self._buy_in_initial_logged_by_asset[asset] = True
-                except Exception:
-                    # don't block tick on logging
-                    self._buy_in_initial_logged_by_asset[asset] = True
+    
 
     cdef void c_cleanup_old_orders(self):
         """Clean up old order tracking data"""

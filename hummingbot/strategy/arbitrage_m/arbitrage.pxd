@@ -51,8 +51,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         double _buy_in_target_usd
         double _buy_in_min_profitability
         dict _buy_in_completed_by_asset  # key: base_asset -> bool
-        dict _buy_in_initial_logged_by_asset  # key: base_asset -> bool
-        dict _buy_in_completion_logged_by_asset  # key: base_asset -> bool
         
         # Notifications
         bint _hb_app_notification
@@ -74,7 +72,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
     # Trading logic
     cdef c_process_market_pair(self, object market_pair)
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple)
-    cdef void c_log_buy_in_status_once(self)
     cdef tuple c_find_best_buyin_amount(self,
                                         object buy_market_tuple,
                                         object sell_market_tuple,

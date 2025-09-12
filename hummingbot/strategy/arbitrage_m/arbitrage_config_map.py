@@ -83,8 +83,18 @@ def additional_markets_on_validated(value: str):
     if not value:
         return
     try:
-        parts = [p.strip() for p in value.split(",") if p.strip()]
-        for part in parts:
+        # Accept list-like strings (e.g., "['mexc:SLF-USDT', 'htx:SLF-USDT']") or comma-separated strings
+        if isinstance(value, list):
+            iterable = value
+        else:
+            s = str(value).strip()
+            if s.startswith("[") and s.endswith("]"):
+                # naive split for list-like repr
+                s = s.strip("[]")
+                iterable = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
+            else:
+                iterable = [x.strip() for x in s.split(",") if x.strip()]
+        for part in iterable:
             if ":" in part:
                 conn, _pair = part.split(":", 1)
                 conn = conn.strip().lower()
