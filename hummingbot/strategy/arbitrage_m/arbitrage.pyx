@@ -104,6 +104,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # State tracking
         self._all_markets_ready = False
         self._last_timestamp = 0
+        self._status_debounce_until = 0
         self._last_trade_timestamps = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
@@ -373,7 +374,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             int64_t current_tick = <int64_t>(timestamp // self._status_report_interval)
             int64_t last_tick = <int64_t>(self._last_timestamp // self._status_report_interval)
             bint should_report = ((current_tick > last_tick) and
-                                  (self._logging_options & self.OPTION_LOG_STATUS_REPORT))
+                                  (self._logging_options & self.OPTION_LOG_STATUS_REPORT) and
+                                  (timestamp >= self._status_debounce_until))
             object best_buy = None
             object best_sell = None
             tuple best_result
@@ -477,6 +479,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return False
             elif should_report:
                 self.logger().info("Markets ready. Trading started.")
+                # Debounce status logs for a short window to let connectors settle
+                self._status_debounce_until = self._current_timestamp + 2.0
         
         # Check network status
         for market in self._sb_markets:
@@ -740,6 +744,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
             double sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
             double conv_rate = 1.0
+            double approx_buy_ask = 0.0
+            double approx_sell_bid = 0.0
+            double capacity_limit = 0.0
+            double capacity_left
             
         # Early exit if no balance
         if buy_quote_balance <= 0 or sell_base_balance <= 0:
@@ -752,6 +760,35 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
                 conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
         
+        # Compute quantization-aware capacity limits up-front to pre-filter unsellable opportunities
+        try:
+            approx_buy_ask = float(buy_market_tuple.get_price(True))
+        except Exception:
+            approx_buy_ask = 0.0
+        try:
+            approx_sell_bid = float(sell_market_tuple.get_price(False))
+        except Exception:
+            approx_sell_bid = 0.0
+
+        # Cap by actual sell-side base (quantized)
+        cdef object sell_cap_q_dec = sell_market.c_quantize_order_amount(
+            sell_market_tuple.trading_pair,
+            Decimal(str(max(0.0, sell_base_balance - 1e-12))))
+        capacity_limit = float(sell_cap_q_dec) if sell_cap_q_dec is not None else 0.0
+
+        # Cap by buy-side quote affordability (quantized)
+        if approx_buy_ask > 0 and buy_quote_balance > 0:
+            cdef double buy_aff_base = buy_quote_balance / approx_buy_ask
+            cdef object buy_cap_q_dec = buy_market.c_quantize_order_amount(
+                buy_market_tuple.trading_pair,
+                Decimal(str(max(0.0, buy_aff_base - 1e-12))))
+            if buy_cap_q_dec is not None:
+                capacity_limit = min(capacity_limit, float(buy_cap_q_dec)) if capacity_limit > 0 else float(buy_cap_q_dec)
+
+        # If no capacity remains after caps, skip early
+        if capacity_limit <= EPSILON:
+            return (0.0, 0.0, 0.0, 0.0)
+
         # Find profitable orders
         profitable_orders = c_find_profitable_arbitrage_orders(
             self._min_profitability,
@@ -763,7 +800,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
         
-        # Calculate best amount considering balances
+        # Calculate best amount considering balances and capacity caps
         cdef:
             double total_base = 0.0
             double total_cost = 0.0
@@ -771,6 +808,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
             double remaining_quote, remaining_base
+        capacity_left = capacity_limit
             
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             # Calculate remaining capacity
@@ -781,11 +819,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if remaining_quote <= EPSILON or remaining_base <= EPSILON:
                 break
                 
-            # Adjust amount to available capacity
+            # Adjust amount to available capacity and quantized caps
             if ask_adj > 0:
-                amount = min(amount, remaining_quote / ask_adj, remaining_base)
+                amount = min(amount, remaining_quote / ask_adj, remaining_base, capacity_left)
             else:
-                amount = min(amount, remaining_base)
+                amount = min(amount, remaining_base, capacity_left)
                 
             if amount <= EPSILON:
                 continue
@@ -795,6 +833,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
             total_proceeds_orig += orig_bid * amount
+            capacity_left -= amount
+            if capacity_left <= EPSILON:
+                break
         
         # Calculate results
         if total_base > EPSILON and total_cost > EPSILON:
@@ -802,6 +843,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             avg_bid_orig = total_proceeds_orig / total_base
             avg_ask = total_cost / total_base
             profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
+            # Optional early min-notional filter here (use sell side as reference)
+            if approx_sell_bid > 0 and (total_base * approx_sell_bid) < self._min_order_usd:
+                return (0.0, 0.0, 0.0, 0.0)
             return (total_base, profitability, avg_bid_orig, avg_ask)
         
         return (0.0, 0.0, 0.0, 0.0)
