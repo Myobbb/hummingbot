@@ -748,6 +748,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double approx_sell_bid = 0.0
             double capacity_limit = 0.0
             double capacity_left
+            double buy_aff_base
+            object sell_cap_q_dec
+            object buy_cap_q_dec
             
         # Early exit if no balance
         if buy_quote_balance <= 0 or sell_base_balance <= 0:
@@ -771,15 +774,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
             approx_sell_bid = 0.0
 
         # Cap by actual sell-side base (quantized)
-        cdef object sell_cap_q_dec = sell_market.c_quantize_order_amount(
+        sell_cap_q_dec = sell_market.c_quantize_order_amount(
             sell_market_tuple.trading_pair,
             Decimal(str(max(0.0, sell_base_balance - 1e-12))))
         capacity_limit = float(sell_cap_q_dec) if sell_cap_q_dec is not None else 0.0
 
         # Cap by buy-side quote affordability (quantized)
         if approx_buy_ask > 0 and buy_quote_balance > 0:
-            cdef double buy_aff_base = buy_quote_balance / approx_buy_ask
-            cdef object buy_cap_q_dec = buy_market.c_quantize_order_amount(
+            buy_aff_base = buy_quote_balance / approx_buy_ask
+            buy_cap_q_dec = buy_market.c_quantize_order_amount(
                 buy_market_tuple.trading_pair,
                 Decimal(str(max(0.0, buy_aff_base - 1e-12))))
             if buy_cap_q_dec is not None:
