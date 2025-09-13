@@ -47,17 +47,18 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def _is_ws_close_code_1003_exception(self, exc: Exception) -> bool:
         """
-        Return True if the given exception string indicates a WebSocket closed event with code 1003.
-        We match the diagnostic message produced by the shared WS connection layer.
+        Return True if the given exception string indicates a WebSocket closed event with code 1000 or 1003.
+        We match the diagnostic message produced by the shared WS connection layer. Treat 1000 (normal closure)
+        and 1003 (unsupported data / policy) as expected reconnect scenarios to avoid noisy error logs.
         """
         try:
             text = str(exc)
         except Exception:
             return False
-        if "Close code = 1003" in text:
+        if "Close code = 1000" in text or "Close code = 1003" in text:
             return True
         match = re.search(r"Close code\s*=\s*(\d+)", text)
-        return bool(match and match.group(1) == "1003")
+        return bool(match and match.group(1) in {"1000", "1003"})
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
