@@ -671,8 +671,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         dec_amount = Decimal(str(amount))
         
         # Quantize amounts
-        quantized_buy = buy_market.c_quantize_order_amount(buy_market_tuple.trading_pair, dec_amount)
-        quantized_sell = sell_market.c_quantize_order_amount(sell_market_tuple.trading_pair, dec_amount)
+        # Use connector Python API for quantization to support all exchanges
+        quantized_buy = buy_market.quantize_order_amount(buy_market_tuple.trading_pair, dec_amount)
+        quantized_sell = sell_market.quantize_order_amount(sell_market_tuple.trading_pair, dec_amount)
         quantized_amount = min(quantized_buy, quantized_sell)
         
         # Check minimum order size
@@ -836,14 +837,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
             capacity = min(capacity, buy_quote_balance / approx_ask)
         
         # Apply sell-side quantization
-        quantized = sell_market_tuple.market.c_quantize_order_amount(
+        quantized = sell_market_tuple.market.quantize_order_amount(
             sell_market_tuple.trading_pair,
             Decimal(str(max(0.0, capacity - 1e-12))))
         capacity = float(quantized) if quantized else 0.0
         
         # Apply buy-side quantization
         if capacity > 0:
-            quantized = buy_market_tuple.market.c_quantize_order_amount(
+            quantized = buy_market_tuple.market.quantize_order_amount(
                 buy_market_tuple.trading_pair,
                 Decimal(str(max(0.0, capacity - 1e-12))))
             capacity = float(quantized) if quantized else 0.0
@@ -910,13 +911,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Place only the buy leg on buy market
         cdef object order_type = market.get_taker_order_type()
-        cdef object quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(best_amount)))
+        cdef object quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(best_amount)))
         # Ensure not exceeding available quote after quantization
         cdef double max_affordable = 0.0
         if buy_price > 0:
             max_affordable = float(market.c_get_available_balance(buy_market_tuple.quote_asset)) / buy_price
         if float(quantized_amount) > max_affordable:
-            quantized_amount = market.c_quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
+            quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
         if quantized_amount <= Decimal("0"):
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: quantized amount is zero after affordability check")
@@ -986,7 +987,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double buy_cap_base = 0.0
         if approx_ask > 0.0 and spend_cap > 0.0:
             buy_cap_base = spend_cap / approx_ask
-            q = buy_market_tuple.market.c_quantize_order_amount(
+            q = buy_market_tuple.market.quantize_order_amount(
                 buy_market_tuple.trading_pair,
                 Decimal(str(max(0.0, buy_cap_base - 1e-12))))
             if q is not None:
