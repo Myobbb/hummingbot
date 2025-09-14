@@ -168,6 +168,7 @@ arbitrage_m_config_map = {
         key="additional_markets",
         prompt=additional_markets_prompt,
         prompt_on_new=True,
+        required_if=lambda: False,
         default="",
         type_str="str",
         on_validated=additional_markets_on_validated,
