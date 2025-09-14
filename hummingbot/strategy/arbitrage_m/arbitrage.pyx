@@ -738,24 +738,62 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     f"High order placement latency detected: {placement_latency:.3f}s. "
                     f"Consider colocating servers or optimizing network connectivity.")
 
+    cdef pair[bint, double] c_top_of_book_profitable_get_conv(self,
+                                                              object buy_market_tuple,
+                                                              object sell_market_tuple,
+                                                              double min_profitability):
+        """Top-of-book gate. Returns (is_profitable, sell->buy conv_rate)."""
+        cdef:
+            double min_prof_threshold = 1.0 + min_profitability
+            double top_bid
+            double top_ask
+            double top_bid_adj
+            double top_ask_adj
+            double conv_rate = 1.0
+            bint needs_conversion = False
+        try:
+            if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
+                buy_market_tuple.base_asset != sell_market_tuple.base_asset):
+                if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                    conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+                    needs_conversion = True
+            top_bid = float(sell_market_tuple.get_price(False))
+            top_ask = float(buy_market_tuple.get_price(True))
+            if top_bid <= 0 or top_ask <= 0:
+                return pair[bint, double](False, conv_rate)
+            if needs_conversion:
+                top_bid_adj = top_bid * conv_rate
+                top_ask_adj = top_ask  # buy side conversion is 1.0 per amount-finder convention
+            else:
+                top_bid_adj = top_bid
+                top_ask_adj = top_ask
+            if top_bid_adj / top_ask_adj < min_prof_threshold:
+                return pair[bint, double](False, conv_rate)
+            return pair[bint, double](True, conv_rate)
+        except Exception:
+            return pair[bint, double](False, 1.0)
+
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - clean and optimized"""
         cdef:
             ExchangeBase buy_market = buy_market_tuple.market
             ExchangeBase sell_market = sell_market_tuple.market
-            double buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
-            double sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+            double buy_quote_balance
+            double sell_base_balance
             double conv_rate = 1.0
-        
         # Early exit if no balance
+        buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+        sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
         
-        # Get conversion rate once
-        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
-            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
-                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+        # Early uniform gate: skip deeper work if top-of-book fails, and reuse conv_rate
+        gate_res = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, self._min_profitability)
+        if not gate_res.first:
+            return (0.0, 0.0, 0.0, 0.0)
+        conv_rate = gate_res.second
+
+        # conv_rate already obtained from top-of-book gate
         
         # Calculate capacity limits once
         cdef double max_base_amount = self._calculate_capacity_limit(
@@ -853,12 +891,60 @@ cdef class ArbitrageMStrategy(StrategyBase):
  
  
  
+    cdef void c_maybe_disable_buy_in(self):
+        """Disable buy-in globally once all base assets across market pairs are completed."""
+        cdef:
+            set unique_bases = set()
+            object mp
+        for mp in self._market_pairs:
+            unique_bases.add(mp.first.base_asset)
+            unique_bases.add(mp.second.base_asset)
+        for a in unique_bases:
+            if not self._buy_in_completed_by_asset.get(a, False):
+                return
+        if self._buy_in_enabled:
+            self._buy_in_enabled = False
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.log_with_clock(logging.INFO, "Buy-in completed for all assets. Disabling buy-in.")
+
+    cdef pair[double, double] c_compute_value_and_shortfall(self,
+                                                           double base_balance,
+                                                           double last_bid):
+        """Return (current_value_quote, shortfall)."""
+        cdef double current_value_quote = base_balance * last_bid
+        cdef double shortfall = 0.0
+        if current_value_quote < self._buy_in_target_usd:
+            shortfall = self._buy_in_target_usd - current_value_quote
+        else:
+            shortfall = 0.0
+        return pair[double, double](current_value_quote, shortfall)
+
+    cdef bint c_try_mark_complete_buy_in(self,
+                                         str asset_key,
+                                         str pair,
+                                         double current_value_quote,
+                                         double shortfall):
+        """Mark asset buy-in as completed if at target or remaining < min notional."""
+        if current_value_quote >= self._buy_in_target_usd:
+            self._buy_in_completed_by_asset[asset_key] = True
+            self.c_maybe_disable_buy_in()
+            return True
+        if shortfall > 0 and shortfall < self._min_order_usd:
+            self._buy_in_completed_by_asset[asset_key] = True
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: shortfall {shortfall:.6f} < min notional {self._min_order_usd:.6f}")
+            self.c_maybe_disable_buy_in()
+            return True
+        return False
+
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple):
         """
         If base asset holdings on buy_market_tuple are below target (in that market's quote units), place a taker buy
         using the same amount-finding logic as arbitrage execution, gated by a separate buy-in profitability.
         Returns True if a buy-in was placed; False otherwise.
         """
+        if not self._buy_in_enabled:
+            return False
         cdef:
             str pair = buy_market_tuple.trading_pair
             ExchangeBase market = buy_market_tuple.market #object market = buy_market_tuple.market
@@ -874,11 +960,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if asset_key in self._buy_in_completed_by_asset and self._buy_in_completed_by_asset[asset_key]:
             return False
 
-        # Evaluate current base value vs target (approx using current bid; units: quote asset of buy market)
+        # Evaluate progress vs target and early complete
         cdef double last_bid = float(buy_market_tuple.get_price(False))
-        cdef double current_value_quote = base_bal * last_bid
-        if current_value_quote >= self._buy_in_target_usd:
-            self._buy_in_completed_by_asset[asset_key] = True
+        cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
+        cdef double current_value_quote = val_short.first
+        cdef double shortfall = val_short.second
+        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
             return False
 
         # Require quote balance to spend and a minimal edge
@@ -887,13 +974,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: no quote balance to spend")
             return False
 
-        # Determine shortfall in quote units, and compute best buy-only amount using both books for price edge
-        cdef double shortfall = max(self._buy_in_target_usd - current_value_quote, 0.0)
-        # If the remaining shortfall is below the minimum order notional, consider buy-in complete
-        if shortfall > 0 and shortfall < self._min_order_usd:
-            self._buy_in_completed_by_asset[asset_key] = True
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: shortfall {shortfall:.6f} < min notional {self._min_order_usd:.6f}")
+        # If the remaining shortfall is below the minimum order notional, consider buy-in complete (uniform)
+        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
             return False
         res = self.c_find_best_buyin_amount(
             buy_market_tuple,
@@ -926,12 +1008,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Enforce minimum notional like normal arbitrage orders
         cdef double volume_usd = float(quantized_amount) * buy_price
         if volume_usd < self._min_order_usd:
-            # If we cannot place a valid minimum-size order and the remaining shortfall is under min notional,
-            # mark buy-in as complete to avoid retrying tiny remainders.
-            if shortfall < self._min_order_usd:
-                self._buy_in_completed_by_asset[asset_key] = True
-                if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                    self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: remaining notional {shortfall:.6f} < min {self._min_order_usd:.6f}")
+            # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
+            if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
                 return False
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
@@ -948,12 +1026,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef string buy_id_str = buy_order_id.encode('utf-8')
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
-        # Check if target reached after placing
-        # Refresh bid for completion check
+        # Check if target reached after placing (uniform)
         last_bid = float(buy_market_tuple.get_price(False))
-        current_value_quote = float(market.c_get_available_balance(buy_market_tuple.base_asset)) * last_bid
-        if current_value_quote >= self._buy_in_target_usd:
-            self._buy_in_completed_by_asset[asset_key] = True
+        base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
+        val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
+        current_value_quote = val_short.first
+        shortfall = val_short.second
+        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
+            pass
+            self.c_maybe_disable_buy_in()
 
         return True
 
@@ -973,10 +1054,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if spend_cap <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
 
-        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
-            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
-                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+        # Early uniform gate for buy-in; reuse conv_rate
+        gate_res2 = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, self._buy_in_min_profitability)
+        if not gate_res2.first:
+            return (0.0, 0.0, 0.0, 0.0)
+        conv_rate = gate_res2.second
+
+        # conv_rate already obtained from top-of-book gate
 
         # Determine an upper bound on base we might buy given spend_cap and quantization on buy side
         cdef double approx_ask = 0.0
@@ -1106,7 +1190,7 @@ cdef list c_find_profitable_arbitrage_orders(
         
     #  Top-of-book profitability check
     try:
-        # Peek at top prices without consuming iterators
+        # Peek at top prices without consuming iterators #not strictly needed
         top_bid = float(sell_market_tuple.get_price(False))
         top_ask = float(buy_market_tuple.get_price(True))
         
