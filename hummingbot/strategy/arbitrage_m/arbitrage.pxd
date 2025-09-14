@@ -78,6 +78,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                         object sell_market_tuple,
                                         double buy_quote_balance,
                                         double max_spend_quote)
+    cdef void c_maybe_disable_buy_in(self)
+    cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
+                                                             object buy_market_tuple,
+                                                             object sell_market_tuple,
+                                                             double min_profitability)
+    cdef pair[double, double] c_compute_value_and_shortfall(self,
+                                                            double base_balance,
+                                                            double last_bid)
+    cdef bint c_try_mark_complete_buy_in(self,
+                                         str asset_key,
+                                         str pair,
+                                         double current_value_quote,
+                                         double shortfall)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)

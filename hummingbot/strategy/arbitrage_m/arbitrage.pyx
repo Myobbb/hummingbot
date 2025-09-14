@@ -738,7 +738,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     f"High order placement latency detected: {placement_latency:.3f}s. "
                     f"Consider colocating servers or optimizing network connectivity.")
 
-    cdef pair[bint, double] c_top_of_book_profitable_get_conv(self,
+    cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                               object buy_market_tuple,
                                                               object sell_market_tuple,
                                                               double min_profitability):
@@ -760,7 +760,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             top_bid = float(sell_market_tuple.get_price(False))
             top_ask = float(buy_market_tuple.get_price(True))
             if top_bid <= 0 or top_ask <= 0:
-                return pair[bint, double](False, conv_rate)
+                return pair[int, double](False, conv_rate)
             if needs_conversion:
                 top_bid_adj = top_bid * conv_rate
                 top_ask_adj = top_ask  # buy side conversion is 1.0 per amount-finder convention
@@ -768,10 +768,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 top_bid_adj = top_bid
                 top_ask_adj = top_ask
             if top_bid_adj / top_ask_adj < min_prof_threshold:
-                return pair[bint, double](False, conv_rate)
-            return pair[bint, double](True, conv_rate)
+                return pair[int, double](False, conv_rate)
+            return pair[int, double](True, conv_rate)
         except Exception:
-            return pair[bint, double](False, 1.0)
+            return pair[int, double](False, 1.0)
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - clean and optimized"""
