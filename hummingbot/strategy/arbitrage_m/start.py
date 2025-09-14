@@ -11,10 +11,17 @@ def _parse_additional_markets(raw) -> List[Tuple[str, str]]:
     items: List[Tuple[str, str]] = []
     if not raw:
         return items
+    # Treat placeholder values as empty/skip
+    try:
+        s = str(raw).strip()
+    except Exception:
+        s = ""
+    if s in {"-", ""}:
+        return items
     if isinstance(raw, list):
-        parts = [str(p).strip() for p in raw if str(p).strip()]
+        parts = [str(p).strip() for p in raw if str(p).strip() and str(p).strip() != "-"]
     else:
-        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+        parts = [p.strip() for p in str(raw).split(",") if p.strip() and p.strip() != "-"]
     for part in parts:
         if ":" not in part:
             continue
