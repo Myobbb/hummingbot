@@ -393,11 +393,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
                 try:
                     best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
-                except Exception:
+                except Exception as e:
                     # Order books may not be initialized yet right after start/reload; skip this pair this tick
                     if should_report:
                         self.logger().warning(
-                            f"Order books not ready for {market_pair.first.trading_pair} on {market_pair.first.market.name} or {market_pair.second.market.name}; skipping")
+                            f"Order books not ready for {market_pair.first.trading_pair} on {market_pair.first.market.name} or {market_pair.second.market.name}; skipping (err={e})",
+                            exc_info=True)
                     continue
                 if best_result[0] <= 0:
                     continue
@@ -1128,10 +1129,10 @@ cdef list c_find_profitable_arbitrage_orders(
         overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
     # Now scan the books
-    bid_it = sell_market_tuple.order_book_bid_entries()
-    ask_it = buy_market_tuple.order_book_ask_entries()
-    
     try:
+        bid_it = sell_market_tuple.order_book_bid_entries()
+        ask_it = buy_market_tuple.order_book_ask_entries()
+        
         current_bid = next(bid_it)
         current_ask = next(ask_it)
         bid_leftover = float(current_bid.amount)
@@ -1191,5 +1192,7 @@ cdef list c_find_profitable_arbitrage_orders(
                 
     except StopIteration:
         pass  # End of order book
+    except Exception:
+        return []  # Iterator creation/advancement failed (e.g., books not ready)
     
     return profitable_orders
