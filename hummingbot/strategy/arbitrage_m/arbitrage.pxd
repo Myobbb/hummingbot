@@ -96,4 +96,6 @@ cdef list c_find_profitable_arbitrage_orders(
     object buy_market_tuple,
     object sell_market_tuple,
     double buy_conversion_rate,
-    double sell_conversion_rate)
+    double sell_conversion_rate,
+    double target_base_amount=0.0,
+    double overshoot_ratio=0.05)

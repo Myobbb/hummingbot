@@ -737,122 +737,120 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     f"Consider colocating servers or optimizing network connectivity.")
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
-        """Find best profitable amount - simplified and optimized"""
+        """Find best profitable amount - clean and optimized"""
         cdef:
             ExchangeBase buy_market = buy_market_tuple.market
             ExchangeBase sell_market = sell_market_tuple.market
             double buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
             double sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
             double conv_rate = 1.0
-            double approx_buy_ask = 0.0
-            double approx_sell_bid = 0.0
-            double capacity_limit = 0.0
-            double capacity_left
-            double buy_aff_base
-            object sell_cap_q_dec
-            object buy_cap_q_dec
-            
+        
         # Early exit if no balance
-        if buy_quote_balance <= 0 or sell_base_balance <= 0:
+        if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
-            
-        # Get conversion rate only if assets differ
+        
+        # Get conversion rate once
         if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
             buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            # Skip if using fixed 1:1 rates
             if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
                 conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
         
-        # Compute quantization-aware capacity limits up-front to pre-filter unsellable opportunities
-        try:
-            approx_buy_ask = float(buy_market_tuple.get_price(True))
-        except Exception:
-            approx_buy_ask = 0.0
-        try:
-            approx_sell_bid = float(sell_market_tuple.get_price(False))
-        except Exception:
-            approx_sell_bid = 0.0
-
-        # Cap by actual sell-side base (quantized)
-        sell_cap_q_dec = sell_market.c_quantize_order_amount(
-            sell_market_tuple.trading_pair,
-            Decimal(str(max(0.0, sell_base_balance - 1e-12))))
-        capacity_limit = float(sell_cap_q_dec) if sell_cap_q_dec is not None else 0.0
-
-        # Cap by buy-side quote affordability (quantized)
-        if approx_buy_ask > 0 and buy_quote_balance > 0:
-            buy_aff_base = buy_quote_balance / approx_buy_ask
-            buy_cap_q_dec = buy_market.c_quantize_order_amount(
-                buy_market_tuple.trading_pair,
-                Decimal(str(max(0.0, buy_aff_base - 1e-12))))
-            if buy_cap_q_dec is not None:
-                capacity_limit = min(capacity_limit, float(buy_cap_q_dec)) if capacity_limit > 0 else float(buy_cap_q_dec)
-
-        # If no capacity remains after caps, skip early
-        if capacity_limit <= EPSILON:
+        # Calculate capacity limits once
+        cdef double max_base_amount = self._calculate_capacity_limit(
+            buy_market_tuple, sell_market_tuple,
+            buy_quote_balance, sell_base_balance)
+        
+        if max_base_amount <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
 
-        # Find profitable orders
+        # Get profitable orders (includes top-of-book check) with capacity-aware early-stop
         profitable_orders = c_find_profitable_arbitrage_orders(
             self._min_profitability,
             buy_market_tuple,
             sell_market_tuple,
-            1.0,  # Buy conversion always 1.0 (primary market)
-            conv_rate)
+            1.0,  # Buy conversion always 1.0
+            conv_rate,
+            max_base_amount,
+            0.05)
         
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
         
-        # Calculate best amount considering balances and capacity caps
+        # Aggregate profitable volume
         cdef:
             double total_base = 0.0
             double total_cost = 0.0
-            double total_proceeds = 0.0
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
-            double remaining_quote, remaining_base
-        capacity_left = capacity_limit
-            
+        
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
-            # Calculate remaining capacity
-            remaining_quote = buy_quote_balance - total_cost
-            remaining_base = sell_base_balance - total_base
+            # Apply constraints
+            amount = min(amount, 
+                        max_base_amount - total_base,
+                        (buy_quote_balance - total_cost) / ask_adj if ask_adj > 0 else 0)
             
-            # Early exit if no capacity left
-            if remaining_quote <= EPSILON or remaining_base <= EPSILON:
-                break
-                
-            # Adjust amount to available capacity and quantized caps
-            if ask_adj > 0:
-                amount = min(amount, remaining_quote / ask_adj, remaining_base, capacity_left)
-            else:
-                amount = min(amount, remaining_base, capacity_left)
-                
             if amount <= EPSILON:
                 continue
             
-            # Update totals
             total_base += amount
             total_cost += ask_adj * amount
-            total_proceeds += bid_adj * amount
             total_proceeds_orig += orig_bid * amount
-            capacity_left -= amount
-            if capacity_left <= EPSILON:
+            
+            # Stop if we've used all capacity
+            if total_base >= max_base_amount - EPSILON:
                 break
         
         # Calculate results
-        if total_base > EPSILON and total_cost > EPSILON:
-            avg_bid_adj = total_proceeds / total_base
-            avg_bid_orig = total_proceeds_orig / total_base
-            avg_ask = total_cost / total_base
-            profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
-            # Optional early min-notional filter here (use sell side as reference)
-            if approx_sell_bid > 0 and (total_base * approx_sell_bid) < self._min_order_usd:
-                return (0.0, 0.0, 0.0, 0.0)
-            return (total_base, profitability, avg_bid_orig, avg_ask)
+        if total_base > EPSILON:
+            avg_sell_price_orig = total_proceeds_orig / total_base
+            avg_buy_price = total_cost / total_base
+            profitability = ((avg_sell_price_orig * conv_rate) / avg_buy_price - 1.0) if avg_buy_price > 0 else 0.0
+            
+            # Check minimum notional
+            if avg_sell_price_orig * total_base >= self._min_order_usd:
+                return (total_base, profitability, avg_sell_price_orig, avg_buy_price)
         
         return (0.0, 0.0, 0.0, 0.0)
 
+
+    cdef double _calculate_capacity_limit(self,
+                                        object buy_market_tuple,
+                                        object sell_market_tuple,
+                                        double buy_quote_balance,
+                                        double sell_base_balance):
+        """Calculate maximum tradeable amount with quantization"""
+        cdef:
+            double capacity = sell_base_balance
+            object quantized
+            double approx_ask
+        
+        # Get approximate buy price for affordability check
+        try:
+            approx_ask = float(buy_market_tuple.get_price(True))
+        except:
+            approx_ask = 0.0
+        
+        # Apply quote balance constraint
+        if approx_ask > 0 and buy_quote_balance > 0:
+            capacity = min(capacity, buy_quote_balance / approx_ask)
+        
+        # Apply sell-side quantization
+        quantized = sell_market_tuple.market.c_quantize_order_amount(
+            sell_market_tuple.trading_pair,
+            Decimal(str(max(0.0, capacity - 1e-12))))
+        capacity = float(quantized) if quantized else 0.0
+        
+        # Apply buy-side quantization
+        if capacity > 0:
+            quantized = buy_market_tuple.market.c_quantize_order_amount(
+                buy_market_tuple.trading_pair,
+                Decimal(str(max(0.0, capacity - 1e-12))))
+            capacity = float(quantized) if quantized else 0.0
+        
+        return capacity
+ 
+ 
+ 
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple):
         """
         If base asset holdings on buy_market_tuple are below target (in that market's quote units), place a taker buy
@@ -978,13 +976,32 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
                 conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
 
-        # Use buy-in profitability threshold here (not the main arbitrage threshold)
+        # Determine an upper bound on base we might buy given spend_cap and quantization on buy side
+        cdef double approx_ask = 0.0
+        try:
+            approx_ask = float(buy_market_tuple.get_price(True))
+        except Exception:
+            approx_ask = 0.0
+        cdef double buy_cap_base = 0.0
+        if approx_ask > 0.0 and spend_cap > 0.0:
+            buy_cap_base = spend_cap / approx_ask
+            q = buy_market_tuple.market.c_quantize_order_amount(
+                buy_market_tuple.trading_pair,
+                Decimal(str(max(0.0, buy_cap_base - 1e-12))))
+            if q is not None:
+                buy_cap_base = float(q)
+            else:
+                buy_cap_base = 0.0
+
+        # Use buy-in profitability threshold here (not the main arbitrage threshold), with capacity-aware early-stop
         profitable_orders = c_find_profitable_arbitrage_orders(
             self._buy_in_min_profitability,
             buy_market_tuple,
             sell_market_tuple,
             1.0,
-            conv_rate)
+            conv_rate,
+            buy_cap_base,
+            0.05)
 
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
@@ -1059,94 +1076,120 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self.logger().info(f"Quote conversion rate: {self._cached_quote_rate:.6f}")
 
 
-# Single optimized function for finding profitable orders
+
 cdef list c_find_profitable_arbitrage_orders(
     double min_profitability,
     object buy_market_tuple,
     object sell_market_tuple,
     double buy_conversion_rate,
-    double sell_conversion_rate):
+    double sell_conversion_rate,
+    double target_base_amount=0.0,
+    double overshoot_ratio=0.05):
     """
     Find profitable arbitrage opportunities between two markets.
-    Uses doubles for performance, applies conversion rates only when != 1.0
+    Returns list of (bid_adj, ask_adj, bid_orig, ask_orig, amount).
     """
     cdef:
-        double step_amount = 0.0
-        double bid_leftover = 0.0
-        double ask_leftover = 0.0
-        double bid_price, ask_price
-        double orig_bid_price, orig_ask_price
         double min_prof_threshold = 1.0 + min_profitability
         bint needs_conversion = (fabs(buy_conversion_rate - 1.0) > EPSILON or 
                                 fabs(sell_conversion_rate - 1.0) > EPSILON)
-        object current_bid = None
-        object current_ask = None
         list profitable_orders = []
-        int orders_found = 0
-        int max_orders = 100  # Limit number of orders for performance
+        int max_levels = 20  # Reduced from 100
+        int levels_processed = 0
+        double bid_leftover = 0.0
+        double ask_leftover = 0.0
+        double step_amount = 0.0
+        double cumulative_base = 0.0
+        double overshoot_stop = 0.0
+        
+    #  Top-of-book profitability check
+    try:
+        # Peek at top prices without consuming iterators
+        top_bid = float(sell_market_tuple.get_price(False))
+        top_ask = float(buy_market_tuple.get_price(True))
+        
+        # Apply conversion for check
+        if needs_conversion:
+            top_bid_adj = top_bid * sell_conversion_rate
+            top_ask_adj = top_ask * buy_conversion_rate
+        else:
+            top_bid_adj = top_bid
+            top_ask_adj = top_ask
+        
+        # Early exit if top-of-book doesn't meet threshold
+        if top_bid_adj / top_ask_adj < min_prof_threshold:
+            return []  # Empty list - no profitable orders
+            
+    except Exception:
+        return []  # Order books not ready
+    
+    # Prepare capacity-aware stopping condition (optional)
+    if target_base_amount > 0.0:
+        overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
+    # Now scan the books
     bid_it = sell_market_tuple.order_book_bid_entries()
     ask_it = buy_market_tuple.order_book_ask_entries()
-
+    
     try:
-        while orders_found < max_orders:
-            # Advance iterators efficiently
-            if bid_leftover <= EPSILON and ask_leftover <= EPSILON:
-                current_bid = next(bid_it)
-                current_ask = next(ask_it)
-                ask_leftover = float(current_ask.amount)
-                bid_leftover = float(current_bid.amount)
-            elif bid_leftover > EPSILON and ask_leftover <= EPSILON:
-                current_ask = next(ask_it)
-                ask_leftover = float(current_ask.amount)
-            elif ask_leftover > EPSILON and bid_leftover <= EPSILON:
-                current_bid = next(bid_it)
-                bid_leftover = float(current_bid.amount)
-
-            # Store original prices
+        current_bid = next(bid_it)
+        current_ask = next(ask_it)
+        bid_leftover = float(current_bid.amount)
+        ask_leftover = float(current_ask.amount)
+        
+        while levels_processed < max_levels:
+            # Get prices
             orig_bid_price = float(current_bid.price)
             orig_ask_price = float(current_ask.price)
             
-            # Apply conversion if needed
+            # Sanity check
+            if orig_bid_price <= 0 or orig_ask_price <= 0:
+                break
+            
+            # Apply conversion once per level
             if needs_conversion:
                 bid_price = orig_bid_price * sell_conversion_rate
                 ask_price = orig_ask_price * buy_conversion_rate
             else:
-                # Fast path - no conversion
                 bid_price = orig_bid_price
                 ask_price = orig_ask_price
             
-            # Early exit conditions
-            if bid_price <= ask_price:
-                break
-            if ask_price <= EPSILON:  # Avoid division by zero
-                break
+            # Check profitability threshold
             if bid_price / ask_price < min_prof_threshold:
-                break
+                break  # No point continuing - will only get worse
             
-            # Additional sanity checks for real-world robustness
-            if bid_price <= 0 or ask_price <= 0:
-                break
-            if orig_bid_price <= 0 or orig_ask_price <= 0:
-                break
-
+            # Calculate step amount
             step_amount = min(bid_leftover, ask_leftover)
-            if step_amount <= EPSILON:
-                continue
-
-            # Store results
-            profitable_orders.append((
-                bid_price,
-                ask_price,
-                orig_bid_price,
-                orig_ask_price,
-                step_amount))
             
-            orders_found += 1
-            ask_leftover -= step_amount
-            bid_leftover -= step_amount
+            if step_amount > EPSILON:
+                profitable_orders.append((
+                    bid_price,      # Adjusted bid
+                    ask_price,      # Adjusted ask
+                    orig_bid_price, # Original bid
+                    orig_ask_price, # Original ask
+                    step_amount
+                ))
 
+                # Capacity-aware early stop
+                cumulative_base += step_amount
+                if overshoot_stop > 0.0 and cumulative_base >= overshoot_stop:
+                    break
+            
+            # Advance to next level based on which side exhausted
+            if bid_leftover <= ask_leftover:
+                # Bid exhausted - get next bid
+                current_bid = next(bid_it)
+                bid_leftover = float(current_bid.amount)
+                ask_leftover -= step_amount
+                levels_processed += 1
+            else:
+                # Ask exhausted - get next ask
+                current_ask = next(ask_it)
+                ask_leftover = float(current_ask.amount)
+                bid_leftover -= step_amount
+                # Don't increment levels_processed for ask advances
+                
     except StopIteration:
-        pass
-
+        pass  # End of order book
+    
     return profitable_orders
