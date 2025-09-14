@@ -946,7 +946,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if not self._buy_in_enabled:
             return False
         cdef:
-            str pair = buy_market_tuple.trading_pair
+            str pair_str = buy_market_tuple.trading_pair
             ExchangeBase market = buy_market_tuple.market #object market = buy_market_tuple.market
             double base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
@@ -965,17 +965,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
         cdef double shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
             return False
 
         # Require quote balance to spend and a minimal edge
         if quote_bal <= 0:
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: no quote balance to spend")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: no quote balance to spend")
             return False
 
         # If the remaining shortfall is below the minimum order notional, consider buy-in complete (uniform)
-        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
             return False
         res = self.c_find_best_buyin_amount(
             buy_market_tuple,
@@ -1002,17 +1002,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
             quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
         if quantized_amount <= Decimal("0"):
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: quantized amount is zero after affordability check")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: quantized amount is zero after affordability check")
             return False
 
         # Enforce minimum notional like normal arbitrage orders
         cdef double volume_usd = float(quantized_amount) * buy_price
         if volume_usd < self._min_order_usd:
             # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
-            if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
+            if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
                 return False
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
+                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
             return False
 
         buy_order_id = self.c_buy_with_specific_market(
@@ -1032,7 +1032,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(asset_key, pair, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
             pass
             self.c_maybe_disable_buy_in()
 
