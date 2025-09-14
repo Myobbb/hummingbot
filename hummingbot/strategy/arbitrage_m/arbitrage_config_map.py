@@ -123,7 +123,7 @@ arbitrage_m_config_map = {
         key="buy_in_target_usdt",
         prompt="Target base asset value to accumulate (in quote units, e.g., USDT) >>> ",
         prompt_on_new=True,
-        default=Decimal("1000"),
+        default=Decimal("100"),
         validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
         type_str="decimal",
     ),
@@ -131,7 +131,7 @@ arbitrage_m_config_map = {
         key="buy_in_min_profitability",
         prompt="Minimum cross-market edge (%) required to trigger buy-in (e.g., 0.5) >>> ",
         prompt_on_new=True,
-        default=Decimal("1.9"),
+        default=Decimal("0.5"),
         validator=lambda v: validate_decimal(v, Decimal(-100), Decimal("100"), inclusive=True),
         type_str="decimal",
     ),
@@ -168,8 +168,8 @@ arbitrage_m_config_map = {
         key="additional_markets",
         prompt=additional_markets_prompt,
         prompt_on_new=True,
-        # Prompt but allow empty by using a single-space default that trims to empty downstream
-        required_if=lambda: True,
+        # Optional: allow empty string to skip adding more markets
+        required_if=lambda: False,
         default="",
         type_str="str",
         on_validated=additional_markets_on_validated,
