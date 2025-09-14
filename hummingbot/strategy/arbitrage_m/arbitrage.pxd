@@ -86,7 +86,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef pair[double, double] c_compute_value_and_shortfall(self,
                                                             double base_balance,
                                                             double last_bid)
-    cdef double c_compute_global_value_quote(self, object buy_market_tuple)
+    cdef double c_get_quote_to_usd_rate(self, str quote_asset)
+    cdef double c_compute_global_value_usd(self, object buy_market_tuple)
     cdef pair[double, double] c_compute_global_value_and_shortfall(self, object buy_market_tuple)
     cdef bint c_try_mark_complete_buy_in(self,
                                          str asset_key,
