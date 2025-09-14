@@ -86,6 +86,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef pair[double, double] c_compute_value_and_shortfall(self,
                                                             double base_balance,
                                                             double last_bid)
+    cdef double c_get_aggregated_base_balance(self, str asset)
     cdef bint c_try_mark_complete_buy_in(self,
                                          str asset_key,
                                          str pair,

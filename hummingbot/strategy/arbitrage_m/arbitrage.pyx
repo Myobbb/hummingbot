@@ -919,6 +919,23 @@ cdef class ArbitrageMStrategy(StrategyBase):
             shortfall = 0.0
         return pair[double, double](current_value_quote, shortfall)
 
+    cdef double c_get_aggregated_base_balance(self, str asset):
+        """Sum available base balance for the asset across all active markets registered by the strategy."""
+        cdef:
+            double total = 0.0
+            object m
+            double bal
+        try:
+            for m in self._sb_markets:
+                try:
+                    bal = float(m.c_get_available_balance(asset))
+                except Exception:
+                    bal = 0.0
+                total += bal
+        except Exception:
+            return 0.0
+        return total
+
     cdef bint c_try_mark_complete_buy_in(self,
                                          str asset_key,
                                          str pair,
@@ -948,7 +965,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef:
             str pair_str = buy_market_tuple.trading_pair
             ExchangeBase market = buy_market_tuple.market #object market = buy_market_tuple.market
-            double base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
+            double base_bal = 0.0
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
             double best_amount
             double best_prof
@@ -960,8 +977,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if asset_key in self._buy_in_completed_by_asset and self._buy_in_completed_by_asset[asset_key]:
             return False
 
-        # Evaluate progress vs target and early complete
+        # Evaluate progress vs target and early complete (aggregate base across all markets)
         cdef double last_bid = float(buy_market_tuple.get_price(False))
+        base_bal = self.c_get_aggregated_base_balance(asset_key)
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
         cdef double shortfall = val_short.second
@@ -1026,9 +1044,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef string buy_id_str = buy_order_id.encode('utf-8')
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
-        # Check if target reached after placing (uniform)
+        # Check if target reached after placing (aggregate across all markets)
         last_bid = float(buy_market_tuple.get_price(False))
-        base_bal = float(market.c_get_available_balance(buy_market_tuple.base_asset))
+        base_bal = self.c_get_aggregated_base_balance(asset_key)
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
