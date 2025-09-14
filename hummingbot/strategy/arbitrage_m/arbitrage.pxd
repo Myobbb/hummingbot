@@ -81,6 +81,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
+    cdef double _calculate_capacity_limit(self,
+                                          object buy_market_tuple,
+                                          object sell_market_tuple,
+                                          double buy_quote_balance,
+                                          double sell_base_balance)
     
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *
