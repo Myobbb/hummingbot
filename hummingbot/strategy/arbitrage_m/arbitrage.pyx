@@ -938,18 +938,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
  
  
     cdef void c_maybe_disable_buy_in(self):
-        """Disable buy-in globally once target is reached for the single base asset."""
-        if self._buy_in_completed:
-            if self._buy_in_enabled:
-                self._buy_in_enabled = False
-                try:
-                    cfg = arbitrage_m_config_map.get("buy_in_enabled")
-                    if cfg is not None:
-                        cfg.value = False
-                except Exception:
-                    pass
-                if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                    self.log_with_clock(logging.INFO, "Buy-in completed. Disabling buy-in.")
+        """Disable buy-in globally for this run once target is reached (do not mutate config)."""
+        if self._buy_in_completed and self._buy_in_enabled:
+            self._buy_in_enabled = False
+            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                self.log_with_clock(logging.INFO, "Buy-in completed. Disabling buy-in for this session.")
 
     cdef void c_scan_and_mark_buyin_completion(self):
         """Re-evaluate the base asset against target and disable buy-in when done."""
