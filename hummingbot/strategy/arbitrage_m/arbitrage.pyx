@@ -14,7 +14,7 @@ from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
 from libcpp.pair cimport pair
 cimport cython
-from libcpp.set cimport set
+from libcpp.set cimport set as cpp_set
 from cython.operator cimport(
     dereference as deref,
     postincrement as inc,
@@ -1248,10 +1248,10 @@ cdef list c_find_profitable_arbitrage_orders(
         ExchangeBase sell_ex
         OrderBook buy_ob
         OrderBook sell_ob
-        set[OrderBookEntry].reverse_iterator bid_it
-        set[OrderBookEntry].reverse_iterator bid_end
-        set[OrderBookEntry].iterator ask_it
-        set[OrderBookEntry].iterator ask_end
+        cpp_set[OrderBookEntry].reverse_iterator bid_it
+        cpp_set[OrderBookEntry].reverse_iterator bid_end
+        cpp_set[OrderBookEntry].iterator ask_it
+        cpp_set[OrderBookEntry].iterator ask_end
         OrderBookEntry bid_entry
         OrderBookEntry ask_entry
         double orig_bid_price
