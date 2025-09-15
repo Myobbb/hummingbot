@@ -381,7 +381,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                         except Exception:
                             total_base = 0.0
                     total_value = total_base * bid
-                    is_pending = (total_value < self._buy_in_target_usd and not self._buy_in_completed)
+                    # Status should reflect the permanent global flag, not current valuation
+                    is_pending = (not self._buy_in_completed)
                     if is_pending:
                         any_pending = True
                     agg_lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({'pending' if is_pending else 'completed'})")
@@ -962,8 +963,24 @@ cdef class ArbitrageMStrategy(StrategyBase):
             asset_key = self._market_pairs[0].first.base_asset
         except Exception:
             return
+        # Get a non-zero bid from any active tuple with this base asset
+        last_bid = 0.0
         try:
-            last_bid = float(self._market_pairs[0].first.get_price(False))
+            for mp in self._market_pairs:
+                if mp.first.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.first.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
+                if mp.second.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.second.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
         except Exception:
             last_bid = 0.0
         base_bal = self.c_get_aggregated_base_balance(asset_key)
@@ -1044,7 +1061,26 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return False
 
         # Evaluate progress vs target and early complete (aggregate base across all markets)
-        cdef double last_bid = float(buy_market_tuple.get_price(False))
+        # Get a reliable bid for the asset from any active tuple to avoid zero-bid stalls
+        cdef double last_bid = 0.0
+        try:
+            for mp in self._market_pairs:
+                if mp.first.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.first.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
+                if mp.second.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.second.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
+        except Exception:
+            last_bid = 0.0
         base_bal = self.c_get_aggregated_base_balance(asset_key)
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
@@ -1111,7 +1147,26 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
         # Check if target reached after placing (aggregate across all markets)
-        last_bid = float(buy_market_tuple.get_price(False))
+        # Use the same reliable bid lookup as above
+        last_bid = 0.0
+        try:
+            for mp in self._market_pairs:
+                if mp.first.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.first.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
+                if mp.second.base_asset == asset_key:
+                    try:
+                        last_bid = float(mp.second.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                    if last_bid > 0.0:
+                        break
+        except Exception:
+            last_bid = 0.0
         base_bal = self.c_get_aggregated_base_balance(asset_key)
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
