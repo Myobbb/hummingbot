@@ -1243,6 +1243,21 @@ cdef list c_find_profitable_arbitrage_orders(
         double step_amount = 0.0
         double cumulative_base = 0.0
         double overshoot_stop = 0.0
+        # Hoisted C-level declarations for Cython (not allowed inside try:)
+        ExchangeBase buy_ex
+        ExchangeBase sell_ex
+        OrderBook buy_ob
+        OrderBook sell_ob
+        set[OrderBookEntry].reverse_iterator bid_it
+        set[OrderBookEntry].reverse_iterator bid_end
+        set[OrderBookEntry].iterator ask_it
+        set[OrderBookEntry].iterator ask_end
+        OrderBookEntry bid_entry
+        OrderBookEntry ask_entry
+        double orig_bid_price
+        double orig_ask_price
+        double bid_price
+        double ask_price
         
     # Optional top-of-book profitability check (callers can pre-gate to avoid duplicate work)
     if perform_top_check:
@@ -1262,21 +1277,21 @@ cdef list c_find_profitable_arbitrage_orders(
 
     # Now scan the books (C-level iteration to avoid Python iterator overhead)
     try:
-        cdef ExchangeBase buy_ex = <ExchangeBase> buy_market_tuple.market
-        cdef ExchangeBase sell_ex = <ExchangeBase> sell_market_tuple.market
-        cdef OrderBook buy_ob = buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
-        cdef OrderBook sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
+        buy_ex = <ExchangeBase> buy_market_tuple.market
+        sell_ex = <ExchangeBase> sell_market_tuple.market
+        buy_ob = buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
+        sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
 
-        cdef set[OrderBookEntry].reverse_iterator bid_it = sell_ob._bid_book.rbegin()
-        cdef set[OrderBookEntry].reverse_iterator bid_end = sell_ob._bid_book.rend()
-        cdef set[OrderBookEntry].iterator ask_it = buy_ob._ask_book.begin()
-        cdef set[OrderBookEntry].iterator ask_end = buy_ob._ask_book.end()
+        bid_it = sell_ob._bid_book.rbegin()
+        bid_end = sell_ob._bid_book.rend()
+        ask_it = buy_ob._ask_book.begin()
+        ask_end = buy_ob._ask_book.end()
 
         if bid_it == bid_end or ask_it == ask_end:
             return []
 
-        cdef OrderBookEntry bid_entry = deref(bid_it)
-        cdef OrderBookEntry ask_entry = deref(ask_it)
+        bid_entry = deref(bid_it)
+        ask_entry = deref(ask_it)
 
         bid_leftover = bid_entry.getAmount()
         ask_leftover = ask_entry.getAmount()
