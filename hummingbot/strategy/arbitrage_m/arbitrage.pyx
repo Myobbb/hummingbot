@@ -962,32 +962,51 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pair[double, double] val_short
             double current_value_quote
             double shortfall
+            # For status-consistent balance aggregation
+            list unique_tuples = []
+            set seen_keys = set()
+            object t
+            object mp
+            tuple key
+            dict balance_map
+            object assets_df
+            object rec
+            str exch
+            str asset_name
+            object avail
         # Determine the single base asset from the first market pair
-        try:
-            asset_key = self._market_pairs[0].first.base_asset
-        except Exception:
-            return
+        asset_key = self._market_pairs[0].first.base_asset
         # Get a non-zero bid from any active tuple with this base asset
         last_bid = 0.0
-        try:
-            for mp in self._market_pairs:
-                if mp.first.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.first.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-                if mp.second.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.second.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-        except Exception:
-            last_bid = 0.0
-        base_bal = self.c_get_aggregated_base_balance(asset_key)
+        for mp in self._market_pairs:
+            if mp.first.base_asset == asset_key and last_bid <= 0.0:
+                last_bid = float(mp.first.get_price(False))
+            if mp.second.base_asset == asset_key and last_bid <= 0.0:
+                last_bid = float(mp.second.get_price(False))
+            if last_bid > 0.0:
+                break
+        # Build balances from the same source as status for consistency
+        balance_map = {}
+        # Aggregate unique market tuples across all ordered pairs
+        seen_keys.clear()
+        unique_tuples.clear()
+        for mp in self._market_pairs:
+            for t in [mp.first, mp.second]:
+                key = (t.market.name, t.trading_pair)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_tuples.append(t)
+        assets_df = self.wallet_balance_data_frame(unique_tuples)
+        for rec in assets_df.to_dict("records"):
+            exch = str(rec.get("Exchange", ""))
+            asset_name = str(rec.get("Asset", ""))
+            avail = rec.get("Available Balance", 0)
+            balance_map[(exch, asset_name)] = float(avail)
+        # Sum base using the same map
+        base_bal = 0.0
+        for t in unique_tuples:
+            if t.base_asset == asset_key:
+                base_bal += float(balance_map.get((t.market.name, asset_key), 0.0))
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
