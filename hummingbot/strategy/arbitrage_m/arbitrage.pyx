@@ -342,20 +342,44 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 agg_lines = []
                 any_pending = False
                 for a in base_assets:
-                    # Get a reference bid from any market tuple with this base asset
+                    # Get a reference bid from any unique tuple with this base asset
                     bid = 0.0
                     try:
-                        for mp in self._market_pairs:
-                            if mp.first.base_asset == a:
-                                bid = float(mp.first.get_price(False))
-                                break
-                            if mp.second.base_asset == a:
-                                bid = float(mp.second.get_price(False))
-                                break
+                        for t in unique_tuples:
+                            if t.base_asset == a:
+                                try:
+                                    bid = float(t.get_price(False))
+                                except Exception:
+                                    bid = 0.0
+                                if bid > 0.0:
+                                    break
+                        if bid <= 0.0:
+                            # Fallback: scan active market pairs
+                            for mp in self._market_pairs:
+                                if mp.first.base_asset == a:
+                                    bid = float(mp.first.get_price(False))
+                                    if bid > 0.0:
+                                        break
+                                if mp.second.base_asset == a:
+                                    bid = float(mp.second.get_price(False))
+                                    if bid > 0.0:
+                                        break
                     except Exception:
                         bid = 0.0
-                    # Aggregate available base balance across active markets
-                    total_base = self.c_get_aggregated_base_balance(a)
+                    # Aggregate available base balance using the same source as the Assets table
+                    total_base = 0.0
+                    try:
+                        for t in unique_tuples:
+                            if t.base_asset == a:
+                                total_base += float(balance_map.get((t.market.name, a), 0.0))
+                    except Exception:
+                        total_base = 0.0
+                    if total_base <= 0.0:
+                        # Fallback: direct aggregation from active markets
+                        try:
+                            total_base = self.c_get_aggregated_base_balance(a)
+                        except Exception:
+                            total_base = 0.0
                     total_value = total_base * bid
                     is_pending = (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False))
                     if is_pending:
