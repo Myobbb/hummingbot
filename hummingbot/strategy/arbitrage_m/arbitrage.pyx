@@ -347,7 +347,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                 break
                     except Exception:
                         bid = 0.0
-                    total_base = self.c_get_aggregated_base_balance(a)
+                    # Aggregate base using the same source as the Assets table for consistency
+                    total_base = 0.0
+                    try:
+                        for t in unique_tuples:
+                            if t.base_asset == a:
+                                total_base += float(balance_map.get((t.market.name, a), 0.0))
+                    except Exception:
+                        total_base = 0.0
                     total_value = total_base * bid
                     status = "pending" if (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
                     lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({status})")
