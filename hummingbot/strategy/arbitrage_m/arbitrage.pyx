@@ -25,6 +25,7 @@ from hummingbot.strategy.strategy_base import StrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.strategy.arbitrage_m.arbitrage_config_map import arbitrage_m_config_map
 
 # Constants - Now configurable via init_params
 cdef:
@@ -923,6 +924,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return
         if self._buy_in_enabled:
             self._buy_in_enabled = False
+            try:
+                # Reflect in config for UI/CLI; do not re-enable during runtime
+                cfg = arbitrage_m_config_map.get("buy_in_enabled")
+                if cfg is not None:
+                    cfg.value = False
+            except Exception:
+                pass
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, "Buy-in completed for all assets. Disabling buy-in.")
 
