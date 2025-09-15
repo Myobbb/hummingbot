@@ -67,6 +67,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     # Conversion rate methods
     cdef double c_get_conversion_rate(self, bint is_base_asset)
     cdef void c_update_conversion_rates(self)
+    cdef tuple c_build_unique_tuples_assets_and_balance_map(self)
     cdef void c_log_conversion_rates(self)
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple)
     
