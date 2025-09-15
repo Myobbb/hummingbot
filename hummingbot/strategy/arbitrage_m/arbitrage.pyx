@@ -14,6 +14,11 @@ from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
 from libcpp.pair cimport pair
 cimport cython
+from libcpp.set cimport set
+from cython.operator cimport(
+    dereference as deref,
+    postincrement as inc,
+)
 
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.connector.exchange_base cimport ExchangeBase
@@ -26,6 +31,8 @@ from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.arbitrage_m.arbitrage_config_map import arbitrage_m_config_map
+from hummingbot.core.data_type.order_book cimport OrderBook
+from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
 
 # Constants - Now configurable via init_params
 cdef:
@@ -1253,36 +1260,47 @@ cdef list c_find_profitable_arbitrage_orders(
     if target_base_amount > 0.0:
         overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
-    # Now scan the books
+    # Now scan the books (C-level iteration to avoid Python iterator overhead)
     try:
-        bid_it = sell_market_tuple.order_book_bid_entries()
-        ask_it = buy_market_tuple.order_book_ask_entries()
-        
-        current_bid = next(bid_it)
-        current_ask = next(ask_it)
-        bid_leftover = float(current_bid.amount)
-        ask_leftover = float(current_ask.amount)
-        
-        while levels_processed < max_levels:
-            # Get prices
-            orig_bid_price = float(current_bid.price)
-            orig_ask_price = float(current_ask.price)
-            
+        cdef ExchangeBase buy_ex = <ExchangeBase> buy_market_tuple.market
+        cdef ExchangeBase sell_ex = <ExchangeBase> sell_market_tuple.market
+        cdef OrderBook buy_ob = buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
+        cdef OrderBook sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
+
+        cdef set[OrderBookEntry].reverse_iterator bid_it = sell_ob._bid_book.rbegin()
+        cdef set[OrderBookEntry].reverse_iterator bid_end = sell_ob._bid_book.rend()
+        cdef set[OrderBookEntry].iterator ask_it = buy_ob._ask_book.begin()
+        cdef set[OrderBookEntry].iterator ask_end = buy_ob._ask_book.end()
+
+        if bid_it == bid_end or ask_it == ask_end:
+            return []
+
+        cdef OrderBookEntry bid_entry = deref(bid_it)
+        cdef OrderBookEntry ask_entry = deref(ask_it)
+
+        bid_leftover = bid_entry.getAmount()
+        ask_leftover = ask_entry.getAmount()
+
+        while levels_processed < max_levels and bid_it != bid_end and ask_it != ask_end:
+            # Get prices (original, unconverted)
+            orig_bid_price = bid_entry.getPrice()
+            orig_ask_price = ask_entry.getPrice()
+
             # Sanity check
             if orig_bid_price <= 0 or orig_ask_price <= 0:
                 break
-            
+
             # Apply conversion once per level
             bid_price = orig_bid_price * sell_conversion_rate
             ask_price = orig_ask_price * buy_conversion_rate
-            
+
             # Check profitability threshold
             if bid_price / ask_price < min_prof_threshold:
-                break  # No point continuing - will only get worse
-            
+                break
+
             # Calculate step amount
-            step_amount = min(bid_leftover, ask_leftover)
-            
+            step_amount = bid_leftover if bid_leftover <= ask_leftover else ask_leftover
+
             if step_amount > EPSILON:
                 profitable_orders.append((
                     bid_price,      # Adjusted bid
@@ -1296,24 +1314,25 @@ cdef list c_find_profitable_arbitrage_orders(
                 cumulative_base += step_amount
                 if overshoot_stop > 0.0 and cumulative_base >= overshoot_stop:
                     break
-            
+
             # Advance to next level based on which side exhausted
             if bid_leftover <= ask_leftover:
-                # Bid exhausted - get next bid
-                current_bid = next(bid_it)
-                bid_leftover = float(current_bid.amount)
-                ask_leftover -= step_amount
+                inc(bid_it)
                 levels_processed += 1
+                if bid_it == bid_end:
+                    break
+                bid_entry = deref(bid_it)
+                bid_leftover = bid_entry.getAmount()
+                ask_leftover -= step_amount
             else:
-                # Ask exhausted - get next ask
-                current_ask = next(ask_it)
-                ask_leftover = float(current_ask.amount)
+                inc(ask_it)
+                if ask_it == ask_end:
+                    break
+                ask_entry = deref(ask_it)
+                ask_leftover = ask_entry.getAmount()
                 bid_leftover -= step_amount
-                # Don't increment levels_processed for ask advances
-                
-    except StopIteration:
-        pass  # End of order book
+
     except Exception:
-        return []  # Iterator creation/advancement failed (e.g., books not ready)
+        return []
     
     return profitable_orders
