@@ -685,15 +685,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self._min_order_usd:
             return
-        
+        # Declare variables before the if block (Cython requirement)
+        cdef double order_start_time
+        cdef object buy_order_type
+        cdef object sell_order_type
+        cdef object buy_price_decimal
+        cdef object sell_price_decimal
+        cdef double placement_latency
+
         if quantized_amount > Decimal("0"):
-            # Declare variables at the start of this block (Cython requirement)
-            cdef double order_start_time
-            cdef object buy_order_type
-            cdef object sell_order_type
-            cdef object buy_price_decimal
-            cdef object sell_price_decimal
-            cdef double placement_latency
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
