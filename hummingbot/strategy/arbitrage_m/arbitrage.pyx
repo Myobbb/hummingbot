@@ -327,26 +327,30 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in evaluation (debug): match buy-in math per market tuple (base_balance * bid), before completion
+            # Buy-in status (compact, aggregated per base asset)
             if self._buy_in_enabled:
-                eval_lines = []
-                # Config summary
                 lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"])
-                for t in unique_tuples:
-                    a = t.base_asset
-                    # Safe reads; if any read fails, use 0.0 defaults
+                try:
+                    base_assets = sorted({t.base_asset for t in unique_tuples})
+                except Exception:
+                    base_assets = []
+                for a in base_assets:
+                    # Use first available bid as reference for valuation
                     bid = 0.0
-                    base_bal = balance_map.get((t.market.name, a), 0.0)
                     try:
-                        bid = float(t.get_price(False))
+                        for t in unique_tuples:
+                            if t.base_asset == a:
+                                try:
+                                    bid = float(t.get_price(False))
+                                except Exception:
+                                    bid = 0.0
+                                break
                     except Exception:
                         bid = 0.0
-                    value_quote = base_bal * bid
-                    status = "pending" if (value_quote < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
-                    eval_lines.append(
-                        f"    {a} on {t.market.name}: value={value_quote:.6f} target={self._buy_in_target_usd:.6f} ({status})")
-                lines.append("  Buy-in evaluation:")
-                lines.extend(eval_lines)
+                    total_base = self.c_get_aggregated_base_balance(a)
+                    total_value = total_base * bid
+                    status = "pending" if (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
+                    lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({status})")
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
