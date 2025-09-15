@@ -328,7 +328,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in status (compact, aggregated per base asset) - only when any asset is pending
+            # Buy-in status (compact, aggregated per base asset) - only when any asset is pending and module enabled
             if self._buy_in_enabled:
                 try:
                     base_assets = sorted({t.base_asset for t in unique_tuples})
@@ -362,7 +362,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     if is_pending:
                         any_pending = True
                     agg_lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({'pending' if is_pending else 'completed'})")
-                if any_pending:
+                if any_pending and self._buy_in_enabled:
                     lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"]) 
                     lines.extend(agg_lines)
 
@@ -929,6 +929,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 cfg = arbitrage_m_config_map.get("buy_in_enabled")
                 if cfg is not None:
                     cfg.value = False
+            except Exception:
+                pass
+            # Mark all bases as permanently completed to prevent future pending displays
+            try:
+                for a in unique_bases:
+                    self._buy_in_completed_by_asset[a] = True
             except Exception:
                 pass
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
