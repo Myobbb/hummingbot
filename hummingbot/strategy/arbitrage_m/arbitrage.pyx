@@ -194,11 +194,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
             buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
             return 1.0
-            
-        # Fast path: if not using oracle and rates are 1:1
-        if not self._use_oracle_conversion_rate:
-            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
-                return 1.0
         
         cdef double base_conv = 1.0
         cdef double quote_conv = 1.0
@@ -257,6 +252,37 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         self._last_rate_update = self._current_timestamp
 
+    cdef tuple c_build_unique_tuples_assets_and_balance_map(self):
+        """Build unique market tuples, assets dataframe and balance map uniformly for status/control paths."""
+        cdef:
+            list unique_tuples = []
+            set seen_keys = set()
+            object t
+            object mp
+            tuple key
+            dict balance_map = {}
+            object assets_df
+            object rec
+            str exch
+            str asset_name
+            object avail
+        for mp in self._market_pairs:
+            for t in [mp.first, mp.second]:
+                key = (t.market.name, t.trading_pair)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_tuples.append(t)
+        assets_df = self.wallet_balance_data_frame(unique_tuples)
+        try:
+            for rec in assets_df.to_dict("records"):
+                exch = str(rec.get("Exchange", ""))
+                asset_name = str(rec.get("Asset", ""))
+                avail = rec.get("Available Balance", 0)
+                balance_map[(exch, asset_name)] = float(avail)
+        except Exception:
+            balance_map = {}
+        return (unique_tuples, assets_df, balance_map)
+
     def format_status(self) -> str:
         """Format strategy status for display"""
         cdef:
@@ -285,26 +311,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Warnings for network and balances
             warning_lines.extend(self.network_warning(unique_tuples))
 
-            # Markets and assets snapshots
+            # Markets and assets snapshots (uniform builder)
+            unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
             markets_df = self.market_status_data_frame(unique_tuples)
             lines.extend(["", "  Markets:"] + ["    " + line for line in str(markets_df).split("\n")])
-
-            assets_df = self.wallet_balance_data_frame(unique_tuples)
             lines.extend(["", "  Assets:"] + ["    " + line for line in str(assets_df).split("\n")])
-            # Build a quick lookup map from the same frame to ensure consistency with what's displayed
-            balance_map = {}
-            try:
-                for rec in assets_df.to_dict("records"):
-                    # Expected columns: Exchange, Asset, Available Balance
-                    exch = str(rec.get("Exchange", ""))
-                    asset_name = str(rec.get("Asset", ""))
-                    avail = rec.get("Available Balance", 0)
-                    try:
-                        balance_map[(exch, asset_name)] = float(avail)
-                    except Exception:
-                        balance_map[(exch, asset_name)] = 0.0
-            except Exception:
-                balance_map = {}
 
             # Profitability snapshot (buy first -> sell second for each ordered pair)
             lines.extend(["", "  Profitability snapshot (without fees):"])
@@ -366,20 +377,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                         break
                     except Exception:
                         bid = 0.0
-                    # Aggregate available base balance using the same source as the Assets table
+                    # Aggregate available base balance using the same source as the Assets table (no fallback)
                     total_base = 0.0
-                    try:
-                        for t in unique_tuples:
-                            if t.base_asset == a:
-                                total_base += float(balance_map.get((t.market.name, a), 0.0))
-                    except Exception:
-                        total_base = 0.0
-                    if total_base <= 0.0:
-                        # Fallback: direct aggregation from active markets
-                        try:
-                            total_base = self.c_get_aggregated_base_balance(a)
-                        except Exception:
-                            total_base = 0.0
+                    for t in unique_tuples:
+                        if t.base_asset == a:
+                            total_base += float(balance_map.get((t.market.name, a), 0.0))
                     total_value = total_base * bid
                     # Status should reflect the permanent global flag, not current valuation
                     is_pending = (not self._buy_in_completed)
@@ -950,18 +952,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pair[double, double] val_short
             double current_value_quote
             double shortfall
-            # For status-consistent balance aggregation
-            list unique_tuples = []
-            set seen_keys = set()
-            object t
-            object mp
-            tuple key
-            dict balance_map
+            list unique_tuples
             object assets_df
-            object rec
-            str exch
-            str asset_name
-            object avail
+            dict balance_map
         # Determine the single base asset from the first market pair
         asset_key = self._market_pairs[0].first.base_asset
         # Get a non-zero bid from any active tuple with this base asset
@@ -973,23 +966,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 last_bid = float(mp.second.get_price(False))
             if last_bid > 0.0:
                 break
-        # Build balances from the same source as status for consistency
-        balance_map = {}
-        # Aggregate unique market tuples across all ordered pairs
-        seen_keys.clear()
-        unique_tuples.clear()
-        for mp in self._market_pairs:
-            for t in [mp.first, mp.second]:
-                key = (t.market.name, t.trading_pair)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    unique_tuples.append(t)
-        assets_df = self.wallet_balance_data_frame(unique_tuples)
-        for rec in assets_df.to_dict("records"):
-            exch = str(rec.get("Exchange", ""))
-            asset_name = str(rec.get("Asset", ""))
-            avail = rec.get("Available Balance", 0)
-            balance_map[(exch, asset_name)] = float(avail)
+        # Build balances from the same source as status for consistency (shared helper)
+        unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
         # Sum base using the same map
         base_bal = 0.0
         for t in unique_tuples:
@@ -1113,9 +1091,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: no quote balance to spend")
             return False
 
-        # If the remaining shortfall is below the minimum order notional, consider buy-in complete (uniform)
-        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
-            return False
         res = self.c_find_best_buyin_amount(
             buy_market_tuple,
             sell_market_tuple,
@@ -1191,7 +1166,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         current_value_quote = val_short.first
         shortfall = val_short.second
         if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
-            pass
             self.c_maybe_disable_buy_in()
 
         return True
