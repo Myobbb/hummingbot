@@ -1,4 +1,5 @@
 # distutils: language=c++
+# distutils: sources=hummingbot/core/cpp/OrderBookEntry.cpp
 # distutils: extra_compile_args=-Wno-psabi
 # distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: cdivision=True
