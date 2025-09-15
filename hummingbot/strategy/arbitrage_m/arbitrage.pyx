@@ -409,16 +409,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
             for market_pair in self._market_pairs:
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
                     continue
-
-                try:
-                    best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
-                except Exception as e:
-                    # Order books may not be initialized yet right after start/reload; skip this pair this tick
-                    if should_report:
-                        self.logger().warning(
-                            f"Order books not ready for {market_pair.first.trading_pair} on {market_pair.first.market.name} or {market_pair.second.market.name}; skipping (err={e})",
-                            exc_info=True)
+                # Cheap non-throwing readiness check for direction (buy asks, sell bids)
+                if not self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                     continue
+                best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
                 if best_result[0] <= 0:
                     continue
 
@@ -446,32 +440,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 # and also try the reversed pairing in case that direction offers cheaper buys.
                 if not self._buy_in_completed:
                     # Attempt with current best direction
-                    try:
+                    if self.c_books_ready_for_direction(best_buy, best_sell):
                         self.c_handle_buy_in(best_buy, best_sell)
-                    except Exception:
-                        if should_report:
-                            self.logger().warning(
-                                f"Buy-in skipped: order books not ready for {best_buy.trading_pair} or {best_sell.trading_pair}")
                 # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
                 if not self._buy_in_completed:
-                    try:
+                    if self.c_books_ready_for_direction(best_sell, best_buy):
                         self.c_handle_buy_in(best_sell, best_buy)
-                    except Exception:
-                        if should_report:
-                            self.logger().warning(
-                                f"Buy-in skipped: order books not ready for {best_sell.trading_pair} or {best_buy.trading_pair}")
             elif self._buy_in_enabled and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
                 if not self._buy_in_completed:
                     for market_pair in self._market_pairs:
-                        try:
+                        if self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                             if self.c_handle_buy_in(market_pair.first, market_pair.second):
                                 break
-                        except Exception:
-                            if should_report:
-                                self.logger().warning(
-                                    f"Buy-in skipped: order books not ready for {market_pair.first.trading_pair} or {market_pair.second.trading_pair}")
 
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
@@ -763,24 +745,31 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double top_ask_adj
             double conv_rate = 1.0
             bint needs_conversion = False
-        try:
-            # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
-            if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
-                buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
-            needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
-            top_bid = float(sell_market_tuple.get_price(False))
-            top_ask = float(buy_market_tuple.get_price(True))
-            if top_bid <= 0 or top_ask <= 0:
-                return pair[int, double](False, conv_rate)
-            # Apply conversion to sell side only (buy side conversion is 1.0 by convention)
-            top_bid_adj = top_bid * conv_rate
-            top_ask_adj = top_ask
-            if top_bid_adj / top_ask_adj < min_prof_threshold:
-                return pair[int, double](False, conv_rate)
-            return pair[int, double](True, conv_rate)
-        except Exception:
-            return pair[int, double](False, 1.0)
+        # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
+        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
+            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
+            conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+        needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
+
+        # Read top-of-book via C-level order book to avoid exceptions
+        cdef ExchangeBase buy_ex = buy_market_tuple.market
+        cdef ExchangeBase sell_ex = sell_market_tuple.market
+        cdef OrderBook buy_ob = buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
+        cdef OrderBook sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
+        if sell_ob._bid_book.size() == 0 or buy_ob._ask_book.size() == 0:
+            return pair[int, double](False, conv_rate)
+        cdef cpp_set[OrderBookEntry].reverse_iterator bid_it = sell_ob._bid_book.rbegin()
+        cdef cpp_set[OrderBookEntry].iterator ask_it = buy_ob._ask_book.begin()
+        top_bid = deref(bid_it).getPrice()
+        top_ask = deref(ask_it).getPrice()
+        if top_bid <= 0 or top_ask <= 0:
+            return pair[int, double](False, conv_rate)
+        # Apply conversion to sell side only (buy side conversion is 1.0 by convention)
+        top_bid_adj = top_bid * conv_rate
+        top_ask_adj = top_ask
+        if top_bid_adj / top_ask_adj < min_prof_threshold:
+            return pair[int, double](False, conv_rate)
+        return pair[int, double](True, conv_rate)
 
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple):
         """Find best profitable amount - clean and optimized"""
