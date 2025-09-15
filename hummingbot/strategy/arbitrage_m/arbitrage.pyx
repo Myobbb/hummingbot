@@ -477,8 +477,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if timestamp - self._last_cleanup_timestamp > 60.0:
                 self.c_cleanup_old_orders()
                 self._last_cleanup_timestamp = timestamp
-
-            # Log conversion rates periodically if using oracle
+           # Log conversion rates periodically if using oracle
             if (self._use_oracle_conversion_rate and 
                 timestamp - self._last_conv_rates_logged > RATE_LOG_INTERVAL):
                 self.c_log_conversion_rates()
@@ -499,6 +498,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.logger().info("Markets ready. Trading started.")
                 # Debounce status logs for a short window to let connectors settle
                 self._status_debounce_until = self._current_timestamp + 2.0
+                # Run one-time global buy-in completion check now that markets are ready
+                if self._buy_in_enabled:
+                    self.c_scan_and_mark_buyin_completion()
         
         # Check network status
         for market in self._sb_markets:
@@ -923,6 +925,47 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._buy_in_enabled = False
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, "Buy-in completed for all assets. Disabling buy-in.")
+
+    cdef void c_scan_and_mark_buyin_completion(self):
+        """Re-evaluate all assets against target and disable buy-in forever when all done."""
+        if not self._buy_in_enabled:
+            return
+        cdef:
+            set unique_bases = set()
+            object mp
+            str asset_key
+            double last_bid
+            double base_bal
+            pair[double, double] val_short
+            double current_value_quote
+            double shortfall
+        # Collect bases
+        for mp in self._market_pairs:
+            unique_bases.add(mp.first.base_asset)
+            unique_bases.add(mp.second.base_asset)
+        # Check each base; pick a tuple to fetch bid for valuation
+        for asset_key in unique_bases:
+            if self._buy_in_completed_by_asset.get(asset_key, False):
+                continue
+            last_bid = 0.0
+            try:
+                for mp in self._market_pairs:
+                    if mp.first.base_asset == asset_key:
+                        last_bid = float(mp.first.get_price(False))
+                        break
+                    if mp.second.base_asset == asset_key:
+                        last_bid = float(mp.second.get_price(False))
+                        break
+            except Exception:
+                last_bid = 0.0
+            base_bal = self.c_get_aggregated_base_balance(asset_key)
+            val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
+            current_value_quote = val_short.first
+            shortfall = val_short.second
+            if self.c_try_mark_complete_buy_in(asset_key, asset_key, current_value_quote, shortfall):
+                pass
+        # If all marked complete, disable globally
+        self.c_maybe_disable_buy_in()
 
     cdef pair[double, double] c_compute_value_and_shortfall(self,
                                                            double base_balance,

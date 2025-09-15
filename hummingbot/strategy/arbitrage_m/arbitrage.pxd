@@ -79,6 +79,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                         double buy_quote_balance,
                                         double max_spend_quote)
     cdef void c_maybe_disable_buy_in(self)
+    cdef void c_scan_and_mark_buyin_completion(self)
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                              object buy_market_tuple,
                                                              object sell_market_tuple,
