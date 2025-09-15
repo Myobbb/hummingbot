@@ -523,7 +523,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self._status_debounce_until = self._current_timestamp + 2.0
                 # Run one-time global buy-in completion check now that markets are ready
                 if self._buy_in_enabled:
+                    self.log_with_clock(logging.INFO, "Buy-in config enabled at startup; performing completion check.")
                     self.c_scan_and_mark_buyin_completion()
+                else:
+                    self.log_with_clock(logging.INFO, "Buy-in config disabled at startup.")
         
         # Check network status
         for market in self._sb_markets:
@@ -987,6 +990,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
+        # Concise info log about startup buy-in state and decision
+        try:
+            decision = "disable" if (current_value_quote >= self._buy_in_target_usd or (shortfall > 0 and shortfall < self._min_order_usd)) else "keep"
+            self.log_with_clock(
+                logging.INFO,
+                f"Buy-in check: asset={asset_key} base={base_bal:.6f} bid={last_bid:.6f} value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f} -> {decision}")
+        except Exception:
+            pass
         if self.c_try_mark_complete_buy_in(asset_key, current_value_quote, shortfall):
             pass
         self.c_maybe_disable_buy_in()
