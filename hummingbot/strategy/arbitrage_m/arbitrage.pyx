@@ -670,15 +670,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
             return pair[double, double](0.0, 0.0)
             
-        # Check if conversion is needed
+        # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
         if (market_pair.first.quote_asset != market_pair.second.quote_asset or
             market_pair.first.base_asset != market_pair.second.base_asset):
-            # Only calculate conversion if not using fixed 1:1 rates
-            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
-                conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
-                needs_conversion = True
-        
-        # Apply conversion only if needed
+            conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+        needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
+        # Apply conversion (sell-side and buy-side) only if needed
         if needs_conversion:
             bid2 *= conv_rate
             ask2 *= conv_rate
@@ -798,21 +795,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double conv_rate = 1.0
             bint needs_conversion = False
         try:
+            # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
             if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
                 buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-                if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
-                    conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
-                    needs_conversion = True
+                conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+            needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
             top_bid = float(sell_market_tuple.get_price(False))
             top_ask = float(buy_market_tuple.get_price(True))
             if top_bid <= 0 or top_ask <= 0:
                 return pair[int, double](False, conv_rate)
-            if needs_conversion:
-                top_bid_adj = top_bid * conv_rate
-                top_ask_adj = top_ask  # buy side conversion is 1.0 per amount-finder convention
-            else:
-                top_bid_adj = top_bid
-                top_ask_adj = top_ask
+            # Apply conversion to sell side only (buy side conversion is 1.0 by convention)
+            top_bid_adj = top_bid * conv_rate
+            top_ask_adj = top_ask
             if top_bid_adj / top_ask_adj < min_prof_threshold:
                 return pair[int, double](False, conv_rate)
             return pair[int, double](True, conv_rate)
@@ -857,7 +851,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             1.0,  # Buy conversion always 1.0
             conv_rate,
             max_base_amount,
-            0.05)
+            0.05,
+            False)
         
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
@@ -1141,7 +1136,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Ensure not exceeding available quote after quantization
         cdef double max_affordable = 0.0
         if buy_price > 0:
-            max_affordable = float(market.c_get_available_balance(buy_market_tuple.quote_asset)) / buy_price
+            max_affordable = quote_bal / buy_price
         if float(quantized_amount) > max_affordable:
             quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
         if quantized_amount <= Decimal("0"):
@@ -1250,7 +1245,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             1.0,
             conv_rate,
             buy_cap_base,
-            0.05)
+            0.05,
+            False)
 
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
@@ -1333,7 +1329,8 @@ cdef list c_find_profitable_arbitrage_orders(
     double buy_conversion_rate,
     double sell_conversion_rate,
     double target_base_amount,
-    double overshoot_ratio):
+    double overshoot_ratio,
+    bint perform_top_check):
     """
     Find profitable arbitrage opportunities between two markets.
     Returns list of (bid_adj, ask_adj, bid_orig, ask_orig, amount).
@@ -1351,26 +1348,17 @@ cdef list c_find_profitable_arbitrage_orders(
         double cumulative_base = 0.0
         double overshoot_stop = 0.0
         
-    #  Top-of-book profitability check
-    try:
-        # Peek at top prices without consuming iterators #not strictly needed
-        top_bid = float(sell_market_tuple.get_price(False))
-        top_ask = float(buy_market_tuple.get_price(True))
-        
-        # Apply conversion for check
-        if needs_conversion:
-            top_bid_adj = top_bid * sell_conversion_rate
-            top_ask_adj = top_ask * buy_conversion_rate
-        else:
-            top_bid_adj = top_bid
-            top_ask_adj = top_ask
-        
-        # Early exit if top-of-book doesn't meet threshold
-        if top_bid_adj / top_ask_adj < min_prof_threshold:
-            return []  # Empty list - no profitable orders
-            
-    except Exception:
-        return []  # Order books not ready
+    # Optional top-of-book profitability check (callers can pre-gate to avoid duplicate work)
+    if perform_top_check:
+        try:
+            top_bid = float(sell_market_tuple.get_price(False))
+            top_ask = float(buy_market_tuple.get_price(True))
+            top_bid_adj = top_bid * sell_conversion_rate if needs_conversion else top_bid
+            top_ask_adj = top_ask * buy_conversion_rate if needs_conversion else top_ask
+            if top_bid_adj / top_ask_adj < min_prof_threshold:
+                return []
+        except Exception:
+            return []
     
     # Prepare capacity-aware stopping condition (optional)
     if target_base_amount > 0.0:

@@ -117,4 +117,5 @@ cdef list c_find_profitable_arbitrage_orders(
     double buy_conversion_rate,
     double sell_conversion_rate,
     double target_base_amount,
-    double overshoot_ratio)
+    double overshoot_ratio,
+    bint perform_top_check)
