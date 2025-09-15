@@ -38,8 +38,6 @@ cdef:
 
  
 
-as_logger = None
-
 
 cdef class ArbitrageMStrategy(StrategyBase):
     """
@@ -54,10 +52,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
     @classmethod
     def logger(cls):
-        global as_logger
-        if as_logger is None:
-            as_logger = logging.getLogger(__name__)
-        return as_logger
+        return logging.getLogger(__name__)
 
     def init_params(self,
                     market_pairs: List[ArbitrageMMarketPair],
@@ -164,6 +159,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
     @property
     def tracked_market_orders(self) -> List[Tuple[ExchangeBase, MarketOrder]]:
         return self._sb_order_tracker.tracked_market_orders
+
+    cdef inline string _to_cpp_str(self, object py_str):
+        """Convert a Python str to libcpp.string efficiently."""
+        return (<str>py_str).encode('utf-8')
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
@@ -535,7 +534,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             str order_id = order_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
             double time_elapsed
-            string order_id_str = order_id.encode('utf-8')
+            string order_id_str = self._to_cpp_str(order_id)
             str order_type = "Buy" if is_buy else "Sell"
             
         if market_pair_tuple is None:
@@ -581,7 +580,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                           self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})]:
                 if orders:
                     for order_id in orders:
-                        order_id_str = order_id.encode('utf-8')
+                        order_id_str = self._to_cpp_str(order_id)
                         
                         # Track new orders
                         if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
@@ -687,15 +686,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if volume_usd < self._min_order_usd:
             return
         
-        # Declare all variables before the if block (Cython requirement)
-        cdef double order_start_time
-        cdef object buy_order_type
-        cdef object sell_order_type
-        cdef object buy_price_decimal
-        cdef object sell_price_decimal
-        cdef double placement_latency
-        
         if quantized_amount > Decimal("0"):
+            # Declare variables at the start of this block (Cython requirement)
+            cdef double order_start_time
+            cdef object buy_order_type
+            cdef object sell_order_type
+            cdef object buy_price_decimal
+            cdef object sell_price_decimal
+            cdef double placement_latency
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
@@ -732,8 +730,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 expiration_seconds=self._next_trade_delay)
             
             # Track orders
-            buy_id_str = buy_order_id.encode('utf-8')
-            sell_id_str = sell_order_id.encode('utf-8')
+            buy_id_str = self._to_cpp_str(buy_order_id)
+            sell_id_str = self._to_cpp_str(sell_order_id)
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
             
@@ -1073,7 +1071,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             expiration_seconds=self._next_trade_delay)
 
         # Track order timestamp for housekeeping
-        cdef string buy_id_str = buy_order_id.encode('utf-8')
+        cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
         # Check if target reached after placing (aggregate across all markets)
