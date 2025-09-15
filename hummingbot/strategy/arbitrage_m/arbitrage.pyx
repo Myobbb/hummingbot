@@ -1093,7 +1093,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double volume_usd = float(quantized_amount) * buy_price
         if volume_usd < self._min_order_usd:
             # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
-            if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
+            if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
                 return False
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
