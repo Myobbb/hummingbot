@@ -72,7 +72,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple)
     
     # Trading logic
-    cdef c_process_market_pair(self, object market_pair)
+    cdef double c_get_reference_bid_for_asset(self, str asset_key)
     cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_buyin_amount(self,
                                         object buy_market_tuple,

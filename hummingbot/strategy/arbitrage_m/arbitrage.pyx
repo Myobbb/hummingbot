@@ -539,6 +539,27 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return False
         
         return True
+    cdef double c_get_reference_bid_for_asset(self, str asset_key):
+        """Return a non-zero bid for the given base asset from any active market tuple, or 0.0 if none."""
+        cdef double last_bid = 0.0
+        try:
+            for mp in self._market_pairs:
+                if mp.first.base_asset == asset_key and last_bid <= 0.0:
+                    try:
+                        last_bid = float(mp.first.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                if mp.second.base_asset == asset_key and last_bid <= 0.0:
+                    try:
+                        last_bid = float(mp.second.get_price(False))
+                    except Exception:
+                        last_bid = 0.0
+                if last_bid > 0.0:
+                    break
+        except Exception:
+            last_bid = 0.0
+        return last_bid
+
 
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
         """Unified order completion handler"""
@@ -630,33 +651,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         return True
 
-    cdef c_process_market_pair(self, object market_pair):
-        """Process a market pair for arbitrage opportunities"""
-        if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
-            return
-        
-        # Calculate profitability
-        self._current_profitability = self.c_calculate_profitability(market_pair)
-        
-        # Check if profitable
-        if (self._current_profitability.first < self._min_profitability and
-            self._current_profitability.second < self._min_profitability):
-            return
-        
-        # Log if verbose
-        if self._logging_options & self.OPTION_LOG_PROFITABILITY_STEP:
-            self.logger().debug(
-                f"Profitability: {market_pair.first.trading_pair}â†’{market_pair.second.trading_pair}: "
-                f"{self._current_profitability.first:.4%}, "
-                f"{market_pair.second.trading_pair}â†’{market_pair.first.trading_pair}: "
-                f"{self._current_profitability.second:.4%}")
-        
-        # Execute the more profitable direction immediately
-        # CRITICAL: No delays here - execute as soon as opportunity is spotted
-        if self._current_profitability.second > self._current_profitability.first:
-            self.c_execute_arbitrage(market_pair.first, market_pair.second)
-        else:
-            self.c_execute_arbitrage(market_pair.second, market_pair.first)
+    
 
     cdef pair[double, double] c_calculate_profitability(self, object market_pair):
         """Calculate profitability for both arbitrage directions"""
@@ -958,14 +953,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Determine the single base asset from the first market pair
         asset_key = self._market_pairs[0].first.base_asset
         # Get a non-zero bid from any active tuple with this base asset
-        last_bid = 0.0
-        for mp in self._market_pairs:
-            if mp.first.base_asset == asset_key and last_bid <= 0.0:
-                last_bid = float(mp.first.get_price(False))
-            if mp.second.base_asset == asset_key and last_bid <= 0.0:
-                last_bid = float(mp.second.get_price(False))
-            if last_bid > 0.0:
-                break
+        last_bid = self.c_get_reference_bid_for_asset(asset_key)
         # Build balances from the same source as status for consistency (shared helper)
         unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
         # Sum base using the same map
@@ -1059,25 +1047,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Evaluate progress vs target and early complete (aggregate base across all markets)
         # Get a reliable bid for the asset from any active tuple to avoid zero-bid stalls
-        cdef double last_bid = 0.0
-        try:
-            for mp in self._market_pairs:
-                if mp.first.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.first.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-                if mp.second.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.second.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-        except Exception:
-            last_bid = 0.0
+        cdef double last_bid = self.c_get_reference_bid_for_asset(asset_key)
         base_bal = self.c_get_aggregated_base_balance(asset_key)
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
@@ -1142,25 +1112,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Check if target reached after placing (aggregate across all markets)
         # Use the same reliable bid lookup as above
-        last_bid = 0.0
-        try:
-            for mp in self._market_pairs:
-                if mp.first.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.first.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-                if mp.second.base_asset == asset_key:
-                    try:
-                        last_bid = float(mp.second.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                    if last_bid > 0.0:
-                        break
-        except Exception:
-            last_bid = 0.0
+        last_bid = self.c_get_reference_bid_for_asset(asset_key)
         base_bal = self.c_get_aggregated_base_balance(asset_key)
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
