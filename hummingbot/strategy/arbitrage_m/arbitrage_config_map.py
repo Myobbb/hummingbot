@@ -78,6 +78,19 @@ def update_oracle_settings(value: str):
         settings.rate_oracle_pairs = []
 
 
+def _assets_differ() -> bool:
+    c_map = arbitrage_m_config_map
+    ptp = c_map.get("primary_market_trading_pair").value
+    stp = c_map.get("secondary_market_trading_pair").value
+    try:
+        if not ptp or not stp or "-" not in ptp or "-" not in stp:
+            return False
+        first_base, first_quote = ptp.split("-")
+        second_base, second_quote = stp.split("-")
+        return first_base != second_base or first_quote != second_quote
+    except Exception:
+        return False
+
 def additional_markets_on_validated(value: str):
     """Add any connectors from additional_markets into required_exchanges."""
     if not value:
@@ -199,6 +212,7 @@ arbitrage_m_config_map = {
         default=Decimal("1"),
         validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
         type_str="decimal",
+        required_if=lambda: (not arbitrage_m_config_map.get("use_oracle_conversion_rate").value) and _assets_differ(),
     ),
     "secondary_to_primary_quote_conversion_rate": ConfigVar(
         key="secondary_to_primary_quote_conversion_rate",
@@ -208,5 +222,6 @@ arbitrage_m_config_map = {
         default=Decimal("1"),
         validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
         type_str="decimal",
+        required_if=lambda: (not arbitrage_m_config_map.get("use_oracle_conversion_rate").value) and _assets_differ(),
     ),
 }
