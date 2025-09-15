@@ -280,6 +280,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
             balance_map = {}
         return (unique_tuples, assets_df, balance_map)
 
+    cdef inline bint c_books_ready_for_direction(self, object buy_market_tuple, object sell_market_tuple):
+        """Cheap non-throwing readiness gate: buy side must have asks, sell side must have bids."""
+        cdef ExchangeBase buy_ex = buy_market_tuple.market
+        cdef ExchangeBase sell_ex = sell_market_tuple.market
+        cdef OrderBook buy_ob = buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
+        cdef OrderBook sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
+        return (buy_ob._ask_book.size() > 0) and (sell_ob._bid_book.size() > 0)
+
     def format_status(self) -> str:
         """Format strategy status for display"""
         cdef:
