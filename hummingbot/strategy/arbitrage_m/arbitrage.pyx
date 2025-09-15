@@ -138,7 +138,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._buy_in_enabled = buy_in_enabled
         self._buy_in_target_usd = buy_in_target_usd
         self._buy_in_min_profitability = buy_in_min_profitability
-        self._buy_in_completed_by_asset = {}
+        self._buy_in_completed = False
         
         # Validate and add markets
         self._validate_configuration()
@@ -381,7 +381,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                         except Exception:
                             total_base = 0.0
                     total_value = total_base * bid
-                    is_pending = (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False))
+                    is_pending = (total_value < self._buy_in_target_usd and not self._buy_in_completed)
                     if is_pending:
                         any_pending = True
                     agg_lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({'pending' if is_pending else 'completed'})")
@@ -452,8 +452,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
                 if self._buy_in_enabled:
-                    # Quick skip if buy-in already completed for this base asset (zero overhead)
-                    if not self._buy_in_completed_by_asset.get(best_buy.base_asset, False):
+                    # Quick skip if buy-in already completed
+                    if not self._buy_in_completed:
                         if self.c_handle_buy_in(best_buy, best_sell):
                             # buy-in executed; skip regular arbitrage this tick
                             pass
@@ -466,7 +466,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             elif self._buy_in_enabled and best_buy is not None and best_sell is not None:
                 # Not enough edge for normal arbitrage. Still try buy-in using its own threshold,
                 # and also try the reversed pairing in case that direction offers cheaper buys.
-                if not self._buy_in_completed_by_asset.get(best_buy.base_asset, False):
+                if not self._buy_in_completed:
                     # Attempt with current best direction
                     try:
                         self.c_handle_buy_in(best_buy, best_sell)
@@ -475,7 +475,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self.logger().warning(
                                 f"Buy-in skipped: order books not ready for {best_buy.trading_pair} or {best_sell.trading_pair}")
                 # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
-                if not self._buy_in_completed_by_asset.get(best_sell.base_asset, False):
+                if not self._buy_in_completed:
                     try:
                         self.c_handle_buy_in(best_sell, best_buy)
                     except Exception:
@@ -485,10 +485,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             elif self._buy_in_enabled and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
-                if any(not self._buy_in_completed_by_asset.get(mp.first.base_asset, False) for mp in self._market_pairs):
+                if not self._buy_in_completed:
                     for market_pair in self._market_pairs:
-                        if self._buy_in_completed_by_asset.get(market_pair.first.base_asset, False):
-                            continue
                         try:
                             if self.c_handle_buy_in(market_pair.first, market_pair.second):
                                 break
@@ -935,73 +933,45 @@ cdef class ArbitrageMStrategy(StrategyBase):
  
  
     cdef void c_maybe_disable_buy_in(self):
-        """Disable buy-in globally once all base assets across market pairs are completed."""
-        cdef:
-            set unique_bases = set()
-            object mp
-        for mp in self._market_pairs:
-            unique_bases.add(mp.first.base_asset)
-            unique_bases.add(mp.second.base_asset)
-        for a in unique_bases:
-            if not self._buy_in_completed_by_asset.get(a, False):
-                return
-        if self._buy_in_enabled:
-            self._buy_in_enabled = False
-            try:
-                # Reflect in config for UI/CLI; do not re-enable during runtime
-                cfg = arbitrage_m_config_map.get("buy_in_enabled")
-                if cfg is not None:
-                    cfg.value = False
-            except Exception:
-                pass
-            # Mark all bases as permanently completed to prevent future pending displays
-            try:
-                for a in unique_bases:
-                    self._buy_in_completed_by_asset[a] = True
-            except Exception:
-                pass
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, "Buy-in completed for all assets. Disabling buy-in.")
+        """Disable buy-in globally once target is reached for the single base asset."""
+        if self._buy_in_completed:
+            if self._buy_in_enabled:
+                self._buy_in_enabled = False
+                try:
+                    cfg = arbitrage_m_config_map.get("buy_in_enabled")
+                    if cfg is not None:
+                        cfg.value = False
+                except Exception:
+                    pass
+                if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+                    self.log_with_clock(logging.INFO, "Buy-in completed. Disabling buy-in.")
 
     cdef void c_scan_and_mark_buyin_completion(self):
-        """Re-evaluate all assets against target and disable buy-in forever when all done."""
-        if not self._buy_in_enabled:
+        """Re-evaluate the base asset against target and disable buy-in when done."""
+        if not self._buy_in_enabled or self._buy_in_completed:
             return
         cdef:
-            set unique_bases = set()
-            object mp
             str asset_key
-            double last_bid
+            double last_bid = 0.0
             double base_bal
             pair[double, double] val_short
             double current_value_quote
             double shortfall
-        # Collect bases
-        for mp in self._market_pairs:
-            unique_bases.add(mp.first.base_asset)
-            unique_bases.add(mp.second.base_asset)
-        # Check each base; pick a tuple to fetch bid for valuation
-        for asset_key in unique_bases:
-            if self._buy_in_completed_by_asset.get(asset_key, False):
-                continue
+        # Determine the single base asset from the first market pair
+        try:
+            asset_key = self._market_pairs[0].first.base_asset
+        except Exception:
+            return
+        try:
+            last_bid = float(self._market_pairs[0].first.get_price(False))
+        except Exception:
             last_bid = 0.0
-            try:
-                for mp in self._market_pairs:
-                    if mp.first.base_asset == asset_key:
-                        last_bid = float(mp.first.get_price(False))
-                        break
-                    if mp.second.base_asset == asset_key:
-                        last_bid = float(mp.second.get_price(False))
-                        break
-            except Exception:
-                last_bid = 0.0
-            base_bal = self.c_get_aggregated_base_balance(asset_key)
-            val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
-            current_value_quote = val_short.first
-            shortfall = val_short.second
-            if self.c_try_mark_complete_buy_in(asset_key, asset_key, current_value_quote, shortfall):
-                pass
-        # If all marked complete, disable globally
+        base_bal = self.c_get_aggregated_base_balance(asset_key)
+        val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
+        current_value_quote = val_short.first
+        shortfall = val_short.second
+        if self.c_try_mark_complete_buy_in(asset_key, current_value_quote, shortfall):
+            pass
         self.c_maybe_disable_buy_in()
 
     cdef pair[double, double] c_compute_value_and_shortfall(self,
@@ -1034,17 +1004,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return total
 
     cdef bint c_try_mark_complete_buy_in(self,
-                                         str asset_key,
                                          str pair,
                                          double current_value_quote,
                                          double shortfall):
-        """Mark asset buy-in as completed if at target or remaining < min notional."""
+        """Mark buy-in as completed if at target or remaining < min notional (single asset)."""
         if current_value_quote >= self._buy_in_target_usd:
-            self._buy_in_completed_by_asset[asset_key] = True
+            self._buy_in_completed = True
             self.c_maybe_disable_buy_in()
             return True
         if shortfall > 0 and shortfall < self._min_order_usd:
-            self._buy_in_completed_by_asset[asset_key] = True
+            self._buy_in_completed = True
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: shortfall {shortfall:.6f} < min notional {self._min_order_usd:.6f}")
             self.c_maybe_disable_buy_in()
@@ -1071,7 +1040,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             tuple res
             str asset_key = buy_market_tuple.base_asset
 
-        if asset_key in self._buy_in_completed_by_asset and self._buy_in_completed_by_asset[asset_key]:
+        if self._buy_in_completed:
             return False
 
         # Evaluate progress vs target and early complete (aggregate base across all markets)
@@ -1080,7 +1049,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
         cdef double shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
             return False
 
         # Require quote balance to spend and a minimal edge
@@ -1090,7 +1059,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return False
 
         # If the remaining shortfall is below the minimum order notional, consider buy-in complete (uniform)
-        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
             return False
         res = self.c_find_best_buyin_amount(
             buy_market_tuple,
@@ -1147,7 +1116,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(asset_key, pair_str, current_value_quote, shortfall):
+        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
             pass
             self.c_maybe_disable_buy_in()
 

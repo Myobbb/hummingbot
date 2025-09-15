@@ -51,7 +51,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         bint _buy_in_enabled
         double _buy_in_target_usd
         double _buy_in_min_profitability
-        dict _buy_in_completed_by_asset  # key: base_asset -> bool
+        bint _buy_in_completed
         
         # Notifications
         bint _hb_app_notification
@@ -89,7 +89,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                                             double last_bid)
     cdef double c_get_aggregated_base_balance(self, str asset)
     cdef bint c_try_mark_complete_buy_in(self,
-                                         str asset_key,
                                          str pair,
                                          double current_value_quote,
                                          double shortfall)
