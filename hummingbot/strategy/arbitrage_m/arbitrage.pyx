@@ -327,13 +327,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in status (compact, aggregated per base asset)
+            # Buy-in status (compact, aggregated per base asset) - only when any asset is pending
             if self._buy_in_enabled:
-                lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"])
                 try:
                     base_assets = sorted({t.base_asset for t in unique_tuples})
                 except Exception:
                     base_assets = []
+                agg_lines = []
+                any_pending = False
                 for a in base_assets:
                     # Use first available bid as reference for valuation
                     bid = 0.0
@@ -356,8 +357,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     except Exception:
                         total_base = 0.0
                     total_value = total_base * bid
-                    status = "pending" if (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False)) else "completed"
-                    lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({status})")
+                    is_pending = (total_value < self._buy_in_target_usd and not self._buy_in_completed_by_asset.get(a, False))
+                    if is_pending:
+                        any_pending = True
+                    agg_lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({'pending' if is_pending else 'completed'})")
+                if any_pending:
+                    lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"]) 
+                    lines.extend(agg_lines)
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
