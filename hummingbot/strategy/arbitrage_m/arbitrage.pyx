@@ -167,8 +167,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
-# Line ~751
-cdef pair[int, double] c_top_of_book_profitable_get_conv(...)        # If not using oracle, return fixed rates directly
         if not self._use_oracle_conversion_rate:
             return self._fixed_base_rate if is_base_asset else self._fixed_quote_rate
         
