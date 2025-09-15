@@ -517,11 +517,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 if should_report:
                     self.logger().warning("Markets not ready. No arbitrage trading permitted.")
                 return False
-            elif should_report:
-                self.logger().info("Markets ready. Trading started.")
-                # Debounce status logs for a short window to let connectors settle
-                self._status_debounce_until = self._current_timestamp + 2.0
-                # Run one-time global buy-in completion check now that markets are ready
+            else:
+                if should_report:
+                    self.logger().info("Markets ready. Trading started.")
+                    # Debounce status logs for a short window to let connectors settle
+                    self._status_debounce_until = self._current_timestamp + 2.0
+                # Run one-time global buy-in completion check now that markets are ready (always log once)
                 if self._buy_in_enabled:
                     self.log_with_clock(logging.INFO, "Buy-in config enabled at startup; performing completion check.")
                     self.c_scan_and_mark_buyin_completion()
