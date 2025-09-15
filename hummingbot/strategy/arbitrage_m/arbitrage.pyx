@@ -506,24 +506,31 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return True
     cdef double c_get_reference_bid_for_asset(self, str asset_key):
         """Return a non-zero bid for the given base asset from any active market tuple, or 0.0 if none."""
-        cdef double last_bid = 0.0
-        try:
-            for mp in self._market_pairs:
-                if mp.first.base_asset == asset_key and last_bid <= 0.0:
-                    try:
-                        last_bid = float(mp.first.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                if mp.second.base_asset == asset_key and last_bid <= 0.0:
-                    try:
-                        last_bid = float(mp.second.get_price(False))
-                    except Exception:
-                        last_bid = 0.0
-                if last_bid > 0.0:
-                    break
-        except Exception:
-            last_bid = 0.0
-        return last_bid
+        cdef:
+            double last_bid = 0.0
+            ExchangeBase _ex
+            OrderBook _ob
+            cpp_set[OrderBookEntry].reverse_iterator _bid_it
+        for mp in self._market_pairs:
+            if last_bid > 0.0:
+                break
+            if mp.first.base_asset == asset_key:
+                _ex = mp.first.market
+                _ob = _ex.c_get_order_book(mp.first.trading_pair)
+                if _ob._bid_book.size() > 0:
+                    _bid_it = _ob._bid_book.rbegin()
+                    last_bid = deref(_bid_it).getPrice()
+                    if last_bid > 0.0:
+                        break
+            if mp.second.base_asset == asset_key:
+                _ex = mp.second.market
+                _ob = _ex.c_get_order_book(mp.second.trading_pair)
+                if _ob._bid_book.size() > 0:
+                    _bid_it = _ob._bid_book.rbegin()
+                    last_bid = deref(_bid_it).getPrice()
+                    if last_bid > 0.0:
+                        break
+        return last_bid if last_bid > 0.0 else 0.0
 
 
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
@@ -871,10 +878,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object quantized
             double approx_ask
         
-        # Get approximate buy price for affordability check
-        try:
-            approx_ask = float(buy_market_tuple.get_price(True))
-        except:
+        # Get approximate buy price for affordability check via C-level top-of-book
+        cdef ExchangeBase _buy_ex = buy_market_tuple.market
+        cdef OrderBook _buy_ob = _buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
+        cdef cpp_set[OrderBookEntry].iterator _ask_it2
+        if _buy_ob._ask_book.size() > 0:
+            _ask_it2 = _buy_ob._ask_book.begin()
+            approx_ask = deref(_ask_it2).getPrice()
+        else:
             approx_ask = 0.0
         
         # Apply quote balance constraint
@@ -958,18 +969,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return pair[double, double](current_value_quote, shortfall)
 
     cdef double c_get_aggregated_base_balance(self, str asset):
-        """Sum available base balance for the asset across all active markets registered by the strategy."""
+        """Aggregate base balance consistently using the same source as startup status (assets_df/balance_map)."""
         cdef:
             double total = 0.0
-            object m
-            double bal
+            list unique_tuples
+            object assets_df
+            dict balance_map
+            object t
         try:
-            for m in self._sb_markets:
-                try:
-                    bal = float(m.c_get_available_balance(asset))
-                except Exception:
-                    bal = 0.0
-                total += bal
+            unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
+            for t in unique_tuples:
+                if t.base_asset == asset:
+                    total += float(balance_map.get((t.market.name, asset), 0.0))
         except Exception:
             return 0.0
         return total
@@ -1117,10 +1128,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Determine an upper bound on base we might buy given spend_cap and quantization on buy side
         cdef double approx_ask = 0.0
-        try:
-            approx_ask = float(buy_market_tuple.get_price(True))
-        except Exception:
-            approx_ask = 0.0
+        cdef ExchangeBase _buy_ex3 = buy_market_tuple.market
+        cdef OrderBook _buy_ob3 = _buy_ex3.c_get_order_book(buy_market_tuple.trading_pair)
+        cdef cpp_set[OrderBookEntry].iterator _ask_it3
+        if _buy_ob3._ask_book.size() > 0:
+            _ask_it3 = _buy_ob3._ask_book.begin()
+            approx_ask = deref(_ask_it3).getPrice()
         cdef double buy_cap_base = 0.0
         if approx_ask > 0.0 and spend_cap > 0.0:
             buy_cap_base = spend_cap / approx_ask
