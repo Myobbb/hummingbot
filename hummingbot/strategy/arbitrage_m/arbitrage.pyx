@@ -36,9 +36,7 @@ cdef:
     double EPSILON = 1e-10
     double RATE_LOG_INTERVAL = 300.0
 
-# NaN constants for price defaults
-NaN = float("nan")
-s_decimal_nan = Decimal("NaN")
+ 
 
 as_logger = None
 
@@ -52,9 +50,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     OPTION_LOG_STATUS_REPORT = 1 << 0
     OPTION_LOG_CREATE_ORDER = 1 << 1
     OPTION_LOG_ORDER_COMPLETED = 1 << 2
-    OPTION_LOG_PROFITABILITY_STEP = 1 << 3
     OPTION_LOG_INSUFFICIENT_ASSET = 1 << 4
-    OPTION_LOG_ALL = 0xfffffffffffffff
 
     @classmethod
     def logger(cls):
@@ -125,11 +121,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._cached_quote_rate = 1.0
         self._last_rate_update = 0
         
-        # Profitability tracking
-        self._current_profitability = pair[double, double](0.0, 0.0)
         
-        # Notifications
-        self._hb_app_notification = hb_app_notification
         
         # Clear order tracking
         self._order_timestamps.clear()
@@ -175,10 +167,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
-        # Fast path: If not using oracle and rates are 1.0, skip all calculations
+# Line ~751
+cdef pair[int, double] c_top_of_book_profitable_get_conv(...)        # If not using oracle, return fixed rates directly
         if not self._use_oracle_conversion_rate:
-            if self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
-                return 1.0
+            return self._fixed_base_rate if is_base_asset else self._fixed_quote_rate
         
         cdef double current_time = self._current_timestamp
         
@@ -353,30 +345,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 agg_lines = []
                 any_pending = False
                 for a in base_assets:
-                    # Get a reference bid from any unique tuple with this base asset
-                    bid = 0.0
-                    try:
-                        for t in unique_tuples:
-                            if t.base_asset == a:
-                                try:
-                                    bid = float(t.get_price(False))
-                                except Exception:
-                                    bid = 0.0
-                                if bid > 0.0:
-                                    break
-                        if bid <= 0.0:
-                            # Fallback: scan active market pairs
-                            for mp in self._market_pairs:
-                                if mp.first.base_asset == a:
-                                    bid = float(mp.first.get_price(False))
-                                    if bid > 0.0:
-                                        break
-                                if mp.second.base_asset == a:
-                                    bid = float(mp.second.get_price(False))
-                                    if bid > 0.0:
-                                        break
-                    except Exception:
-                        bid = 0.0
+                    # Get a reference bid from any active tuple with this base asset
+                    bid = self.c_get_reference_bid_for_asset(a)
                     # Aggregate available base balance using the same source as the Assets table (no fallback)
                     total_base = 0.0
                     for t in unique_tuples:
@@ -671,11 +641,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if (market_pair.first.quote_asset != market_pair.second.quote_asset or
             market_pair.first.base_asset != market_pair.second.base_asset):
             conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
-        needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
-        # Apply conversion (sell-side and buy-side) only if needed
-        if needs_conversion:
-            bid2 *= conv_rate
-            ask2 *= conv_rate
+        # Apply conversion (sell-side and buy-side)
+        bid2 *= conv_rate
+        ask2 *= conv_rate
         
         # Calculate profitability without fees (fees considered in execution)
         # Direction 1: Buy from market2, sell to market1
@@ -1263,8 +1231,7 @@ cdef list c_find_profitable_arbitrage_orders(
     """
     cdef:
         double min_prof_threshold = 1.0 + min_profitability
-        bint needs_conversion = (fabs(buy_conversion_rate - 1.0) > EPSILON or 
-                                fabs(sell_conversion_rate - 1.0) > EPSILON)
+        # Conversion flags not needed; always apply provided conversion rates
         list profitable_orders = []
         int max_levels = 20  # Reduced from 100
         int levels_processed = 0
@@ -1279,8 +1246,8 @@ cdef list c_find_profitable_arbitrage_orders(
         try:
             top_bid = float(sell_market_tuple.get_price(False))
             top_ask = float(buy_market_tuple.get_price(True))
-            top_bid_adj = top_bid * sell_conversion_rate if needs_conversion else top_bid
-            top_ask_adj = top_ask * buy_conversion_rate if needs_conversion else top_ask
+            top_bid_adj = top_bid * sell_conversion_rate
+            top_ask_adj = top_ask * buy_conversion_rate
             if top_bid_adj / top_ask_adj < min_prof_threshold:
                 return []
         except Exception:
@@ -1310,12 +1277,8 @@ cdef list c_find_profitable_arbitrage_orders(
                 break
             
             # Apply conversion once per level
-            if needs_conversion:
-                bid_price = orig_bid_price * sell_conversion_rate
-                ask_price = orig_ask_price * buy_conversion_rate
-            else:
-                bid_price = orig_bid_price
-                ask_price = orig_ask_price
+            bid_price = orig_bid_price * sell_conversion_rate
+            ask_price = orig_ask_price * buy_conversion_rate
             
             # Check profitability threshold
             if bid_price / ask_price < min_prof_threshold:

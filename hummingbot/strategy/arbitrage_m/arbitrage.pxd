@@ -45,16 +45,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         double _cached_quote_rate
         double _last_rate_update
         
-        # Current profitability
-        pair[double, double] _current_profitability
         # Buy-in params/state
         bint _buy_in_enabled
         double _buy_in_target_usd
         double _buy_in_min_profitability
         bint _buy_in_completed
         
-        # Notifications
-        bint _hb_app_notification
         
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
