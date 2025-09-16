@@ -701,12 +701,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
-            if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
-                self.log_with_clock(
-                    logging.INFO,
-                    f"Executing arbitrage: buy {quantized_amount:.8f} {buy_market_tuple.trading_pair} "
-                    f"@ {buy_market.name}, sell @ {sell_market.name}, "
-                    f"profitability: {profitability * 100:.2f}%")
             
             # CRITICAL: Place both orders with minimal latency
             # The price is passed even for market orders as some connectors use it

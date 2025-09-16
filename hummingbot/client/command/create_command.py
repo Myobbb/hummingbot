@@ -212,6 +212,9 @@ class CreateCommand:
         config_map: ClientConfigAdapter,
     ):
         for key in config_map.keys():
+            # The strategy name is already collected upfront during the create flow
+            if key == "strategy":
+                continue
             client_data = config_map.get_client_data(key)
             if (
                 client_data is not None
@@ -234,7 +237,8 @@ class CreateCommand:
             else:
                 config.value = None
         for config in config_map.values():
-            if config.prompt_on_new or config.required:
+            # Skip prompting for the 'strategy' key - it is already chosen in the create flow
+            if (config.prompt_on_new or config.required) and config.key != "strategy":
                 if not self.app.to_stop_config:
                     await self.prompt_a_config_legacy(config)
                 else:
