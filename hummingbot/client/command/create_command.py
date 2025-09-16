@@ -253,7 +253,7 @@ class CreateCommand:
             self.app.set_text("")
             return
 
-        file_name = await self.prompt_new_file_name(strategy)
+        file_name = await self.prompt_new_file_name(strategy, config_context=config_map)
         if self.app.to_stop_config:
             self.restore_config_legacy(config_map, config_map_backup)
             self.app.set_text("")
