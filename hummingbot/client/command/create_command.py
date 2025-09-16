@@ -366,6 +366,30 @@ class CreateCommand:
             try:
                 base = None
                 connectors: list[str] = []
+                
+                def _parse_additional_connectors(val) -> list[str]:
+                    result = []
+                    if not val:
+                        return result
+                    try:
+                        if isinstance(val, list):
+                            iterable = val
+                        else:
+                            s = str(val).strip()
+                            if s.startswith("[") and s.endswith("]"):
+                                s = s.strip("[]")
+                                iterable = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
+                            else:
+                                iterable = [x.strip() for x in s.split(",") if x.strip()]
+                        for part in iterable:
+                            if ":" in part:
+                                conn, _pair = part.split(":", 1)
+                                conn = conn.strip()
+                                if conn:
+                                    result.append(conn)
+                    except Exception:
+                        pass
+                    return result
 
                 # Legacy dict[ConfigVar]
                 if isinstance(config_context, dict):
@@ -374,6 +398,7 @@ class CreateCommand:
                     secondary_pair = getv("secondary_market_trading_pair")
                     primary = getv("primary_market")
                     secondary = getv("secondary_market")
+                    addl = getv("additional_markets")
                     if isinstance(primary_pair, str) and "-" in primary_pair:
                         base = primary_pair.split("-")[0]
                     elif isinstance(secondary_pair, str) and "-" in secondary_pair:
@@ -382,6 +407,7 @@ class CreateCommand:
                         connectors.append(primary)
                     if isinstance(secondary, str):
                         connectors.append(secondary)
+                    connectors.extend(_parse_additional_connectors(addl))
 
                 # Pydantic model adapter
                 elif isinstance(config_context, ClientConfigAdapter):
@@ -401,6 +427,13 @@ class CreateCommand:
                                 connectors.append(val)
                         except Exception:
                             pass
+                    # Include additional markets if present as attribute
+                    try:
+                        addl = getattr(config_context, "additional_markets", None)
+                        if addl is not None:
+                            connectors.extend(_parse_additional_connectors(addl))
+                    except Exception:
+                        pass
 
                 if not base or not connectors:
                     return None
