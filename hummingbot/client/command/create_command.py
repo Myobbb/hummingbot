@@ -175,7 +175,8 @@ class CreateCommand:
                     f"while setting up these below configuration.")
 
         if isinstance(config_map, ClientConfigAdapter):
-            await self.prompt_for_model_config(config_map)
+            # Skip asking for the strategy name again; it was already collected
+            await self.prompt_for_model_config(config_map, skip_strategy=True)
             if not self.app.to_stop_config:
                 file_name = await self.save_config_to_file(config_map)
         elif config_map is not None:
@@ -210,10 +211,11 @@ class CreateCommand:
     async def prompt_for_model_config(
         self,  # type: HummingbotApplication
         config_map: ClientConfigAdapter,
+        skip_strategy: bool = False,
     ):
         for key in config_map.keys():
-            # The strategy name is already collected upfront during the create flow
-            if key == "strategy":
+            # Optionally skip the strategy field when prompting strategy-specific configs
+            if skip_strategy and key == "strategy":
                 continue
             client_data = config_map.get_client_data(key)
             if (
