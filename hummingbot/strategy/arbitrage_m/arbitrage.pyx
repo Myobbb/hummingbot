@@ -223,7 +223,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._tp_key_by_tuple_id[sell_id] = self._to_cpp_str(sell_market_tuple.trading_pair)
         cdef string buy_key = self._tp_key_by_tuple_id[buy_id]
         cdef string sell_key = self._tp_key_by_tuple_id[sell_id]
-        cdef string cache_key = buy_key + string("|") + sell_key
+        cdef string cache_key
+        cdef char sep = '|'
+        cache_key = buy_key
+        cache_key += sep
+        cache_key += sell_key
 
         if self._conv_rate_cache_map.find(cache_key) != self._conv_rate_cache_map.end():
             return self._conv_rate_cache_map[cache_key]
