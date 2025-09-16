@@ -136,7 +136,7 @@ class CreateCommand:
             self.reset_application_state()
 
     async def save_config(self, name: str, config_instance: BaseClientModel, config_dir_path: Path):
-        file_name = await self.prompt_new_file_name(name, True)
+        file_name = await self.prompt_new_file_name(name, is_script=True, config_context=ClientConfigAdapter(config_instance))
         if self.app.to_stop_config:
             self.app.set_text("")
             return
@@ -329,7 +329,7 @@ class CreateCommand:
         self,  # type: HummingbotApplication
         config_map: ClientConfigAdapter,
     ) -> str:
-        file_name = await self.prompt_new_file_name(config_map.strategy)
+        file_name = await self.prompt_new_file_name(config_map.strategy, config_context=config_map)
         if self.app.to_stop_config:
             self.app.set_text("")
             return
@@ -340,8 +340,100 @@ class CreateCommand:
 
     async def prompt_new_file_name(self,  # type: HummingbotApplication
                                    strategy: str,
-                                   is_script: bool = False):
-        file_name = default_strategy_file_path(strategy)
+                                   is_script: bool = False,
+                                   config_context: Optional[object] = None):
+        def _alias(connector: str) -> Optional[str]:
+            m = {
+                "bybit": "bb",
+                "kucoin": "kc",
+                "gate_io": "gt",
+                "mexc": "mexc",
+                "htx": "htx",
+                "binance": "bn",
+                "bitget": "bg",
+                "bitmart": "bm",
+            }
+            return m.get((connector or "").lower())
+
+        def _priority(alias: str) -> int:
+            order = ["bb", "kc", "gt", "mexc", "htx", "bn", "bg", "bm"]
+            try:
+                return order.index(alias)
+            except ValueError:
+                return len(order) + 1
+
+        def _smart_name() -> Optional[str]:
+            try:
+                base = None
+                connectors: list[str] = []
+
+                # Legacy dict[ConfigVar]
+                if isinstance(config_context, dict):
+                    getv = lambda k: (config_context.get(k).value if config_context.get(k) is not None else None)
+                    primary_pair = getv("primary_market_trading_pair")
+                    secondary_pair = getv("secondary_market_trading_pair")
+                    primary = getv("primary_market")
+                    secondary = getv("secondary_market")
+                    if isinstance(primary_pair, str) and "-" in primary_pair:
+                        base = primary_pair.split("-")[0]
+                    elif isinstance(secondary_pair, str) and "-" in secondary_pair:
+                        base = secondary_pair.split("-")[0]
+                    if isinstance(primary, str):
+                        connectors.append(primary)
+                    if isinstance(secondary, str):
+                        connectors.append(secondary)
+
+                # Pydantic model adapter
+                elif isinstance(config_context, ClientConfigAdapter):
+                    # Try common field names used by strategies
+                    try:
+                        primary_pair = getattr(config_context, "primary_market_trading_pair", None)
+                        if isinstance(primary_pair, str) and "-" in primary_pair:
+                            base = primary_pair.split("-")[0]
+                    except Exception:
+                        pass
+                    for attr in [
+                        "primary_market", "secondary_market", "maker_market", "taker_market", "exchange",
+                    ]:
+                        try:
+                            val = getattr(config_context, attr, None)
+                            if isinstance(val, str):
+                                connectors.append(val)
+                        except Exception:
+                            pass
+
+                if not base or not connectors:
+                    return None
+
+                aliases = []
+                for c in connectors:
+                    a = _alias(c)
+                    if a and a not in aliases:
+                        aliases.append(a)
+                if not aliases:
+                    return None
+                aliases = sorted(aliases, key=_priority)
+
+                # Compose base + aliases
+                filename = f"{base.upper()}_{'_'.join(aliases)}.yml"
+
+                # Ensure uniqueness in target dir
+                conf_dir_path = STRATEGIES_CONF_DIR_PATH if not is_script else SCRIPT_STRATEGY_CONF_DIR_PATH
+                candidate = conf_dir_path / filename
+                if not candidate.exists():
+                    return filename
+                # Add incremental suffix
+                i = 1
+                while True:
+                    suffixed = f"{filename[:-4]}_{i}.yml"
+                    if not (conf_dir_path / suffixed).exists():
+                        return suffixed
+                    i += 1
+            except Exception:
+                return None
+
+        smart_default = _smart_name()
+        file_name = smart_default or default_strategy_file_path(strategy)
         self.app.set_text(file_name)
         input = await self.app.prompt(prompt="Enter a new file name for your configuration >>> ")
         input = format_config_file_name(input)
