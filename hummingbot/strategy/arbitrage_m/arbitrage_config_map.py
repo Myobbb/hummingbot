@@ -117,6 +117,15 @@ def additional_markets_on_validated(value: str):
         # best-effort; don't block config flow on parse issues
         pass
 
+
+def _is_buy_in_enabled() -> bool:
+    """Helper to decide whether buy-in specific fields should be prompted."""
+    try:
+        enabled = arbitrage_m_config_map.get("buy_in_enabled").value
+        return bool(enabled)
+    except Exception:
+        return False
+
 arbitrage_m_config_map = {
     "strategy": ConfigVar(
         key="strategy",
@@ -135,18 +144,20 @@ arbitrage_m_config_map = {
     "buy_in_target_usdt": ConfigVar(
         key="buy_in_target_usdt",
         prompt="Target base asset value to accumulate (in quote units, e.g., USDT) >>> ",
-        prompt_on_new=True,
+        prompt_on_new=False,
         default=Decimal("100"),
         validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
         type_str="decimal",
+        required_if=_is_buy_in_enabled,
     ),
     "buy_in_min_profitability": ConfigVar(
         key="buy_in_min_profitability",
         prompt="Minimum cross-market edge (%) required to trigger buy-in (e.g., 0.5) >>> ",
-        prompt_on_new=True,
+        prompt_on_new=False,
         default=Decimal("0.5"),
         validator=lambda v: validate_decimal(v, Decimal(-100), Decimal("100"), inclusive=True),
         type_str="decimal",
+        required_if=_is_buy_in_enabled,
     ),
     "primary_market": ConfigVar(
         key="primary_market",
