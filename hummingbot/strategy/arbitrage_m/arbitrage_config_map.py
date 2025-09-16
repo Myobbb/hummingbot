@@ -82,12 +82,55 @@ def _assets_differ() -> bool:
     c_map = arbitrage_m_config_map
     ptp = c_map.get("primary_market_trading_pair").value
     stp = c_map.get("secondary_market_trading_pair").value
+    addl = c_map.get("additional_markets").value if c_map.get("additional_markets") is not None else None
+
+    def _parse_pair(p: str):
+        try:
+            if isinstance(p, str) and "-" in p:
+                b, q = p.split("-", 1)
+                return b.strip(), q.strip()
+        except Exception:
+            pass
+        return None, None
+
+    def _iter_additional_pairs(val):
+        # Accept list-like or comma-separated string of connector:PAIR
+        if not val:
+            return []
+        try:
+            if isinstance(val, list):
+                iterable = val
+            else:
+                s = str(val).strip()
+                if s.startswith("[") and s.endswith("]"):
+                    s = s.strip("[]")
+                    iterable = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
+                else:
+                    iterable = [x.strip() for x in s.split(",") if x.strip()]
+            pairs = []
+            for part in iterable:
+                if ":" in part:
+                    _conn, pair = part.split(":", 1)
+                    pairs.append(pair.strip())
+            return pairs
+        except Exception:
+            return []
+
     try:
-        if not ptp or not stp or "-" not in ptp or "-" not in stp:
+        if not ptp or not stp:
             return False
-        first_base, first_quote = ptp.split("-")
-        second_base, second_quote = stp.split("-")
-        return first_base != second_base or first_quote != second_quote
+        f_base, f_quote = _parse_pair(ptp)
+        s_base, s_quote = _parse_pair(stp)
+        if not f_base or not s_base:
+            return False
+        if f_base != s_base or f_quote != s_quote:
+            return True
+        # compare additional markets, if any
+        for pair_str in _iter_additional_pairs(addl):
+            a_base, a_quote = _parse_pair(pair_str)
+            if a_base and (a_base != f_base or a_quote != f_quote):
+                return True
+        return False
     except Exception:
         return False
 
@@ -210,10 +253,11 @@ arbitrage_m_config_map = {
         key="use_oracle_conversion_rate",
         type_str="bool",
         prompt="Do you want to use rate oracle on unmatched trading pairs? (Yes/No) >>> ",
-        prompt_on_new=True,
+        prompt_on_new=False,
         default=False,
         validator=lambda v: validate_bool(v),
         on_validated=update_oracle_settings,
+        required_if=_assets_differ,
     ),
     "secondary_to_primary_base_conversion_rate": ConfigVar(
         key="secondary_to_primary_base_conversion_rate",
