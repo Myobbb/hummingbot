@@ -346,7 +346,7 @@ class CreateCommand:
             m = {
                 "bybit": "bb",
                 "kucoin": "kc",
-                "gate_io": "gt",
+                "gate_io": "gate",
                 "mexc": "mexc",
                 "htx": "htx",
                 "binance": "bn",
