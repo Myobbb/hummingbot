@@ -50,6 +50,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         double _buy_in_target_usd
         double _buy_in_min_profitability
         bint _buy_in_completed
+        # Pending buy-in tracking
+        dict _pending_buyin_by_asset
+        dict _pending_buyin_orders
         
         
         # Order tracking - single unified map
@@ -87,6 +90,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                                             double base_balance,
                                                             double last_bid)
     cdef double c_get_aggregated_base_balance(self, str asset)
+    cdef double c_get_pending_buyin_base(self, str asset)
+    cdef double c_get_adjusted_base_balance(self, str asset)
     cdef bint c_try_mark_complete_buy_in(self,
                                          str pair,
                                          double current_value_quote,
