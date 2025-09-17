@@ -471,19 +471,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 # Not enough edge for normal arbitrage. Still try buy-in using its own threshold,
                 # and also try the reversed pairing in case that direction offers cheaper buys.
                 if not self._buy_in_completed:
-                    # Attempt with current best direction
-                    if self.c_books_ready_for_direction(best_buy, best_sell):
-                        self.c_handle_buy_in(best_buy, best_sell)
-                # Also attempt reversed (sell,buy) to source cheapest asks elsewhere for the same base asset
-                if not self._buy_in_completed:
-                    if self.c_books_ready_for_direction(best_sell, best_buy):
-                        self.c_handle_buy_in(best_sell, best_buy)
+                    # Attempt with current best direction (respect pending/cool-off)
+                    placed_buyin = False
+                    if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
+                        placed_buyin = self.c_handle_buy_in(best_buy, best_sell) or False
+                    # Also attempt reversed only if nothing was placed in current direction
+                    if (not placed_buyin) and (not self._buy_in_completed):
+                        if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
+                            self.c_handle_buy_in(best_sell, best_buy)
             elif self._buy_in_enabled and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
                 if not self._buy_in_completed:
                     for market_pair in self._market_pairs:
-                        if self.c_books_ready_for_direction(market_pair.first, market_pair.second):
+                        if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                             if self.c_handle_buy_in(market_pair.first, market_pair.second):
                                 break
 
