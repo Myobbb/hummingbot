@@ -177,7 +177,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return (<str>py_str).encode('utf-8')
 
     cdef inline double _conv_rate(self, object buy_market_tuple, object sell_market_tuple):
-        """Fast path: sell->buy conversion rate; returns 1.0 when assets match."""
+        """Fast path: sell->buy conversion; returns 1.0 for no-op, avoids oracle when disabled."""
+        if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
+            buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
+            return 1.0
+        if not self._use_oracle_conversion_rate and self._fixed_base_rate == 1.0 and self._fixed_quote_rate == 1.0:
+            return 1.0
         return self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
 
     cdef double c_get_conversion_rate(self, bint is_base_asset):
@@ -658,8 +663,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
             return pair[double, double](0.0, 0.0)
             
-        # Reuse top-of-book helper to obtain conversion rate uniformly (ignore gate result)
-        conv_rate = self.c_top_of_book_profitable_get_conv(market_pair.first, market_pair.second, 0.0).second
+        # Cheap unified conversion (1.0 for identical pairs or when fixed 1:1)
+        conv_rate = self._conv_rate(market_pair.first, market_pair.second)
         # Apply conversion (sell-side and buy-side)
         bid2 *= conv_rate
         ask2 *= conv_rate
