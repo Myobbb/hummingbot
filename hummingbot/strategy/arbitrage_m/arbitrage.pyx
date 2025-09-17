@@ -205,8 +205,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double now
         cdef size_t buy_id
         cdef size_t sell_id
-        cdef string buy_key
-        cdef string sell_key
         cdef string cache_key
         cdef double base_conv = 1.0
         cdef double quote_conv = 1.0
@@ -235,9 +233,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._tp_key_by_tuple_id[buy_id] = self._to_cpp_str(buy_market_tuple.trading_pair)
         if self._tp_key_by_tuple_id.find(sell_id) == self._tp_key_by_tuple_id.end():
             self._tp_key_by_tuple_id[sell_id] = self._to_cpp_str(sell_market_tuple.trading_pair)
-        buy_key = self._tp_key_by_tuple_id[buy_id]
-        sell_key = self._tp_key_by_tuple_id[sell_id]
-        cache_key = buy_key + string("|") + sell_key
+        # Build cache key using Python join then convert once to cpp string
+        cache_key = self._to_cpp_str(buy_market_tuple.trading_pair + "|" + sell_market_tuple.trading_pair)
 
         if self._conv_rate_cache_map.find(cache_key) != self._conv_rate_cache_map.end():
             return self._conv_rate_cache_map[cache_key]
