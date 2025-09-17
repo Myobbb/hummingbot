@@ -356,7 +356,7 @@ class CreateCommand:
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
-            order = ["bb", "kc", "gt", "mexc", "htx", "bn", "bg", "bm"]
+            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "bm"]
             try:
                 return order.index(alias)
             except ValueError:
