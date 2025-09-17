@@ -134,6 +134,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._buy_in_target_usd = buy_in_target_usd
         self._buy_in_min_profitability = buy_in_min_profitability
         self._buy_in_completed = False
+        # Pending buy-in tracking (asset -> base amount) and per-order map (order_id -> (asset, amount))
+        # Used to de-stale holdings valuation until fills settle
+        self._pending_buyin_by_asset = {}
+        self._pending_buyin_orders = {}
         
         # Validate and add markets
         self._validate_configuration()
@@ -559,6 +563,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.log_with_clock(
                     logging.INFO,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
+
+            # If this was a buy-in buy order, remove its pending base from tracking
+            if is_buy:
+                try:
+                    pend = self._pending_buyin_orders.pop(order_id, None)
+                    if pend is not None:
+                        asset_key, amt = pend
+                        self._pending_buyin_by_asset[asset_key] = max(0.0, float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt))
+                        if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                            self._pending_buyin_by_asset.pop(asset_key, None)
+                except Exception:
+                    pass
                 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
@@ -935,6 +951,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         for t in unique_tuples:
             if t.base_asset == asset_key:
                 base_bal += float(balance_map.get((t.market.name, asset_key), 0.0))
+        # Include any in-flight buy-in base to avoid stale underestimation
+        base_bal += self.c_get_pending_buyin_base(asset_key)
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
@@ -979,6 +997,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return 0.0
         return total
 
+    cdef double c_get_pending_buyin_base(self, str asset):
+        """Return in-flight buy-in base amount for asset (orders placed but not yet reflected in balances)."""
+        try:
+            return <double> self._pending_buyin_by_asset.get(asset, 0.0)
+        except Exception:
+            return 0.0
+
+    cdef double c_get_adjusted_base_balance(self, str asset):
+        """Aggregated base balance plus pending buy-in base (to avoid stale underestimation)."""
+        cdef double agg = self.c_get_aggregated_base_balance(asset)
+        cdef double pend = self.c_get_pending_buyin_base(asset)
+        return agg + pend
+
     cdef bint c_try_mark_complete_buy_in(self,
                                          str pair,
                                          double current_value_quote,
@@ -1022,7 +1053,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Evaluate progress vs target and early complete (aggregate base across all markets)
         # Get a reliable bid for the asset from any active tuple to avoid zero-bid stalls
         cdef double last_bid = self.c_get_reference_bid_for_asset(asset_key)
-        base_bal = self.c_get_aggregated_base_balance(asset_key)
+        base_bal = self.c_get_adjusted_base_balance(asset_key)
         cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         cdef double current_value_quote = val_short.first
         cdef double shortfall = val_short.second
@@ -1083,11 +1114,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
+        # Track pending base to avoid stale underestimation until fills settle
+        try:
+            self._pending_buyin_orders[buy_order_id] = (asset_key, float(quantized_amount))
+            self._pending_buyin_by_asset[asset_key] = float(self._pending_buyin_by_asset.get(asset_key, 0.0)) + float(quantized_amount)
+        except Exception:
+            pass
 
         # Check if target reached after placing (aggregate across all markets)
         # Use the same reliable bid lookup as above
         last_bid = self.c_get_reference_bid_for_asset(asset_key)
-        base_bal = self.c_get_aggregated_base_balance(asset_key)
+        base_bal = self.c_get_adjusted_base_balance(asset_key)
         val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
@@ -1205,6 +1242,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Remove old entries
         for order_id_str in to_remove:
             self._order_timestamps.erase(order_id_str)
+            # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount
+            try:
+                oid = order_id_str.decode('utf-8')
+            except Exception:
+                oid = None
+            if oid is not None:
+                try:
+                    pend = self._pending_buyin_orders.pop(oid, None)
+                    if pend is not None:
+                        asset_key, amt = pend
+                        self._pending_buyin_by_asset[asset_key] = max(0.0, float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt))
+                        if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                            self._pending_buyin_by_asset.pop(asset_key, None)
+                except Exception:
+                    pass
         
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
