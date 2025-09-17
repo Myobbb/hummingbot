@@ -57,6 +57,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
+        # Cached taker order types per market to avoid repeated Python calls
+        dict _taker_order_type_by_market
 
     # Core methods
     cdef void _validate_configuration(self)

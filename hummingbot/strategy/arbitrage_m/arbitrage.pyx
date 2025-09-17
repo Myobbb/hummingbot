@@ -42,6 +42,7 @@ cdef:
     double DEFAULT_ORDER_WARNING_DELAY = 10.0
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
     double EPSILON = 1e-10
+    double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
 
  
@@ -148,6 +149,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
             for market in [market_pair.first.market, market_pair.second.market]
         }
         self.c_add_markets(list(all_markets))
+        # Cache taker order types per market to avoid Python calls in hot path
+        try:
+            self._taker_order_type_by_market = {}
+            for _m in all_markets:
+                try:
+                    self._taker_order_type_by_market[_m] = _m.get_taker_order_type()
+                except Exception:
+                    pass
+        except Exception:
+            self._taker_order_type_by_market = {}
     
     cdef void _validate_configuration(self):
         """Validate strategy configuration parameters"""
@@ -699,13 +710,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.logger().info("Insufficient balance or no profitable amount found")
             return
         
-        # Convert to Decimal for market operations
-        dec_amount = Decimal(str(amount))
-        
-        # Quantize amounts
-        # Use connector Python API for quantization to support all exchanges
-        quantized_buy = buy_market.quantize_order_amount(buy_market_tuple.trading_pair, dec_amount)
-        quantized_sell = sell_market.quantize_order_amount(sell_market_tuple.trading_pair, dec_amount)
+        # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API
+        cdef object buy_price_decimal = Decimal(str(buy_price))
+        cdef object sell_price_decimal = Decimal(str(sell_price))
+        cdef object dec_safe_amount = Decimal(str(max(0.0, amount - QUANTIZATION_EPSILON)))
+        try:
+            quantized_buy = buy_market.c_quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount, buy_price_decimal)
+        except Exception:
+            quantized_buy = buy_market.quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount)
+        try:
+            quantized_sell = sell_market.c_quantize_order_amount(sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
+        except Exception:
+            quantized_sell = sell_market.quantize_order_amount(sell_market_tuple.trading_pair, dec_safe_amount)
         quantized_amount = min(quantized_buy, quantized_sell)
         
         # Check minimum order size
@@ -716,8 +732,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double order_start_time
         cdef object buy_order_type
         cdef object sell_order_type
-        cdef object buy_price_decimal
-        cdef object sell_price_decimal
         cdef double placement_latency
 
         if quantized_amount > Decimal("0"):
@@ -729,10 +743,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # to calculate the correct amount (especially for quote currency market orders)
             
             # Pre-calculate all parameters to minimize latency between orders
-            buy_order_type = buy_market.get_taker_order_type()
-            sell_order_type = sell_market.get_taker_order_type()
-            buy_price_decimal = Decimal(str(buy_price))
-            sell_price_decimal = Decimal(str(sell_price))
+            # Use cached taker order type if available to avoid Python lookups
+            buy_order_type = self._taker_order_type_by_market.get(buy_market, buy_market.get_taker_order_type())
+            sell_order_type = self._taker_order_type_by_market.get(sell_market, sell_market.get_taker_order_type())
+            # Prices already prepared above as Decimal for quantization
             
             # Execute both orders in rapid succession
             # This is the best we can do in Cython without async support
@@ -1083,14 +1097,30 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return False
 
         # Place only the buy leg on buy market
-        cdef object order_type = market.get_taker_order_type()
-        cdef object quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(best_amount)))
+        cdef object order_type = self._taker_order_type_by_market.get(market, market.get_taker_order_type())
+        cdef object quantized_amount
+        cdef object dec_safe_amount2 = Decimal(str(max(0.0, best_amount - QUANTIZATION_EPSILON)))
+        try:
+            quantized_amount = market.c_quantize_order_amount(
+                buy_market_tuple.trading_pair,
+                dec_safe_amount2,
+                Decimal(str(buy_price)))
+        except Exception:
+            quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount2)
         # Ensure not exceeding available quote after quantization
         cdef double max_affordable = 0.0
         if buy_price > 0:
             max_affordable = quote_bal / buy_price
         if float(quantized_amount) > max_affordable:
-            quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - 1e-12))))
+            try:
+                quantized_amount = market.c_quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))),
+                    Decimal(str(buy_price)))
+            except Exception:
+                quantized_amount = market.quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))))
         if quantized_amount <= Decimal("0"):
             if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: quantized amount is zero after affordability check")
@@ -1170,9 +1200,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef double buy_cap_base = 0.0
         if approx_ask > 0.0 and spend_cap > 0.0:
             buy_cap_base = spend_cap / approx_ask
-            q = buy_market_tuple.market.quantize_order_amount(
-                buy_market_tuple.trading_pair,
-                Decimal(str(max(0.0, buy_cap_base - 1e-12))))
+            try:
+                q = buy_market_tuple.market.c_quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    Decimal(str(max(0.0, buy_cap_base - QUANTIZATION_EPSILON))),
+                    Decimal(str(approx_ask)))
+            except Exception:
+                q = buy_market_tuple.market.quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    Decimal(str(max(0.0, buy_cap_base - QUANTIZATION_EPSILON))))
             if q is not None:
                 buy_cap_base = float(q)
             else:
