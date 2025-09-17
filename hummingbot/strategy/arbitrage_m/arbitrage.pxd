@@ -45,14 +45,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         double _cached_quote_rate
         double _last_rate_update
         
-        # Per-tick conversion rate cache
-        double _conv_cache_tick
-        unordered_map[string, double] _conv_rate_cache_map
-        size_t _conv_cache_max_size
-        # Pre-encode trading pairs to avoid repeated string encoding during conversion lookups
-        # Maps tuple object ID -> encoded trading pair string
-        unordered_map[size_t, string] _tp_key_by_tuple_id
-
         # Buy-in params/state
         bint _buy_in_enabled
         double _buy_in_target_usd

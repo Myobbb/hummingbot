@@ -39,7 +39,6 @@ from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
 cdef:
     double DEFAULT_MIN_ORDER_USD = 15.0
     double DEFAULT_RATE_CACHE_DURATION = 10.0
-    size_t DEFAULT_CONV_CACHE_MAX_SIZE = 2048
     double DEFAULT_ORDER_WARNING_DELAY = 10.0
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
     double EPSILON = 1e-10
@@ -124,20 +123,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._cached_base_rate = 1.0
         self._cached_quote_rate = 1.0
         self._last_rate_update = 0
-        # Per-tick conversion cache init
-        self._conv_cache_tick = -1.0
-        self._conv_rate_cache_map.clear()
-        self._conv_cache_max_size = DEFAULT_CONV_CACHE_MAX_SIZE
-        # Pre-encode trading pairs for cache keys
-        self._tp_key_by_tuple_id.clear()
-        cdef object _mp
-        cdef object _t
-        cdef size_t _tid
-        for _mp in self._market_pairs:
-            for _t in [_mp.first, _mp.second]:
-                _tid = <size_t>id(_t)
-                if self._tp_key_by_tuple_id.find(_tid) == self._tp_key_by_tuple_id.end():
-                    self._tp_key_by_tuple_id[_tid] = self._to_cpp_str(_t.trading_pair)
         
         
         
@@ -201,46 +186,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return self._cached_base_rate if is_base_asset else self._cached_quote_rate
     
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple):
-        """Conversion to express sell market prices in buy market quote units (with per-tick caching)."""
-        cdef double now
-        cdef size_t buy_id
-        cdef size_t sell_id
-        cdef string cache_key
-        cdef double base_conv = 1.0
-        cdef double quote_conv = 1.0
-        cdef double base_rate = 0.0
-        cdef double quote_rate = 0.0
-        cdef double result
-        cdef object primary_first
-        cdef object primary_second
-
+        """Conversion to express sell market prices in buy market quote units."""
         # Fast path: if assets match, no conversion needed
         if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
             buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
             return 1.0
-
-        # Per-tick cache handling (persist across ticks if fixed rates are used)
-        now = self._current_timestamp
-        if self._use_oracle_conversion_rate:
-            if self._conv_cache_tick != now:
-                self._conv_rate_cache_map.clear()
-                self._conv_cache_tick = now
-
-        # Fetch pre-encoded keys by tuple object id, fallback to on-demand encode if missing
-        buy_id = <size_t>id(buy_market_tuple)
-        sell_id = <size_t>id(sell_market_tuple)
-        if self._tp_key_by_tuple_id.find(buy_id) == self._tp_key_by_tuple_id.end():
-            self._tp_key_by_tuple_id[buy_id] = self._to_cpp_str(buy_market_tuple.trading_pair)
-        if self._tp_key_by_tuple_id.find(sell_id) == self._tp_key_by_tuple_id.end():
-            self._tp_key_by_tuple_id[sell_id] = self._to_cpp_str(sell_market_tuple.trading_pair)
-        # Build cache key using Python join then convert once to cpp string
-        cache_key = self._to_cpp_str(buy_market_tuple.trading_pair + "|" + sell_market_tuple.trading_pair)
-
-        if self._conv_rate_cache_map.find(cache_key) != self._conv_rate_cache_map.end():
-            return self._conv_rate_cache_map[cache_key]
-
-        primary_first = self._market_pairs[0].first
-        primary_second = self._market_pairs[0].second
+        
+        cdef double base_conv = 1.0
+        cdef double quote_conv = 1.0
+        cdef object primary_first = self._market_pairs[0].first
+        cdef object primary_second = self._market_pairs[0].second
 
         # Base asset conversion (sell base -> buy base)
         if buy_market_tuple.base_asset != sell_market_tuple.base_asset:
@@ -249,8 +204,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 base_conv = self.c_get_conversion_rate(True)
             elif (buy_market_tuple.base_asset == primary_second.base_asset and
                   sell_market_tuple.base_asset == primary_first.base_asset):
-                base_rate = self.c_get_conversion_rate(True)
-                base_conv = 1.0 / base_rate if base_rate != 0 else 0.0
+                base_conv = 1.0 / self.c_get_conversion_rate(True) if self.c_get_conversion_rate(True) != 0 else 0.0
             else:
                 base_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
@@ -262,20 +216,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 quote_conv = self.c_get_conversion_rate(False)
             elif (buy_market_tuple.quote_asset == primary_second.quote_asset and
                   sell_market_tuple.quote_asset == primary_first.quote_asset):
-                quote_rate = self.c_get_conversion_rate(False)
-                quote_conv = 1.0 / quote_rate if quote_rate != 0 else 0.0
+                quote_conv = 1.0 / self.c_get_conversion_rate(False) if self.c_get_conversion_rate(False) != 0 else 0.0
             else:
                 quote_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
 
-        result = quote_conv / base_conv if base_conv != 0 else 0.0
-        # Enforce simple cache size limit (only for oracle-driven cache)
-        if self._use_oracle_conversion_rate and self._conv_rate_cache_map.size() >= self._conv_cache_max_size:
-            self._conv_rate_cache_map.clear()
-            self._conv_cache_tick = now
-        self._conv_rate_cache_map[cache_key] = result
-        return result
-
+        return quote_conv / base_conv if base_conv != 0 else 0.0
     
     cdef void c_update_conversion_rates(self):
         """Update cached conversion rates efficiently"""
