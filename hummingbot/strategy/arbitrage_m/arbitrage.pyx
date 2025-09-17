@@ -176,6 +176,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         """Convert a Python str to libcpp.string efficiently."""
         return (<str>py_str).encode('utf-8')
 
+    cdef inline double _conv_rate(self, object buy_market_tuple, object sell_market_tuple):
+        """Fast path: sell->buy conversion rate; returns 1.0 when assets match."""
+        return self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
+
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
         if not self._use_oracle_conversion_rate:
@@ -649,16 +653,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double bid2 = float(market_pair.second.get_price(False))
             double ask2 = float(market_pair.second.get_price(True))
             double conv_rate = 1.0
-            bint needs_conversion = False
             
         # Sanity check - prices must be positive
         if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
             return pair[double, double](0.0, 0.0)
             
-        # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
-        if (market_pair.first.quote_asset != market_pair.second.quote_asset or
-            market_pair.first.base_asset != market_pair.second.base_asset):
-            conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+        # Reuse top-of-book helper to obtain conversion rate uniformly (ignore gate result)
+        conv_rate = self.c_top_of_book_profitable_get_conv(market_pair.first, market_pair.second, 0.0).second
         # Apply conversion (sell-side and buy-side)
         bid2 *= conv_rate
         ask2 *= conv_rate
@@ -769,12 +770,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double top_bid_adj
             double top_ask_adj
             double conv_rate = 1.0
-            bint needs_conversion = False
-        # Compute conversion rate only if assets differ; callee returns 1.0 in no-op cases
-        if (buy_market_tuple.quote_asset != sell_market_tuple.quote_asset or
-            buy_market_tuple.base_asset != sell_market_tuple.base_asset):
-            conv_rate = self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
-        needs_conversion = (fabs(conv_rate - 1.0) > EPSILON)
+        # Compute conversion via unified helper (1.0 if no-op)
+        conv_rate = self._conv_rate(buy_market_tuple, sell_market_tuple)
 
         # Read top-of-book via C-level order book to avoid exceptions
         cdef ExchangeBase buy_ex = buy_market_tuple.market
