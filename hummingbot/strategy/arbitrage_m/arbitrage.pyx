@@ -202,38 +202,48 @@ cdef class ArbitrageMStrategy(StrategyBase):
     
     cdef double c_get_market_to_market_conversion_rate(self, object buy_market_tuple, object sell_market_tuple):
         """Conversion to express sell market prices in buy market quote units (with per-tick caching)."""
+        cdef double now
+        cdef size_t buy_id
+        cdef size_t sell_id
+        cdef string buy_key
+        cdef string sell_key
+        cdef pair[string, string] cache_key
+        cdef double base_conv = 1.0
+        cdef double quote_conv = 1.0
+        cdef double base_rate = 0.0
+        cdef double quote_rate = 0.0
+        cdef double result
+        cdef object primary_first
+        cdef object primary_second
+
         # Fast path: if assets match, no conversion needed
         if (buy_market_tuple.base_asset == sell_market_tuple.base_asset and
             buy_market_tuple.quote_asset == sell_market_tuple.quote_asset):
             return 1.0
 
         # Per-tick cache handling (persist across ticks if fixed rates are used)
-        cdef double now = self._current_timestamp
+        now = self._current_timestamp
         if self._use_oracle_conversion_rate:
             if self._conv_cache_tick != now:
                 self._conv_rate_cache_map.clear()
                 self._conv_cache_tick = now
 
         # Fetch pre-encoded keys by tuple object id, fallback to on-demand encode if missing
-        cdef size_t buy_id = <size_t>id(buy_market_tuple)
-        cdef size_t sell_id = <size_t>id(sell_market_tuple)
+        buy_id = <size_t>id(buy_market_tuple)
+        sell_id = <size_t>id(sell_market_tuple)
         if self._tp_key_by_tuple_id.find(buy_id) == self._tp_key_by_tuple_id.end():
             self._tp_key_by_tuple_id[buy_id] = self._to_cpp_str(buy_market_tuple.trading_pair)
         if self._tp_key_by_tuple_id.find(sell_id) == self._tp_key_by_tuple_id.end():
             self._tp_key_by_tuple_id[sell_id] = self._to_cpp_str(sell_market_tuple.trading_pair)
-        cdef string buy_key = self._tp_key_by_tuple_id[buy_id]
-        cdef string sell_key = self._tp_key_by_tuple_id[sell_id]
-        cdef pair[string, string] cache_key = pair[string, string](buy_key, sell_key)
+        buy_key = self._tp_key_by_tuple_id[buy_id]
+        sell_key = self._tp_key_by_tuple_id[sell_id]
+        cache_key = pair[string, string](buy_key, sell_key)
 
         if self._conv_rate_cache_map.find(cache_key) != self._conv_rate_cache_map.end():
             return self._conv_rate_cache_map[cache_key]
 
-        cdef double base_conv = 1.0
-        cdef double quote_conv = 1.0
-        cdef double base_rate = 0.0
-        cdef double quote_rate = 0.0
-        cdef object primary_first = self._market_pairs[0].first
-        cdef object primary_second = self._market_pairs[0].second
+        primary_first = self._market_pairs[0].first
+        primary_second = self._market_pairs[0].second
 
         # Base asset conversion (sell base -> buy base)
         if buy_market_tuple.base_asset != sell_market_tuple.base_asset:
@@ -261,7 +271,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 quote_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
 
-        cdef double result = quote_conv / base_conv if base_conv != 0 else 0.0
+        result = quote_conv / base_conv if base_conv != 0 else 0.0
         # Enforce simple cache size limit (only for oracle-driven cache)
         if self._use_oracle_conversion_rate and self._conv_rate_cache_map.size() >= self._conv_cache_max_size:
             self._conv_rate_cache_map.clear()
