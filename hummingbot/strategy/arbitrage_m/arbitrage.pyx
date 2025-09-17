@@ -820,17 +820,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double buy_quote_balance
             double sell_base_balance
             double conv_rate = 1.0
-        # Early exit if no balance
-        buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
-        sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
-        if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
-            return (0.0, 0.0, 0.0, 0.0)
-        
-        # Early uniform gate: skip deeper work if top-of-book fails, and reuse conv_rate
+        # Early uniform gate: skip any Python balance calls if top-of-book fails
         gate_res = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, self._min_profitability)
         if not gate_res.first:
             return (0.0, 0.0, 0.0, 0.0)
         conv_rate = gate_res.second
+
+        # Fetch balances only after passing the gate
+        buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+        sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+        if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
+            return (0.0, 0.0, 0.0, 0.0)
 
         # conv_rate already obtained from top-of-book gate
         
