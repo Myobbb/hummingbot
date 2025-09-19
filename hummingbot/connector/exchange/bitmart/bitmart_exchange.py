@@ -427,18 +427,8 @@ class BitmartExchange(ExchangePyBase):
 
                 # Refer to https://developer-pro.bitmart.com/en/spot/#private-balance-change
                 elif event_type == CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME:
-                    # Example payload:
-                    # {
-                    #   "table":"spot/user/balance",
-                    #   "data":[{"currency":"USDT","available":"123.45","frozen":"0"}],
-                    #   "action":"BALANCE_UPDATE"
-                    # }
                     for balance_event in execution_data:
                         try:
-                            # Support current Bitmart schema with nested balance_details and legacy flat schema
-                            evt_type = str(balance_event.get("event_type", ""))
-                            evt_time = str(balance_event.get("event_time", ""))
-
                             details = balance_event.get("balance_details") or []
                             if isinstance(details, list) and len(details) > 0:
                                 for detail in details:
@@ -450,8 +440,6 @@ class BitmartExchange(ExchangePyBase):
                                     if asset_name:
                                         self._account_available_balances[asset_name] = available
                                         self._account_balances[asset_name] = available + frozen
-                                        self.logger().info(
-                                            f"[Bitmart WS] Balance updated ({evt_type} @ {evt_time}): {asset_name} free={available} frozen={frozen} total={available + frozen}")
                             else:
                                 asset_name = str(balance_event.get("ccy") or balance_event.get("currency") or "")
                                 available_str = str(balance_event.get("av_bal") or balance_event.get("available") or "0")
@@ -461,8 +449,6 @@ class BitmartExchange(ExchangePyBase):
                                 if asset_name:
                                     self._account_available_balances[asset_name] = available
                                     self._account_balances[asset_name] = available + frozen
-                                    self.logger().info(
-                                        f"[Bitmart WS] Balance updated ({evt_type} @ {evt_time}): {asset_name} free={available} frozen={frozen} total={available + frozen}")
                         except Exception:
                             # Ignore malformed entries but keep processing
                             continue
