@@ -17,6 +17,7 @@ BROKER_ID = "hummingbotfound"
 PUBLIC_TRADE_CHANNEL_NAME = "spot/trade"
 PUBLIC_DEPTH_CHANNEL_NAME = "spot/depth50"
 PRIVATE_ORDER_PROGRESS_CHANNEL_NAME = "spot/user/order"
+PRIVATE_BALANCE_CHANNEL_NAME = "spot/user/balance"
 
 # REST API ENDPOINTS
 CHECK_NETWORK_PATH_URL = "system/service"

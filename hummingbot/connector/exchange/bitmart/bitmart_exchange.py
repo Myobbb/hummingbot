@@ -61,7 +61,7 @@ class BitmartExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
 
         super().__init__(client_config_map)
-        self.real_time_balance_update = False
+        self.real_time_balance_update = True
 
     @property
     def authenticator(self):
@@ -418,7 +418,27 @@ class BitmartExchange(ExchangePyBase):
                                     client_order_id=client_order_id,
                                     exchange_order_id=each_event["order_id"],
                                 )
-                                self._order_tracker.process_order_update(order_update=order_update)
+                            self._order_tracker.process_order_update(order_update=order_update)
+
+                # Refer to https://developer-pro.bitmart.com/en/spot/#private-balance-change
+                elif event_type == CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME:
+                    # Example payload:
+                    # {
+                    #   "table":"spot/user/balance",
+                    #   "data":[{"currency":"USDT","available":"123.45","frozen":"0"}],
+                    #   "action":"BALANCE_UPDATE"
+                    # }
+                    for balance_event in execution_data:
+                        try:
+                            asset_name = str(balance_event.get("currency"))
+                            available = Decimal(str(balance_event.get("available", "0")))
+                            frozen = Decimal(str(balance_event.get("frozen", "0")))
+                            if asset_name:
+                                self._account_available_balances[asset_name] = available
+                                self._account_balances[asset_name] = available + frozen
+                        except Exception:
+                            # Ignore malformed entries but keep processing
+                            continue
 
                         except asyncio.CancelledError:
                             raise
