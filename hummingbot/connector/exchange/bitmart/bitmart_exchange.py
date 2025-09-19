@@ -435,12 +435,34 @@ class BitmartExchange(ExchangePyBase):
                     # }
                     for balance_event in execution_data:
                         try:
-                            asset_name = str(balance_event.get("currency"))
-                            available = Decimal(str(balance_event.get("available", "0")))
-                            frozen = Decimal(str(balance_event.get("frozen", "0")))
-                            if asset_name:
-                                self._account_available_balances[asset_name] = available
-                                self._account_balances[asset_name] = available + frozen
+                            # Support current Bitmart schema with nested balance_details and legacy flat schema
+                            evt_type = str(balance_event.get("event_type", ""))
+                            evt_time = str(balance_event.get("event_time", ""))
+
+                            details = balance_event.get("balance_details") or []
+                            if isinstance(details, list) and len(details) > 0:
+                                for detail in details:
+                                    asset_name = str(detail.get("ccy") or detail.get("currency") or "")
+                                    available_str = str(detail.get("av_bal") or detail.get("available") or "0")
+                                    frozen_str = str(detail.get("fz_bal") or detail.get("frozen") or "0")
+                                    available = Decimal(available_str)
+                                    frozen = Decimal(frozen_str)
+                                    if asset_name:
+                                        self._account_available_balances[asset_name] = available
+                                        self._account_balances[asset_name] = available + frozen
+                                        self.logger().info(
+                                            f"[Bitmart WS] Balance updated ({evt_type} @ {evt_time}): {asset_name} free={available} frozen={frozen} total={available + frozen}")
+                            else:
+                                asset_name = str(balance_event.get("ccy") or balance_event.get("currency") or "")
+                                available_str = str(balance_event.get("av_bal") or balance_event.get("available") or "0")
+                                frozen_str = str(balance_event.get("fz_bal") or balance_event.get("frozen") or "0")
+                                available = Decimal(available_str)
+                                frozen = Decimal(frozen_str)
+                                if asset_name:
+                                    self._account_available_balances[asset_name] = available
+                                    self._account_balances[asset_name] = available + frozen
+                                    self.logger().info(
+                                        f"[Bitmart WS] Balance updated ({evt_type} @ {evt_time}): {asset_name} free={available} frozen={frozen} total={available + frozen}")
                         except Exception:
                             # Ignore malformed entries but keep processing
                             continue
