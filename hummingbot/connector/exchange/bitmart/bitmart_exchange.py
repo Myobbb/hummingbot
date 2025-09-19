@@ -186,17 +186,26 @@ class BitmartExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
 
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        api_params = {
+            "symbol": symbol,
+            "side": trade_type.name.lower(),
+            "type": order_type.name.lower(),
+            "client_order_id": order_id,
+        }
+
         if order_type is OrderType.MARKET:
-            price = await self._get_last_traded_price(trading_pair)
-        notionalValue: Decimal = (amount * Decimal(price))
-        api_params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
-                      "side": trade_type.name.lower(),
-                      "type": order_type.name.lower(),
-                      "size": f"{amount:f}",
-                      "price": f"{price:f}",
-                      "client_order_id": order_id,
-                      "notional": f"{notionalValue:f}",
-                      }
+            # Market BUY requires only notional; Market SELL requires only size. Do not send price for market orders
+            if trade_type is TradeType.BUY:
+                last_price = await self._get_last_traded_price(trading_pair)
+                notional_value: Decimal = (amount * Decimal(str(last_price)))
+                api_params["notional"] = f"{notional_value:f}"
+            else:
+                api_params["size"] = f"{amount:f}"
+        else:
+            # Limit orders require both size and price
+            api_params["size"] = f"{amount:f}"
+            api_params["price"] = f"{price:f}"
         order_result = await self._api_post(
             path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
             data=api_params,
