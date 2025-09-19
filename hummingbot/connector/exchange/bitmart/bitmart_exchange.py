@@ -197,8 +197,8 @@ class BitmartExchange(ExchangePyBase):
         if order_type is OrderType.MARKET:
             # Market BUY requires only notional; Market SELL requires only size. Do not send price for market orders
             if trade_type is TradeType.BUY:
-                last_price = await self._get_last_traded_price(trading_pair)
-                notional_value: Decimal = (amount * Decimal(str(last_price)))
+                # Use strategy-provided price to size notional consistently with the computed base amount
+                notional_value: Decimal = (amount * Decimal(str(price)))
                 api_params["notional"] = f"{notional_value:f}"
             else:
                 api_params["size"] = f"{amount:f}"
