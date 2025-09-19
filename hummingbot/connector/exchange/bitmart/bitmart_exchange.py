@@ -418,7 +418,7 @@ class BitmartExchange(ExchangePyBase):
                                     client_order_id=client_order_id,
                                     exchange_order_id=each_event["order_id"],
                                 )
-                            self._order_tracker.process_order_update(order_update=order_update)
+                                self._order_tracker.process_order_update(order_update=order_update)
 
                 # Refer to https://developer-pro.bitmart.com/en/spot/#private-balance-change
                 elif event_type == CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME:
@@ -439,11 +439,6 @@ class BitmartExchange(ExchangePyBase):
                         except Exception:
                             # Ignore malformed entries but keep processing
                             continue
-
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            self.logger().exception("Unexpected error in user stream listener loop.")
             except asyncio.CancelledError:
                 raise
             except Exception:
