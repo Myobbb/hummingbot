@@ -189,7 +189,7 @@ class BitmartExchange(ExchangePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         api_params = {
             "symbol": symbol,
-            "side": trade_type.name.lowerBROKER_ID(),
+            "side": trade_type.name.lower(),
             "type": order_type.name.lower(),
             "client_order_id": order_id,
         }
