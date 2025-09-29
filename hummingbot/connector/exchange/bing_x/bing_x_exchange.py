@@ -325,7 +325,9 @@ class BingXExchange(ExchangePyBase):
                     client_order_id = data.get('C')
                     # exchange_order_id = data.get('i')
 
-                    tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
+                    # Use updatable orders instead of fillable so we also catch orders
+                    # that are still in PENDING_CREATE when the first FILLED event arrives
+                    tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     # tracked_order = self._order_tracker.fetch_order(exchange_order_id=str(exchange_order_id))
                     if tracked_order is not None:
                         if execution_type in ["PARTIALLY_FILLED", "FILLED"]:

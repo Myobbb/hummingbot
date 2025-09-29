@@ -352,11 +352,13 @@ class CreateCommand:
                 "binance": "bn",
                 "bitget": "bg",
                 "bitmart": "bm",
+                "bing_x": "bing",
+                "okx": "okx",
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
-            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "bm"]
+            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "bm", "bing", "okx"]
             try:
                 return order.index(alias)
             except ValueError:
