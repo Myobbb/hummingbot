@@ -323,12 +323,17 @@ class BingXExchange(ExchangePyBase):
                     execution_type = data.get('X')
 
                     client_order_id = data.get('C')
-                    # exchange_order_id = data.get('i')
+                    exchange_order_id = data.get('i')
 
-                    # Use updatable orders instead of fillable so we also catch orders
-                    # that are still in PENDING_CREATE when the first FILLED event arrives
-                    tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-                    # tracked_order = self._order_tracker.fetch_order(exchange_order_id=str(exchange_order_id))
+                    # Prefer lookup by client id; fall back to exchange id if needed (some WS fills may omit C)
+                    tracked_order = None
+                    if client_order_id:
+                        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                    if tracked_order is None and exchange_order_id is not None:
+                        try:
+                            tracked_order = self._order_tracker.fetch_order(exchange_order_id=str(exchange_order_id))
+                        except Exception:
+                            tracked_order = None
                     if tracked_order is not None:
                         if execution_type in ["PARTIALLY_FILLED", "FILLED"]:
                             new_state = CONSTANTS.ORDER_STATE[data["X"]]
@@ -360,6 +365,25 @@ class BingXExchange(ExchangePyBase):
                                 fill_timestamp=int(data["E"]) * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
+
+                            # Fast-path for MARKET orders: mark as filled on first trade to avoid long pending state
+                            try:
+                                if str(data.get("o")) == "MARKET":
+                                    force_state = OrderState.FILLED if execution_type in ["PARTIALLY_FILLED", "FILLED"] else None
+                                    if force_state is not None:
+                                        forced_update = OrderUpdate(
+                                            trading_pair=tracked_order.trading_pair,
+                                            update_timestamp=int(data["E"]) * 1e-3,
+                                            new_state=force_state,
+                                            client_order_id=tracked_order.client_order_id,
+                                            exchange_order_id=str(data["i"]),
+                                        )
+                                        self._order_tracker.process_order_update(order_update=forced_update)
+                                        # Skip generic state handling below to prevent duplicate transitions
+                                        continue
+                            except Exception:
+                                # Best-effort fast path; fall back to generic handling if anything goes wrong
+                                pass
 
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
