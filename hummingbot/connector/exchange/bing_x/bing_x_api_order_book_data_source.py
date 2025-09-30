@@ -50,6 +50,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._last_ws_message_sent_timestamp = 0
+        # Ensure strictly increasing update_ids per trading pair to avoid skipped diffs
+        self._last_ob_update_id_ms: Dict[str, int] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -111,7 +113,14 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             ws_time_ms = None
 
-        time = (ws_time_ms * 1e-3) if ws_time_ms is not None else self._time()
+        # Compute base ms timestamp
+        base_ms = ws_time_ms if ws_time_ms is not None else int(self._time() * 1e3)
+        # Enforce monotonic increasing update_id per pair (ms)
+        last_ms = self._last_ob_update_id_ms.get(trading_pair, 0)
+        if base_ms <= last_ms:
+            base_ms = last_ms + 1
+        self._last_ob_update_id_ms[trading_pair] = base_ms
+        time = base_ms * 1e-3
         order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
             raw_message, time, {"trading_pair": trading_pair})
         message_queue.put_nowait(order_book_message)
@@ -219,9 +228,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
-                # Treat any depth variants (e.g. depth, depth100) as snapshots (BingX pushes full depth)
+                # Route depth updates as diffs to avoid full snapshot application on each tick
                 if event_type.startswith("depth"):
-                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                     # if data.get("f"):
                     #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
                     # else:
