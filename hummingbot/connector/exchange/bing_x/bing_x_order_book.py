@@ -20,7 +20,8 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = timestamp
+        # Use millisecond update_id consistently across REST and WS
+        ts = int(timestamp * 1e3)
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": ts,
@@ -42,7 +43,8 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = msg["timestamp"]
+        # Keep update_id in milliseconds
+        ts = int(msg["timestamp"])  # already ms from REST
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": ts,
@@ -64,7 +66,8 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        ts = timestamp
+        # Use millisecond update_id for diffs to ensure ordering vs snapshot
+        ts = int(timestamp * 1e3) if timestamp is not None else None
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
             "update_id": ts,

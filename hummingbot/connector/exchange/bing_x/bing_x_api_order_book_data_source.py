@@ -98,7 +98,19 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         #     order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
         #         diff_message, diff_message["t"], {"trading_pair": trading_pair})
         #     message_queue.put_nowait(order_book_message)
-        time = self._time()
+        # Prefer server-provided timestamp for monotonic update_ids
+        ws_time_ms = None
+        try:
+            if isinstance(raw_message.get('time'), (int, float)):
+                ws_time_ms = int(raw_message.get('time'))
+            elif isinstance(raw_message.get('ts'), (int, float)):
+                ws_time_ms = int(raw_message.get('ts'))
+            elif isinstance(raw_message.get('data', {}).get('t'), (int, float)):
+                ws_time_ms = int(raw_message.get('data', {}).get('t'))
+        except Exception:
+            ws_time_ms = None
+
+        time = (ws_time_ms * 1e-3) if ws_time_ms is not None else self._time()
         order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
             raw_message, time, {"trading_pair": trading_pair})
         message_queue.put_nowait(order_book_message)
