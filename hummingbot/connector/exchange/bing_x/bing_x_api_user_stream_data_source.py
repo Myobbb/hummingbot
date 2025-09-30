@@ -81,13 +81,8 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         await asyncio.wait_for(
                             self._process_ws_messages(ws=ws, output=output), timeout=seconds_until_next_ping)
                     except asyncio.TimeoutError:
-                        ping_time = self._time()
-                        payload = {
-                            "ping": int(ping_time * 1e3)
-                        }
-                        ping_request = WSJSONRequest(payload=payload)
-                        await ws.send(request=ping_request)
-                        self._last_ws_message_sent_timestamp = ping_time
+                        # No client-initiated pings; rely on server heartbeats to avoid rate issues
+                        continue
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -231,7 +226,8 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
                         self._last_listen_key_ping_ts = int(time.time())
                 else:
-                    await self._sleep(self.LISTEN_KEY_KEEP_ALIVE_INTERVAL)
+                    # Sleep shorter to ensure timely renewal regardless of drift
+                    await self._sleep(max(5, self.LISTEN_KEY_KEEP_ALIVE_INTERVAL // 6))
         finally:
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
