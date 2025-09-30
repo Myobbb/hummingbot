@@ -229,7 +229,56 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
 
-    
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listen for trades using websocket trade channel.
+        """
+        message_queue = self._message_queue[CONSTANTS.TRADE_EVENT_TYPE]
+        while True:
+            try:
+                json_msg = await message_queue.get()
+                trading_pair = json_msg["symbol"]
+                
+                # BingX sends trades as an array in the data field
+                trades_data = json_msg.get("data", [])
+                if not isinstance(trades_data, list):
+                    trades_data = [trades_data]
+                    
+                for trade_data in trades_data:
+                    trade_message: OrderBookMessage = BingXOrderBook.trade_message_from_exchange(
+                        trade_data, 
+                        {"trading_pair": trading_pair}
+                    )
+                    output.put_nowait(trade_message)
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error when processing public trade updates from exchange", exc_info=True)
+                await self._sleep(1.0)
+
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listen for orderbook diffs using websocket book channel.
+        """
+        message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
+        while True:
+            try:
+                json_msg = await message_queue.get()
+                trading_pair = json_msg["symbol"]
+                
+                order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
+                    json_msg, 
+                    self._time(), 
+                    {"trading_pair": trading_pair}
+                )
+                output.put_nowait(order_book_message)
+                
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error when processing public order book updates from exchange", exc_info=True)
+                await self._sleep(1.0)
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
