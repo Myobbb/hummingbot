@@ -170,13 +170,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 trade_payload = {
                     "id": "trade",
+                    "reqType": "sub",
                     "dataType": trading_pair + "@trade"
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
                 depth_payload = {
                     "id": "depth",
-                    "dataType": trading_pair + "@depth"
+                    "reqType": "sub",
+                    "dataType": trading_pair + "@depth100"
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
 
@@ -200,15 +202,17 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             # self.logger().info(f"data process: {data}")
             if data.get("ping"):
-                # self.logger().info("send pong through websocket")
-                payload = "pong"
+                # Respond per BingX spec with {"pong": ping}
+                payload = {"pong": data.get("ping"), "time": data.get("time")}
                 ping_request = WSJSONRequest(payload=payload)
                 await ws.send(request=ping_request)
+                self._last_ws_message_sent_timestamp = self._time()
             elif data.get("dataType"):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
-                if event_type == CONSTANTS.DIFF_EVENT_TYPE:
+                # Treat any depth variants (e.g. depth, depth100) as order book diffs
+                if event_type.startswith("depth"):
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                     # if data.get("f"):
                     #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
