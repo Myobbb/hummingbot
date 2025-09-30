@@ -125,15 +125,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     trading_pairs=self._trading_pairs, 
                     snapshot_queue=output
                 )
+                self.logger().info("Snapshot taken successfully")
                 
-                # Wait for one hour before taking the next snapshot
-                await self._sleep(self.ONE_HOUR)
+                # TEMPORARILY REDUCED for testing - change back to self.ONE_HOUR later
+                await self._sleep(30)  # Take snapshot every 30 seconds for testing
                 
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().error("Unexpected error.", exc_info=True)
-                # On error, wait 5 seconds before retrying
+            except Exception as e:
+                self.logger().error(f"Snapshot error: {e}", exc_info=True)
                 await self._sleep(5.0)
 
     async def listen_for_subscriptions(self):
@@ -275,10 +275,25 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Listen for orderbook diffs using websocket book channel.
         """
         message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
+        self.logger().info("Started listening for order book diffs")
+        
         while True:
             try:
                 json_msg = await message_queue.get()
                 trading_pair = json_msg["symbol"]
+                
+                # DEBUG: Print the entire message structure once
+                import json
+                self.logger().info(f"FULL DEPTH MESSAGE: {json.dumps(json_msg, indent=2)[:500]}")  # First 500 chars
+                
+                # Check if data exists and has the expected structure
+                if "data" not in json_msg:
+                    self.logger().error(f"No 'data' field in message: {json_msg.keys()}")
+                    continue
+                    
+                if "bids" not in json_msg["data"] or "asks" not in json_msg["data"]:
+                    self.logger().error(f"Missing bids/asks in data: {json_msg['data'].keys()}")
+                    continue
                 
                 order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
                     json_msg, 
@@ -286,11 +301,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     {"trading_pair": trading_pair}
                 )
                 output.put_nowait(order_book_message)
+                self.logger().info(f"Successfully created and queued order book message for {trading_pair}")
                 
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().error("Unexpected error when processing public order book updates from exchange", exc_info=True)
+            except Exception as e:
+                self.logger().error(f"Error processing order book diff: {e}", exc_info=True)
                 await self._sleep(1.0)
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
