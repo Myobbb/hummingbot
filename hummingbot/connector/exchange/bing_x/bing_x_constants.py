@@ -22,7 +22,7 @@ WSS_PRIVATE_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 LAST_TRADED_PRICE_PATH = "/openApi/spot/v1/ticker/24hr"
 EXCHANGE_INFO_PATH_URL = "/openApi/spot/v1/common/symbols"
 SNAPSHOT_PATH_URL = "/openApi/spot/v1/market/depth"
-SERVER_TIME_PATH_URL = "/openApi/spot/v2/server/time"
+SERVER_TIME_PATH_URL = "/openApi/spot/v1/server/time"
 
 # Private API endpoints
 USER_STREAM_PATH_URL = "/openApi/user/auth/userDataStream"
