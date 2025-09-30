@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
@@ -141,7 +142,6 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         exchange. Each message is stored in its own queue.
         """
         ws = None
-        heartbeat_task = None
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -149,23 +149,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                  ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
-
-                async def _heartbeat():
-                    try:
-                        while True:
-                            await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
-                            ping_time = self._time()
-                            payload = {"ping": int(ping_time * 1e3)}
-                            ping_request = WSJSONRequest(payload=payload)
-                            await ws.send(request=ping_request)
-                            self._last_ws_message_sent_timestamp = ping_time
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # Heartbeat is best-effort
-                        pass
-
-                heartbeat_task = asyncio.create_task(_heartbeat())
+                # Process messages continuously and only respond to server pings
                 await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
@@ -176,9 +160,6 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(5.0)
             finally:
-                if heartbeat_task is not None:
-                    heartbeat_task.cancel()
-                    heartbeat_task = None
                 ws and await ws.disconnect()
 
     async def _subscribe_channels(self, ws: WSAssistant):
@@ -219,6 +200,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
+         
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    continue
             if data.get("msg") == "SUCCESS":
                 continue
             # self.logger().info(f"data process: {data}")
@@ -232,9 +219,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
-                # Treat any depth variants (e.g. depth, depth100) as order book diffs
+                # Treat any depth variants (e.g. depth, depth100) as snapshots (BingX pushes full depth)
                 if event_type.startswith("depth"):
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
                     # if data.get("f"):
                     #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
                     # else:
@@ -251,8 +238,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 trading_pair = json_msg["symbol"]
                 # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 #     symbol=json_msg["symbol"])
+                # Prefer server-provided time if present for monotonic update_ids
+                ts_sec = self._time()
+                try:
+                    if isinstance(json_msg.get("time"), (int, float)):
+                        ts_sec = float(json_msg.get("time")) * 1e-3
+                except Exception:
+                    pass
                 order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
-                    json_msg["data"], self._time(), {"trading_pair": trading_pair})
+                    json_msg["data"], ts_sec, {"trading_pair": trading_pair})
                 snapshot_queue.put_nowait(order_book_message)
             except asyncio.CancelledError:
                 raise
