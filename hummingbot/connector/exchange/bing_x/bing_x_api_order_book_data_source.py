@@ -50,6 +50,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._last_ws_message_sent_timestamp = 0
+        # Throttled per-symbol lag logging (ms timestamp)
+        self._last_depth_lag_log_ms: Dict[str, int] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -144,8 +146,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
-                                 ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                # Rely on server heartbeats; avoid client ping timeouts
+                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
                 # Process messages continuously and only respond to server pings
@@ -157,7 +159,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
                     exc_info=True,
                 )
-                await self._sleep(5.0)
+                await self._sleep(1.0)
             finally:
                 ws and await ws.disconnect()
 
@@ -209,8 +211,10 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             # self.logger().info(f"data process: {data}")
             if data.get("ping"):
-                # Respond per BingX spec with {"pong": ping}
-                payload = {"pong": data.get("ping"), "time": data.get("time")}
+                # Respond per BingX spec with {"pong": ping} and echo time when present
+                payload = {"pong": data.get("ping")}
+                if data.get("time") is not None:
+                    payload["time"] = data.get("time")
                 ping_request = WSJSONRequest(payload=payload)
                 await ws.send(request=ping_request)
                 self._last_ws_message_sent_timestamp = self._time()
@@ -220,6 +224,21 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 data['symbol'] = symbol
                 # Treat depth* as snapshots (BingX depth100 pushes full book state)
                 if event_type.startswith("depth"):
+                    # Lightweight lag measurement: server time vs receipt time
+                    try:
+                        now_ms = int(self._time() * 1e3)
+                        server_ms = None
+                        if isinstance(data.get("time"), (int, float)):
+                            server_ms = int(data.get("time"))
+                        elif isinstance(data.get("ts"), (int, float)):
+                            server_ms = int(data.get("ts"))
+                        last_log = self._last_depth_lag_log_ms.get(symbol, 0)
+                        if server_ms is not None and (now_ms - last_log) >= 2000:
+                            lag_ms = max(0, now_ms - server_ms)
+                            self.logger().debug(f"BingX depth recv lag {symbol}: {lag_ms} ms")
+                            self._last_depth_lag_log_ms[symbol] = now_ms
+                    except Exception:
+                        pass
                     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
                     # if data.get("f"):
                     #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)

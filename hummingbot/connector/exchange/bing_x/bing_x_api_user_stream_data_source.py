@@ -246,7 +246,8 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws: WSAssistant = await self._get_ws_assistant()
         web_utils.wss_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
         url = f"{CONSTANTS.WSS_PRIVATE_URL[self._domain]}?listenKey={self._current_listen_key}"
-        await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        # Rely on server heartbeats; avoid client ping timeouts
+        await ws.connect(ws_url=url)
         return ws
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
