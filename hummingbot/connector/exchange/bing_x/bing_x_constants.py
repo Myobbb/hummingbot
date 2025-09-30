@@ -18,11 +18,16 @@ WSS_PUBLIC_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 
 WSS_PRIVATE_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 
+# Websocket event types
+DIFF_EVENT_TYPE = ""
+TRADE_EVENT_TYPE = ""
+SNAPSHOT_EVENT_TYPE = "depth"
+
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/openApi/spot/v1/ticker/24hr"
 EXCHANGE_INFO_PATH_URL = "/openApi/spot/v1/common/symbols"
 SNAPSHOT_PATH_URL = "/openApi/spot/v1/market/depth"
-SERVER_TIME_PATH_URL = "/openApi/spot/v1/server/time"
+SERVER_TIME_PATH_URL = "/openApi/swap/v2/server/time"
 
 # Private API endpoints
 USER_STREAM_PATH_URL = "/openApi/user/auth/userDataStream"
@@ -106,13 +111,18 @@ RATE_LIMITS = {
 
 }
 
-# Websocket event types
-TRADE_EVENT_TYPE = "trade"
-DIFF_EVENT_TYPE = "depth"
-SNAPSHOT_EVENT_TYPE = "snapshot" 
 
-# Additional constants
 EXCHANGE_NAME = "bing_x"
 HBOT_BROKER_ID = "hummingbot"
 HBOT_ORDER_ID = "t-HBOT"
+
+REST_URL = "https://open-api.bingx.com/openapi"
+
+
+SYMBOL_PATH_URL = "/spot/v1/common/symbols"
+
+TRADE_EVENT_TYPE = "trade"
+DIFF_EVENT_TYPE = "depth"
+
+BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
 SOURCE_KEY = 'Hummingbot'

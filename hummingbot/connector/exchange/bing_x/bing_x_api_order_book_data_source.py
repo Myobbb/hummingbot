@@ -38,7 +38,6 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  time_synchronizer: Optional[TimeSynchronizer] = None):
         super().__init__(trading_pairs)
         self._connector = connector
-        self._trade_messages_queue_key = CONSTANTS.TRADE_EVENT_TYPE
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._time_synchronizer = time_synchronizer
@@ -85,38 +84,29 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["symbol"])
         trading_pair = raw_message["dataType"].split('@')[0]
+        # for trades in raw_message["data"]:
         trade_message: OrderBookMessage = BingXOrderBook.trade_message_from_exchange(
             raw_message["data"], {"trading_pair": trading_pair})
         message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        # self.logger().info(f"parse msg queue: {raw_message}")
         trading_pair = raw_message.get('dataType').split('@')[0]
+        # for diff_message in raw_message["data"]:
+        #     order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
+        #         diff_message, diff_message["t"], {"trading_pair": trading_pair})
+        #     message_queue.put_nowait(order_book_message)
         time = self._time()
         order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
             raw_message, time, {"trading_pair": trading_pair})
         message_queue.put_nowait(order_book_message)
 
-    async def _connected_websocket_assistant(self) -> WSAssistant:
-        """
-        Creates and connects a WebSocket assistant for market data streams.
-        
-        :return: A connected WSAssistant instance
-        """
-        ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(
-            ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
-            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
-        )
-        return ws
-
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
-        This method runs continuously and request the full order book content from the exchange periodically.
+        This method runs continuously and requests the full order book content from the exchange periodically.
         BingX does not provide snapshots via WebSocket, only via REST API.
-        
-        :param ev_loop: the event loop the method will run in
-        :param output: a queue to add the created snapshot messages
         """
         while True:
             try:
@@ -127,13 +117,14 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 self.logger().info("Snapshot taken successfully")
                 
-                # TEMPORARILY REDUCED for testing - change back to self.ONE_HOUR later
-                await self._sleep(30)  # Take snapshot every 30 seconds for testing
+                # Wait for one hour before taking the next snapshot
+                await self._sleep(self.ONE_HOUR)
                 
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                self.logger().error(f"Snapshot error: {e}", exc_info=True)
+            except Exception:
+                self.logger().error("Unexpected error.", exc_info=True)
+                # On error, wait 5 seconds before retrying
                 await self._sleep(5.0)
 
     async def listen_for_subscriptions(self):
@@ -144,7 +135,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         ws = None
         while True:
             try:
-                ws: WSAssistant = await self._connected_websocket_assistant()
+                ws: WSAssistant = await self._api_factory.get_ws_assistant()
+                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
 
@@ -179,16 +171,13 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         try:
             for trading_pair in self._trading_pairs:
+
                 trade_payload = {
-                    "id": f"trade_{trading_pair}",
-                    "reqType": "sub",
-                    "dataType": f"{trading_pair}@trade"
+                    "id": "trade",
+                    "dataType": trading_pair + "@trade"
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
-                # Subscribe to depth with 100 levels
-                # Per BingX Spot API: format is <symbol>@depth<level> (no interval)
-                # Updates are pushed every 300ms by default
                 depth_payload = {
                     "id": f"depth_{trading_pair}",
                     "reqType": "sub",
@@ -212,35 +201,65 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
-            
-            # Handle subscription confirmations  
-            if isinstance(data, dict) and data.get("msg") == "SUCCESS":
-                self.logger().info(f"Subscription confirmed: {data}")
+            if data.get("msg") == "SUCCESS":
                 continue
-                
-            # Handle ping/pong - MUST echo back the ping value
-            if isinstance(data, dict) and "ping" in data:
-                pong_payload = {
-                    "pong": data["ping"]  # Echo the ping timestamp
-                }
-                pong_request = WSJSONRequest(payload=pong_payload)
-                await ws.send(request=pong_request)
-                self._last_ws_message_sent_timestamp = self._time()
-                continue
-                
-            # Process market data messages
-            if isinstance(data, dict) and data.get("dataType"):
-                data_type_parts = data.get("dataType").split('@')
-                if len(data_type_parts) >= 2:
-                    symbol = data_type_parts[0]
-                    event_type = data_type_parts[1]
-                    data['symbol'] = symbol
-                    
-                    # Handle depth events which may include level info (e.g., "depth100")
-                    if event_type.startswith(CONSTANTS.DIFF_EVENT_TYPE):
-                        self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                    elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
-                        self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
+            # self.logger().info(f"data process: {data}")
+            if data.get("ping"):
+                # self.logger().info("send pong through websocket")
+                payload = {"pong": data["ping"]}  
+                ping_request = WSJSONRequest(payload=payload)
+                await ws.send(request=ping_request)
+            elif data.get("dataType"):
+                symbol = data.get("dataType").split('@')[0]
+                event_type = data.get("dataType").split('@')[1]
+                data['symbol'] = symbol
+                if event_type == CONSTANTS.DIFF_EVENT_TYPE:
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    # if data.get("f"):
+                    #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                    # else:
+                    #     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
+                    self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
+
+    async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
+        message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        while True:
+            try:
+                json_msg = await message_queue.get()
+                # self.logger().info(f"data in queue: {json_msg}")
+                trading_pair = json_msg["symbol"]
+                # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
+                #     symbol=json_msg["symbol"])
+                order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
+                    json_msg["data"], self._time(), {"trading_pair": trading_pair})
+                snapshot_queue.put_nowait(order_book_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error when processing public order book updates from exchange")
+                raise
+
+    async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
+        for trading_pair in trading_pairs:
+            try:
+                snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
+                snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
+                snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
+                    snapshot,
+                    snapshot_timestamp,
+                    metadata={"trading_pair": trading_pair}
+                )
+                snapshot_queue.put_nowait(snapshot_msg)
+                self.logger().debug(f"Saved order book snapshot for {trading_pair}")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error(f"Unexpected error fetching order book snapshot for {trading_pair}.",
+                                    exc_info=True)
+                await self._sleep(5.0)
+
+    # Add these methods to your BingXAPIOrderBookDataSource class:
 
     async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
@@ -275,25 +294,10 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Listen for orderbook diffs using websocket book channel.
         """
         message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
-        self.logger().info("Started listening for order book diffs")
-        
         while True:
             try:
                 json_msg = await message_queue.get()
                 trading_pair = json_msg["symbol"]
-                
-                # DEBUG: Print the entire message structure once
-                import json
-                self.logger().info(f"FULL DEPTH MESSAGE: {json.dumps(json_msg, indent=2)[:500]}")  # First 500 chars
-                
-                # Check if data exists and has the expected structure
-                if "data" not in json_msg:
-                    self.logger().error(f"No 'data' field in message: {json_msg.keys()}")
-                    continue
-                    
-                if "bids" not in json_msg["data"] or "asks" not in json_msg["data"]:
-                    self.logger().error(f"Missing bids/asks in data: {json_msg['data'].keys()}")
-                    continue
                 
                 order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
                     json_msg, 
@@ -301,32 +305,13 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     {"trading_pair": trading_pair}
                 )
                 output.put_nowait(order_book_message)
-                self.logger().info(f"Successfully created and queued order book message for {trading_pair}")
                 
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                self.logger().error(f"Error processing order book diff: {e}", exc_info=True)
+            except Exception:
+                self.logger().error("Unexpected error when processing public order book updates from exchange", exc_info=True)
                 await self._sleep(1.0)
 
-    async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
-        for trading_pair in trading_pairs:
-            try:
-                snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
-                snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
-                snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
-                    snapshot,
-                    snapshot_timestamp,
-                    metadata={"trading_pair": trading_pair}
-                )
-                snapshot_queue.put_nowait(snapshot_msg)
-                self.logger().debug(f"Saved order book snapshot for {trading_pair}")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().error(f"Unexpected error fetching order book snapshot for {trading_pair}.",
-                                    exc_info=True)
-                await self._sleep(5.0)
-
+    
     def _time(self):
         return time.time()
