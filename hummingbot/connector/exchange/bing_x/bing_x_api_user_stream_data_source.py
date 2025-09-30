@@ -81,7 +81,16 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         await asyncio.wait_for(
                             self._process_ws_messages(ws=ws, output=output), timeout=seconds_until_next_ping)
                     except asyncio.TimeoutError:
-                        # No client-initiated pings; rely on server heartbeats to avoid rate issues
+                        # Adaptive fallback: if we haven't received any frame for ~12s, send a JSON ping
+                        try:
+                            if (self._time() - ws.last_recv_time) >= 12:
+                                ping_time = self._time()
+                                payload = {"ping": int(ping_time * 1e3)}
+                                ping_request = WSJSONRequest(payload=payload)
+                                await ws.send(request=ping_request)
+                                self._last_ws_message_sent_timestamp = ping_time
+                        except Exception:
+                            pass
                         continue
             except asyncio.CancelledError:
                 raise
@@ -242,8 +251,14 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws: WSAssistant = await self._get_ws_assistant()
         web_utils.wss_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
         url = f"{CONSTANTS.WSS_PRIVATE_URL[self._domain]}?listenKey={self._current_listen_key}"
-        # Rely on server heartbeats; avoid client ping timeouts
-        await ws.connect(ws_url=url)
+        # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
+        await ws.connect(
+            ws_url=url,
+            ping_timeout=None,
+            message_timeout=60,
+            ws_headers={"Accept-Encoding": "gzip"},
+            max_msg_size=16 * 1024 * 1024,
+        )
         return ws
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):

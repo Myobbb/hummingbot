@@ -146,8 +146,14 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                # Rely on server heartbeats; avoid client ping timeouts
-                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
+                # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
+                await ws.connect(
+                    ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
+                    ping_timeout=None,
+                    message_timeout=60,
+                    ws_headers={"Accept-Encoding": "gzip"},
+                    max_msg_size=16 * 1024 * 1024,
+                )
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
                 # Process messages continuously and only respond to server pings
