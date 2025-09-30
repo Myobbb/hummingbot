@@ -141,26 +141,32 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         exchange. Each message is stored in its own queue.
         """
         ws = None
+        heartbeat_task = None
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
+                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
+                                 ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
 
-                while True:
+                async def _heartbeat():
                     try:
-                        seconds_until_next_ping = (CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL - (
-                            self._time() - self._last_ws_message_sent_timestamp))
-                        await asyncio.wait_for(self._process_ws_messages(ws=ws), timeout=seconds_until_next_ping)
-                    except asyncio.TimeoutError:
-                        ping_time = self._time()
-                        payload = {
-                            "ping": int(ping_time * 1e3)
-                        }
-                        ping_request = WSJSONRequest(payload=payload)
-                        await ws.send(request=ping_request)
-                        self._last_ws_message_sent_timestamp = ping_time
+                        while True:
+                            await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                            ping_time = self._time()
+                            payload = {"ping": int(ping_time * 1e3)}
+                            ping_request = WSJSONRequest(payload=payload)
+                            await ws.send(request=ping_request)
+                            self._last_ws_message_sent_timestamp = ping_time
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Heartbeat is best-effort
+                        pass
+
+                heartbeat_task = asyncio.create_task(_heartbeat())
+                await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -170,6 +176,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(5.0)
             finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    heartbeat_task = None
                 ws and await ws.disconnect()
 
     async def _subscribe_channels(self, ws: WSAssistant):
