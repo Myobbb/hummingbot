@@ -203,9 +203,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = utils.decompress_ws_message(ws_response.data)
             if data.get("msg") == "SUCCESS":
                 continue
-            # self.logger().info(f"data process: {data}")
+                
             if data.get("ping"):
-                # self.logger().info("send pong through websocket")
                 payload = {"pong": data["ping"]}  
                 ping_request = WSJSONRequest(payload=payload)
                 await ws.send(request=ping_request)
@@ -213,12 +212,10 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
-                if event_type == CONSTANTS.DIFF_EVENT_TYPE:
+                
+                # Fix: Check if event_type starts with "depth" instead of exact match
+                if event_type.startswith("depth"):
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                    # if data.get("f"):
-                    #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                    # else:
-                    #     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
 
