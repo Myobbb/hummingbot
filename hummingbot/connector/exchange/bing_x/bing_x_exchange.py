@@ -21,6 +21,7 @@ from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ class BingXExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_trades_poll_bingx_timestamp = 1.0
         super().__init__(client_config_map)
+        
 
     @staticmethod
     def bingx_order_type(order_type: OrderType) -> str:
@@ -458,6 +460,8 @@ class BingXExchange(ExchangePyBase):
                 trade_updates.append(trade_update)
 
         return trade_updates
+
+    
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         updated_order_data = await self._api_get(

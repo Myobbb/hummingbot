@@ -105,12 +105,14 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         try:
             trade_payload = {
                 "id": "usertrade",
+                "reqType": "sub",
                 "dataType": "spot.executionReport"
             }
             subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
             balance_payload = {
                 "id": "userbalance",
+                "reqType": "sub",
                 "dataType": "ACCOUNT_UPDATE"
             }
             subscribe_balance_request: WSJSONRequest = WSJSONRequest(payload=balance_payload)
@@ -141,6 +143,19 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._last_recv_time = self._time()
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
+            # Respond to server heartbeat ping per BingX spec
+            # https://bingx-api.github.io/docs/#/en-us/spot/socket/#Connection%20Limits
+            if isinstance(data, dict) and "ping" in data:
+                try:
+                    pong_payload = {"pong": data.get("ping"), "time": data.get("time")}
+                    pong_request = WSJSONRequest(payload=pong_payload)
+                    await ws.send(request=pong_request)
+                    self._last_ws_message_sent_timestamp = self._time()
+                except Exception:
+                    # Best-effort; continue processing
+                    pass
+                continue
+
             if data.get("e") == "ACCOUNT_UPDATE":
                 output.put_nowait(data)
             elif (data.get("dataType") == "spot.executionReport"):
@@ -187,7 +202,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 return_err=True,
                 throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
-            self.logger().info(data)
+            # Per docs, expect 200/204 on success; avoid noisy logging
 
         except asyncio.CancelledError:
             raise
