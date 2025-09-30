@@ -38,6 +38,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  time_synchronizer: Optional[TimeSynchronizer] = None):
         super().__init__(trading_pairs)
         self._connector = connector
+        self._trade_messages_queue_key = CONSTANTS.TRADE_EVENT_TYPE
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._time_synchronizer = time_synchronizer
@@ -84,24 +85,30 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["symbol"])
         trading_pair = raw_message["dataType"].split('@')[0]
-        # for trades in raw_message["data"]:
         trade_message: OrderBookMessage = BingXOrderBook.trade_message_from_exchange(
             raw_message["data"], {"trading_pair": trading_pair})
         message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # self.logger().info(f"parse msg queue: {raw_message}")
         trading_pair = raw_message.get('dataType').split('@')[0]
-        # for diff_message in raw_message["data"]:
-        #     order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
-        #         diff_message, diff_message["t"], {"trading_pair": trading_pair})
-        #     message_queue.put_nowait(order_book_message)
         time = self._time()
         order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
             raw_message, time, {"trading_pair": trading_pair})
         message_queue.put_nowait(order_book_message)
+
+    async def _connected_websocket_assistant(self) -> WSAssistant:
+        """
+        Creates and connects a WebSocket assistant for market data streams.
+        
+        :return: A connected WSAssistant instance
+        """
+        ws: WSAssistant = await self._api_factory.get_ws_assistant()
+        await ws.connect(
+            ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
+            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
+        )
+        return ws
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
@@ -131,8 +138,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         ws = None
         while True:
             try:
-                ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
+                ws: WSAssistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
 
@@ -167,16 +173,20 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         try:
             for trading_pair in self._trading_pairs:
-
                 trade_payload = {
-                    "id": "trade",
-                    "dataType": trading_pair + "@trade"
+                    "id": f"trade_{trading_pair}",
+                    "reqType": "sub",
+                    "dataType": f"{trading_pair}@trade"
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
+                # Subscribe to depth with 100 levels
+                # Per BingX Spot API: format is <symbol>@depth<level> (no interval)
+                # Updates are pushed every 300ms by default
                 depth_payload = {
-                    "id": "depth",
-                    "dataType": trading_pair + "@depth"
+                    "id": f"depth_{trading_pair}",
+                    "reqType": "sub",
+                    "dataType": f"{trading_pair}@depth100"
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
 
@@ -198,22 +208,18 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = utils.decompress_ws_message(ws_response.data)
             if data.get("msg") == "SUCCESS":
                 continue
-            # self.logger().info(f"data process: {data}")
             if data.get("ping"):
-                # self.logger().info("send pong through websocket")
                 payload = "pong"
                 ping_request = WSJSONRequest(payload=payload)
                 await ws.send(request=ping_request)
             elif data.get("dataType"):
-                symbol = data.get("dataType").split('@')[0]
-                event_type = data.get("dataType").split('@')[1]
+                data_type_parts = data.get("dataType").split('@')
+                symbol = data_type_parts[0]
+                event_type = data_type_parts[1]
                 data['symbol'] = symbol
-                if event_type == CONSTANTS.DIFF_EVENT_TYPE:
+                # Handle depth events which may include level info (e.g., "depth100")
+                if event_type.startswith(CONSTANTS.DIFF_EVENT_TYPE):
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                    # if data.get("f"):
-                    #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                    # else:
-                    #     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
 
@@ -222,10 +228,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 json_msg = await message_queue.get()
-                # self.logger().info(f"data in queue: {json_msg}")
                 trading_pair = json_msg["symbol"]
-                # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                #     symbol=json_msg["symbol"])
                 order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
                     json_msg["data"], self._time(), {"trading_pair": trading_pair})
                 snapshot_queue.put_nowait(order_book_message)
