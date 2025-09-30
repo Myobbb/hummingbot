@@ -335,9 +335,6 @@ class BingXExchange(ExchangePyBase):
                         except Exception:
                             tracked_order = None
                     if tracked_order is not None:
-                        # Ignore any further messages once order reached a final state to avoid regressions
-                        if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
-                            continue
                         if execution_type in ["PARTIALLY_FILLED", "FILLED"]:
                             new_state = CONSTANTS.ORDER_STATE[data["X"]]
                             if new_state == OrderState.FILLED and tracked_order.current_state == OrderState.PENDING_CREATE:
@@ -369,21 +366,20 @@ class BingXExchange(ExchangePyBase):
                             )
                             self._order_tracker.process_trade_update(trade_update)
 
-                            # Fast-path for MARKET orders: when we receive a trade, mark accordingly to avoid pending
+                            # Fast-path for MARKET orders: on first trade, consider order FILLED to avoid long pending
                             try:
                                 if str(data.get("o")) == "MARKET":
-                                    # Respect partial fills unless exchange explicitly reports FILLED
-                                    force_state = OrderState.FILLED if execution_type == "FILLED" else OrderState.PARTIALLY_FILLED
-                                    if force_state is not None and tracked_order.current_state != force_state:
+                                    if tracked_order.current_state not in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
                                         forced_update = OrderUpdate(
                                             trading_pair=tracked_order.trading_pair,
                                             update_timestamp=int(data["E"]) * 1e-3,
-                                            new_state=force_state,
+                                            new_state=OrderState.FILLED,
                                             client_order_id=tracked_order.client_order_id,
                                             exchange_order_id=str(data["i"]),
                                         )
                                         self._order_tracker.process_order_update(order_update=forced_update)
-                                        # Do not continue; allow generic state handling to process additional fields
+                                        # Skip generic state handling to prevent regression to PARTIALLY_FILLED
+                                        continue
                             except Exception:
                                 # Best-effort fast path; fall back to generic handling if anything goes wrong
                                 pass
@@ -391,8 +387,8 @@ class BingXExchange(ExchangePyBase):
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
                         new_state = CONSTANTS.ORDER_STATE[data["X"]]
-                        # Skip if already final to avoid resurrecting finished orders
-                        if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
+                        # Allow CANCELED to override previous state; otherwise skip updates after final
+                        if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED] and new_state is not OrderState.CANCELED:
                             continue
                         if new_state == OrderState.PENDING_CREATE:
                             # This event has already been dispatched after calling _place_order.
