@@ -109,6 +109,7 @@ RATE_LIMITS = {
 # Websocket event types
 TRADE_EVENT_TYPE = "trade"
 DIFF_EVENT_TYPE = "depth"
+SNAPSHOT_EVENT_TYPE = "snapshot" 
 
 # Additional constants
 EXCHANGE_NAME = "bing_x"
