@@ -212,22 +212,35 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
-            if data.get("msg") == "SUCCESS":
+            
+            # Handle subscription confirmations  
+            if isinstance(data, dict) and data.get("msg") == "SUCCESS":
+                self.logger().info(f"Subscription confirmed: {data}")
                 continue
-            if data.get("ping"):
-                payload = "pong"
-                ping_request = WSJSONRequest(payload=payload)
-                await ws.send(request=ping_request)
-            elif data.get("dataType"):
+                
+            # Handle ping/pong - MUST echo back the ping value
+            if isinstance(data, dict) and "ping" in data:
+                pong_payload = {
+                    "pong": data["ping"]  # Echo the ping timestamp
+                }
+                pong_request = WSJSONRequest(payload=pong_payload)
+                await ws.send(request=pong_request)
+                self._last_ws_message_sent_timestamp = self._time()
+                continue
+                
+            # Process market data messages
+            if isinstance(data, dict) and data.get("dataType"):
                 data_type_parts = data.get("dataType").split('@')
-                symbol = data_type_parts[0]
-                event_type = data_type_parts[1]
-                data['symbol'] = symbol
-                # Handle depth events which may include level info (e.g., "depth100")
-                if event_type.startswith(CONSTANTS.DIFF_EVENT_TYPE):
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
-                    self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
+                if len(data_type_parts) >= 2:
+                    symbol = data_type_parts[0]
+                    event_type = data_type_parts[1]
+                    data['symbol'] = symbol
+                    
+                    # Handle depth events which may include level info (e.g., "depth100")
+                    if event_type.startswith(CONSTANTS.DIFF_EVENT_TYPE):
+                        self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
+                        self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
 
     async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
