@@ -239,7 +239,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         elif isinstance(data.get("ts"), (int, float)):
                             server_ms = int(data.get("ts"))
                         last_log = self._last_depth_lag_log_ms.get(symbol, 0)
-                        if server_ms is not None and (now_ms - last_log) >= 2000:
+                        if server_ms is not None and (now_ms - last_log) >= 1000:
                             lag_ms = max(0, now_ms - server_ms)
                             self.logger().debug(f"BingX depth recv lag {symbol}: {lag_ms} ms")
                             self._last_depth_lag_log_ms[symbol] = now_ms

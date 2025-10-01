@@ -180,13 +180,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return time.time()
 
     async def _get_listen_key(self):
-        rest_assistant = await self._api_factory.get_rest_assistant()
         try:
-            data = await rest_assistant.execute_request(
-                url=web_utils.rest_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
+            # Signed request per docs: include timestamp and signature
+            data = await web_utils.api_request(
+                path=CONSTANTS.USER_STREAM_PATH_URL,
+                api_factory=self._api_factory,
+                throttler=self._throttler,
+                time_synchronizer=None,
+                domain=self._domain,
                 method=RESTMethod.POST,
-                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL,
-                headers=self._auth.header_for_authentication()
+                is_auth_required=True,
+                headers=self._auth.header_for_authentication(),
+                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
             )
         except asyncio.CancelledError:
             raise
@@ -196,15 +201,20 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return data["listenKey"]
 
     async def _ping_listen_key(self) -> bool:
-        rest_assistant = await self._api_factory.get_rest_assistant()
         # self.logger().info("start renew listen key")
         try:
-            data = await rest_assistant.execute_request(
-                url=web_utils.rest_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
+            data = await web_utils.api_request(
+                path=CONSTANTS.USER_STREAM_PATH_URL,
+                api_factory=self._api_factory,
+                throttler=self._throttler,
+                time_synchronizer=None,
+                domain=self._domain,
                 params={"listenKey": self._current_listen_key},
                 method=RESTMethod.PUT,
+                is_auth_required=True,
                 return_err=True,
-                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
+                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
+                headers=self._auth.header_for_authentication(),
             )
             # Per docs, expect 200/204 on success; avoid noisy logging
 
@@ -232,7 +242,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         self.logger().error("Error occurred renewing listen key ...")
                         break
                     else:
-                        self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
+                        self.logger().debug(f"Refreshed listen key {self._current_listen_key}.")
                         self._last_listen_key_ping_ts = int(time.time())
                 else:
                     # Sleep shorter to ensure timely renewal regardless of drift
