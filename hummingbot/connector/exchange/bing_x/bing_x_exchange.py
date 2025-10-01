@@ -389,6 +389,9 @@ class BingXExchange(ExchangePyBase):
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
                         new_state = CONSTANTS.ORDER_STATE[data["X"]]
+                        # Treat MARKET orders as completed if partially filled; only cancellations should override
+                        if tracked_order.order_type is OrderType.MARKET and new_state is OrderState.PARTIALLY_FILLED:
+                            new_state = OrderState.FILLED
                         # Allow CANCELED to override previous state; otherwise skip updates after final
                         if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED] and new_state is not OrderState.CANCELED:
                             continue
@@ -473,6 +476,12 @@ class BingXExchange(ExchangePyBase):
             is_auth_required=True)
 
         new_state = CONSTANTS.ORDER_STATE[updated_order_data["data"]["status"]]
+        # Normalize MARKET orders: treat partial fills as completed 
+        try:
+            if tracked_order.order_type is OrderType.MARKET and new_state is OrderState.PARTIALLY_FILLED:
+                new_state = OrderState.FILLED
+        except Exception:
+            pass
         if new_state == OrderState.PENDING_CREATE:
             # This event has already been dispatched after calling _place_order.
             new_state = OrderState.OPEN
