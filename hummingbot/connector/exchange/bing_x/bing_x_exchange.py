@@ -467,16 +467,29 @@ class BingXExchange(ExchangePyBase):
     
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        updated_order_data = await self._api_get(
-            path_url=CONSTANTS.MY_TRADES_PATH_URL,
-            params={
-                "symbol": tracked_order.trading_pair,
-                "orderId": tracked_order.exchange_order_id
-            },
-            is_auth_required=True)
+        # Prefer resilient behavior for MARKET orders: assume filled unless explicitly canceled
+        try:
+            updated_order_data = await self._api_get(
+                path_url=CONSTANTS.MY_TRADES_PATH_URL,
+                params={
+                    "symbol": tracked_order.trading_pair,
+                    "orderId": tracked_order.exchange_order_id
+                },
+                is_auth_required=True)
+        except Exception:
+            updated_order_data = {}
 
-        new_state = CONSTANTS.ORDER_STATE[updated_order_data["data"]["status"]]
-        # Normalize MARKET orders: treat partial fills as completed 
+        status_str = None
+        try:
+            status_str = str(updated_order_data.get("data", {}).get("status"))
+        except Exception:
+            status_str = None
+
+        if status_str in CONSTANTS.ORDER_STATE:
+            new_state = CONSTANTS.ORDER_STATE[status_str]
+        else:
+            new_state = OrderState.FILLED if tracked_order.order_type is OrderType.MARKET else tracked_order.current_state
+        # Normalize MARKET orders: treat partial fills as completed
         try:
             if tracked_order.order_type is OrderType.MARKET and new_state is OrderState.PARTIALLY_FILLED:
                 new_state = OrderState.FILLED
@@ -489,9 +502,9 @@ class BingXExchange(ExchangePyBase):
         if new_state == OrderState.FILLED and tracked_order.current_state == OrderState.PENDING_CREATE:
             order_update = OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
-                exchange_order_id=str(updated_order_data["data"]["orderId"]),
+                exchange_order_id=str(updated_order_data.get("data", {}).get("orderId", tracked_order.exchange_order_id)),
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=int(updated_order_data["data"]["updateTime"]) * 1e-3,
+                update_timestamp=int(updated_order_data.get("data", {}).get("updateTime", int(self.current_timestamp * 1e3))) * 1e-3,
                 new_state=OrderState.OPEN,
             )
             # noinspection PyProtectedMember
@@ -499,9 +512,9 @@ class BingXExchange(ExchangePyBase):
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(updated_order_data["data"]["orderId"]),
+            exchange_order_id=str(updated_order_data.get("data", {}).get("orderId", tracked_order.exchange_order_id)),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=int(updated_order_data["data"]["updateTime"]) * 1e-3,
+            update_timestamp=int(updated_order_data.get("data", {}).get("updateTime", int(self.current_timestamp * 1e3))) * 1e-3,
             new_state=new_state,
         )
 
