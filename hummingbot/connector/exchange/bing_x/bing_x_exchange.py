@@ -350,10 +350,14 @@ class BingXExchange(ExchangePyBase):
                                 # noinspection PyProtectedMember
                                 await self._order_tracker._process_order_update(order_update)
 
+                            # Normalize fee to positive amount per HB conventions
+                            fee_amt = Decimal(str(data["n"]))
+                            if fee_amt < 0:
+                                fee_amt = -fee_amt
                             fee = TradeFeeBase.new_spot_fee(
                                 fee_schema=self.trade_fee_schema(),
                                 trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=Decimal(str(data["n"])), token=data["N"])]
+                                flat_fees=[TokenAmount(amount=fee_amt, token=data["N"])]
                             )
                             trade_update = TradeUpdate(
                                 trade_id=str(data["t"]),
@@ -368,30 +372,12 @@ class BingXExchange(ExchangePyBase):
                             )
                             self._order_tracker.process_trade_update(trade_update)
 
-                            # Fast-path for MARKET orders: on first trade, consider order FILLED to avoid long pending
-                            try:
-                                if str(data.get("o")) == "MARKET":
-                                    if tracked_order.current_state not in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
-                                        forced_update = OrderUpdate(
-                                            trading_pair=tracked_order.trading_pair,
-                                            update_timestamp=int(data["E"]) * 1e-3,
-                                            new_state=OrderState.FILLED,
-                                            client_order_id=tracked_order.client_order_id,
-                                            exchange_order_id=str(data["i"]),
-                                        )
-                                        self._order_tracker.process_order_update(order_update=forced_update)
-                                        # Skip generic state handling to prevent regression to PARTIALLY_FILLED
-                                        continue
-                            except Exception:
-                                # Best-effort fast path; fall back to generic handling if anything goes wrong
-                                pass
+                            # Remove aggressive fast-path; rely on normal state progression
 
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
                         new_state = CONSTANTS.ORDER_STATE[data["X"]]
-                        # Treat MARKET orders as completed if partially filled; only cancellations should override
-                        if tracked_order.order_type is OrderType.MARKET and new_state is OrderState.PARTIALLY_FILLED:
-                            new_state = OrderState.FILLED
+                        # Keep exchange-reported state; only allow CANCELED override logic below
                         # Allow CANCELED to override previous state; otherwise skip updates after final
                         if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED] and new_state is not OrderState.CANCELED:
                             continue
@@ -467,7 +453,7 @@ class BingXExchange(ExchangePyBase):
     
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        # Prefer resilient behavior for MARKET orders: assume filled unless explicitly canceled
+        # Query order status and map reported state; do not default to FILLED
         try:
             updated_order_data = await self._api_get(
                 path_url=CONSTANTS.MY_TRADES_PATH_URL,
@@ -488,13 +474,8 @@ class BingXExchange(ExchangePyBase):
         if status_str in CONSTANTS.ORDER_STATE:
             new_state = CONSTANTS.ORDER_STATE[status_str]
         else:
-            new_state = OrderState.FILLED if tracked_order.order_type is OrderType.MARKET else tracked_order.current_state
-        # Normalize MARKET orders: treat partial fills as completed
-        try:
-            if tracked_order.order_type is OrderType.MARKET and new_state is OrderState.PARTIALLY_FILLED:
-                new_state = OrderState.FILLED
-        except Exception:
-            pass
+            new_state = tracked_order.current_state
+        # Keep PARTIALLY_FILLED as-is for MARKET orders; finalization happens when exchange reports FILLED
         if new_state == OrderState.PENDING_CREATE:
             # This event has already been dispatched after calling _place_order.
             new_state = OrderState.OPEN
