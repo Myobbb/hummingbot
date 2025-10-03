@@ -149,13 +149,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self.logger().warning(f"Failed to send pong: {e}")
                 continue
             
-            # Handle subscription confirmations
-            if isinstance(data, dict) and "code" in data:
-                if data.get("code") == 0:
-                    self.logger().info(f"Subscription confirmed for {data.get('id')}")
-                else:
-                    self.logger().warning(f"Subscription error code {data.get('code')} for {data.get('id')}")
-                continue
+
             
             # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":

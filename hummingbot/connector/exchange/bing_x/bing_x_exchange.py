@@ -313,89 +313,77 @@ class BingXExchange(ExchangePyBase):
         pass
 
     async def _user_stream_event_listener(self):
-        """
-        This functions runs in background continuously processing the events received from the exchange by the user
-        stream data source. It keeps reading events from the queue until the task is interrupted.
-        The events received are balance updates, order updates and trade events.
-        """
         async for event_message in self._iter_user_event_queue():
             try:
                 if event_message.get("dataType") == "spot.executionReport":
                     data = event_message.get('data')
                     execution_type = data.get('X')
-
+                    
+                    # Get IDs from the correct fields
                     client_order_id = data.get('C')
-                    exchange_order_id = data.get('i')
-
-                    # Prefer lookup by client id; fall back to exchange id if needed (some WS fills may omit C)
+                    exchange_order_id = str(data.get('i'))
+                    
+                    # Find the tracked order
                     tracked_order = None
                     if client_order_id:
                         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-                    if tracked_order is None and exchange_order_id is not None:
-                        try:
-                            tracked_order = self._order_tracker.fetch_order(exchange_order_id=str(exchange_order_id))
-                        except Exception:
-                            tracked_order = None
-                    if tracked_order is not None:
-                        if execution_type in ["PARTIALLY_FILLED", "FILLED"]:
-                            new_state = CONSTANTS.ORDER_STATE[data["X"]]
-                            if new_state == OrderState.FILLED and tracked_order.current_state == OrderState.PENDING_CREATE:
-                                order_update = OrderUpdate(
-                                    trading_pair=tracked_order.trading_pair,
-                                    update_timestamp=int(data["E"]) * 1e-3,
-                                    new_state=OrderState.OPEN,
-                                    client_order_id=tracked_order.client_order_id,
-                                    exchange_order_id=str(data["i"]),
-                                )
-                                # noinspection PyProtectedMember
-                                await self._order_tracker._process_order_update(order_update)
-
-                            # Normalize fee to positive amount per HB conventions
-                            fee_amt = Decimal(str(data["n"]))
-                            if fee_amt < 0:
-                                fee_amt = -fee_amt
-                            fee = TradeFeeBase.new_spot_fee(
-                                fee_schema=self.trade_fee_schema(),
-                                trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=fee_amt, token=data["N"])]
-                            )
-                            trade_update = TradeUpdate(
-                                trade_id=str(data["t"]),
-                                client_order_id=tracked_order.client_order_id,
-                                exchange_order_id=str(data["i"]),
+                    
+                    if not tracked_order and exchange_order_id:
+                        tracked_order = self._order_tracker.fetch_order(exchange_order_id=exchange_order_id)
+                    
+                    if tracked_order is None:
+                        # Log but don't fail - this might be an old order
+                        self.logger().debug(f"Received execution report for unknown order: "
+                                        f"client_id={client_order_id}, exchange_id={exchange_order_id}")
+                        continue
+                    
+                    # Process TRADE events (both PARTIALLY_FILLED and FILLED)
+                    if execution_type in ["PARTIALLY_FILLED", "FILLED"]:
+                        # Ensure order is marked as OPEN if it was PENDING_CREATE
+                        if tracked_order.current_state == OrderState.PENDING_CREATE:
+                            order_update = OrderUpdate(
                                 trading_pair=tracked_order.trading_pair,
-                                fee=fee,
-                                fill_base_amount=Decimal(str(data["l"])),
-                                fill_quote_amount=Decimal(str(data["l"])) * Decimal(str(data["L"])),
-                                fill_price=Decimal(str(data["L"])),
-                                fill_timestamp=int(data["E"]) * 1e-3,
+                                update_timestamp=int(data["E"]) * 1e-3,
+                                new_state=OrderState.OPEN,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
                             )
-                            self._order_tracker.process_trade_update(trade_update)
-
-                            # Remove aggressive fast-path; rely on normal state progression
-
-                    tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-                    if tracked_order is not None:
-                        new_state = CONSTANTS.ORDER_STATE[data["X"]]
-                        # Keep exchange-reported state; only allow CANCELED override logic below
-                        # Allow CANCELED to override previous state; otherwise skip updates after final
-                        if tracked_order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED] and new_state is not OrderState.CANCELED:
-                            continue
-                        if new_state == OrderState.PENDING_CREATE:
-                            # This event has already been dispatched after calling _place_order.
-                            continue
-
+                            self._order_tracker.process_order_update(order_update)
+                        
+                        # Process the trade fill
+                        fee_amt = abs(Decimal(str(data["n"])))  # Make fee positive
+                        fee = TradeFeeBase.new_spot_fee(
+                            fee_schema=self.trade_fee_schema(),
+                            trade_type=tracked_order.trade_type,
+                            flat_fees=[TokenAmount(amount=fee_amt, token=data["N"])]
+                        )
+                        trade_update = TradeUpdate(
+                            trade_id=str(data["t"]),
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            fee=fee,
+                            fill_base_amount=Decimal(str(data["l"])),
+                            fill_quote_amount=Decimal(str(data["l"])) * Decimal(str(data["L"])),
+                            fill_price=Decimal(str(data["L"])),
+                            fill_timestamp=int(data["E"]) * 1e-3,
+                        )
+                        self._order_tracker.process_trade_update(trade_update)
+                    
+                    # Update order state based on execution type
+                    new_state = CONSTANTS.ORDER_STATE.get(execution_type)
+                    if new_state and new_state != OrderState.PENDING_CREATE:
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=int(data["E"]) * 1e-3,
                             new_state=new_state,
                             client_order_id=tracked_order.client_order_id,
-                            exchange_order_id=str(data["i"]),
+                            exchange_order_id=exchange_order_id,
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
-
-                        continue
+                        
                 elif event_message.get("e") == "ACCOUNT_UPDATE":
+                    # Balance update handling remains the same
                     balances = event_message["a"]["B"]
                     for balance_entry in balances:
                         asset_name = balance_entry["a"]
@@ -403,8 +391,7 @@ class BingXExchange(ExchangePyBase):
                         total_balance = Decimal(str(balance_entry["wb"]))
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
-
-                    continue
+                        
             except asyncio.CancelledError:
                 raise
             except Exception:
