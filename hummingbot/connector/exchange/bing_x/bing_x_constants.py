@@ -37,7 +37,7 @@ MY_TRADES_PATH_URL = "/openApi/spot/v1/trade/query"
 ORDER_PATH_URL = "/openApi/spot/v1/trade/order"
 CANCEL_ORDER_PATH_URL = "/openApi/spot/v1/trade/cancel"
 
-WS_HEARTBEAT_TIME_INTERVAL = 30
+WS_HEARTBEAT_TIME_INTERVAL = 5
 
 # Order States
 ORDER_STATE = {

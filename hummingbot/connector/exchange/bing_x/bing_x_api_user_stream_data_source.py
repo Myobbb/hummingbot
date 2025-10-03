@@ -70,28 +70,13 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
-                # await ws.connect(ws_url=CONSTANTS.WSS_PRIVATE_URL[self._domain])
-                # await self._authenticate_connection(ws)
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
-                while True:
-                    try:
-                        seconds_until_next_ping = (CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL -
-                                                   (self._time() - self._last_ws_message_sent_timestamp))
-                        await asyncio.wait_for(
-                            self._process_ws_messages(ws=ws, output=output), timeout=seconds_until_next_ping)
-                    except asyncio.TimeoutError:
-                        # Adaptive fallback: if we haven't received any frame for ~12s, send a JSON ping
-                        try:
-                            if (self._time() - ws.last_recv_time) >= 12:
-                                ping_time = self._time()
-                                payload = {"ping": int(ping_time * 1e3)}
-                                ping_request = WSJSONRequest(payload=payload)
-                                await ws.send(request=ping_request)
-                                self._last_ws_message_sent_timestamp = ping_time
-                        except Exception:
-                            pass
-                        continue
+                
+                # Simply process messages continuously - no timeout logic needed
+                # BingX server sends pings every 5 seconds, we respond in _process_ws_messages
+                await self._process_ws_messages(ws=ws, output=output)
+                
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -143,33 +128,40 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     #     await ws.send(auth_message)
 
     async def _process_ws_messages(self, ws: WSAssistant, output: asyncio.Queue):
-        # self.logger().info('process ws msgs')
         self._last_recv_time = self._time()
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
+            
             # Respond to server heartbeat ping per BingX spec
-            # https://bingx-api.github.io/docs/#/en-us/spot/socket/#Connection%20Limits
+            # https://bingx-api.github.io/docs/#/en-us/spot/socket/#Heartbeats
             if isinstance(data, dict) and "ping" in data:
                 try:
-                    pong_payload = {"pong": data.get("ping"), "time": data.get("time")}
+                    pong_payload = {"pong": data.get("ping")}
+                    # Include time in response if provided by server
+                    if data.get("time") is not None:
+                        pong_payload["time"] = data.get("time")
                     pong_request = WSJSONRequest(payload=pong_payload)
                     await ws.send(request=pong_request)
                     self._last_ws_message_sent_timestamp = self._time()
-                except Exception:
+                    self.logger().debug(f"Responded to ping: {data.get('ping')}")
+                except Exception as e:
                     # Best-effort; continue processing
-                    pass
+                    self.logger().warning(f"Failed to send pong: {e}")
                 continue
-
+            
+            # Handle subscription confirmations
+            if isinstance(data, dict) and "code" in data:
+                if data.get("code") == 0:
+                    self.logger().info(f"Subscription confirmed for {data.get('id')}")
+                else:
+                    self.logger().warning(f"Subscription error code {data.get('code')} for {data.get('id')}")
+                continue
+            
+            # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":
                 output.put_nowait(data)
-            elif (data.get("dataType") == "spot.executionReport"):
+            elif data.get("dataType") == "spot.executionReport":
                 output.put_nowait(data)
-            # if isinstance(data, list):
-            #     for message in data:
-            #         if message["e"] in ["executionReport", "outboundAccountInfo"]:
-            #             output.put_nowait(message)
-            # elif data.get("auth") == "fail":
-            #     raise IOError("Private channel authentication failed.")
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:
