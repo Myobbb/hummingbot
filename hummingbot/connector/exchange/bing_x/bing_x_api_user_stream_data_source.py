@@ -42,6 +42,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
         self._current_listen_key = None
+        self._manage_listen_key_task = None
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -145,11 +146,10 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self._last_ws_message_sent_timestamp = self._time()
                     self.logger().debug(f"Responded to ping: {data.get('ping')}")
                 except Exception as e:
-                    # Best-effort; continue processing
-                    self.logger().warning(f"Failed to send pong: {e}")
+                    # CRITICAL FIX: Failed pong must trigger reconnection
+                    self.logger().error(f"Failed to send pong: {e}")
+                    raise  # This will exit the method and trigger reconnection
                 continue
-            
-
             
             # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":
@@ -187,9 +187,10 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return data["listenKey"]
 
     async def _ping_listen_key(self) -> bool:
-        # self.logger().info("start renew listen key")
         try:
-            data = await web_utils.api_request(
+            # BingX returns 200 (with body) or 204 (no content) on success
+            # Use return_err=False to let api_request handle 204 properly
+            await web_utils.api_request(
                 path=CONSTANTS.USER_STREAM_PATH_URL,
                 api_factory=self._api_factory,
                 throttler=self._throttler,
@@ -198,19 +199,25 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 params={"listenKey": self._current_listen_key},
                 method=RESTMethod.PUT,
                 is_auth_required=True,
-                return_err=True,
+                return_err=False,  # Let it raise on error
                 limit_id=CONSTANTS.USER_STREAM_PATH_URL,
                 headers=self._auth.header_for_authentication(),
             )
-            # Per docs, expect 200/204 on success; avoid noisy logging
-
+            self.logger().debug(f"Successfully renewed listen key {self._current_listen_key}")
+            return True
+            
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {exception}")
+            # 404 means key not found - need new key
+            if "404" in str(exception):
+                self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
+                # Clear current key to force new key creation
+                self._current_listen_key = None
+                self._listen_key_initialized_event.clear()
+            else:
+                self.logger().warning(f"Failed to refresh listen key: {exception}")
             return False
-
-        return True
 
     async def _manage_listen_key_task_loop(self):
         try:
@@ -225,8 +232,12 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
                     success: bool = await self._ping_listen_key()
                     if not success:
-                        self.logger().error("Error occurred renewing listen key ...")
-                        break
+                        self.logger().error("Error occurred renewing listen key, will get a new one...")
+                        # Don't break - instead clear key and continue to get a new one
+                        self._current_listen_key = None
+                        self._listen_key_initialized_event.clear()
+                        await self._sleep(5)  # Brief delay before retry
+                        continue
                     else:
                         self.logger().debug(f"Refreshed listen key {self._current_listen_key}.")
                         self._last_listen_key_ping_ts = int(time.time())
@@ -237,6 +248,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
 
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
         Creates an instance of WSAssistant connected to the exchange
@@ -245,7 +257,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._get_ws_assistant()
-        web_utils.wss_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
+        # Remove the stray line that does nothing
         url = f"{CONSTANTS.WSS_PRIVATE_URL[self._domain]}?listenKey={self._current_listen_key}"
         # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
         await ws.connect(
@@ -256,7 +268,6 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             max_msg_size=16 * 1024 * 1024,
         )
         return ws
-
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
         self._manage_listen_key_task and self._manage_listen_key_task.cancel()
