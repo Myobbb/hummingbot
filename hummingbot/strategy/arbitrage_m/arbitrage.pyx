@@ -721,6 +721,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object affordable_dec
             object q_buy2
             object q_sell2
+            object sell_req2
             
         if amount <= 0:
             if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
@@ -792,7 +793,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     buy_market_tuple.trading_pair,
                     affordable_dec)
             # Align sell side to the reduced buy size
-            cdef object sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
+            sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
             try:
                 q_sell2 = sell_market.c_quantize_order_amount(
                     sell_market_tuple.trading_pair,
