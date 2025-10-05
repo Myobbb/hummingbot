@@ -705,7 +705,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             ExchangeBase sell_market = sell_market_tuple.market
             string buy_id_str
             string sell_id_str
-1            # Declarations for quantization and safety caps
+            # Declarations for quantization and safety caps
             object quantized_buy
             object quantized_sell
             object quantized_amount
