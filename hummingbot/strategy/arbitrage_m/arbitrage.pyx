@@ -705,6 +705,22 @@ cdef class ArbitrageMStrategy(StrategyBase):
             ExchangeBase sell_market = sell_market_tuple.market
             string buy_id_str
             string sell_id_str
+1            # Declarations for quantization and safety caps
+            object quantized_buy
+            object quantized_sell
+            object quantized_amount
+            double sell_available_now
+            object sell_cap_dec
+            object quantized_sell_cap
+            object quantized_buy_cap
+            object buy_req
+            object dec_eps
+            double buy_quote_available_now
+            double buy_required_quote
+            double affordable_base
+            object affordable_dec
+            object q_buy2
+            object q_sell2
             
         if amount <= 0:
             if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
@@ -725,7 +741,70 @@ cdef class ArbitrageMStrategy(StrategyBase):
             quantized_sell = sell_market.quantize_order_amount(sell_market_tuple.trading_pair, dec_safe_amount)
         quantized_amount = min(quantized_buy, quantized_sell)
         
-        # Check minimum order size
+        # Safety cap: re-check sell venue's live available base and re-quantize to prevent oversold at submission time
+        sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+        # Only do extra work if available shrank below our planned amount
+        if sell_available_now + 1e-15 < float(quantized_amount):
+            sell_cap_dec = Decimal(str(max(0.0, sell_available_now - QUANTIZATION_EPSILON)))
+            try:
+                quantized_sell_cap = sell_market.c_quantize_order_amount(
+                    sell_market_tuple.trading_pair,
+                    sell_cap_dec,
+                    sell_price_decimal)
+            except Exception:
+                quantized_sell_cap = sell_market.quantize_order_amount(
+                    sell_market_tuple.trading_pair,
+                    sell_cap_dec)
+            # Re-quantize buy side to the capped amount using Decimal math (avoid float conversions)
+            buy_req = quantized_sell_cap
+            dec_eps = Decimal("1e-12")
+            if buy_req is None or buy_req <= Decimal("0"):
+                buy_req = Decimal("0")
+            else:
+                buy_req = buy_req - dec_eps if buy_req > dec_eps else Decimal("0")
+            try:
+                quantized_buy_cap = buy_market.c_quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    buy_req,
+                    buy_price_decimal)
+            except Exception:
+                quantized_buy_cap = buy_market.quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    buy_req)
+            quantized_amount = min(quantized_amount, quantized_sell_cap, quantized_buy_cap)
+
+        # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability
+        buy_quote_available_now = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+        buy_required_quote = float(quantized_amount) * buy_price
+        if buy_quote_available_now + 1e-15 < buy_required_quote:
+            # Reduce to affordable base amount and re-quantize both sides accordingly
+            affordable_base = 0.0
+            if buy_price > 0.0:
+                affordable_base = max(0.0, buy_quote_available_now / buy_price)
+            affordable_dec = Decimal(str(max(0.0, affordable_base - QUANTIZATION_EPSILON)))
+            try:
+                q_buy2 = buy_market.c_quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    affordable_dec,
+                    buy_price_decimal)
+            except Exception:
+                q_buy2 = buy_market.quantize_order_amount(
+                    buy_market_tuple.trading_pair,
+                    affordable_dec)
+            # Align sell side to the reduced buy size
+            cdef object sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
+            try:
+                q_sell2 = sell_market.c_quantize_order_amount(
+                    sell_market_tuple.trading_pair,
+                    sell_req2,
+                    sell_price_decimal)
+            except Exception:
+                q_sell2 = sell_market.quantize_order_amount(
+                    sell_market_tuple.trading_pair,
+                    sell_req2)
+            quantized_amount = min(quantized_amount, q_buy2, q_sell2)
+
+        # Check minimum order size after any safety caps
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self._min_order_usd:
             return
