@@ -42,8 +42,6 @@ class BingXExchange(ExchangePyBase):
     BALANCE_REST_MIN_INTERVAL = 120.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
     WS_BALANCE_FRESHNESS_WINDOW = 120.0
-    # Avoid any REST balance fetch during the first seconds after start to give WS time to initialize
-    STARTUP_BALANCE_BACKOFF = 15.0
 
     def __init__(self,
                  client_config_map: "ClientConfigAdapter",
@@ -62,7 +60,6 @@ class BingXExchange(ExchangePyBase):
         self._last_rest_balance_ts = 0.0
         self._last_ws_balance_update_ts = 0.0
         self._balance_cooldown_until_ts = 0.0
-        self._connector_start_ts = time.time()
         super().__init__(client_config_map)
         
 
@@ -557,9 +554,6 @@ class BingXExchange(ExchangePyBase):
 
         # Throttle REST balance calls; prefer WS updates when fresh
         now = self.current_timestamp or time.time()
-        # Startup backoff to let user stream subscribe and deliver initial balances
-        if (now - (self._connector_start_ts or now)) < self.STARTUP_BALANCE_BACKOFF:
-            return
         # Respect server-declared cooldown window if previously rate-limited
         if self._balance_cooldown_until_ts > now:
             return
@@ -606,8 +600,6 @@ class BingXExchange(ExchangePyBase):
                         self._balance_cooldown_until_ts = max(self._balance_cooldown_until_ts, unlock_ts_ms * 1e-3)
                 except Exception:
                     pass
-                # Ensure zero placeholders for strategy readiness
-                self._ensure_zero_balance_placeholders()
                 self._last_rest_balance_ts = now
                 return
             # Surface other BingX error details instead of causing KeyError
@@ -648,23 +640,6 @@ class BingXExchange(ExchangePyBase):
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
         self._last_rest_balance_ts = now
-
-    def _ensure_zero_balance_placeholders(self):
-        try:
-            if not self._trading_pairs:
-                return
-            for tp in self._trading_pairs:
-                try:
-                    base, quote = tp.split("-")
-                except Exception:
-                    continue
-                for asset in (base, quote):
-                    if asset not in self._account_available_balances:
-                        self._account_available_balances[asset] = Decimal("0")
-                    if asset not in self._account_balances:
-                        self._account_balances[asset] = Decimal("0")
-        except Exception:
-            pass
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
