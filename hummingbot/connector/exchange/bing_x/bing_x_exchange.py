@@ -38,6 +38,10 @@ class BingXExchange(ExchangePyBase):
     # BingX can deliver execution reports with significant delay. After this timeout,
     # market orders will be auto-finalized as FILLED if they haven't been canceled/failed.
     FILLED_FALLBACK_TIMEOUT = 10.0
+    # Minimum interval between REST balance snapshots; rely on WS in-between
+    BALANCE_REST_MIN_INTERVAL = 120.0
+    # Consider WS balance fresh for this window; skip REST fetch while fresh
+    WS_BALANCE_FRESHNESS_WINDOW = 120.0
 
     def __init__(self,
                  client_config_map: "ClientConfigAdapter",
@@ -53,6 +57,8 @@ class BingXExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_bingx_timestamp = 1.0
+        self._last_rest_balance_ts = 0.0
+        self._last_ws_balance_update_ts = 0.0
         super().__init__(client_config_map)
         
 
@@ -429,6 +435,8 @@ class BingXExchange(ExchangePyBase):
                         total_balance = Decimal(str(balance_entry["wb"]))
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
+                    # Mark last WS balance update time
+                    self._last_ws_balance_update_ts = self.current_timestamp
                         
             except asyncio.CancelledError:
                 raise
@@ -543,6 +551,13 @@ class BingXExchange(ExchangePyBase):
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
+        # Throttle REST balance calls; prefer WS updates when fresh
+        now = self.current_timestamp or time.time()
+        if self._last_ws_balance_update_ts > 0 and (now - self._last_ws_balance_update_ts) < self.WS_BALANCE_FRESHNESS_WINDOW:
+            return
+        if self._last_rest_balance_ts > 0 and (now - self._last_rest_balance_ts) < self.BALANCE_REST_MIN_INTERVAL:
+            return
+
         account_info = await self._api_request(
             method=RESTMethod.GET,
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
@@ -566,6 +581,7 @@ class BingXExchange(ExchangePyBase):
                 # Log and keep previous balances; do not raise to avoid failing readiness
                 self.logger().warning(
                     f"Balance request temporarily blocked by rate limits (code=100410). Message: {msg}")
+                self._last_rest_balance_ts = now
                 return
             # Surface other BingX error details instead of causing KeyError
             raise IOError(f"Unexpected balance response format (code={code}, msg={msg}): {account_info}")
@@ -604,6 +620,7 @@ class BingXExchange(ExchangePyBase):
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
+        self._last_rest_balance_ts = now
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
