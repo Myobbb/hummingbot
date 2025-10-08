@@ -546,6 +546,7 @@ class BingXExchange(ExchangePyBase):
         account_info = await self._api_request(
             method=RESTMethod.GET,
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
+            params={"recvWindow": "60000"},
             is_auth_required=True)
 
         # BingX may return balances in different shapes depending on context/errors
@@ -558,9 +559,15 @@ class BingXExchange(ExchangePyBase):
             balances_list = account_info.get("balances") or account_info.get("balance")
 
         if not isinstance(balances_list, list):
-            # Surface BingX error details when present instead of causing KeyError
+            # Handle known BingX rate limit block (100410) gracefully
             code = account_info.get("code") if isinstance(account_info, dict) else None
             msg = account_info.get("msg") if isinstance(account_info, dict) else None
+            if code == 100410:
+                # Log and keep previous balances; do not raise to avoid failing readiness
+                self.logger().warning(
+                    f"Balance request temporarily blocked by rate limits (code=100410). Message: {msg}")
+                return
+            # Surface other BingX error details instead of causing KeyError
             raise IOError(f"Unexpected balance response format (code={code}, msg={msg}): {account_info}")
 
         for balance_entry in balances_list:
