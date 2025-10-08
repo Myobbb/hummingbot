@@ -42,6 +42,8 @@ class BingXExchange(ExchangePyBase):
     BALANCE_REST_MIN_INTERVAL = 120.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
     WS_BALANCE_FRESHNESS_WINDOW = 120.0
+    # Avoid any REST balance fetch during the first seconds after start to give WS time to initialize
+    STARTUP_BALANCE_BACKOFF = 15.0
 
     def __init__(self,
                  client_config_map: "ClientConfigAdapter",
@@ -59,6 +61,8 @@ class BingXExchange(ExchangePyBase):
         self._last_trades_poll_bingx_timestamp = 1.0
         self._last_rest_balance_ts = 0.0
         self._last_ws_balance_update_ts = 0.0
+        self._balance_cooldown_until_ts = 0.0
+        self._connector_start_ts = time.time()
         super().__init__(client_config_map)
         
 
@@ -553,6 +557,12 @@ class BingXExchange(ExchangePyBase):
 
         # Throttle REST balance calls; prefer WS updates when fresh
         now = self.current_timestamp or time.time()
+        # Startup backoff to let user stream subscribe and deliver initial balances
+        if (now - (self._connector_start_ts or now)) < self.STARTUP_BALANCE_BACKOFF:
+            return
+        # Respect server-declared cooldown window if previously rate-limited
+        if self._balance_cooldown_until_ts > now:
+            return
         if self._last_ws_balance_update_ts > 0 and (now - self._last_ws_balance_update_ts) < self.WS_BALANCE_FRESHNESS_WINDOW:
             return
         if self._last_rest_balance_ts > 0 and (now - self._last_rest_balance_ts) < self.BALANCE_REST_MIN_INTERVAL:
@@ -581,6 +591,21 @@ class BingXExchange(ExchangePyBase):
                 # Log and keep previous balances; do not raise to avoid failing readiness
                 self.logger().warning(
                     f"Balance request temporarily blocked by rate limits (code=100410). Message: {msg}")
+                # Try to parse unlock timestamp (in ms) from message and set cooldown
+                try:
+                    msg_str = str(msg or "")
+                    unlock_ts_ms = 0
+                    for token in msg_str.split():
+                        try:
+                            v = int(token)
+                            if v > 10**12 and v > unlock_ts_ms:
+                                unlock_ts_ms = v
+                        except Exception:
+                            continue
+                    if unlock_ts_ms > 0:
+                        self._balance_cooldown_until_ts = max(self._balance_cooldown_until_ts, unlock_ts_ms * 1e-3)
+                except Exception:
+                    pass
                 self._last_rest_balance_ts = now
                 return
             # Surface other BingX error details instead of causing KeyError
