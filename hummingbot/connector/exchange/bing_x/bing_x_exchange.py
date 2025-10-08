@@ -23,6 +23,7 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.connector.client_order_tracker import ClientOrderTracker
 
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -33,6 +34,10 @@ s_decimal_NaN = Decimal("nan")
 
 class BingXExchange(ExchangePyBase):
     web_utils = web_utils
+
+    # BingX can deliver execution reports with significant delay. After this timeout,
+    # market orders will be auto-finalized as FILLED if they haven't been canceled/failed.
+    FILLED_FALLBACK_TIMEOUT = 10.0
 
     def __init__(self,
                  client_config_map: "ClientConfigAdapter",
@@ -157,6 +162,39 @@ class BingXExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory,
             domain=self.domain,
         )
+
+    def _create_order_tracker(self) -> ClientOrderTracker:
+        tracker = ClientOrderTracker(connector=self)
+        # Do not wait long for trailing trade fill messages after FILLED
+        tracker.TRADE_FILLS_WAIT_TIMEOUT = 1
+        return tracker
+
+    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
+        # Schedule a fallback to auto-finalize long-hanging MARKET orders
+        safe_ensure_future(self._bingx_finalize_market_order_after_timeout(order.client_order_id))
+        return exchange_order_id
+
+    async def _bingx_finalize_market_order_after_timeout(self, client_order_id: str):
+        try:
+            await self._sleep(self.FILLED_FALLBACK_TIMEOUT)
+            tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
+            if tracked_order is None:
+                return
+            if (tracked_order.order_type == OrderType.MARKET
+                    and tracked_order.current_state not in [OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED]):
+                order_update = OrderUpdate(
+                    client_order_id=tracked_order.client_order_id,
+                    exchange_order_id=tracked_order.exchange_order_id,
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.FILLED,
+                )
+                self._order_tracker.process_order_update(order_update)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception("Unexpected error in BingX market order finalize fallback")
 
     def _get_fee(self,
                  base_currency: str,
@@ -466,6 +504,19 @@ class BingXExchange(ExchangePyBase):
         if new_state == OrderState.PENDING_CREATE:
             # This event has already been dispatched after calling _place_order.
             new_state = OrderState.OPEN
+
+        # BingX-specific fallback: auto-finalize long-hanging MARKET orders as FILLED
+        try:
+            order_age = float(self.current_timestamp - tracked_order.creation_timestamp)
+        except Exception:
+            order_age = 0.0
+        if (
+            tracked_order.order_type == OrderType.MARKET
+            and new_state in [tracked_order.current_state, OrderState.OPEN, OrderState.PARTIALLY_FILLED]
+            and order_age >= self.FILLED_FALLBACK_TIMEOUT
+            and tracked_order.current_state not in [OrderState.CANCELED, OrderState.FAILED]
+        ):
+            new_state = OrderState.FILLED
 
         if new_state == OrderState.FILLED and tracked_order.current_state == OrderState.PENDING_CREATE:
             order_update = OrderUpdate(

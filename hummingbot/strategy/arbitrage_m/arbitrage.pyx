@@ -635,11 +635,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
                             self._order_timestamps.erase(order_id_str)
                             
-                            # Try to cancel on exchange (may or may not succeed)
-                            try:
-                                self.c_cancel_order(market_tuple, order_id)
-                            except:
-                                pass  # Continue even if cancel fails
+                      
                             
                             # Force removal from tracker to unblock trading
                             self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
