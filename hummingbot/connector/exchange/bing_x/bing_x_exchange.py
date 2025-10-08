@@ -547,11 +547,48 @@ class BingXExchange(ExchangePyBase):
             method=RESTMethod.GET,
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
             is_auth_required=True)
-        balances = account_info["data"]["balances"]
-        for balance_entry in balances:
-            asset_name = balance_entry["asset"]
-            free_balance = Decimal(str(balance_entry["free"]))
-            total_balance = Decimal(str(balance_entry["free"])) + Decimal(str(balance_entry["locked"]))
+
+        # BingX may return balances in different shapes depending on context/errors
+        # Prefer data.balances, but fall back to data.balance or top-level keys
+        balances_container = account_info.get("data") if isinstance(account_info, dict) else None
+        balances_list = None
+        if isinstance(balances_container, dict):
+            balances_list = balances_container.get("balances") or balances_container.get("balance")
+        if balances_list is None and isinstance(account_info, dict):
+            balances_list = account_info.get("balances") or account_info.get("balance")
+
+        if not isinstance(balances_list, list):
+            # Surface BingX error details when present instead of causing KeyError
+            code = account_info.get("code") if isinstance(account_info, dict) else None
+            msg = account_info.get("msg") if isinstance(account_info, dict) else None
+            raise IOError(f"Unexpected balance response format (code={code}, msg={msg}): {account_info}")
+
+        for balance_entry in balances_list:
+            asset_name = (
+                balance_entry.get("asset")
+                or balance_entry.get("currency")
+                or balance_entry.get("coin")
+            )
+            if not asset_name:
+                continue
+
+            free_str = (
+                balance_entry.get("free")
+                or balance_entry.get("available")
+                or balance_entry.get("availableBalance")
+                or balance_entry.get("freeBalance")
+                or "0"
+            )
+            locked_str = (
+                balance_entry.get("locked")
+                or balance_entry.get("freeze")
+                or balance_entry.get("frozen")
+                or balance_entry.get("lockedBalance")
+                or "0"
+            )
+
+            free_balance = Decimal(str(free_str))
+            total_balance = free_balance + Decimal(str(locked_str))
             self._account_available_balances[asset_name] = free_balance
             self._account_balances[asset_name] = total_balance
             remote_asset_names.add(asset_name)
