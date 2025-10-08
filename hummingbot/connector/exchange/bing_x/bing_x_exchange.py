@@ -606,6 +606,8 @@ class BingXExchange(ExchangePyBase):
                         self._balance_cooldown_until_ts = max(self._balance_cooldown_until_ts, unlock_ts_ms * 1e-3)
                 except Exception:
                     pass
+                # Ensure zero placeholders for strategy readiness
+                self._ensure_zero_balance_placeholders()
                 self._last_rest_balance_ts = now
                 return
             # Surface other BingX error details instead of causing KeyError
@@ -646,6 +648,23 @@ class BingXExchange(ExchangePyBase):
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
         self._last_rest_balance_ts = now
+
+    def _ensure_zero_balance_placeholders(self):
+        try:
+            if not self._trading_pairs:
+                return
+            for tp in self._trading_pairs:
+                try:
+                    base, quote = tp.split("-")
+                except Exception:
+                    continue
+                for asset in (base, quote):
+                    if asset not in self._account_available_balances:
+                        self._account_available_balances[asset] = Decimal("0")
+                    if asset not in self._account_balances:
+                        self._account_balances[asset] = Decimal("0")
+        except Exception:
+            pass
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
