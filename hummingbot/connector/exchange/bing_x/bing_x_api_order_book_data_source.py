@@ -73,8 +73,36 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         data = await self._connector._api_request(path_url=CONSTANTS.SNAPSHOT_PATH_URL,
                                                   method=RESTMethod.GET,
                                                   params=params)
-        data['data']['timestamp'] = data['timestamp']
-        return data['data']
+        # Some BingX responses can arrive as raw strings (text/plain) or JSON strings; normalize to dict
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                raise IOError(f"Unexpected snapshot response type (string) for {trading_pair}: {data[:120]}")
+
+        if not isinstance(data, dict):
+            raise IOError(f"Unexpected snapshot response format for {trading_pair}: type={type(data)}")
+
+        # Extract sub-payload and timestamp robustly
+        sub = data.get('data')
+        if sub is None:
+            # Some variants may place book arrays at top-level
+            if all(k in data for k in ("asks", "bids")):
+                sub = data
+            else:
+                raise IOError(f"Snapshot payload missing 'data' for {trading_pair}: keys={list(data.keys())}")
+
+        if not isinstance(sub, dict):
+            raise IOError(f"Unexpected 'data' payload type for {trading_pair}: type={type(sub)}")
+
+        ts = data.get('timestamp') or data.get('ts') or int(self._time() * 1e3)
+        try:
+            sub['timestamp'] = ts
+        except Exception:
+            # Ensure we can attach timestamp even if sub is a mapping-like
+            sub = dict(sub)
+            sub['timestamp'] = ts
+        return sub
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
