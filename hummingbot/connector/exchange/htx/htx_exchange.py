@@ -15,7 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate, OrderState
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -62,6 +62,9 @@ class HtxExchange(ExchangePyBase):
                     self._account_id_from_config = True
         except Exception:
             pass
+
+        # Debounced finalize for partial-filled orders: order_id -> asyncio.Task
+        self._partial_finalize_tasks: Dict[str, asyncio.Task] = {}
 
     @property
     def name(self) -> str:
@@ -356,6 +359,15 @@ class HtxExchange(ExchangePyBase):
             )
             self._order_tracker.process_order_update(order_update=order_update)
 
+            # Schedule/Cancel finalize based on status
+            try:
+                if order_status == "partial-filled":
+                    self._schedule_partial_finalize(client_order_id)
+                elif order_status in ("filled", "canceled", "rejected", "partial-canceled"):
+                    self._cancel_partial_finalize(client_order_id)
+            except Exception:
+                pass
+
     async def _process_trade_event(self, trade_event: Dict[str, Any]):
         client_order_id = trade_event.get("clientOrderId")
         if client_order_id is None:
@@ -383,6 +395,12 @@ class HtxExchange(ExchangePyBase):
                 fill_timestamp=trade_event["tradeTime"] * 1e-3,
             )
             self._order_tracker.process_trade_update(trade_update)
+
+            # Any trade event indicates progress; reschedule partial finalize debounce
+            try:
+                self._schedule_partial_finalize(client_order_id)
+            except Exception:
+                pass
 
     async def _update_trading_fees(self):
         pass
@@ -439,6 +457,41 @@ class HtxExchange(ExchangePyBase):
             return exchange_order_id, self.current_timestamp
         else:
             raise ValueError(f"Htx rejected the order {order_id} ({creation_response})")
+
+    def _cancel_partial_finalize(self, client_order_id: str) -> None:
+        try:
+            t = self._partial_finalize_tasks.pop(client_order_id, None)
+            if t and not t.done():
+                t.cancel()
+        except Exception:
+            pass
+
+    def _schedule_partial_finalize(self, client_order_id: str) -> None:
+        # Cancel existing task first (debounce)
+        self._cancel_partial_finalize(client_order_id)
+
+        async def _finalize_later():
+            try:
+                await asyncio.sleep(CONSTANTS.PARTIAL_FINALIZE_TIMEOUT_S)
+                # Double-check order still exists and remains partial/open
+                order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                if order is None:
+                    return
+                # Synthesize a filled update to unblock strategies
+                update = OrderUpdate(
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.FILLED,
+                    client_order_id=client_order_id,
+                )
+                self._order_tracker.process_order_update(order_update=update)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_finalize_later())
+        self._partial_finalize_tasks[client_order_id] = task
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         if tracked_order is None:

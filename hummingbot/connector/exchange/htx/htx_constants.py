@@ -76,3 +76,7 @@ ORDER_STATE = {
     "created": OrderState.PENDING_CREATE,
     "canceling": OrderState.PENDING_CANCEL
 }
+
+# Timeout (seconds) after last partial-filled update to auto-finalize as FILLED
+# Keeps strategies from hanging when HTX never emits a final filled state.
+PARTIAL_FINALIZE_TIMEOUT_S = 6.0
