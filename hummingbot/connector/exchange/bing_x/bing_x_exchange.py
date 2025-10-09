@@ -1,5 +1,6 @@
 import asyncio
 import time
+import math
 from decimal import ROUND_DOWN, Decimal
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -39,9 +40,11 @@ class BingXExchange(ExchangePyBase):
     # market orders will be auto-finalized as FILLED if they haven't been canceled/failed.
     FILLED_FALLBACK_TIMEOUT = 10.0
     # Minimum interval between REST balance snapshots; rely on WS in-between
-    BALANCE_REST_MIN_INTERVAL = 120.0
+    BALANCE_REST_MIN_INTERVAL = 300.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
-    WS_BALANCE_FRESHNESS_WINDOW = 120.0
+    WS_BALANCE_FRESHNESS_WINDOW = 300.0
+    # Fallback backoff when exchange returns 100410 without unlock timestamp (seconds)
+    RATE_LIMIT_FALLBACK_BACKOFF_SEC = 600.0
 
     def __init__(self,
                  client_config_map: "ClientConfigAdapter",
@@ -553,7 +556,9 @@ class BingXExchange(ExchangePyBase):
         remote_asset_names = set()
 
         # Throttle REST balance calls; prefer WS updates when fresh
-        now = self.current_timestamp or time.time()
+        now = self.current_timestamp
+        if now is None or not isinstance(now, (int, float)) or math.isnan(now):
+            now = time.time()
         # Respect server-declared cooldown window if previously rate-limited
         if self._balance_cooldown_until_ts > now:
             return
@@ -598,6 +603,9 @@ class BingXExchange(ExchangePyBase):
                             continue
                     if unlock_ts_ms > 0:
                         self._balance_cooldown_until_ts = max(self._balance_cooldown_until_ts, unlock_ts_ms * 1e-3)
+                    else:
+                        # No unlock timestamp provided: apply a conservative fallback backoff
+                        self._balance_cooldown_until_ts = max(self._balance_cooldown_until_ts, now + self.RATE_LIMIT_FALLBACK_BACKOFF_SEC)
                 except Exception:
                     pass
                 self._last_rest_balance_ts = now
