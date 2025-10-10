@@ -621,7 +621,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             for orders in [self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {}),
                           self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})]:
                 if orders:
-                    for order_id in orders:
+                    # Snapshot keys to avoid 'dictionary changed size during iteration' when tracker updates arrive
+                    for order_id in list(orders):
                         order_id_str = self._to_cpp_str(order_id)
                         
                         # Track new orders
