@@ -600,6 +600,22 @@ cdef class ArbitrageMStrategy(StrategyBase):
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
+    cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
+        """Keep MARKET orders tracked after cancel to enforce order_timeout buffer; stop LIMITs as usual."""
+        cdef:
+            str order_id = order_cancelled_event.order_id
+            object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+            object maybe_market_order
+
+        if market_pair is None:
+            return
+        # If this is a MARKET order, keep it tracked so c_ready_for_new_orders enforces _order_timeout buffer.
+        # LIMIT orders are stopped immediately (not used in this strategy but kept for completeness).
+        maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
+        if maybe_market_order is not None:
+            return
+        self.c_stop_tracking_limit_order(market_pair, order_id)
+
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
         self.c_handle_order_completion(buy_order_completed_event, True)

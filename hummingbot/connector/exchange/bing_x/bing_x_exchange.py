@@ -37,7 +37,9 @@ class BingXExchange(ExchangePyBase):
     web_utils = web_utils
 
     # Debounce before finalizing a MARKET order after first fill (seconds)
-    MARKET_FILL_DEBOUNCE_SEC = 2.0
+    MARKET_FILL_DEBOUNCE_SEC = 0.0
+    # Short fallback window to auto-finalize MARKET orders in REST polling if WS finalization missed (seconds)
+    FILLED_FALLBACK_TIMEOUT = 2.0
     # Minimum interval between REST balance snapshots; rely on WS in-between
     BALANCE_REST_MIN_INTERVAL = 300.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
@@ -366,10 +368,10 @@ class BingXExchange(ExchangePyBase):
                     client_order_id = data.get('C')
                     exchange_order_id = str(data.get('i'))
                     
-                    # Find the tracked order
+                    # Find the tracked order (prefer fillable to keep accepting fills after finalization)
                     tracked_order = None
                     if client_order_id:
-                        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                        tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                     
                     if not tracked_order and exchange_order_id:
                         tracked_order = self._order_tracker.fetch_order(exchange_order_id=exchange_order_id)
