@@ -36,9 +36,8 @@ s_decimal_NaN = Decimal("nan")
 class BingXExchange(ExchangePyBase):
     web_utils = web_utils
 
-    # BingX can deliver execution reports with significant delay. After this timeout,
-    # market orders will be auto-finalized as FILLED if they haven't been canceled/failed.
-    FILLED_FALLBACK_TIMEOUT = 10.0
+    # Debounce before finalizing a MARKET order after first fill (seconds)
+    MARKET_FILL_DEBOUNCE_SEC = 2.0
     # Minimum interval between REST balance snapshots; rely on WS in-between
     BALANCE_REST_MIN_INTERVAL = 300.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
@@ -63,6 +62,10 @@ class BingXExchange(ExchangePyBase):
         self._last_rest_balance_ts = 0.0
         self._last_ws_balance_update_ts = 0.0
         self._balance_cooldown_until_ts = 0.0
+        # Track MARKET orders that have received at least one fill
+        self._market_orders_with_fill = set()
+        # Track MARKET orders already scheduled for finalize
+        self._market_finalize_scheduled = set()
         super().__init__(client_config_map)
         
 
@@ -174,25 +177,17 @@ class BingXExchange(ExchangePyBase):
         )
 
     def _create_order_tracker(self) -> ClientOrderTracker:
-        tracker = ClientOrderTracker(connector=self)
-        # Do not wait long for trailing trade fill messages after FILLED
-        tracker.TRADE_FILLS_WAIT_TIMEOUT = 1
-        return tracker
+        return ClientOrderTracker(connector=self)
 
-    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
-        exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
-        # Schedule a fallback to auto-finalize long-hanging MARKET orders
-        safe_ensure_future(self._bingx_finalize_market_order_after_timeout(order.client_order_id))
-        return exchange_order_id
-
-    async def _bingx_finalize_market_order_after_timeout(self, client_order_id: str):
+    async def _finalize_market_after_debounce(self, client_order_id: str, debounce_sec: float):
         try:
-            await self._sleep(self.FILLED_FALLBACK_TIMEOUT)
+            await self._sleep(debounce_sec)
             tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
             if tracked_order is None:
                 return
-            if (tracked_order.order_type == OrderType.MARKET
-                    and tracked_order.current_state not in [OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED]):
+            if tracked_order.client_order_id not in self._market_orders_with_fill:
+                return
+            if tracked_order.current_state not in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
                 order_update = OrderUpdate(
                     client_order_id=tracked_order.client_order_id,
                     exchange_order_id=tracked_order.exchange_order_id,
@@ -204,7 +199,7 @@ class BingXExchange(ExchangePyBase):
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.logger().exception("Unexpected error in BingX market order finalize fallback")
+            self.logger().exception("Unexpected error in BingX market finalize debounce")
 
     def _get_fee(self,
                  base_currency: str,
@@ -417,9 +412,22 @@ class BingXExchange(ExchangePyBase):
                             fill_timestamp=int(data["E"]) * 1e-3,
                         )
                         self._order_tracker.process_trade_update(trade_update)
+
+                        # Remember that this MARKET order received at least one fill; schedule finalize after debounce
+                        if tracked_order.order_type == OrderType.MARKET:
+                            self._market_orders_with_fill.add(tracked_order.client_order_id)
+                            if tracked_order.client_order_id not in self._market_finalize_scheduled:
+                                asyncio.create_task(self._finalize_market_after_debounce(
+                                    tracked_order.client_order_id, self.MARKET_FILL_DEBOUNCE_SEC))
+                                self._market_finalize_scheduled.add(tracked_order.client_order_id)
                     
                     # Update order state based on execution type
                     new_state = CONSTANTS.ORDER_STATE.get(execution_type)
+                    # If MARKET order already had any fill, ignore subsequent CANCELED updates
+                    if (new_state == OrderState.CANCELED
+                            and tracked_order.order_type == OrderType.MARKET
+                            and tracked_order.client_order_id in self._market_orders_with_fill):
+                        continue
                     if new_state and new_state != OrderState.PENDING_CREATE:
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
@@ -512,6 +520,14 @@ class BingXExchange(ExchangePyBase):
             new_state = CONSTANTS.ORDER_STATE[status_str]
         else:
             new_state = tracked_order.current_state
+
+        # If MARKET order had any fill previously, treat CANCELED as FILLED (ignore cancel-after-fill)
+        if (
+            tracked_order.order_type == OrderType.MARKET
+            and tracked_order.client_order_id in self._market_orders_with_fill
+            and new_state == OrderState.CANCELED
+        ):
+            new_state = OrderState.FILLED
         # Keep PARTIALLY_FILLED as-is for MARKET orders; finalization happens when exchange reports FILLED
         if new_state == OrderState.PENDING_CREATE:
             # This event has already been dispatched after calling _place_order.
