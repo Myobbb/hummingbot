@@ -415,13 +415,21 @@ class BingXExchange(ExchangePyBase):
                         )
                         self._order_tracker.process_trade_update(trade_update)
 
-                        # Remember that this MARKET order received at least one fill; schedule finalize after debounce
+                        # For MARKET orders: finalize immediately on first fill to avoid hanging (even if cancel arrived earlier)
                         if tracked_order.order_type == OrderType.MARKET:
                             self._market_orders_with_fill.add(tracked_order.client_order_id)
-                            if tracked_order.client_order_id not in self._market_finalize_scheduled:
-                                asyncio.create_task(self._finalize_market_after_debounce(
-                                    tracked_order.client_order_id, self.MARKET_FILL_DEBOUNCE_SEC))
-                                self._market_finalize_scheduled.add(tracked_order.client_order_id)
+                            if tracked_order.current_state not in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
+                                try:
+                                    order_update_final = OrderUpdate(
+                                        trading_pair=tracked_order.trading_pair,
+                                        update_timestamp=int(data["E"]) * 1e-3,
+                                        new_state=OrderState.FILLED,
+                                        client_order_id=tracked_order.client_order_id,
+                                        exchange_order_id=exchange_order_id,
+                                    )
+                                    self._order_tracker.process_order_update(order_update_final)
+                                except Exception:
+                                    self.logger().exception("Unexpected error finalizing MARKET order after fill")
                     
                     # Update order state based on execution type
                     new_state = CONSTANTS.ORDER_STATE.get(execution_type)
