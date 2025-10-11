@@ -362,7 +362,8 @@ class BingXExchange(ExchangePyBase):
             try:
                 if event_message.get("dataType") == "spot.executionReport":
                     data = event_message.get('data')
-                    execution_type = data.get('X')
+                    execution_type = data.get('X')  # order status (e.g., PARTIALLY_FILLED, FILLED)
+                    evt_type = data.get('x')        # execution type (e.g., TRADE)
                     
                     # Get IDs from the correct fields
                     client_order_id = data.get('C')
@@ -382,8 +383,8 @@ class BingXExchange(ExchangePyBase):
                                         f"client_id={client_order_id}, exchange_id={exchange_order_id}")
                         continue
                     
-                    # Process TRADE events (both PARTIALLY_FILLED and FILLED)
-                    if execution_type in ["PARTIALLY_FILLED", "FILLED"]:
+                    # Process fills on either order-status or execution-type signal
+                    if (execution_type in ["PARTIALLY_FILLED", "FILLED"]) or (str(evt_type).upper() == "TRADE"):
                         # Ensure order is marked as OPEN if it was PENDING_CREATE
                         if tracked_order.current_state == OrderState.PENDING_CREATE:
                             order_update = OrderUpdate(
