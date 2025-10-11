@@ -36,6 +36,8 @@ ACCOUNTS_PATH_URL = "/openApi/spot/v1/account/balance"
 MY_TRADES_PATH_URL = "/openApi/spot/v1/trade/query"
 ORDER_PATH_URL = "/openApi/spot/v1/trade/order"
 CANCEL_ORDER_PATH_URL = "/openApi/spot/v1/trade/cancel"
+# Order details (per-order status) endpoint
+ORDER_INFO_PATH_URL = "/openApi/spot/v1/trade/orderInfo"
 
 WS_HEARTBEAT_TIME_INTERVAL = 5
 
@@ -103,6 +105,9 @@ RATE_LIMITS = {
     RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
               linked_limits=[LinkedLimitWeightPair(REQUEST_POST, 1), LinkedLimitWeightPair(REQUEST_POST_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_POST_MIXED, 1)]),
+    RateLimit(limit_id=ORDER_INFO_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
+                             LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
 
     # Hard cap balance endpoint globally to 1 request per 30 seconds
     RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=1, time_interval=30,

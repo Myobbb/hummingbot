@@ -479,43 +479,60 @@ class BingXExchange(ExchangePyBase):
                 },
                 is_auth_required=True,
                 limit_id=CONSTANTS.MY_TRADES_PATH_URL)
-            trade = all_fills_response.get("data", [])
-            if trade is not None:
-                # for trade in fills_data:
-                exchange_order_id = str(trade["orderId"])
-                fee = TradeFeeBase.new_spot_fee(
-                    fee_schema=self.trade_fee_schema(),
-                    trade_type=order.trade_type,
-                    percent_token=trade["feeAsset"],
-                    flat_fees=[TokenAmount(amount=Decimal(str(trade["fee"])), token=trade["feeAsset"])]
-                )
-                trade_update = TradeUpdate(
-                    trade_id=str(trade["orderId"]),
-                    client_order_id=order.client_order_id,
-                    exchange_order_id=exchange_order_id,
-                    trading_pair=trading_pair,
-                    fee=fee,
-                    fill_base_amount=Decimal(str(trade["executedQty"])),
-                    fill_quote_amount=Decimal(str(trade["price"])) * Decimal(str(trade["executedQty"])),
-                    fill_price=Decimal(str(trade["price"])),
-                    fill_timestamp=int(trade["updateTime"]) * 1e-3,
-                )
-                trade_updates.append(trade_update)
+            data_node = all_fills_response.get("data", [])
+            # Normalize to list
+            if isinstance(data_node, dict):
+                data_list = [data_node]
+            elif isinstance(data_node, list):
+                data_list = data_node
+            else:
+                data_list = []
+
+            for t in data_list:
+                try:
+                    ex_order_id_str = str(t.get("orderId", order.exchange_order_id))
+                    fee_asset = t.get("feeAsset")
+                    fee_amt = t.get("fee")
+                    fee = TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=order.trade_type,
+                        percent_token=fee_asset,
+                        flat_fees=[TokenAmount(amount=Decimal(str(fee_amt)), token=fee_asset)] if fee_asset is not None and fee_amt is not None else []
+                    )
+                    qty = Decimal(str(t.get("executedQty", "0")))
+                    price = Decimal(str(t.get("price", "0")))
+                    ts = int(t.get("updateTime", int(self.current_timestamp * 1e3))) * 1e-3
+                    trade_update = TradeUpdate(
+                        trade_id=str(t.get("orderId", ex_order_id_str)),
+                        client_order_id=order.client_order_id,
+                        exchange_order_id=ex_order_id_str,
+                        trading_pair=trading_pair,
+                        fee=fee,
+                        fill_base_amount=qty,
+                        fill_quote_amount=price * qty,
+                        fill_price=price,
+                        fill_timestamp=ts,
+                    )
+                    trade_updates.append(trade_update)
+                except Exception:
+                    continue
 
         return trade_updates
 
     
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        # Query order status and map reported state; do not default to FILLED
+        # Query order status and map reported state using orderInfo and trade history per BingX docs
         try:
-            updated_order_data = await self._api_get(
-                path_url=CONSTANTS.MY_TRADES_PATH_URL,
+            # First, order details/status
+            order_info = await self._api_get(
+                path_url=CONSTANTS.ORDER_INFO_PATH_URL,
                 params={
                     "symbol": tracked_order.trading_pair,
                     "orderId": tracked_order.exchange_order_id
                 },
                 is_auth_required=True)
+            updated_order_data = order_info
         except Exception:
             updated_order_data = {}
 
@@ -529,6 +546,25 @@ class BingXExchange(ExchangePyBase):
             new_state = CONSTANTS.ORDER_STATE[status_str]
         else:
             new_state = tracked_order.current_state
+
+        # If MARKET, double-check trades endpoint to force FILLED when any fills exist (covers status drift)
+        if tracked_order.order_type == OrderType.MARKET:
+            try:
+                trades_resp = await self._api_get(
+                    path_url=CONSTANTS.MY_TRADES_PATH_URL,
+                    params={
+                        "symbol": tracked_order.trading_pair,
+                        "orderId": tracked_order.exchange_order_id
+                    },
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.MY_TRADES_PATH_URL
+                )
+                node = trades_resp.get("data", [])
+                has_any_fills = (isinstance(node, dict) and len(node) > 0) or (isinstance(node, list) and len(node) > 0)
+                if has_any_fills:
+                    new_state = OrderState.FILLED
+            except Exception:
+                pass
 
         # If MARKET had any fill previously, force FILLED and ignore cancel-after-fill
         if (
