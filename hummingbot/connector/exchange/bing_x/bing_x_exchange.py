@@ -418,18 +418,17 @@ class BingXExchange(ExchangePyBase):
                         # For MARKET orders: finalize immediately on first fill to avoid hanging (even if cancel arrived earlier)
                         if tracked_order.order_type == OrderType.MARKET:
                             self._market_orders_with_fill.add(tracked_order.client_order_id)
-                            if tracked_order.current_state not in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
-                                try:
-                                    order_update_final = OrderUpdate(
-                                        trading_pair=tracked_order.trading_pair,
-                                        update_timestamp=int(data["E"]) * 1e-3,
-                                        new_state=OrderState.FILLED,
-                                        client_order_id=tracked_order.client_order_id,
-                                        exchange_order_id=exchange_order_id,
-                                    )
-                                    self._order_tracker.process_order_update(order_update_final)
-                                except Exception:
-                                    self.logger().exception("Unexpected error finalizing MARKET order after fill")
+                            try:
+                                order_update_final = OrderUpdate(
+                                    trading_pair=tracked_order.trading_pair,
+                                    update_timestamp=int(data["E"]) * 1e-3,
+                                    new_state=OrderState.FILLED,
+                                    client_order_id=tracked_order.client_order_id,
+                                    exchange_order_id=exchange_order_id,
+                                )
+                                self._order_tracker.process_order_update(order_update_final)
+                            except Exception:
+                                self.logger().exception("Unexpected error finalizing MARKET order after fill")
                     
                     # Update order state based on execution type
                     new_state = CONSTANTS.ORDER_STATE.get(execution_type)
@@ -531,11 +530,10 @@ class BingXExchange(ExchangePyBase):
         else:
             new_state = tracked_order.current_state
 
-        # If MARKET order had any fill previously, treat CANCELED as FILLED (ignore cancel-after-fill)
+        # If MARKET had any fill previously, force FILLED and ignore cancel-after-fill
         if (
             tracked_order.order_type == OrderType.MARKET
             and tracked_order.client_order_id in self._market_orders_with_fill
-            and new_state == OrderState.CANCELED
         ):
             new_state = OrderState.FILLED
         # Keep PARTIALLY_FILLED as-is for MARKET orders; finalization happens when exchange reports FILLED
