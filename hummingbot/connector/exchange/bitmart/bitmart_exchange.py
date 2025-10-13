@@ -358,7 +358,9 @@ class BitmartExchange(ExchangePyBase):
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_update: Dict[str, Any]) -> List[TradeUpdate]:
         updates = []
-        fills_data = fill_update["data"]
+        fills_data = fill_update.get("data")
+        if not isinstance(fills_data, list):
+            return updates
 
         for fill_data in fills_data:
             fee = TradeFeeBase.new_spot_fee(
@@ -425,6 +427,20 @@ class BitmartExchange(ExchangePyBase):
                                 is_fill_candidate_by_amount = fillable_order.executed_amount_base < Decimal(
                                     each_event["filled_size"])
                                 if is_fill_candidate_by_state and is_fill_candidate_by_amount:
+                                    # For MARKET orders: finalize immediately on first fill and record indicator
+                                    try:
+                                        if fillable_order.order_type == OrderType.MARKET:
+                                            self._market_orders_with_fill.add(fillable_order.client_order_id)
+                                            forced_update = OrderUpdate(
+                                                trading_pair=fillable_order.trading_pair,
+                                                update_timestamp=event_timestamp,
+                                                new_state=OrderState.FILLED,
+                                                client_order_id=fillable_order.client_order_id,
+                                                exchange_order_id=each_event["order_id"],
+                                            )
+                                            self._order_tracker.process_order_update(order_update=forced_update)
+                                    except Exception:
+                                        pass
                                     try:
                                         trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
                                         trade_updates = self._create_order_fill_updates(
