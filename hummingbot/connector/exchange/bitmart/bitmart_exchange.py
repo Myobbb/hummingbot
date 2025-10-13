@@ -62,6 +62,8 @@ class BitmartExchange(ExchangePyBase):
 
         super().__init__(client_config_map)
         self.real_time_balance_update = True
+        # Track MARKET orders that have received at least one fill (to suppress cancel-after-fill and finalize early)
+        self._market_orders_with_fill = set()
 
     @property
     def authenticator(self):
@@ -323,6 +325,9 @@ class BitmartExchange(ExchangePyBase):
                 all_fills_response = await self._request_order_fills(order=order)
                 updates = self._create_order_fill_updates(order=order, fill_update=all_fills_response)
                 trade_updates.extend(updates)
+                # If MARKET order has any fills, record for early finalization
+                if updates and order.order_type == OrderType.MARKET:
+                    self._market_orders_with_fill.add(order.client_order_id)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
@@ -336,6 +341,19 @@ class BitmartExchange(ExchangePyBase):
         updated_order_data = await self._request_order_update(order=tracked_order)
 
         order_update = self._create_order_update(order=tracked_order, order_update=updated_order_data)
+
+        # Force FILLED for MARKET orders that already had any fills (ignore subsequent cancel-after-fill)
+        try:
+            if tracked_order.order_type == OrderType.MARKET and tracked_order.client_order_id in self._market_orders_with_fill:
+                order_update = OrderUpdate(
+                    client_order_id=order_update.client_order_id,
+                    exchange_order_id=order_update.exchange_order_id,
+                    trading_pair=order_update.trading_pair,
+                    update_timestamp=order_update.update_timestamp,
+                    new_state=OrderState.FILLED,
+                )
+        except Exception:
+            pass
         return order_update
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_update: Dict[str, Any]) -> List[TradeUpdate]:
@@ -427,7 +445,20 @@ class BitmartExchange(ExchangePyBase):
                                     client_order_id=client_order_id,
                                     exchange_order_id=each_event["order_id"],
                                 )
-                                self._order_tracker.process_order_update(order_update=order_update)
+                                # For MARKET orders with any fills, suppress cancel-after-fill and finalize immediately
+                                if (updatable_order.order_type == OrderType.MARKET
+                                        and new_state == OrderState.CANCELED
+                                        and updatable_order.client_order_id in getattr(self, "_market_orders_with_fill", set())):
+                                    forced_update = OrderUpdate(
+                                        trading_pair=updatable_order.trading_pair,
+                                        update_timestamp=event_timestamp,
+                                        new_state=OrderState.FILLED,
+                                        client_order_id=client_order_id,
+                                        exchange_order_id=each_event["order_id"],
+                                    )
+                                    self._order_tracker.process_order_update(order_update=forced_update)
+                                else:
+                                    self._order_tracker.process_order_update(order_update=order_update)
 
                         except asyncio.CancelledError:
                             raise
