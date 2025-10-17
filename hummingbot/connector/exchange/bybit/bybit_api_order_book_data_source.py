@@ -135,7 +135,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain])
+                await ws.connect(
+                    ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
+                    ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+                )
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
 
@@ -152,14 +155,17 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         ping_request = WSJSONRequest(payload=payload)
                         await ws.send(request=ping_request)
                         self._last_ws_message_sent_timestamp = ping_time
+                        # Watchdog: if no frames received in > 2 heartbeats, force reconnect
+                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
+                            raise ConnectionError("Bybit public WS inactive for too long; reconnecting.")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().error(
-                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
+                    "Unexpected error occurred when listening to order book streams. Retrying in 1 second...",
                     exc_info=True,
                 )
-                await self._sleep(5.0)
+                await self._sleep(1.0)
             finally:
                 ws and await ws.disconnect()
 

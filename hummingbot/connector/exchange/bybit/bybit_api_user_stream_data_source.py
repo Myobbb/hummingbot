@@ -79,6 +79,9 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             self._process_ws_messages(ws=ws, output=output), timeout=seconds_until_next_ping)
                     except asyncio.TimeoutError:
                         await self._ping_server(ws)
+                        # Watchdog: if no frames received in > 2 heartbeats, force reconnect
+                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
+                            raise ConnectionError("Bybit private WS inactive for too long; reconnecting.")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -86,7 +89,7 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             finally:
                 # Make sure no background task is leaked.
                 ws and await ws.disconnect()
-                await self._sleep(5)
+                await self._sleep(1)
 
     async def _ping_server(self, ws: WSAssistant):
         ping_time = self._time()
@@ -152,10 +155,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     await self._process_ws_auth_msg(data)
                 elif data.get("op") == "subscribe":
                     if data.get("success") is False:
-                        self.logger().error(
-                            "Unexpected error occurred subscribing to private channels...",
-                            exc_info=True
-                        )
+                        # Treat subscribe failure as hard failure to trigger reconnect
+                        raise ConnectionError(f"Subscribe failed: {data}")
                 continue
             topic = data.get("topic")
             channel = ""
@@ -184,8 +185,9 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _connected_websocket_assistant(self, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> WSAssistant:
         ws: WSAssistant = await self._get_ws_assistant()
+        ws_url = f"{CONSTANTS.WSS_PRIVATE_URL[domain]}?max_active_time=5m"
         await ws.connect(
-            ws_url=CONSTANTS.WSS_PRIVATE_URL[domain],
+            ws_url=ws_url,
             ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
         )
         await self._authenticate_connection(ws)
