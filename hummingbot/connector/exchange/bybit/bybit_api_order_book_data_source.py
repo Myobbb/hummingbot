@@ -154,6 +154,31 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         message_queue.put_nowait(order_book_message)
 
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        High-throughput diff consumer with batching to reduce per-message await overhead.
+        """
+        message_queue = self._message_queue[self._diff_messages_queue_key]
+        while True:
+            try:
+                # Block for at least one item
+                diff_event = await message_queue.get()
+                await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+                # Drain remaining items in batches without awaiting between each get
+                drained = 0
+                max_batch = 500
+                while drained < max_batch:
+                    try:
+                        diff_event = message_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+                    drained += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error when processing Bybit order book diffs")
+
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
         This method runs continuously and request the full order book content from the exchange every hour.
@@ -439,6 +464,29 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception:
                 self.logger().error("Unexpected error when processing public order book updates from exchange")
                 raise
+
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        High-throughput trade consumer with batching.
+        """
+        message_queue = self._message_queue[self._trade_messages_queue_key]
+        while True:
+            try:
+                trade_event = await message_queue.get()
+                await self._parse_trade_message(raw_message=trade_event, message_queue=output)
+                drained = 0
+                max_batch = 500
+                while drained < max_batch:
+                    try:
+                        trade_event = message_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    await self._parse_trade_message(raw_message=trade_event, message_queue=output)
+                    drained += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error when processing Bybit public trade updates")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
