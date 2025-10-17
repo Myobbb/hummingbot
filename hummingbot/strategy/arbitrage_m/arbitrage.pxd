@@ -32,6 +32,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         double _last_timestamp
         double _status_debounce_until
         dict _last_trade_timestamps
+        dict _last_failure_timestamps
         double _last_cleanup_timestamp
         double _last_conv_rates_logged
         
@@ -110,6 +111,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *
+    cdef c_did_fail_order(self, object order_failed_event)
     cdef c_did_complete_buy_order(self, object buy_order_completed_event)
     cdef c_did_complete_sell_order(self, object sell_order_completed_event)
     
