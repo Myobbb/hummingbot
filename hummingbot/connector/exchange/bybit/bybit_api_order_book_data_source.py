@@ -258,36 +258,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._pair_last_update_time[trading_pair] = now
                 continue
             if (now - last_ts) >= self._per_pair_stale_threshold:
+                # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:
-                    snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
-                    snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
-                    snapshot_msg: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_rest(
-                        snapshot,
-                        snapshot_timestamp,
-                        metadata={"trading_pair": trading_pair}
-                    )
                     exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
-                    snapshot_queue.put_nowait({
-                        "type": CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE,
-                        "topic": f"orderbook.{self._depth}.{exchange_symbol}",
-                        "data": {
-                            "s": exchange_symbol,
-                            "b": snapshot_msg.bids,
-                            "a": snapshot_msg.asks,
-                            "u": snapshot_msg.update_id,
-                        },
-                        "ts": int(snapshot_timestamp * 1e3),
-                    })
-                    self._pair_last_update_time[trading_pair] = now
-                    self.logger().warning(f"Resnapshotted stale orderbook for {trading_pair} after {(now - last_ts):.0f}s inactivity.")
-                    # Also re-subscribe the specific topic (unsubscribe + subscribe) with cooldown
                     last_re_sub = self._pair_last_resubscribe_time.get(trading_pair, 0)
                     if (now - last_re_sub) >= self._per_pair_resubscribe_cooldown:
                         topic = f"orderbook.{self._depth}.{exchange_symbol}"
                         try:
                             await ws.send(WSJSONRequest({"op": "unsubscribe", "args": [topic]}))
                         except Exception:
-                            # Unsubscribe may fail if not subscribed; ignore
                             pass
                         try:
                             await ws.send(WSJSONRequest({"op": "subscribe", "args": [topic]}))
@@ -296,8 +275,38 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         except Exception:
                             self.logger().warning(f"Failed to re-subscribe topic for {trading_pair}", exc_info=True)
                 except Exception:
-                    # Log and continue; next tick will try again
-                    self.logger().warning(f"Failed to resnapshot stale orderbook for {trading_pair}", exc_info=True)
+                    self.logger().warning(f"Failed during re-subscribe attempt for {trading_pair}", exc_info=True)
+
+                # If still severely stale, inject a REST snapshot to heal book state
+                if (now - last_ts) >= (2 * self._per_pair_stale_threshold):
+                    try:
+                        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
+                        snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
+                        snapshot_msg: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_rest(
+                            snapshot,
+                            snapshot_timestamp,
+                            metadata={"trading_pair": trading_pair}
+                        )
+                        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+                        snapshot_queue.put_nowait({
+                            "type": CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE,
+                            "topic": f"orderbook.{self._depth}.{exchange_symbol}",
+                            "data": {
+                                "s": exchange_symbol,
+                                "b": snapshot_msg.bids,
+                                "a": snapshot_msg.asks,
+                                "u": snapshot_msg.update_id,
+                            },
+                            "ts": int(snapshot_timestamp * 1e3),
+                        })
+                        self._pair_last_update_time[trading_pair] = now
+                        self.logger().warning(f"Resnapshotted stale orderbook for {trading_pair} after {(now - last_ts):.0f}s inactivity.")
+                    except Exception:
+                        self.logger().warning(f"Failed to resnapshot stale orderbook for {trading_pair}", exc_info=True)
+
+                # Escalate to full WS reconnect if extreme staleness persists
+                if (now - last_ts) >= (3 * self._per_pair_stale_threshold):
+                    raise ConnectionError(f"Persistent staleness for {trading_pair} ({int(now - last_ts)}s); reconnecting WS.")
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[self._snapshot_messages_queue_key]
