@@ -305,20 +305,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = ws_response.data
             # Handle ping/pong acks from server (public channels may respond with op: "ping" + ret_msg: "pong")
             if data.get("op") in ("ping", "pong"):
-                # Server-initiated ping: reply with pong
-                if data.get("op") == "ping":
-                    try:
-                        pong_payload = {"op": "pong"}
-                        if "req_id" in data:
-                            pong_payload["req_id"] = data["req_id"]
-                        elif "ts" in data:
-                            pong_payload["req_id"] = data["ts"]
-                        await ws.send(WSJSONRequest(pong_payload))
-                        self._last_ws_message_sent_timestamp = self._time()
-                    except Exception:
-                        pass
-                    continue
-                # Considered as a heartbeat acknowledgement; verify correlation if present
+                # Treat ack frames first (public spot acks: op=="ping" with ret_msg=="pong"; some channels: op=="pong")
                 if data.get("ret_msg") == "pong" or data.get("op") == "pong":
                     received_req_id = data.get("req_id")
                     if received_req_id is not None and self._last_ping_req_id is not None and received_req_id == self._last_ping_req_id:
@@ -326,7 +313,20 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             self.logger().debug(f"Bybit pong ack for ping {received_req_id}")
                         except Exception:
                             pass
-                    continue  # skip to next message
+                    continue  # ack handled
+                # Server-initiated ping without ack fields: reply with pong
+                if data.get("op") == "ping":
+                    try:
+                        pong_payload = {"op": "pong"}
+                        if "req_id" in data:
+                            pong_payload["req_id"] = str(data["req_id"])  # echo if present
+                        elif "ts" in data:
+                            pong_payload["req_id"] = str(data["ts"])  # some variants use ts
+                        await ws.send(WSJSONRequest(pong_payload))
+                        self._last_ws_message_sent_timestamp = self._time()
+                    except Exception:
+                        pass
+                    continue
                 continue
             if data.get("op") == "subscribe":
                 if data.get("success") is False:

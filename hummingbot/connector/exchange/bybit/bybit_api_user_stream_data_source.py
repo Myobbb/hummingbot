@@ -95,7 +95,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ping_time = self._time()
         payload = {
             "op": "ping",
-            "args": int(ping_time * 1e3)
+            # Per Bybit docs, include req_id (optional). We use ms timestamp as string.
+            "req_id": str(int(ping_time * 1e3))
         }
         ping_request = WSJSONRequest(payload=payload)
         await ws.send(request=ping_request)
