@@ -153,6 +153,10 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             
             # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":
+                # Ignore funding/non-spot reasons per requirement
+                reason = str(data.get("a", {}).get("m", "")).upper()
+                if reason in ("INIT", "FUNDING_FEE"):
+                    continue
                 output.put_nowait(data)
             elif data.get("dataType") == "spot.executionReport":
                 output.put_nowait(data)

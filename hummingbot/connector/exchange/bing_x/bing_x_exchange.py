@@ -449,7 +449,10 @@ class BingXExchange(ExchangePyBase):
                         self._order_tracker.process_order_update(order_update=order_update)
                         
                 elif event_message.get("e") == "ACCOUNT_UPDATE":
-                    # Balance update handling remains the same
+                    # Ignore non-spot reasons per BingX docs (e.g., INIT, FUNDING_FEE)
+                    reason = str(event_message.get("a", {}).get("m", "")).upper()
+                    if reason in ("INIT", "FUNDING_FEE"):
+                        continue
                     balances = event_message["a"]["B"]
                     for balance_entry in balances:
                         asset_name = balance_entry["a"]
