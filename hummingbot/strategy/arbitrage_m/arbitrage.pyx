@@ -107,6 +107,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._last_timestamp = 0
         self._status_debounce_until = 0
         self._last_trade_timestamps = {}
+        self._last_failure_timestamps = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
         
@@ -624,6 +625,24 @@ cdef class ArbitrageMStrategy(StrategyBase):
         """Handle sell order completion"""
         self.c_handle_order_completion(sell_order_completed_event, False)
 
+    cdef c_did_fail_order(self, object order_failed_event):
+        """On order placement failure, gate new orders for the affected market tuple for _order_timeout."""
+        cdef:
+            str order_id = order_failed_event.order_id
+            object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+        if market_pair_tuple is None:
+            return
+        try:
+            self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp
+            try:
+                self.logger().warning(
+                    f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
+                    f"cooling down for {self._order_timeout:.0f}s")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """Check if ready for new orders - simplified"""
         cdef:
@@ -670,6 +689,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
                            self._next_trade_delay - self._current_timestamp)
                 if time_left > 0:
                     return False
+            # Failure cooldown window (treat placement errors like cancels/timeouts)
+            if market_tuple in self._last_failure_timestamps:
+                time_left = (self._last_failure_timestamps[market_tuple] +
+                           self._order_timeout - self._current_timestamp)
+                if time_left > 0:
+                    return False
+                else:
+                    try:
+                        self._last_failure_timestamps.pop(market_tuple, None)
+                    except Exception:
+                        pass
         
         return True
 
@@ -845,18 +875,40 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Execute both orders in rapid succession
             # This is the best we can do in Cython without async support
             # The actual network calls happen inside the exchange connectors
-            buy_order_id = self.c_buy_with_specific_market(
-                buy_market_tuple, quantized_amount,
-                order_type=buy_order_type,
-                price=buy_price_decimal,
-                expiration_seconds=self._next_trade_delay)
+            try:
+                buy_order_id = self.c_buy_with_specific_market(
+                    buy_market_tuple, quantized_amount,
+                    order_type=buy_order_type,
+                    price=buy_price_decimal,
+                    expiration_seconds=self._next_trade_delay)
+            except Exception as e:
+                try:
+                    self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
+                except Exception:
+                    pass
+                try:
+                    self.logger().warning(f"Error submitting buy order to {buy_market.name}: {e}")
+                except Exception:
+                    pass
+                return
             
             # Immediately place the sell order - minimal delay
-            sell_order_id = self.c_sell_with_specific_market(
-                sell_market_tuple, quantized_amount,
-                order_type=sell_order_type,
-                price=sell_price_decimal,
-                expiration_seconds=self._next_trade_delay)
+            try:
+                sell_order_id = self.c_sell_with_specific_market(
+                    sell_market_tuple, quantized_amount,
+                    order_type=sell_order_type,
+                    price=sell_price_decimal,
+                    expiration_seconds=self._next_trade_delay)
+            except Exception as e:
+                try:
+                    self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
+                except Exception:
+                    pass
+                try:
+                    self.logger().warning(f"Error submitting sell order to {sell_market.name}: {e}")
+                except Exception:
+                    pass
+                return
             
             # Track orders
             buy_id_str = self._to_cpp_str(buy_order_id)
@@ -1230,12 +1282,23 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
             return False
 
-        buy_order_id = self.c_buy_with_specific_market(
-            buy_market_tuple,
-            quantized_amount,
-            order_type=order_type,
-            price=Decimal(str(buy_price)),
-            expiration_seconds=self._next_trade_delay)
+        try:
+            buy_order_id = self.c_buy_with_specific_market(
+                buy_market_tuple,
+                quantized_amount,
+                order_type=order_type,
+                price=Decimal(str(buy_price)),
+                expiration_seconds=self._next_trade_delay)
+        except Exception as e:
+            try:
+                self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
+            except Exception:
+                pass
+            try:
+                self.logger().warning(f"Error submitting buy-in order to {market.name}: {e}")
+            except Exception:
+                pass
+            return False
 
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
@@ -1393,6 +1456,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
             self.logger().warning(f"Tracked orders exceed limit: {self._order_timestamps.size()}")
+
+        # Cleanup stale failure timestamps beyond cutoff
+        try:
+            keys_to_drop = []
+            for mp_tuple, ts in self._last_failure_timestamps.items():
+                if ts < cutoff:
+                    keys_to_drop.append(mp_tuple)
+            for k in keys_to_drop:
+                self._last_failure_timestamps.pop(k, None)
+        except Exception:
+            pass
 
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
