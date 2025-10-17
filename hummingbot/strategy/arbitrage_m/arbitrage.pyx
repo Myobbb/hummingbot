@@ -63,6 +63,34 @@ cdef class ArbitrageMStrategy(StrategyBase):
     def logger(cls):
         return logging.getLogger(__name__)
 
+    def __cinit__(self):
+        # Defensive defaults so attributes exist even if init_params isn't called yet
+        try:
+            self._last_trade_timestamps = {}
+        except Exception:
+            pass
+        try:
+            self._last_failure_timestamps = {}
+        except Exception:
+            pass
+        try:
+            self._pending_buyin_by_asset = {}
+        except Exception:
+            pass
+        try:
+            self._pending_buyin_orders = {}
+        except Exception:
+            pass
+        # Safe basic defaults for timers and caches
+        self._all_markets_ready = False
+        self._last_timestamp = 0
+        self._status_debounce_until = 0
+        self._last_cleanup_timestamp = 0
+        self._last_conv_rates_logged = 0
+        self._cached_base_rate = 1.0
+        self._cached_quote_rate = 1.0
+        self._last_rate_update = 0
+
     def init_params(self,
                     market_pairs: List[ArbitrageMMarketPair],
                     min_profitability: Decimal,

@@ -58,10 +58,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Track last per-pair update time (diff or snapshot) to detect staleness
         self._pair_last_update_time: Dict[str, float] = {}
         # Minimum inactivity before a resnapshot is attempted (seconds)
-        self._per_pair_stale_threshold: float = 180.0
+        # Tighten threshold to recover faster from silent stream stalls
+        self._per_pair_stale_threshold: float = 60.0
         # Cooldown between topic resubscriptions per pair (seconds)
         self._pair_last_resubscribe_time: Dict[str, float] = {}
-        self._per_pair_resubscribe_cooldown: float = 120.0
+        self._per_pair_resubscribe_cooldown: float = 45.0
         # Proactive reconnect window to avoid aged connections (seconds)
         self._max_connection_age_seconds: float = 60.0 * 60.0 * 6.0  # 6 hours
         self._conn_start_time: Optional[float] = None
@@ -109,9 +110,23 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        data = raw_message["data"]
+        data = raw_message.get("data", [])
+        # Fast path: prefer enriched trading_pair, else cached symbol mapping, fallback to async lookup once
+        trading_pair = raw_message.get("trading_pair")
+        if trading_pair is None and data:
+            symbol = data[0].get("s")
+            if symbol:
+                trading_pair = self._symbol_to_pair_cache.get(symbol)
+                if trading_pair is None:
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                    # Cache for subsequent frames
+                    try:
+                        self._symbol_to_pair_cache[symbol] = trading_pair
+                    except Exception:
+                        pass
+        if trading_pair is None:
+            return
         for trade in data:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=trade["s"])
             trade_message: OrderBookMessage = BybitOrderBook.trade_message_from_exchange(
                 trade,
                 {"trading_pair": trading_pair}
@@ -119,9 +134,19 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-            symbol=raw_message["data"]["s"]
-        )
+        trading_pair = raw_message.get("trading_pair")
+        if trading_pair is None:
+            symbol = raw_message.get("data", {}).get("s")
+            if symbol:
+                trading_pair = self._symbol_to_pair_cache.get(symbol)
+                if trading_pair is None:
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                    try:
+                        self._symbol_to_pair_cache[symbol] = trading_pair
+                    except Exception:
+                        pass
+        if trading_pair is None:
+            return
         order_book_message: OrderBookMessage = BybitOrderBook.diff_message_from_exchange(
             raw_message['data'],
             raw_message["ts"] * 1e-3,
@@ -214,6 +239,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                # Pre-seed symbol -> trading pair cache to avoid per-message async lookups
+                try:
+                    self._symbol_to_pair_cache[symbol] = trading_pair
+                except Exception:
+                    pass
                 trade_topic = self._get_trade_topic_from_symbol(symbol)
                 trade_payload = {
                     "op": "subscribe",
@@ -276,6 +306,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             event_type = data.get("type")
             topic = data.get("topic")
+            # Per Bybit docs, occasionally u==1 indicates a snapshot data due to service restart
+            # Route such frames to snapshot handling regardless of 'type'
+            if (topic and "orderbook" in topic) and isinstance(data.get("data"), dict) and data["data"].get("u") == 1:
+                event_type = CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE
+
             if event_type == CONSTANTS.TRADE_EVENT_TYPE and topic and "publicTrade" in topic:
                 channel = self._trade_messages_queue_key
             elif event_type == CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE and topic and "orderbook" in topic:
@@ -295,6 +330,24 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
                                 self._symbol_to_pair_cache[symbol] = trading_pair
                             self._pair_last_update_time[trading_pair] = self._time()
+                            # Enrich frame with trading_pair to avoid async lookups in parsers
+                            try:
+                                data["trading_pair"] = trading_pair
+                            except Exception:
+                                pass
+                    elif topic and "publicTrade" in topic:
+                        # Trades: infer symbol from first item if available, enrich top-level with trading_pair
+                        trades = data.get("data", []) if isinstance(data, dict) else []
+                        if trades:
+                            ts = trades[0]
+                            symbol = ts.get("s") if isinstance(ts, dict) else None
+                            if symbol:
+                                tp = self._symbol_to_pair_cache.get(symbol)
+                                if tp is not None:
+                                    try:
+                                        data["trading_pair"] = tp
+                                    except Exception:
+                                        pass
                 except Exception as e:
                     self.logger().warning(f"Failed to update staleness tracker for topic={topic}: {e}")
                 try:
@@ -373,8 +426,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 json_msg = await message_queue.get()
                 data = json_msg["data"]
-                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                    symbol=data["s"])
+                trading_pair = json_msg.get("trading_pair")
+                if trading_pair is None:
+                    # Fallback lookup (infrequent path)
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
+                        symbol=data["s"])
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
                     data, json_msg["ts"], {"trading_pair": trading_pair})
                 snapshot_queue.put_nowait(order_book_message)

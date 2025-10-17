@@ -20,6 +20,24 @@ class BybitOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
+        # Normalize possible RPI format
+        def _normalize(levels):
+            out = []
+            for lvl in levels:
+                if isinstance(lvl, list) or isinstance(lvl, tuple):
+                    if len(lvl) >= 2:
+                        try:
+                            size = float(lvl[1]) + (float(lvl[2]) if len(lvl) > 2 else 0.0)
+                        except Exception:
+                            size = float(lvl[1])
+                        out.append([lvl[0], str(size)])
+            return out
+        if isinstance(msg.get("b"), list) and msg.get("b") and len(msg["b"][0]) > 2:
+            msg = dict(msg)
+            msg["b"] = _normalize(msg["b"]) 
+        if isinstance(msg.get("a"), list) and msg.get("a") and len(msg["a"][0]) > 2:
+            msg = dict(msg)
+            msg["a"] = _normalize(msg["a"]) 
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": msg["u"],
@@ -62,6 +80,29 @@ class BybitOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
+        # Normalize potential RPI frames (where sizes can be [price, non_rpi, rpi]) to 2-tuple [price, size]
+        # For non-RPI topics, arrays are already [price, size]
+        def _normalize(levels):
+            out = []
+            for lvl in levels:
+                if isinstance(lvl, list) or isinstance(lvl, tuple):
+                    if len(lvl) >= 2:
+                        # Sum non-RPI and RPI sizes if present (index 1 and 2)
+                        try:
+                            size = float(lvl[1]) + (float(lvl[2]) if len(lvl) > 2 else 0.0)
+                        except Exception:
+                            size = float(lvl[1])
+                        out.append([lvl[0], str(size)])
+                # else skip malformed level
+            return out
+        if isinstance(msg.get("b"), list) and msg.get("b") and len(msg["b"][0]) > 2:
+            msg = dict(msg)
+            msg["b"] = _normalize(msg["b"]) 
+        if isinstance(msg.get("a"), list) and msg.get("a") and len(msg["a"][0]) > 2:
+            if "a" not in msg:
+                pass
+            msg = dict(msg)
+            msg["a"] = _normalize(msg["a"]) 
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
             "update_id": msg["u"],
