@@ -55,13 +55,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ws_message_sent_timestamp = 0
         self._category = "spot"
         self._depth = CONSTANTS.SPOT_ORDER_BOOK_DEPTH
-        # Track last per-pair update time (diff or snapshot) to detect staleness
-        self._pair_last_update_time: Dict[str, float] = {}
+        # Track last per-symbol update time (diff or snapshot) to detect staleness (Bybit symbol-specific)
+        self._symbol_last_update_time: Dict[str, float] = {}
         # Minimum inactivity before a resnapshot is attempted (seconds)
         # Tighten threshold to recover faster from silent stream stalls
         self._per_pair_stale_threshold: float = 60.0
-        # Cooldown between topic resubscriptions per pair (seconds)
-        self._pair_last_resubscribe_time: Dict[str, float] = {}
+        # Cooldown between topic resubscriptions per symbol (seconds)
+        self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 45.0
         # Proactive reconnect window to avoid aged connections (seconds)
         self._max_connection_age_seconds: float = 60.0 * 60.0 * 6.0  # 6 hours
@@ -70,11 +70,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ping_req_id: Optional[str] = None
         # Cache for symbol -> trading pair to avoid blocking lookups in hot path
         self._symbol_to_pair_cache: Dict[str, str] = {}
+        # Cache for trading pair -> symbol (Bybit-specific)
+        self._pair_to_symbol_cache: Dict[str, str] = {}
         # Track repeated subscription failures to avoid reconnect loops
         self._subscription_failure_count: Dict[str, int] = defaultdict(int)
         self._max_subscription_failures: int = 5
-        # Throttled per-pair warning timestamps to avoid log spam
-        self._pair_last_warn_time: Dict[str, float] = {}
+        # Throttled per-symbol warning timestamps to avoid log spam
+        self._symbol_last_warn_time: Dict[str, float] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -269,6 +271,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Pre-seed symbol -> trading pair cache to avoid per-message async lookups
                 try:
                     self._symbol_to_pair_cache[symbol] = trading_pair
+                    self._pair_to_symbol_cache[trading_pair] = symbol
                 except Exception:
                     pass
                 trade_topic = self._get_trade_topic_from_symbol(symbol)
@@ -379,7 +382,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             if trading_pair is None:
                                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
                                 self._symbol_to_pair_cache[symbol] = trading_pair
-                            self._pair_last_update_time[trading_pair] = self._time()
+                            self._symbol_last_update_time[symbol] = self._time()
                             # Enrich frame with trading_pair to avoid async lookups in parsers
                             try:
                                 data["trading_pair"] = trading_pair
@@ -428,26 +431,35 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _resnapshot_stale_pairs_if_any(self, ws: WSAssistant, snapshot_queue: asyncio.Queue):
         now = self._time()
         for trading_pair in list(self._trading_pairs):
-            last_ts = self._pair_last_update_time.get(trading_pair)
+            # Use Bybit symbol to detect staleness so other exchanges do not mask inactivity here
+            symbol = self._pair_to_symbol_cache.get(trading_pair)
+            if symbol is None:
+                try:
+                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+                    self._pair_to_symbol_cache[trading_pair] = symbol
+                except Exception:
+                    symbol = None
+            last_ts = self._symbol_last_update_time.get(symbol) if symbol else None
             if last_ts is None:
                 # Initialize on first run to avoid immediate resnapshot
-                self._pair_last_update_time[trading_pair] = now
+                if symbol:
+                    self._symbol_last_update_time[symbol] = now
                 continue
             # Throttled warning if pair has had no orderbook updates for a while
             idle = now - last_ts
             if idle >= 30.0:  # warn after 30s of silence
-                last_warn = self._pair_last_warn_time.get(trading_pair, 0)
+                last_warn = self._symbol_last_warn_time.get(symbol or trading_pair, 0)
                 if (now - last_warn) >= 30.0:
                     try:
                         self.logger().warning(f"Bybit orderbook idle {idle:.0f}s for {trading_pair}")
                     except Exception:
                         pass
-                    self._pair_last_warn_time[trading_pair] = now
+                    self._symbol_last_warn_time[symbol or trading_pair] = now
             if (now - last_ts) >= self._per_pair_stale_threshold:
                 # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:
-                    exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
-                    last_re_sub = self._pair_last_resubscribe_time.get(trading_pair, 0)
+                    exchange_symbol = symbol or await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+                    last_re_sub = self._symbol_last_resubscribe_time.get(exchange_symbol, 0)
                     if (now - last_re_sub) >= self._per_pair_resubscribe_cooldown:
                         topic = f"orderbook.{self._depth}.{exchange_symbol}"
                         try:
@@ -456,7 +468,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             pass
                         try:
                             await ws.send(WSJSONRequest({"op": "subscribe", "args": [topic]}))
-                            self._pair_last_resubscribe_time[trading_pair] = now
+                            self._symbol_last_resubscribe_time[exchange_symbol] = now
                             self.logger().info(f"Re-subscribed Bybit topic for {trading_pair} ({topic}) after staleness.")
                         except Exception:
                             self.logger().warning(f"Failed to re-subscribe topic for {trading_pair}", exc_info=True)
@@ -468,7 +480,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     try:
                         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
                         snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
-                        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+                        exchange_symbol = symbol or await self._connector.exchange_symbol_associated_to_pair(trading_pair)
                         snapshot_queue.put_nowait({
                             "type": CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE,
                             "topic": f"orderbook.{self._depth}.{exchange_symbol}",
@@ -480,7 +492,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             },
                             "ts": int(snapshot_timestamp * 1e3),
                         })
-                        self._pair_last_update_time[trading_pair] = now
+                        if symbol:
+                            self._symbol_last_update_time[symbol] = now
                         self.logger().warning(f"Resnapshotted stale orderbook for {trading_pair} after {(now - last_ts):.0f}s inactivity.")
                     except Exception:
                         self.logger().warning(f"Failed to resnapshot stale orderbook for {trading_pair}", exc_info=True)
