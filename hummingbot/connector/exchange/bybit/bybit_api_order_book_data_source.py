@@ -73,6 +73,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Track repeated subscription failures to avoid reconnect loops
         self._subscription_failure_count: Dict[str, int] = defaultdict(int)
         self._max_subscription_failures: int = 5
+        # Throttled per-pair warning timestamps to avoid log spam
+        self._pair_last_warn_time: Dict[str, float] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -300,6 +302,19 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = ws_response.data
             # Handle ping/pong acks from server (public channels may respond with op: "ping" + ret_msg: "pong")
             if data.get("op") in ("ping", "pong"):
+                # Server-initiated ping: reply with pong
+                if data.get("op") == "ping":
+                    try:
+                        pong_payload = {"op": "pong"}
+                        if "req_id" in data:
+                            pong_payload["req_id"] = data["req_id"]
+                        elif "ts" in data:
+                            pong_payload["req_id"] = data["ts"]
+                        await ws.send(WSJSONRequest(pong_payload))
+                        self._last_ws_message_sent_timestamp = self._time()
+                    except Exception:
+                        pass
+                    continue
                 # Considered as a heartbeat acknowledgement; verify correlation if present
                 if data.get("ret_msg") == "pong" or data.get("op") == "pong":
                     received_req_id = data.get("req_id")
@@ -320,6 +335,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     for arg in failed_args:
                         topic_str = str(arg)
                         self._subscription_failure_count[topic_str] += 1
+                        self.logger().warning(
+                            f"Bybit subscribe failure #{self._subscription_failure_count[topic_str]} for topic '{topic_str}': {data.get('ret_msg')}"
+                        )
                         if self._subscription_failure_count[topic_str] >= self._max_subscription_failures:
                             self.logger().error(f"Max subscription failures reached for {topic_str}, skipping further escalation")
                     # Escalate orderbook subscription failure as critical unless max failures reached
@@ -328,6 +346,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         for arg in failed_args
                     ):
                         raise ConnectionError(f"Critical orderbook subscription failed: {data.get('ret_msg')}")
+                else:
+                    # Successful subscribe ack (rarely carries args). Log at info for visibility.
+                    try:
+                        acked = data.get("args") or data.get("topic") or "<unknown>"
+                        self.logger().info(f"Bybit subscribe acknowledged: {acked}")
+                    except Exception:
+                        pass
                 continue
             event_type = data.get("type")
             topic = data.get("topic")
@@ -377,6 +402,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().warning(f"Failed to update staleness tracker for topic={topic}: {e}")
                 try:
                     self._message_queue[channel].put_nowait(data)
+                    # Backlog diagnostics for active pairs: warn if queue > 80% capacity
+                    try:
+                        q = self._message_queue[channel]
+                        if hasattr(q, "qsize"):
+                            size = q.qsize()
+                            if size >= int(self._max_queue_size * 0.8):
+                                self.logger().warning(f"Bybit {channel} queue high water mark: size={size}/{self._max_queue_size}")
+                    except Exception:
+                        pass
                 except asyncio.QueueFull:
                     self.logger().warning(f"Message queue '{channel}' full; dropping message to prevent OOM")
             # (no-op)
@@ -399,6 +433,16 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Initialize on first run to avoid immediate resnapshot
                 self._pair_last_update_time[trading_pair] = now
                 continue
+            # Throttled warning if pair has had no orderbook updates for a while
+            idle = now - last_ts
+            if idle >= 30.0:  # warn after 30s of silence
+                last_warn = self._pair_last_warn_time.get(trading_pair, 0)
+                if (now - last_warn) >= 30.0:
+                    try:
+                        self.logger().warning(f"Bybit orderbook idle {idle:.0f}s for {trading_pair}")
+                    except Exception:
+                        pass
+                    self._pair_last_warn_time[trading_pair] = now
             if (now - last_ts) >= self._per_pair_stale_threshold:
                 # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:

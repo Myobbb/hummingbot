@@ -156,7 +156,29 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 elif data.get("op") == "subscribe":
                     if data.get("success") is False:
                         # Treat subscribe failure as hard failure to trigger reconnect
+                        self.logger().error(f"Private subscribe failed: {data}")
                         raise ConnectionError(f"Subscribe failed: {data}")
+                    else:
+                        try:
+                            acked = data.get("args") or data.get("topic") or "<unknown>"
+                            self.logger().info(f"Bybit private subscribe acknowledged: {acked}")
+                        except Exception:
+                            pass
+                elif data.get("op") == "ping":
+                    # Respond to server-initiated pings to keep the connection healthy
+                    try:
+                        pong_payload = {"op": "pong"}
+                        if "req_id" in data:
+                            pong_payload["req_id"] = data["req_id"]
+                        elif "ts" in data:
+                            pong_payload["req_id"] = data["ts"]
+                        await ws.send(WSJSONRequest(pong_payload))
+                        self._last_ws_message_sent_timestamp = self._time()
+                    except Exception:
+                        pass
+                elif data.get("op") == "pong":
+                    # Ack received; nothing else required
+                    pass
                 continue
             topic = data.get("topic")
             channel = ""
