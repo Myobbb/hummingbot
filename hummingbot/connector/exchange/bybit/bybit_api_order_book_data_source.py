@@ -45,7 +45,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
         )
-        self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        # Bounded queues to prevent unbounded growth under high load
+        self._max_queue_size: int = 1000
+        self._message_queue: Dict[str, asyncio.Queue] = {
+            self._trade_messages_queue_key: asyncio.Queue(maxsize=self._max_queue_size),
+            self._diff_messages_queue_key: asyncio.Queue(maxsize=self._max_queue_size),
+            self._snapshot_messages_queue_key: asyncio.Queue(maxsize=self._max_queue_size),
+        }
         self._last_ws_message_sent_timestamp = 0
         self._category = "spot"
         self._depth = CONSTANTS.SPOT_ORDER_BOOK_DEPTH
@@ -56,6 +62,16 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Cooldown between topic resubscriptions per pair (seconds)
         self._pair_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 120.0
+        # Proactive reconnect window to avoid aged connections (seconds)
+        self._max_connection_age_seconds: float = 60.0 * 60.0 * 6.0  # 6 hours
+        self._conn_start_time: Optional[float] = None
+        # Track last ping req_id to correlate pong acks
+        self._last_ping_req_id: Optional[str] = None
+        # Cache for symbol -> trading pair to avoid blocking lookups in hot path
+        self._symbol_to_pair_cache: Dict[str, str] = {}
+        # Track repeated subscription failures to avoid reconnect loops
+        self._subscription_failure_count: Dict[str, int] = defaultdict(int)
+        self._max_subscription_failures: int = 5
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -147,7 +163,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
                 )
                 await self._subscribe_channels(ws)
+                # Wait briefly to allow subscribe acks without consuming messages
+                await self._wait_for_initial_subscribe_acks(ws, timeout=5.0)
                 self._last_ws_message_sent_timestamp = self._time()
+                self._conn_start_time = self._time()
 
                 while True:
                     try:
@@ -156,15 +175,21 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         await asyncio.wait_for(self._process_ws_messages(ws=ws), timeout=seconds_until_next_ping)
                     except asyncio.TimeoutError:
                         ping_time = self._time()
+                        ping_req_id = str(int(ping_time * 1e3))
                         payload = {
+                            "req_id": ping_req_id,
                             "op": "ping"
                         }
                         ping_request = WSJSONRequest(payload=payload)
                         await ws.send(request=ping_request)
                         self._last_ws_message_sent_timestamp = ping_time
-                        # Watchdog: if no frames received in > 2 heartbeats, force reconnect
-                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
+                        self._last_ping_req_id = ping_req_id
+                        # Watchdog: if no frames received in > 2.5 heartbeats, force reconnect
+                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2.5 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
                             raise ConnectionError("Bybit public WS inactive for too long; reconnecting.")
+                        # Proactive reconnect if connection age exceeds threshold
+                        if self._conn_start_time is not None and (self._time() - self._conn_start_time) > self._max_connection_age_seconds:
+                            raise ConnectionError("Bybit public WS reached max connection age; reconnecting proactively.")
                         # Per-pair staleness check: resnapshot stale pairs without tearing down connection
                         await self._resnapshot_stale_pairs_if_any(
                             ws=ws,
@@ -205,8 +230,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 await ws.send(subscribe_trade_request)
                 await ws.send(subscribe_orderbook_request)
-
-                self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().info(f"Subscribed to public order book and trade channels for {len(self._trading_pairs)} pairs")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -219,35 +243,75 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = ws_response.data
+            # Handle ping/pong acks from server (public channels may respond with op: "ping" + ret_msg: "pong")
+            if data.get("op") in ("ping", "pong"):
+                # Considered as a heartbeat acknowledgement; verify correlation if present
+                if data.get("ret_msg") == "pong" or data.get("op") == "pong":
+                    received_req_id = data.get("req_id")
+                    if received_req_id is not None and self._last_ping_req_id is not None and received_req_id == self._last_ping_req_id:
+                        try:
+                            self.logger().debug(f"Bybit pong ack for ping {received_req_id}")
+                        except Exception:
+                            pass
+                    continue  # skip to next message
+                continue
             if data.get("op") == "subscribe":
                 if data.get("success") is False:
-                    self.logger().error(
-                        "Unexpected error occurred subscribing to order book trading and delta streams...",
-                        exc_info=True
+                    failed_args = data.get("args") or (
+                        data.get("data", {}).get("failTopics", []) if isinstance(data.get("data"), dict) else []
                     )
+                    self.logger().error(f"Subscription failed for {failed_args}: {data.get('ret_msg')}")
+                    # Track failures per topic and avoid tight reconnect loops
+                    for arg in failed_args:
+                        topic_str = str(arg)
+                        self._subscription_failure_count[topic_str] += 1
+                        if self._subscription_failure_count[topic_str] >= self._max_subscription_failures:
+                            self.logger().error(f"Max subscription failures reached for {topic_str}, skipping further escalation")
+                    # Escalate orderbook subscription failure as critical unless max failures reached
+                    if any(
+                        ("orderbook" in str(arg)) and (self._subscription_failure_count.get(str(arg), 0) < self._max_subscription_failures)
+                        for arg in failed_args
+                    ):
+                        raise ConnectionError(f"Critical orderbook subscription failed: {data.get('ret_msg')}")
                 continue
             event_type = data.get("type")
             topic = data.get("topic")
-            if event_type == CONSTANTS.TRADE_EVENT_TYPE and "publicTrade" in topic:
+            if event_type == CONSTANTS.TRADE_EVENT_TYPE and topic and "publicTrade" in topic:
                 channel = self._trade_messages_queue_key
-            elif event_type == CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE and "orderbook" in topic:
+            elif event_type == CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE and topic and "orderbook" in topic:
                 channel = self._snapshot_messages_queue_key
-            elif event_type == CONSTANTS.ORDERBOOK_DIFF_EVENT_TYPE and "orderbook" in topic:
+            elif event_type == CONSTANTS.ORDERBOOK_DIFF_EVENT_TYPE and topic and "orderbook" in topic:
                 channel = self._diff_messages_queue_key
             else:
                 channel = None
             if channel:
                 # Update per-pair timestamp for orderbook topics to track freshness
                 try:
-                    if "orderbook" in topic:
+                    if topic and "orderbook" in topic:
                         symbol = data["data"].get("s")
                         if symbol:
-                            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                            trading_pair = self._symbol_to_pair_cache.get(symbol)
+                            if trading_pair is None:
+                                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                                self._symbol_to_pair_cache[symbol] = trading_pair
                             self._pair_last_update_time[trading_pair] = self._time()
-                except Exception:
-                    # Do not block on telemetry
-                    pass
-                self._message_queue[channel].put_nowait(data)
+                except Exception as e:
+                    self.logger().warning(f"Failed to update staleness tracker for topic={topic}: {e}")
+                try:
+                    self._message_queue[channel].put_nowait(data)
+                except asyncio.QueueFull:
+                    self.logger().warning(f"Message queue '{channel}' full; dropping message to prevent OOM")
+            # (no-op)
+
+    async def _wait_for_initial_subscribe_acks(self, ws: WSAssistant, timeout: float = 5.0):
+        """
+        Brief sleep to allow subscription acknowledgements to arrive without consuming messages
+        from the main iterator/receive pipeline.
+        """
+        try:
+            await asyncio.sleep(min(max(0.0, timeout), 2.0))
+        except Exception:
+            pass
 
     async def _resnapshot_stale_pairs_if_any(self, ws: WSAssistant, snapshot_queue: asyncio.Queue):
         now = self._time()
@@ -282,20 +346,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     try:
                         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
                         snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
-                        snapshot_msg: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_rest(
-                            snapshot,
-                            snapshot_timestamp,
-                            metadata={"trading_pair": trading_pair}
-                        )
                         exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
                         snapshot_queue.put_nowait({
                             "type": CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE,
                             "topic": f"orderbook.{self._depth}.{exchange_symbol}",
                             "data": {
                                 "s": exchange_symbol,
-                                "b": snapshot_msg.bids,
-                                "a": snapshot_msg.asks,
-                                "u": snapshot_msg.update_id,
+                                "b": snapshot.get("b"),
+                                "a": snapshot.get("a"),
+                                "u": snapshot.get("u"),
                             },
                             "ts": int(snapshot_timestamp * 1e3),
                         })
