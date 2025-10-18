@@ -129,8 +129,5 @@ REST_URL = "https://open-api.bingx.com/openApi"
 
 SYMBOL_PATH_URL = "/spot/v1/common/symbols" #should remove and stop using?
 
-TRADE_EVENT_TYPE = "trade"
-DIFF_EVENT_TYPE = "depth"
-
 BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
 SOURCE_KEY = 'Hummingbot'

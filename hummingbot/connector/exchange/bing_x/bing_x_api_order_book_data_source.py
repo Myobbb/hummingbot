@@ -289,65 +289,87 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
 
-                self.logger().debug(f"Processing {event_type} message for {symbol}: {data.get('data', {}).get('action', 'unknown')}")
+                self.logger().debug(f"Processing {event_type} message for {symbol}")
+                self.logger().debug(f"Message data: {data}")
                 
                 if event_type.startswith("depth"):
                     # Handle incremental depth messages
                     if event_type == "incrDepth":
-                        # Extract nested action from data.data
+                        # Extract nested data from data.data
                         data_node = data.get('data', {})
-                        action = data_node.get('action')  # 'all' or 'update'
-                        last_update_id = data_node.get('lastUpdateId')
 
-                        if action == "all":
-                            # Full snapshot from websocket - use for resync
+                        # BingX sends messages with different structures
+                        # Some have 'action' field, others don't
+                        action = data_node.get('action')
+                        # Normalize last update id to int when possible
+                        last_update_id_raw = data_node.get('lastUpdateId') or data_node.get('version') or data_node.get('sequence')
+                        try:
+                            last_update_id = int(last_update_id_raw) if last_update_id_raw is not None else None
+                        except Exception:
+                            last_update_id = None
+
+                        # Check if this message has orderbook data (snapshot) or just changes (incremental)
+                        has_orderbook_data = bool(data_node.get('bids') and data_node.get('asks'))
+
+                        if action == "all" or has_orderbook_data:
+                            # This is a snapshot message
                             self.logger().info(
-                                f"{symbol}: Received full depth snapshot from websocket "
+                                f"{symbol}: Received incremental depth snapshot "
                                 f"(lastUpdateId={last_update_id})"
                             )
                             self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                            self.logger().debug(f"Queued websocket snapshot for {symbol} with lastUpdateId {last_update_id}")
-                            self._last_update_ids[symbol] = last_update_id
-                            # Track that we need to validate the first update
-                            self._awaiting_first_update[symbol] = True
+                            self.logger().debug(f"Queued snapshot for {symbol} with lastUpdateId {last_update_id}")
+                            if last_update_id:
+                                self._last_update_ids[symbol] = last_update_id
+                                # Track that we need to validate the first update
+                                self._awaiting_first_update[symbol] = True
 
-                        elif action == "update":
-                            # Process incremental updates - they should work with REST bootstrap
-                            # Don't wait for websocket snapshots, use REST bootstrap instead
+                        elif action == "update" or last_update_id:
+                            # This is an incremental update
+                            self.logger().debug(f"Processing incremental update for {symbol}")
+                            prev_id = self._last_update_ids.get(symbol)
 
-                            # Validate first update after bootstrap (REST or WS snapshot)
+                            # If we haven't seen a snapshot yet, request recovery and skip
+                            if prev_id is None:
+                                self.logger().warning(
+                                    f"{symbol}: Incremental update arrived before snapshot (lastUpdateId={last_update_id}). Triggering recovery."
+                                )
+                                await self._trigger_immediate_recovery(symbol)
+                                continue
+
+                            # Validate first update after snapshot
                             if self._awaiting_first_update.get(symbol):
-                                expected_first_id = self._last_update_ids[symbol] + 1
-                                if last_update_id != expected_first_id:
-                                    self.logger().error(
-                                        f"{symbol}: First update ID mismatch! "
-                                        f"Snapshot lastUpdateId={self._last_update_ids[symbol]}, "
-                                        f"Expected first update={expected_first_id}, "
-                                        f"Got={last_update_id}. Requesting new snapshot."
+                                if last_update_id is not None and last_update_id < prev_id:
+                                    self.logger().warning(
+                                        f"{symbol}: First update lastUpdateId {last_update_id} < snapshot {prev_id}. Recovering."
                                     )
-                                    # Clear state and wait for next snapshot (REST or WS)
-                                    self._last_update_ids.pop(symbol, None)
-                                    self._awaiting_first_update.pop(symbol, None)
+                                    await self._trigger_immediate_recovery(symbol)
                                     continue
+                                # First update accepted
                                 self._awaiting_first_update[symbol] = False
 
-                            # Existing incremental diff validation
-                            if symbol in self._last_update_ids:
-                                expected_id = self._last_update_ids[symbol] + 1
-                                if last_update_id != expected_id:
-                                    self.logger().warning(
-                                        f"{symbol}: Sequence gap detected "
-                                        f"(expected {expected_id}, got {last_update_id}). "
-                                        "Clearing state and waiting for next snapshot."
-                                    )
-                                    # Clear state and wait for next snapshot (REST or WS)
-                                    self._last_update_ids.pop(symbol, None)
-                                    self._awaiting_first_update.pop(symbol, None)
-                                    continue  # Don't process this gapped update
+                            # For subsequent updates, ensure monotonic non-decreasing sequence when available
+                            if last_update_id is not None and prev_id is not None and last_update_id < prev_id:
+                                self.logger().warning(
+                                    f"{symbol}: Out-of-order diff detected (lastUpdateId {last_update_id} < {prev_id}). Recovering."
+                                )
+                                await self._trigger_immediate_recovery(symbol)
+                                continue
 
-                            self._last_update_ids[symbol] = last_update_id
+                            # Update the last update ID for this symbol when present
+                            if last_update_id is not None:
+                                self._last_update_ids[symbol] = last_update_id
+
+                            # Enqueue diff
                             self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                            self.logger().debug(f"Queued diff message for {symbol} with update_id {last_update_id}")
+                            self.logger().debug(f"Queued diff message for {symbol}")
+
+                        else:
+                            self.logger().warning(f"Unknown depth message format for {symbol}: {data_node}")
+                            # Try to process as incremental update anyway if it has the right structure
+                            if data_node.get('bids') or data_node.get('asks'):
+                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                self.logger().debug(f"Processed as incremental update despite unknown format")
                     
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
@@ -435,6 +457,17 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         except Exception:
             self.logger().exception(f"Error during {trading_pair} recovery")
+
+    async def _trigger_immediate_recovery(self, trading_pair: str):
+        """
+        Clear local sequence state and immediately fetch a REST snapshot into the snapshot queue if available.
+        """
+        await self._recover_orderbook_snapshot(trading_pair)
+        if self._snapshot_output_queue is not None:
+            try:
+                await self._take_full_order_book_snapshot([trading_pair], self._snapshot_output_queue)
+            except Exception:
+                self.logger().exception(f"{trading_pair}: Failed immediate REST snapshot during recovery")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
