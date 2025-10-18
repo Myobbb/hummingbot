@@ -108,12 +108,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sub = dict(sub)
             sub['timestamp'] = ts
 
-        # BingX REST API may not return a sequence; do not use timestamp as update_id
-        version = sub.get('version') or sub.get('lastUpdateId') or sub.get('sequence')
-        try:
-            sub['lastUpdateId'] = int(version) if version is not None else 0
-        except Exception:
-            sub['lastUpdateId'] = 0
+        # Always set REST snapshot lastUpdateId to 0 to avoid sequence mismatch vs WS incrDepth
+        sub['lastUpdateId'] = 0
 
         return sub
 
@@ -536,10 +532,18 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 # Initialize internal state for this trading pair (same as WS snapshot processing)
                 last_update_id = snapshot.get("lastUpdateId")
-                if last_update_id is not None:
+                # If REST snapshot has a non-zero sequence, start from it; else accept first diff as baseline
+                try:
+                    last_update_id = int(last_update_id) if last_update_id is not None else 0
+                except Exception:
+                    last_update_id = 0
+                if last_update_id > 0:
                     self._last_update_ids[trading_pair] = last_update_id
                     self._awaiting_first_update[trading_pair] = True
-                    self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (lastUpdateId={last_update_id})")
+                else:
+                    self._last_update_ids.pop(trading_pair, None)
+                    self._awaiting_first_update[trading_pair] = False
+                self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (lastUpdateId={last_update_id})")
 
                 snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
                     snapshot,
@@ -547,7 +551,14 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     metadata={"trading_pair": trading_pair}
                 )
                 snapshot_queue.put_nowait(snapshot_msg)
-                self.logger().debug(f"Saved order book snapshot for {trading_pair} with update_id {snapshot_msg.update_id}")
+                try:
+                    bids_len = len(snapshot_msg.content.get("bids", []))
+                    asks_len = len(snapshot_msg.content.get("asks", []))
+                except Exception:
+                    bids_len = asks_len = -1
+                self.logger().debug(
+                    f"Saved order book snapshot for {trading_pair} with update_id {snapshot_msg.update_id} "
+                    f"(bids={bids_len}, asks={asks_len})")
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -86,17 +86,17 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        # Use version field from BingX REST API for proper sequence validation
-        update_id = (
-            msg.get("lastUpdateId")
-            or msg.get("version")
-            or msg.get("sequence")
-            or msg.get("timestamp")
-        )
-        try:
-            update_id = int(update_id)
-        except Exception:
-            update_id = int(timestamp * 1e3)
+        # REST snapshot often lacks a reliable sequence; treat 0 as bootstrap
+        if "lastUpdateId" in msg:
+            try:
+                update_id = int(msg.get("lastUpdateId"))
+            except Exception:
+                update_id = 0
+        else:
+            try:
+                update_id = int(msg.get("version") or msg.get("sequence") or 0)
+            except Exception:
+                update_id = 0
         bids_raw = msg.get("bids") or msg.get("b") or []
         asks_raw = msg.get("asks") or msg.get("a") or []
         bids = cls._normalize_levels(bids_raw)
