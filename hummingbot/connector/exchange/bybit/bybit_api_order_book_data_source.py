@@ -64,7 +64,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 45.0
         # Proactive reconnect window to avoid aged connections (seconds)
-        self._max_connection_age_seconds: float = 60.0 * 60.0 * 6.0  # 6 hours
+        self._max_connection_age_seconds: float = 60.0 * 10.0  # 10 minutes
         self._conn_start_time: Optional[float] = None
         # Track last ping req_id to correlate pong acks
         self._last_ping_req_id: Optional[str] = None
@@ -251,6 +251,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         )
             except asyncio.CancelledError:
                 raise
+            except ConnectionError as connection_exception:
+                # Expected reconnect scenarios (inactive socket, proactive age-based reconnect, etc.)
+                try:
+                    self.logger().warning(f"Bybit public WS reconnecting: {connection_exception}")
+                except Exception:
+                    pass
+                await self._sleep(1.0)
             except Exception:
                 self.logger().error(
                     "Unexpected error occurred when listening to order book streams. Retrying in 1 second...",
