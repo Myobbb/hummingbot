@@ -108,15 +108,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sub = dict(sub)
             sub['timestamp'] = ts
 
-        # BingX REST API may not return version field, use timestamp as fallback
-        # For proper sequence validation with incremental updates
-        version = sub.get('version')
-        if version is not None:
-            sub['lastUpdateId'] = version
-        else:
-            # Use timestamp as version for sequence validation
-            # This ensures incremental updates start from the correct sequence
-            sub['lastUpdateId'] = ts
+        # BingX REST API may not return a sequence; do not use timestamp as update_id
+        version = sub.get('version') or sub.get('lastUpdateId') or sub.get('sequence')
+        try:
+            sub['lastUpdateId'] = int(version) if version is not None else 0
+        except Exception:
+            sub['lastUpdateId'] = 0
 
         return sub
 
@@ -339,13 +336,20 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             self.logger().debug(f"Processing incremental update for {symbol}")
                             prev_id = self._last_update_ids.get(symbol)
 
-                            # If we haven't seen a snapshot yet, request recovery and skip
+                            # If we haven't seen a snapshot yet, treat first diff as baseline (after REST bootstrap)
                             if prev_id is None:
-                                self.logger().warning(
-                                    f"{symbol}: Incremental update arrived before snapshot (lastUpdateId={last_update_id}). Triggering recovery."
-                                )
-                                await self._trigger_immediate_recovery(symbol)
-                                continue
+                                if last_update_id is not None:
+                                    self._last_update_ids[symbol] = last_update_id
+                                    self._awaiting_first_update[symbol] = False
+                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                    self.logger().info(f"{symbol}: Accepted first incremental as baseline (id={last_update_id})")
+                                    await self._flush_pending_diffs(symbol)
+                                    continue
+                                else:
+                                    self.logger().warning(
+                                        f"{symbol}: Incremental update without lastUpdateId before snapshot. Skipping."
+                                    )
+                                    continue
 
                             # Expected next id strictly prev + 1 per BingX
                             expected_id = prev_id + 1 if prev_id is not None else None
