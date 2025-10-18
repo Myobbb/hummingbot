@@ -54,6 +54,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_depth_lag_log_ms: Dict[str, int] = {}
         self._last_update_ids: Dict[str, int] = {}
         self._awaiting_first_update: Dict[str, bool] = {}
+        # Buffer out-of-order diffs up to 3 per BingX guidance
+        self._pending_diffs: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._snapshot_output_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self,
@@ -71,7 +73,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         params = {
             "symbol": trading_pair,
-            "limit": "100"
+            "limit": "1000"
         }
         data = await self._connector._api_request(path_url=CONSTANTS.SNAPSHOT_PATH_URL,
                                                   method=RESTMethod.GET,
@@ -292,9 +294,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().debug(f"Processing {event_type} message for {symbol}")
                 self.logger().debug(f"Message data: {data}")
                 
-                if event_type.startswith("depth"):
-                    # Handle incremental depth messages
-                    if event_type == "incrDepth":
+                if event_type == "incrDepth" or event_type.startswith("depth"):
+                    # Handle incremental/full depth messages
+                    if event_type in ("incrDepth", "depth"):
                         # Extract nested data from data.data
                         data_node = data.get('data', {})
 
@@ -323,6 +325,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 self._last_update_ids[symbol] = last_update_id
                                 # Track that we need to validate the first update
                                 self._awaiting_first_update[symbol] = True
+                                # Clear any pending diffs on fresh snapshot
+                                self._pending_diffs.pop(symbol, None)
 
                         elif action == "update" or last_update_id:
                             # This is an incremental update
@@ -337,32 +341,54 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 await self._trigger_immediate_recovery(symbol)
                                 continue
 
-                            # Validate first update after snapshot
+                            # Expected next id strictly prev + 1 per BingX
+                            expected_id = prev_id + 1 if prev_id is not None else None
+
+                            if last_update_id is None:
+                                # If BingX omitted id (shouldn't happen), skip to avoid corrupting sequence
+                                self.logger().warning(f"{symbol}: Incremental update without lastUpdateId. Skipping.")
+                                continue
+
+                            # If first update after snapshot, enforce expected = prev + 1
                             if self._awaiting_first_update.get(symbol):
-                                if last_update_id is not None and last_update_id < prev_id:
+                                if last_update_id != expected_id:
                                     self.logger().warning(
-                                        f"{symbol}: First update lastUpdateId {last_update_id} < snapshot {prev_id}. Recovering."
+                                        f"{symbol}: First update id {last_update_id} does not equal snapshot+1 {expected_id}. Attempting buffer/recovery."
                                     )
-                                    await self._trigger_immediate_recovery(symbol)
-                                    continue
+                                    # Try buffering if within window, else recover
+                                    if expected_id is not None and 0 < (last_update_id - expected_id) <= 3:
+                                        self._pending_diffs.setdefault(symbol, {})[last_update_id] = data
+                                        # Try to flush if contiguous
+                                        await self._flush_pending_diffs(symbol)
+                                        continue
+                                    else:
+                                        await self._trigger_immediate_recovery(symbol)
+                                        continue
                                 # First update accepted
                                 self._awaiting_first_update[symbol] = False
 
-                            # For subsequent updates, ensure monotonic non-decreasing sequence when available
-                            if last_update_id is not None and prev_id is not None and last_update_id < prev_id:
-                                self.logger().warning(
-                                    f"{symbol}: Out-of-order diff detected (lastUpdateId {last_update_id} < {prev_id}). Recovering."
-                                )
-                                await self._trigger_immediate_recovery(symbol)
-                                continue
-
-                            # Update the last update ID for this symbol when present
-                            if last_update_id is not None:
+                            # Handle in-order, ahead, and behind cases
+                            if last_update_id == expected_id:
+                                # Enqueue current in-order diff
+                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                                 self._last_update_ids[symbol] = last_update_id
-
-                            # Enqueue diff
-                            self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                            self.logger().debug(f"Queued diff message for {symbol}")
+                                # After accepting, try flushing buffered contiguous diffs
+                                await self._flush_pending_diffs(symbol)
+                                self.logger().debug(f"Queued diff message for {symbol} (id={last_update_id})")
+                            elif last_update_id > expected_id:
+                                gap = last_update_id - expected_id
+                                if 0 < gap <= 3:
+                                    # Buffer and wait for missing ones
+                                    self._pending_diffs.setdefault(symbol, {})[last_update_id] = data
+                                    self.logger().debug(f"Buffered out-of-order diff for {symbol} (id={last_update_id}, expected={expected_id})")
+                                else:
+                                    self.logger().warning(
+                                        f"{symbol}: Sequence gap too large (id={last_update_id}, expected={expected_id}). Recovering."
+                                    )
+                                    await self._trigger_immediate_recovery(symbol)
+                            else:  # last_update_id < expected_id
+                                # Late or duplicate diff; drop
+                                self.logger().debug(f"Dropped stale diff for {symbol} (id={last_update_id}, expected={expected_id})")
 
                         else:
                             self.logger().warning(f"Unknown depth message format for {symbol}: {data_node}")
@@ -468,6 +494,33 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._take_full_order_book_snapshot([trading_pair], self._snapshot_output_queue)
             except Exception:
                 self.logger().exception(f"{trading_pair}: Failed immediate REST snapshot during recovery")
+
+    async def _flush_pending_diffs(self, trading_pair: str):
+        """
+        Attempt to flush buffered diffs in-order (prev+1) up to 3 deep.
+        """
+        try:
+            prev_id = self._last_update_ids.get(trading_pair)
+            if prev_id is None:
+                return
+            pending = self._pending_diffs.get(trading_pair) or {}
+            # Try to emit while next contiguous ids exist
+            while True:
+                next_id = prev_id + 1
+                if next_id in pending:
+                    data = pending.pop(next_id)
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    self._last_update_ids[trading_pair] = next_id
+                    prev_id = next_id
+                else:
+                    break
+            # Clean empty map
+            if not pending:
+                self._pending_diffs.pop(trading_pair, None)
+            else:
+                self._pending_diffs[trading_pair] = pending
+        except Exception:
+            self.logger().exception(f"{trading_pair}: Error while flushing pending diffs")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:

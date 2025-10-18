@@ -22,13 +22,24 @@ class BingXOrderBook(OrderBook):
             msg.update(metadata)
         # Extract orderbook data from nested structure
         data_node = msg.get("data", {})
-        # Use lastUpdateId instead of timestamp for better ordering
-        update_id = data_node.get("lastUpdateId", int(timestamp * 1e3))
+        # Use BingX-provided sequence fields when available
+        update_id = (
+            data_node.get("lastUpdateId")
+            or data_node.get("version")
+            or data_node.get("sequence")
+            or int(timestamp * 1e3)
+        )
+        try:
+            update_id = int(update_id)
+        except Exception:
+            update_id = int(timestamp * 1e3)
+        bids = data_node.get("bids") or data_node.get("b") or []
+        asks = data_node.get("asks") or data_node.get("a") or []
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,  # Sequential ID from BingX
-            "bids": data_node.get("bids", []),
-            "asks": data_node.get("asks", [])
+            "bids": bids,
+            "asks": asks
         }, timestamp=timestamp)
 
     @classmethod
@@ -46,15 +57,23 @@ class BingXOrderBook(OrderBook):
         if metadata:
             msg.update(metadata)
         # Use version field from BingX REST API for proper sequence validation
-        update_id = msg.get("lastUpdateId")  # This should be set from version field in data source
-        if update_id is None:
-            # Fallback to timestamp if version not available
-            update_id = int(msg["timestamp"])
+        update_id = (
+            msg.get("lastUpdateId")
+            or msg.get("version")
+            or msg.get("sequence")
+            or msg.get("timestamp")
+        )
+        try:
+            update_id = int(update_id)
+        except Exception:
+            update_id = int(timestamp * 1e3)
+        bids = msg.get("bids") or msg.get("b") or []
+        asks = msg.get("asks") or msg.get("a") or []
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,
-            "bids": msg["bids"],
-            "asks": msg["asks"]
+            "bids": bids,
+            "asks": asks
         }, timestamp=timestamp)
 
     @classmethod
@@ -73,12 +92,23 @@ class BingXOrderBook(OrderBook):
             msg.update(metadata)
         # Extract from nested structure
         data_node = msg.get("data", {})
-        update_id = data_node.get("lastUpdateId", int(timestamp * 1e3) if timestamp else None)
+        update_id = (
+            data_node.get("lastUpdateId")
+            or data_node.get("version")
+            or data_node.get("sequence")
+            or (int(timestamp * 1e3) if timestamp else None)
+        )
+        try:
+            update_id = int(update_id) if update_id is not None else None
+        except Exception:
+            update_id = int(timestamp * 1e3) if timestamp else None
+        bids = data_node.get("bids") or data_node.get("b") or []
+        asks = data_node.get("asks") or data_node.get("a") or []
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,
-            "bids": data_node.get("bids", []),
-            "asks": data_node.get("asks", [])
+            "bids": bids,
+            "asks": asks
         }, timestamp=timestamp)
 
     @classmethod
