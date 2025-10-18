@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
@@ -6,6 +6,33 @@ from hummingbot.core.data_type.order_book_message import OrderBookMessage, Order
 
 
 class BingXOrderBook(OrderBook):
+    @staticmethod
+    def _normalize_levels(levels: List[Any]) -> List[List[Any]]:
+        """
+        Normalize BingX levels which may arrive as:
+        - [price, qty]
+        - "price:qty"
+        - {"price": "..", "quantity"|"qty": ".."} or {"p": "..", "q": ".."}
+        Returns list of [price, qty] (strings/numbers), Hummingbot converts to floats later.
+        """
+        if not isinstance(levels, list):
+            return []
+        normalized: List[List[Any]] = []
+        for entry in levels:
+            price = None
+            qty = None
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                price, qty = entry[0], entry[1]
+            elif isinstance(entry, str):
+                parts = entry.split(":")
+                if len(parts) >= 2:
+                    price, qty = parts[0], parts[1]
+            elif isinstance(entry, dict):
+                price = entry.get("price") or entry.get("p")
+                qty = entry.get("quantity") or entry.get("qty") or entry.get("q")
+            if price is not None and qty is not None:
+                normalized.append([price, qty])
+        return normalized
     @classmethod
     def snapshot_message_from_exchange_websocket(cls,
                                                  msg: Dict[str, any],
@@ -33,8 +60,11 @@ class BingXOrderBook(OrderBook):
             update_id = int(update_id)
         except Exception:
             update_id = int(timestamp * 1e3)
-        bids = data_node.get("bids") or data_node.get("b") or []
-        asks = data_node.get("asks") or data_node.get("a") or []
+        # BingX returns arrays of [price, qty] for asks/bids
+        bids_raw = data_node.get("bids") or data_node.get("b") or []
+        asks_raw = data_node.get("asks") or data_node.get("a") or []
+        bids = cls._normalize_levels(bids_raw)
+        asks = cls._normalize_levels(asks_raw)
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,  # Sequential ID from BingX
@@ -67,8 +97,10 @@ class BingXOrderBook(OrderBook):
             update_id = int(update_id)
         except Exception:
             update_id = int(timestamp * 1e3)
-        bids = msg.get("bids") or msg.get("b") or []
-        asks = msg.get("asks") or msg.get("a") or []
+        bids_raw = msg.get("bids") or msg.get("b") or []
+        asks_raw = msg.get("asks") or msg.get("a") or []
+        bids = cls._normalize_levels(bids_raw)
+        asks = cls._normalize_levels(asks_raw)
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,
@@ -102,11 +134,15 @@ class BingXOrderBook(OrderBook):
             update_id = int(update_id) if update_id is not None else None
         except Exception:
             update_id = int(timestamp * 1e3) if timestamp else None
-        bids = data_node.get("bids") or data_node.get("b") or []
-        asks = data_node.get("asks") or data_node.get("a") or []
+        bids_raw = data_node.get("bids") or data_node.get("b") or []
+        asks_raw = data_node.get("asks") or data_node.get("a") or []
+        bids = cls._normalize_levels(bids_raw)
+        asks = cls._normalize_levels(asks_raw)
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,
+            # BingX diffs don't include a separate first id; use update_id for compatibility
+            "first_update_id": (update_id - 1) if update_id is not None else None,
             "bids": bids,
             "asks": asks
         }, timestamp=timestamp)

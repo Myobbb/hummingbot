@@ -253,6 +253,14 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await ws.send(subscribe_orderbook_request)
 
                 self.logger().info(f"Subscribed to public order book and trade channels of {trading_pair}...")
+            
+            # Immediately bootstrap via REST snapshot to ensure non-empty book if 'all' is delayed
+            try:
+                if self._snapshot_output_queue is not None:
+                    await self._take_full_order_book_snapshot(trading_pairs=self._trading_pairs,
+                                                              snapshot_queue=self._snapshot_output_queue)
+            except Exception:
+                self.logger().exception("Error bootstrapping order books via REST after subscription")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -310,10 +318,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         except Exception:
                             last_update_id = None
 
-                        # Check if this message has orderbook data (snapshot) or just changes (incremental)
-                        has_orderbook_data = bool(data_node.get('bids') and data_node.get('asks'))
-
-                        if action == "all" or has_orderbook_data:
+                        # Per docs, only action == 'all' is a full snapshot
+                        if action == "all":
                             # This is a snapshot message
                             self.logger().info(
                                 f"{symbol}: Received incremental depth snapshot "
@@ -328,7 +334,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 # Clear any pending diffs on fresh snapshot
                                 self._pending_diffs.pop(symbol, None)
 
-                        elif action == "update" or last_update_id:
+                        elif action == "update" or last_update_id is not None:
                             # This is an incremental update
                             self.logger().debug(f"Processing incremental update for {symbol}")
                             prev_id = self._last_update_ids.get(symbol)
@@ -392,10 +398,6 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                         else:
                             self.logger().warning(f"Unknown depth message format for {symbol}: {data_node}")
-                            # Try to process as incremental update anyway if it has the right structure
-                            if data_node.get('bids') or data_node.get('asks'):
-                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                                self.logger().debug(f"Processed as incremental update despite unknown format")
                     
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
