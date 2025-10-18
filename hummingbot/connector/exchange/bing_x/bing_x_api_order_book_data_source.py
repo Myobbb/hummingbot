@@ -106,11 +106,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sub = dict(sub)
             sub['timestamp'] = ts
 
-        # BingX REST API should return version field for sequence validation
-        # Store version as lastUpdateId for consistency with WS messages
+        # BingX REST API may not return version field, use timestamp as fallback
+        # For proper sequence validation with incremental updates
         version = sub.get('version')
         if version is not None:
             sub['lastUpdateId'] = version
+        else:
+            # Use timestamp as version for sequence validation
+            # This ensures incremental updates start from the correct sequence
+            sub['lastUpdateId'] = ts
 
         return sub
 
@@ -284,39 +288,34 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
+
+                self.logger().debug(f"Processing {event_type} message for {symbol}: {data.get('data', {}).get('action', 'unknown')}")
                 
                 if event_type.startswith("depth"):
                     # Handle incremental depth messages
-                    if data.get("dataType") and "@incrDepth" in data.get("dataType", ""):
-                        symbol = data.get("dataType").split('@')[0]
-                        data['symbol'] = symbol
-
+                    if event_type == "incrDepth":
                         # Extract nested action from data.data
                         data_node = data.get('data', {})
                         action = data_node.get('action')  # 'all' or 'update'
                         last_update_id = data_node.get('lastUpdateId')
 
                         if action == "all":
-                            # Full snapshot (first message)
+                            # Full snapshot from websocket - use for resync
                             self.logger().info(
-                                f"{symbol}: Received full depth snapshot "
+                                f"{symbol}: Received full depth snapshot from websocket "
                                 f"(lastUpdateId={last_update_id})"
                             )
                             self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                            self.logger().debug(f"Queued websocket snapshot for {symbol} with lastUpdateId {last_update_id}")
                             self._last_update_ids[symbol] = last_update_id
                             # Track that we need to validate the first update
                             self._awaiting_first_update[symbol] = True
 
                         elif action == "update":
-                            # Don't process incremental messages until we have a proper snapshot
-                            if symbol not in self._last_update_ids:
-                                self.logger().warning(
-                                    f"{symbol}: Received incremental update before snapshot. "
-                                    f"Ignoring update and waiting for snapshot."
-                                )
-                                continue
+                            # Process incremental updates - they should work with REST bootstrap
+                            # Don't wait for websocket snapshots, use REST bootstrap instead
 
-                            # Validate first update after snapshot
+                            # Validate first update after bootstrap (REST or WS snapshot)
                             if self._awaiting_first_update.get(symbol):
                                 expected_first_id = self._last_update_ids[symbol] + 1
                                 if last_update_id != expected_first_id:
@@ -326,7 +325,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                         f"Expected first update={expected_first_id}, "
                                         f"Got={last_update_id}. Requesting new snapshot."
                                     )
-                                    # Clear state and wait for next WS snapshot
+                                    # Clear state and wait for next snapshot (REST or WS)
                                     self._last_update_ids.pop(symbol, None)
                                     self._awaiting_first_update.pop(symbol, None)
                                     continue
@@ -339,15 +338,16 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                     self.logger().warning(
                                         f"{symbol}: Sequence gap detected "
                                         f"(expected {expected_id}, got {last_update_id}). "
-                                        "Clearing state and waiting for next WS snapshot."
+                                        "Clearing state and waiting for next snapshot."
                                     )
-                                    # Clear state and wait for next WS snapshot
+                                    # Clear state and wait for next snapshot (REST or WS)
                                     self._last_update_ids.pop(symbol, None)
                                     self._awaiting_first_update.pop(symbol, None)
                                     continue  # Don't process this gapped update
 
                             self._last_update_ids[symbol] = last_update_id
                             self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                            self.logger().debug(f"Queued diff message for {symbol} with update_id {last_update_id}")
                     
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
@@ -368,9 +368,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         ts_sec = float(json_msg.get("time")) * 1e-3
                 except Exception:
                     pass
-                # Pass the nested data node, not top-level
+                # Pass the full message structure for proper metadata handling
                 order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
-                    json_msg["data"],  # This now contains action, lastUpdateId, bids, asks
+                    json_msg,  # Pass full message structure
                     ts_sec,
                     {"trading_pair": trading_pair}
                 )
@@ -417,20 +417,21 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _recover_orderbook_snapshot(self, trading_pair: str):
         """
-        Request recovery by clearing state and waiting for next WS snapshot.
-        BingX sends periodic full snapshots with action='all' which will resync.
+        Request recovery by clearing state and waiting for next snapshot.
+        Uses REST snapshot for recovery since WS snapshots may not be reliable.
         """
         try:
             self.logger().warning(
                 f"{trading_pair}: Detected sequence gap. "
-                "Clearing orderbook state. Will resync on next WS snapshot."
+                "Clearing orderbook state. Will resync with REST snapshot."
             )
 
             # Clear state for this symbol
             self._last_update_ids.pop(trading_pair, None)
             self._awaiting_first_update.pop(trading_pair, None)
 
-            # The next WS message with action="all" will reinitialize properly
+            # Trigger REST snapshot recovery via the snapshot queue
+            # The _take_full_order_book_snapshot will be called by listen_for_order_book_snapshots
 
         except Exception:
             self.logger().exception(f"Error during {trading_pair} recovery")
@@ -440,13 +441,21 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
                 snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
+
+                # Initialize internal state for this trading pair (same as WS snapshot processing)
+                last_update_id = snapshot.get("lastUpdateId")
+                if last_update_id is not None:
+                    self._last_update_ids[trading_pair] = last_update_id
+                    self._awaiting_first_update[trading_pair] = True
+                    self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (lastUpdateId={last_update_id})")
+
                 snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
                     snapshot,
                     snapshot_timestamp,
                     metadata={"trading_pair": trading_pair}
                 )
                 snapshot_queue.put_nowait(snapshot_msg)
-                self.logger().debug(f"Saved order book snapshot for {trading_pair}")
+                self.logger().debug(f"Saved order book snapshot for {trading_pair} with update_id {snapshot_msg.update_id}")
             except asyncio.CancelledError:
                 raise
             except Exception:

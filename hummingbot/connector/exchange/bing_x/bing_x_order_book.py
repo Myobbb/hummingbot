@@ -20,13 +20,15 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
+        # Extract orderbook data from nested structure
+        data_node = msg.get("data", {})
         # Use lastUpdateId instead of timestamp for better ordering
-        update_id = msg.get("lastUpdateId", int(timestamp * 1e3))
+        update_id = data_node.get("lastUpdateId", int(timestamp * 1e3))
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,  # Sequential ID from BingX
-            "bids": msg["bids"],
-            "asks": msg["asks"]
+            "bids": data_node.get("bids", []),
+            "asks": data_node.get("asks", [])
         }, timestamp=timestamp)
 
     @classmethod
