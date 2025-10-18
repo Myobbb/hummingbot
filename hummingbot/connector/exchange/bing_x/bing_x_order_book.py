@@ -7,12 +7,13 @@ from hummingbot.core.data_type.order_book_message import OrderBookMessage, Order
 
 class BingXOrderBook(OrderBook):
     @staticmethod
-    def _normalize_levels(levels: List[Any]) -> List[List[Any]]:
+    def _normalize_levels(levels: Any) -> List[List[Any]]:
         """
         Normalize BingX levels which may arrive as:
-        - [price, qty]
-        - "price:qty"
-        - {"price": "..", "quantity"|"qty": ".."} or {"p": "..", "q": ".."}
+        - Dict (price-keyed): {"95999.0": "1.234", ...}
+        - List of arrays: [["95999.0", "1.234"], ...]
+        - List of strings: ["95999.0:1.234", ...]
+        - List of dicts: [{"price": "95999.0", "quantity": "1.234"}, ...]
         Returns list of [price, qty] (strings/numbers), Hummingbot converts to floats later.
         """
         # Debug logging
@@ -21,9 +22,31 @@ class BingXOrderBook(OrderBook):
             logger = logging.getLogger(__name__)
         except Exception:
             logger = None
+
+        # Handle dictionary format (WS snapshot/update from BingX)
+        if isinstance(levels, dict):
+            try:
+                if logger:
+                    logger.debug(f"_normalize_levels: Converting dict with {len(levels)} entries to list")
+            except Exception:
+                pass
+            normalized_from_dict: List[List[Any]] = []
+            try:
+                for price, qty in levels.items():
+                    if price is not None and qty is not None:
+                        normalized_from_dict.append([price, qty])
+            except Exception:
+                pass
+            try:
+                if logger:
+                    logger.debug(f"_normalize_levels: Converted dict to {len(normalized_from_dict)} levels")
+            except Exception:
+                pass
+            return normalized_from_dict
+
         if not isinstance(levels, list):
             if logger:
-                logger.warning(f"_normalize_levels: Input is not a list, type={type(levels)}")
+                logger.warning(f"_normalize_levels: Input is not a list or dict, type={type(levels)}")
             return []
         if logger:
             try:
