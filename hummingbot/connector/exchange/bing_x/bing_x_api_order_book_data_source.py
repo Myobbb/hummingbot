@@ -115,15 +115,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sub = dict(sub)
             sub['timestamp'] = ts
 
-        # Preserve REST sequence if present; otherwise set to 0 so next WS update becomes baseline
-        try:
-            rest_seq = sub.get('lastUpdateId') or sub.get('version') or sub.get('sequence')
-            if rest_seq is not None:
-                sub['lastUpdateId'] = int(rest_seq)
-            else:
-                sub['lastUpdateId'] = 0
-        except Exception:
-            sub['lastUpdateId'] = 0
+        # Do NOT trust REST sequence for BingX; let WS establish the baseline
+        sub['lastUpdateId'] = 0
 
         return sub
 
@@ -589,22 +582,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
                 snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
 
-                # Initialize/reset internal state for this trading pair
-                try:
-                    last_update_id = int(snapshot.get("lastUpdateId", 0))
-                except Exception:
-                    last_update_id = 0
-                if last_update_id > 0:
-                    # Tentatively use REST sequence; first WS update must be lastUpdateId + 1
-                    self._last_update_ids[trading_pair] = last_update_id
-                    self._awaiting_first_update[trading_pair] = True
-                else:
-                    # No reliable sequence from REST; accept next WS update as baseline
-                    self._last_update_ids.pop(trading_pair, None)
-                    self._awaiting_first_update[trading_pair] = False
+                # Do NOT initialize sequence from REST; accept next WS update as baseline
+                self._last_update_ids.pop(trading_pair, None)
+                self._awaiting_first_update[trading_pair] = False
                 # Clear stale buffers
                 self._pending_diffs.pop(trading_pair, None)
-                self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (lastUpdateId={last_update_id})")
+                self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (sequence ignored)")
 
                 snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
                     snapshot,

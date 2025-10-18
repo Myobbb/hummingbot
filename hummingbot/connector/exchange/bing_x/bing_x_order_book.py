@@ -123,11 +123,13 @@ class BingXOrderBook(OrderBook):
         # BingX returns arrays of [price, qty] for asks/bids
         bids_raw = data_node.get("bids") or data_node.get("b") or []
         asks_raw = data_node.get("asks") or data_node.get("a") or []
+        """
         try:
             logger = logging.getLogger(__name__)
             logger.info(f"WS Snapshot - bids_raw count: {len(bids_raw)}, asks_raw count: {len(asks_raw)}")
         except Exception:
             pass
+        """
         bids = cls._normalize_levels(bids_raw)
         asks = cls._normalize_levels(asks_raw)
         try:
