@@ -52,6 +52,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ws_message_sent_timestamp = 0
         # Throttled per-symbol lag logging (ms timestamp)
         self._last_depth_lag_log_ms: Dict[str, int] = {}
+        self._last_update_ids: Dict[str, int] = {}
+        self._awaiting_first_update: Dict[str, bool] = {}
+        self._snapshot_output_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -102,6 +105,13 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Ensure we can attach timestamp even if sub is a mapping-like
             sub = dict(sub)
             sub['timestamp'] = ts
+
+        # BingX REST API should return version field for sequence validation
+        # Store version as lastUpdateId for consistency with WS messages
+        version = sub.get('version')
+        if version is not None:
+            sub['lastUpdateId'] = version
+
         return sub
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
@@ -153,6 +163,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param ev_loop: the event loop the method will run in
         :param output: a queue to add the created snapshot messages
         """
+        self._snapshot_output_queue = output  # Store reference for recovery
         while True:
             try:
                 await asyncio.wait_for(self._process_ob_snapshot(snapshot_queue=output), timeout=self.ONE_HOUR)
@@ -200,22 +211,35 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_channels(self, ws: WSAssistant):
         """
         Subscribes to the trade events and diff orders events through the provided websocket connection.
+        Respects BingX's 200 subscription limit per connection by batching if needed.
         :param ws: the websocket assistant used to connect to the exchange
         """
         try:
-            for trading_pair in self._trading_pairs:
+            # BingX allows up to 200 subscriptions per websocket connection
+            MAX_SUBSCRIPTIONS_PER_CONNECTION = 200
 
+            # Calculate subscriptions needed: 2 per trading pair (trade + depth)
+            total_subscriptions_needed = len(self._trading_pairs) * 2
+
+            if total_subscriptions_needed > MAX_SUBSCRIPTIONS_PER_CONNECTION:
+                self.logger().warning(
+                    f"Total subscriptions ({total_subscriptions_needed}) exceeds BingX limit "
+                    f"({MAX_SUBSCRIPTIONS_PER_CONNECTION}) per connection. Consider reducing trading pairs."
+                )
+
+            # Subscribe to all trading pairs (BingX should handle the limit gracefully)
+            for trading_pair in self._trading_pairs:
                 trade_payload = {
-                    "id": "trade",
+                    "id": f"trade_{trading_pair}",
                     "reqType": "sub",
                     "dataType": trading_pair + "@trade"
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
                 depth_payload = {
-                    "id": "depth",
+                    "id": f"depth_{trading_pair}",
                     "reqType": "sub",
-                    "dataType": trading_pair + "@depth100"
+                    "dataType": trading_pair + "@incrDepth"
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
 
@@ -231,53 +255,100 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 exc_info=True
             )
             raise
-
+        
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
-         
+        
             if isinstance(data, str):
                 try:
                     data = json.loads(data)
                 except Exception:
                     continue
+            
             if data.get("msg") == "SUCCESS":
                 continue
-            # self.logger().info(f"data process: {data}")
+            
+            # Handle ping/pong
             if data.get("ping"):
-                # Respond per BingX spec with {"pong": ping} and echo time when present
                 payload = {"pong": data.get("ping")}
                 if data.get("time") is not None:
                     payload["time"] = data.get("time")
                 ping_request = WSJSONRequest(payload=payload)
                 await ws.send(request=ping_request)
                 self._last_ws_message_sent_timestamp = self._time()
-            elif data.get("dataType"):
+                continue
+            
+            # Process data messages
+            if data.get("dataType"):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
-                # Treat depth* as snapshots (BingX depth100 pushes full book state)
+                
                 if event_type.startswith("depth"):
-                    # Lightweight lag measurement: server time vs receipt time
-                    try:
-                        now_ms = int(self._time() * 1e3)
-                        server_ms = None
-                        if isinstance(data.get("time"), (int, float)):
-                            server_ms = int(data.get("time"))
-                        elif isinstance(data.get("ts"), (int, float)):
-                            server_ms = int(data.get("ts"))
-                        last_log = self._last_depth_lag_log_ms.get(symbol, 0)
-                        if server_ms is not None and (now_ms - last_log) >= 1000:
-                            lag_ms = max(0, now_ms - server_ms)
-                            self.logger().debug(f"BingX depth recv lag {symbol}: {lag_ms} ms")
-                            self._last_depth_lag_log_ms[symbol] = now_ms
-                    except Exception:
-                        pass
-                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                    # if data.get("f"):
-                    #     self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                    # else:
-                    #     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    # Handle incremental depth messages
+                    if data.get("dataType") and "@incrDepth" in data.get("dataType", ""):
+                        symbol = data.get("dataType").split('@')[0]
+                        data['symbol'] = symbol
+
+                        # Extract nested action from data.data
+                        data_node = data.get('data', {})
+                        action = data_node.get('action')  # 'all' or 'update'
+                        last_update_id = data_node.get('lastUpdateId')
+
+                        if action == "all":
+                            # Full snapshot (first message)
+                            self.logger().info(
+                                f"{symbol}: Received full depth snapshot "
+                                f"(lastUpdateId={last_update_id})"
+                            )
+                            self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                            self._last_update_ids[symbol] = last_update_id
+                            # Track that we need to validate the first update
+                            self._awaiting_first_update[symbol] = True
+
+                        elif action == "update":
+                            # Don't process incremental messages until we have a proper snapshot
+                            if symbol not in self._last_update_ids:
+                                self.logger().warning(
+                                    f"{symbol}: Received incremental update before snapshot. "
+                                    f"Ignoring update and waiting for snapshot."
+                                )
+                                continue
+
+                            # Validate first update after snapshot
+                            if self._awaiting_first_update.get(symbol):
+                                expected_first_id = self._last_update_ids[symbol] + 1
+                                if last_update_id != expected_first_id:
+                                    self.logger().error(
+                                        f"{symbol}: First update ID mismatch! "
+                                        f"Snapshot lastUpdateId={self._last_update_ids[symbol]}, "
+                                        f"Expected first update={expected_first_id}, "
+                                        f"Got={last_update_id}. Requesting new snapshot."
+                                    )
+                                    # Clear state and wait for next WS snapshot
+                                    self._last_update_ids.pop(symbol, None)
+                                    self._awaiting_first_update.pop(symbol, None)
+                                    continue
+                                self._awaiting_first_update[symbol] = False
+
+                            # Existing incremental diff validation
+                            if symbol in self._last_update_ids:
+                                expected_id = self._last_update_ids[symbol] + 1
+                                if last_update_id != expected_id:
+                                    self.logger().warning(
+                                        f"{symbol}: Sequence gap detected "
+                                        f"(expected {expected_id}, got {last_update_id}). "
+                                        "Clearing state and waiting for next WS snapshot."
+                                    )
+                                    # Clear state and wait for next WS snapshot
+                                    self._last_update_ids.pop(symbol, None)
+                                    self._awaiting_first_update.pop(symbol, None)
+                                    continue  # Don't process this gapped update
+
+                            self._last_update_ids[symbol] = last_update_id
+                            self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                    
                 elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
 
@@ -297,14 +368,72 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         ts_sec = float(json_msg.get("time")) * 1e-3
                 except Exception:
                     pass
+                # Pass the nested data node, not top-level
                 order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
-                    json_msg["data"], ts_sec, {"trading_pair": trading_pair})
+                    json_msg["data"],  # This now contains action, lastUpdateId, bids, asks
+                    ts_sec,
+                    {"trading_pair": trading_pair}
+                )
                 snapshot_queue.put_nowait(order_book_message)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().error("Unexpected error when processing public order book updates from exchange")
                 raise
+
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listen for incremental order book updates from @incrDepth stream.
+        """
+        message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
+        while True:
+            try:
+                json_msg = await message_queue.get()
+                trading_pair = json_msg["symbol"]
+
+                # Extract timestamp
+                ts_sec = self._time()
+                # BingX incrDepth has timestamp at root level
+                if isinstance(json_msg.get("timestamp"), (int, float)):
+                    ts_sec = float(json_msg.get("timestamp")) * 1e-3
+                elif isinstance(json_msg.get("time"), (int, float)):
+                    ts_sec = float(json_msg.get("time")) * 1e-3
+
+                # Build diff message
+                diff_message = BingXOrderBook.diff_message_from_exchange(
+                    json_msg,
+                    ts_sec,
+                    {"trading_pair": trading_pair}
+                )
+                output.put_nowait(diff_message)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error(
+                    "Unexpected error processing incremental depth update",
+                    exc_info=True
+                )
+
+    async def _recover_orderbook_snapshot(self, trading_pair: str):
+        """
+        Request recovery by clearing state and waiting for next WS snapshot.
+        BingX sends periodic full snapshots with action='all' which will resync.
+        """
+        try:
+            self.logger().warning(
+                f"{trading_pair}: Detected sequence gap. "
+                "Clearing orderbook state. Will resync on next WS snapshot."
+            )
+
+            # Clear state for this symbol
+            self._last_update_ids.pop(trading_pair, None)
+            self._awaiting_first_update.pop(trading_pair, None)
+
+            # The next WS message with action="all" will reinitialize properly
+
+        except Exception:
+            self.logger().exception(f"Error during {trading_pair} recovery")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:

@@ -20,11 +20,11 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        # Use millisecond update_id consistently across REST and WS
-        ts = int(timestamp * 1e3)
+        # Use lastUpdateId instead of timestamp for better ordering
+        update_id = msg.get("lastUpdateId", int(timestamp * 1e3))
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
-            "update_id": ts,
+            "update_id": update_id,  # Sequential ID from BingX
             "bids": msg["bids"],
             "asks": msg["asks"]
         }, timestamp=timestamp)
@@ -43,11 +43,14 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        # Keep update_id in milliseconds
-        ts = int(msg["timestamp"])  # already ms from REST
+        # Use version field from BingX REST API for proper sequence validation
+        update_id = msg.get("lastUpdateId")  # This should be set from version field in data source
+        if update_id is None:
+            # Fallback to timestamp if version not available
+            update_id = int(msg["timestamp"])
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
-            "update_id": ts,
+            "update_id": update_id,
             "bids": msg["bids"],
             "asks": msg["asks"]
         }, timestamp=timestamp)
@@ -66,13 +69,14 @@ class BingXOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
-        # Use millisecond update_id for diffs to ensure ordering vs snapshot
-        ts = int(timestamp * 1e3) if timestamp is not None else None
+        # Extract from nested structure
+        data_node = msg.get("data", {})
+        update_id = data_node.get("lastUpdateId", int(timestamp * 1e3) if timestamp else None)
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
-            "update_id": ts,
-            "bids": msg["data"]["bids"],
-            "asks": msg["data"]["asks"]
+            "update_id": update_id,
+            "bids": data_node.get("bids", []),
+            "asks": data_node.get("asks", [])
         }, timestamp=timestamp)
 
     @classmethod

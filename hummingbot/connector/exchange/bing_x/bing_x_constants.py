@@ -124,10 +124,10 @@ EXCHANGE_NAME = "bing_x"
 HBOT_BROKER_ID = "hummingbot"
 HBOT_ORDER_ID = "t-HBOT"
 
-REST_URL = "https://open-api.bingx.com/openapi"
+REST_URL = "https://open-api.bingx.com/openApi"
 
 
-SYMBOL_PATH_URL = "/spot/v1/common/symbols"
+SYMBOL_PATH_URL = "/spot/v1/common/symbols" #should remove and stop using?
 
 TRADE_EVENT_TYPE = "trade"
 DIFF_EVENT_TYPE = "depth"
