@@ -98,6 +98,7 @@ class BingXOrderBook(OrderBook):
             msg.update(metadata)
         # Extract orderbook data from nested structure
         data_node = msg.get("data", {})
+        """
         # Diagnostic logging for WS snapshot contents
         try:
             import logging
@@ -107,6 +108,7 @@ class BingXOrderBook(OrderBook):
             logger.info(f"WS Snapshot - raw asks sample: {str(data_node.get('asks', []))[:200]}")
         except Exception:
             pass
+        """
         # Use BingX-provided sequence fields when available
         update_id = (
             data_node.get("lastUpdateId")

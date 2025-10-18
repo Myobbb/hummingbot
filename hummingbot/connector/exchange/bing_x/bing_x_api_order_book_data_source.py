@@ -16,6 +16,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+import logging
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.bing_x.bing_x_exchange import BingXExchange
@@ -48,7 +49,13 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
         )
-        self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        # Bounded queues to avoid unbounded memory growth and improve throughput
+        MAX_QUEUE_SIZE = 5000
+        self._message_queue: Dict[str, asyncio.Queue] = {
+            CONSTANTS.SNAPSHOT_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
+            CONSTANTS.DIFF_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
+            CONSTANTS.TRADE_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
+        }
         self._last_ws_message_sent_timestamp = 0
         # Throttled per-symbol lag logging (ms timestamp)
         self._last_depth_lag_log_ms: Dict[str, int] = {}
@@ -293,8 +300,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 event_type = data.get("dataType").split('@')[1]
                 data['symbol'] = symbol
 
-                self.logger().debug(f"Processing {event_type} message for {symbol}")
-                self.logger().debug(f"Message data: {data}")
+                # Reduced logging in hot path for performance
                 
                 if event_type == "incrDepth" or event_type.startswith("depth"):
                     # Handle incremental/full depth messages
@@ -314,31 +320,17 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                         # Per docs, only action == 'all' is a full snapshot
                         if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
-                            # TEMPORARY DIAGNOSTIC for WS snapshot content
-                            try:
-                                self.logger().info(f"=== WS SNAPSHOT DEBUG for {symbol} ===")
-                                self.logger().info(f"Full message keys: {list(data.keys())}")
-                                self.logger().info(f"data_node keys: {list(data_node.keys())}")
-                                self.logger().info(f"data_node.bids type: {type(data_node.get('bids'))}")
-                                self.logger().info(f"data_node.asks type: {type(data_node.get('asks'))}")
-                                if isinstance(data_node.get('bids'), list):
-                                    self.logger().info(f"bids count: {len(data_node.get('bids', []))}")
-                                    if data_node.get('bids'):
-                                        self.logger().info(f"first bid: {data_node['bids'][0]}")
-                                if isinstance(data_node.get('asks'), list):
-                                    self.logger().info(f"asks count: {len(data_node.get('asks', []))}")
-                                    if data_node.get('asks'):
-                                        self.logger().info(f"first ask: {data_node['asks'][0]}")
-                                self.logger().info("=== END WS SNAPSHOT DEBUG ===")
-                            except Exception:
-                                pass
                             # This is a WS full snapshot - initialize sequence tracking
                             self.logger().info(
                                 f"{symbol}: Received WS full depth snapshot "
                                 f"(lastUpdateId={last_update_id})"
                             )
-                            # Queue as snapshot for orderbook initialization
-                            self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                            # Queue as snapshot for orderbook initialization (handle overflow)
+                            try:
+                                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+                            except asyncio.QueueFull:
+                                self.logger().warning(f"{symbol}: Snapshot queue full, forcing recovery")
+                                await self._trigger_immediate_recovery(symbol)
                             if last_update_id is not None:
                                 # Initialize sequence tracking from WS snapshot
                                 self._last_update_ids[symbol] = last_update_id
@@ -365,7 +357,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 # No prior WS snapshot state; take first diff as baseline only if we have nothing
                                 self._last_update_ids[symbol] = last_update_id
                                 self._awaiting_first_update[symbol] = False
-                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                try:
+                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                except asyncio.QueueFull:
+                                    self.logger().warning(f"{symbol}: Diff queue full, forcing recovery")
+                                    await self._trigger_immediate_recovery(symbol)
                                 self.logger().info(f"{symbol}: Accepted first incremental as baseline (id={last_update_id})")
                                 await self._flush_pending_diffs(symbol)
                                 continue
@@ -403,7 +399,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             # Handle in-order, ahead, and behind cases
                             if last_update_id == expected_id:
                                 # Enqueue current in-order diff
-                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                try:
+                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                except asyncio.QueueFull:
+                                    self.logger().warning(f"{symbol}: Diff queue full during in-order accept, forcing recovery")
+                                    await self._trigger_immediate_recovery(symbol)
                                 self._last_update_ids[symbol] = last_update_id
                                 # After accepting, try flushing buffered contiguous diffs
                                 await self._flush_pending_diffs(symbol)
@@ -451,15 +451,16 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     ts_sec,
                     {"trading_pair": trading_pair}
                 )
-                # Diagnostic: sizes before queueing
-                try:
-                    bids_len = len(order_book_message.content.get("bids", []))
-                    asks_len = len(order_book_message.content.get("asks", []))
-                    self.logger().info(
-                        f"Snapshot message created for {trading_pair} - update_id={order_book_message.update_id}, "
-                        f"bids={bids_len}, asks={asks_len}")
-                except Exception:
-                    pass
+                # Reduced logging: only if debug enabled
+                if self.logger().isEnabledFor(logging.DEBUG):
+                    try:
+                        bids_len = len(order_book_message.content.get("bids", []))
+                        asks_len = len(order_book_message.content.get("asks", []))
+                        self.logger().debug(
+                            f"Snapshot message created for {trading_pair} - update_id={order_book_message.update_id}, "
+                            f"bids={bids_len}, asks={asks_len}")
+                    except Exception:
+                        pass
                 snapshot_queue.put_nowait(order_book_message)
             except asyncio.CancelledError:
                 raise
@@ -469,29 +470,51 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
-        Listen for incremental order book updates from @incrDepth stream.
+        High-throughput diff consumer with batching to reduce per-message overhead.
         """
         message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
         while True:
             try:
+                # Block for at least one message
                 json_msg = await message_queue.get()
                 trading_pair = json_msg["symbol"]
 
-                # Extract timestamp
                 ts_sec = self._time()
-                # BingX incrDepth has timestamp at root level
                 if isinstance(json_msg.get("timestamp"), (int, float)):
                     ts_sec = float(json_msg.get("timestamp")) * 1e-3
                 elif isinstance(json_msg.get("time"), (int, float)):
                     ts_sec = float(json_msg.get("time")) * 1e-3
 
-                # Build diff message
                 diff_message = BingXOrderBook.diff_message_from_exchange(
                     json_msg,
                     ts_sec,
                     {"trading_pair": trading_pair}
                 )
                 output.put_nowait(diff_message)
+
+                # Drain remaining items in batches without awaiting between each get
+                drained = 0
+                max_batch = CONSTANTS.DIFF_BATCH_SIZE
+                while drained < max_batch:
+                    try:
+                        json_msg = message_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    trading_pair = json_msg["symbol"]
+                    ts_sec = self._time()
+                    if isinstance(json_msg.get("timestamp"), (int, float)):
+                        ts_sec = float(json_msg.get("timestamp")) * 1e-3
+                    elif isinstance(json_msg.get("time"), (int, float)):
+                        ts_sec = float(json_msg.get("time")) * 1e-3
+
+                    diff_message = BingXOrderBook.diff_message_from_exchange(
+                        json_msg,
+                        ts_sec,
+                        {"trading_pair": trading_pair}
+                    )
+                    output.put_nowait(diff_message)
+                    drained += 1
 
             except asyncio.CancelledError:
                 raise

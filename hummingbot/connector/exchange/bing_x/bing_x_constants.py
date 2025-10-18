@@ -44,6 +44,7 @@ WS_HEARTBEAT_TIME_INTERVAL = 5
 # Orderbook management
 ONE_HOUR = 60 * 60  # Periodic snapshot interval (seconds)
 SNAPSHOT_DEPTH_LIMIT = 1000  # Maximum depth levels per REST snapshot
+DIFF_BATCH_SIZE = 100  # Max diffs to process per iteration
 
 # BingX-specific WebSocket stream identifiers
 BINGX_SNAPSHOT_ACTION = "all"      # Full depth indicator in 'action' field
