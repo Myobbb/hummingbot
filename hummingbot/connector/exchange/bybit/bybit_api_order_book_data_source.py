@@ -1,5 +1,6 @@
 import asyncio
 import time
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
@@ -34,7 +35,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  api_factory: Optional[WebAssistantsFactory] = None,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  throttler: Optional[AsyncThrottler] = None,
-                 time_synchronizer: Optional[TimeSynchronizer] = None):
+                 time_synchronizer: Optional[TimeSynchronizer] = None,
+                 max_queue_size: Optional[int] = None):
         super().__init__(trading_pairs)
         self._connector = connector
         self._domain = domain
@@ -45,8 +47,22 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
         )
-        # Bounded queues to prevent unbounded growth under high load
-        self._max_queue_size: int = 1000
+        # Bounded queues to prevent unbounded growth under high load (configurable/scaled)
+        env_max = os.getenv("HUMMINGBOT_BYBIT_WS_QUEUE_MAXSIZE")
+        env_buffer_seconds = os.getenv("HUMMINGBOT_BYBIT_WS_QUEUE_BUFFER_SECONDS")
+        try:
+            computed_updates_per_second = 50  # Bybit L50 can burst ~50 updates/sec
+            buffer_seconds = int(env_buffer_seconds) if env_buffer_seconds is not None else 60
+            pairs_factor = max(1, min(len(self._trading_pairs), 5))
+            computed_size = computed_updates_per_second * buffer_seconds * pairs_factor
+        except Exception:
+            computed_size = 1000
+        try:
+            override_size = int(max_queue_size) if max_queue_size is not None else (int(env_max) if env_max is not None else None)
+        except Exception:
+            override_size = None
+        # Clamp to sane bounds
+        self._max_queue_size: int = max(1000, min(50000, override_size if override_size is not None else computed_size))
         self._message_queue: Dict[str, asyncio.Queue] = {
             self._trade_messages_queue_key: asyncio.Queue(maxsize=self._max_queue_size),
             self._diff_messages_queue_key: asyncio.Queue(maxsize=self._max_queue_size),
@@ -64,7 +80,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 45.0
         # Proactive reconnect window to avoid aged connections (seconds)
-        self._max_connection_age_seconds: float = 60.0 * 10.0  # 10 minutes
+        self._max_connection_age_seconds: float = 60.0 * 60.0 * 1.0  # 1 hours
         self._conn_start_time: Optional[float] = None
         # Track last ping req_id to correlate pong acks
         self._last_ping_req_id: Optional[str] = None
@@ -330,7 +346,6 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         elif "ts" in data:
                             pong_payload["req_id"] = str(data["ts"])  # some variants use ts
                         await ws.send(WSJSONRequest(pong_payload))
-                        self._last_ws_message_sent_timestamp = self._time()
                     except Exception:
                         pass
                     continue
@@ -348,14 +363,32 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         self.logger().warning(
                             f"Bybit subscribe failure #{self._subscription_failure_count[topic_str]} for topic '{topic_str}': {data.get('ret_msg')}"
                         )
+                        # If we've hit max failures, drop only the affected pair/topic; otherwise retry subscribing with backoff
                         if self._subscription_failure_count[topic_str] >= self._max_subscription_failures:
-                            self.logger().error(f"Max subscription failures reached for {topic_str}, skipping further escalation")
-                    # Escalate orderbook subscription failure as critical unless max failures reached
-                    if any(
-                        ("orderbook" in str(arg)) and (self._subscription_failure_count.get(str(arg), 0) < self._max_subscription_failures)
-                        for arg in failed_args
-                    ):
-                        raise ConnectionError(f"Critical orderbook subscription failed: {data.get('ret_msg')}")
+                            try:
+                                symbol = self._parse_symbol_from_topic(topic_str)
+                                trading_pair = None
+                                if symbol:
+                                    trading_pair = self._symbol_to_pair_cache.get(symbol)
+                                    if trading_pair is None:
+                                        try:
+                                            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                                        except Exception:
+                                            trading_pair = None
+                                if trading_pair and trading_pair in self._trading_pairs:
+                                    self._trading_pairs.remove(trading_pair)
+                                    self.logger().error(f"Removing {trading_pair} from tracking after repeated subscription failures for {topic_str}")
+                                else:
+                                    self.logger().error(f"Max subscription failures reached for {topic_str}, not reconnecting entire WS")
+                            except Exception:
+                                self.logger().error(f"Error handling max failure for topic {topic_str}", exc_info=True)
+                        else:
+                            # Exponential backoff capped to 30s
+                            delay = min(30.0, 2.0 * float(self._subscription_failure_count[topic_str]))
+                            try:
+                                asyncio.create_task(self._retry_subscribe_topic(ws, topic_str, delay))
+                            except Exception:
+                                self.logger().warning(f"Failed to schedule retry subscribe for topic {topic_str}")
                 else:
                     # Successful subscribe ack (rarely carries args). Log at info for visibility.
                     try:
@@ -366,10 +399,6 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             event_type = data.get("type")
             topic = data.get("topic")
-            # Per Bybit docs, occasionally u==1 indicates a snapshot data due to service restart
-            # Route such frames to snapshot handling regardless of 'type'
-            if (topic and "orderbook" in topic) and isinstance(data.get("data"), dict) and data["data"].get("u") == 1:
-                event_type = CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE
 
             if event_type == CONSTANTS.TRADE_EVENT_TYPE and topic and "publicTrade" in topic:
                 channel = self._trade_messages_queue_key
@@ -579,3 +608,32 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def _get_ob_topic_from_symbol(self, symbol: str, depth: int) -> str:
         return f"orderbook.{depth}.{symbol}"
+
+    def _parse_symbol_from_topic(self, topic: str) -> Optional[str]:
+        try:
+            parts = str(topic).split(".")
+            return parts[-1] if parts else None
+        except Exception:
+            return None
+
+    async def _retry_subscribe_topic(self, ws: WSAssistant, topic: str, delay: float):
+        try:
+            await self._sleep(delay)
+            # Ensure the underlying connection is still alive before attempting to send
+            is_connected = bool(getattr(getattr(ws, "_connection", None), "connected", False))
+            if is_connected:
+                payload = {"op": "subscribe", "args": [topic]}
+                await ws.send(WSJSONRequest(payload))
+                try:
+                    self.logger().info(f"Retried subscribing topic {topic} after {delay:.1f}s")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.logger().debug(f"Skipping retry for {topic} - WS disconnected")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().warning(f"Retry subscribe failed for topic {topic}", exc_info=True)
