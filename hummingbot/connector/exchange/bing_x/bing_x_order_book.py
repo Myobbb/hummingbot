@@ -15,8 +15,23 @@ class BingXOrderBook(OrderBook):
         - {"price": "..", "quantity"|"qty": ".."} or {"p": "..", "q": ".."}
         Returns list of [price, qty] (strings/numbers), Hummingbot converts to floats later.
         """
+        # Debug logging
+        try:
+            import logging
+            logger = logging.getLogger(__name__)
+        except Exception:
+            logger = None
         if not isinstance(levels, list):
+            if logger:
+                logger.warning(f"_normalize_levels: Input is not a list, type={type(levels)}")
             return []
+        if logger:
+            try:
+                logger.debug(f"_normalize_levels: Processing {len(levels)} levels")
+                if levels:
+                    logger.debug(f"_normalize_levels: First level type={type(levels[0])}, value={levels[0]}")
+            except Exception:
+                pass
         normalized: List[List[Any]] = []
         for entry in levels:
             price = None
@@ -32,6 +47,17 @@ class BingXOrderBook(OrderBook):
                 qty = entry.get("quantity") or entry.get("qty") or entry.get("q")
             if price is not None and qty is not None:
                 normalized.append([price, qty])
+            else:
+                if logger:
+                    try:
+                        logger.warning(f"_normalize_levels: Skipped entry (no price/qty): {entry}")
+                    except Exception:
+                        pass
+        if logger:
+            try:
+                logger.debug(f"_normalize_levels: Normalized {len(normalized)}/{len(levels)} levels")
+            except Exception:
+                pass
         return normalized
     @classmethod
     def snapshot_message_from_exchange_websocket(cls,
@@ -49,6 +75,15 @@ class BingXOrderBook(OrderBook):
             msg.update(metadata)
         # Extract orderbook data from nested structure
         data_node = msg.get("data", {})
+        # Diagnostic logging for WS snapshot contents
+        try:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"WS Snapshot - data_node keys: {list(data_node.keys())}")
+            logger.info(f"WS Snapshot - raw bids sample: {str(data_node.get('bids', []))[:200]}")
+            logger.info(f"WS Snapshot - raw asks sample: {str(data_node.get('asks', []))[:200]}")
+        except Exception:
+            pass
         # Use BingX-provided sequence fields when available
         update_id = (
             data_node.get("lastUpdateId")
@@ -63,8 +98,22 @@ class BingXOrderBook(OrderBook):
         # BingX returns arrays of [price, qty] for asks/bids
         bids_raw = data_node.get("bids") or data_node.get("b") or []
         asks_raw = data_node.get("asks") or data_node.get("a") or []
+        try:
+            logger = logging.getLogger(__name__)
+            logger.info(f"WS Snapshot - bids_raw count: {len(bids_raw)}, asks_raw count: {len(asks_raw)}")
+        except Exception:
+            pass
         bids = cls._normalize_levels(bids_raw)
         asks = cls._normalize_levels(asks_raw)
+        try:
+            logger = logging.getLogger(__name__)
+            logger.info(f"WS Snapshot - normalized bids: {len(bids)}, normalized asks: {len(asks)}")
+            if bids:
+                logger.info(f"WS Snapshot - first bid: {bids[0]}")
+            if asks:
+                logger.info(f"WS Snapshot - first ask: {asks[0]}")
+        except Exception:
+            pass
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,  # Sequential ID from BingX

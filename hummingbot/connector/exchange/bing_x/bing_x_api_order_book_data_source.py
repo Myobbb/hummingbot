@@ -314,6 +314,24 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                         # Per docs, only action == 'all' is a full snapshot
                         if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
+                            # TEMPORARY DIAGNOSTIC for WS snapshot content
+                            try:
+                                self.logger().info(f"=== WS SNAPSHOT DEBUG for {symbol} ===")
+                                self.logger().info(f"Full message keys: {list(data.keys())}")
+                                self.logger().info(f"data_node keys: {list(data_node.keys())}")
+                                self.logger().info(f"data_node.bids type: {type(data_node.get('bids'))}")
+                                self.logger().info(f"data_node.asks type: {type(data_node.get('asks'))}")
+                                if isinstance(data_node.get('bids'), list):
+                                    self.logger().info(f"bids count: {len(data_node.get('bids', []))}")
+                                    if data_node.get('bids'):
+                                        self.logger().info(f"first bid: {data_node['bids'][0]}")
+                                if isinstance(data_node.get('asks'), list):
+                                    self.logger().info(f"asks count: {len(data_node.get('asks', []))}")
+                                    if data_node.get('asks'):
+                                        self.logger().info(f"first ask: {data_node['asks'][0]}")
+                                self.logger().info("=== END WS SNAPSHOT DEBUG ===")
+                            except Exception:
+                                pass
                             # This is a WS full snapshot - initialize sequence tracking
                             self.logger().info(
                                 f"{symbol}: Received WS full depth snapshot "
@@ -433,6 +451,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     ts_sec,
                     {"trading_pair": trading_pair}
                 )
+                # Diagnostic: sizes before queueing
+                try:
+                    bids_len = len(order_book_message.content.get("bids", []))
+                    asks_len = len(order_book_message.content.get("asks", []))
+                    self.logger().info(
+                        f"Snapshot message created for {trading_pair} - update_id={order_book_message.update_id}, "
+                        f"bids={bids_len}, asks={asks_len}")
+                except Exception:
+                    pass
                 snapshot_queue.put_nowait(order_book_message)
             except asyncio.CancelledError:
                 raise
