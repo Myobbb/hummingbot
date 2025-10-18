@@ -1,7 +1,6 @@
 import asyncio
 import json
 import time
-from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import hummingbot.connector.exchange.bing_x.bing_x_constants as CONSTANTS
@@ -16,7 +15,6 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
-import logging
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.bing_x.bing_x_exchange import BingXExchange
@@ -40,7 +38,6 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  time_synchronizer: Optional[TimeSynchronizer] = None):
         super().__init__(trading_pairs)
         self._connector = connector
-        self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._time_synchronizer = time_synchronizer
         self._throttler = throttler
@@ -49,20 +46,16 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
         )
-        # Bounded queues to avoid unbounded memory growth and improve throughput
-        MAX_QUEUE_SIZE = 5000
+        # Larger queue for high-frequency bursts
+        MAX_QUEUE_SIZE = 10000
         self._message_queue: Dict[str, asyncio.Queue] = {
             CONSTANTS.SNAPSHOT_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
             CONSTANTS.DIFF_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
             CONSTANTS.TRADE_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
         }
         self._last_ws_message_sent_timestamp = 0
-        # Throttled per-symbol lag logging (ms timestamp)
-        self._last_depth_lag_log_ms: Dict[str, int] = {}
+        # Simplified state tracking - only what we need
         self._last_update_ids: Dict[str, int] = {}
-        self._awaiting_first_update: Dict[str, bool] = {}
-        # Buffer out-of-order diffs up to 3 per BingX guidance
-        self._pending_diffs: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._snapshot_output_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self,
@@ -70,128 +63,93 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                      domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
-    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        """
-        Retrieves a copy of the full order book from the exchange, for a particular trading pair.
-
-        :param trading_pair: the trading pair for which the order book will be retrieved
-
-        :return: the response from the exchange (JSON dictionary)
-        """
-        params = {
-            "symbol": trading_pair,
-            "limit": str(CONSTANTS.SNAPSHOT_DEPTH_LIMIT)
-        }
-        data = await self._connector._api_request(path_url=CONSTANTS.SNAPSHOT_PATH_URL,
-                                                  method=RESTMethod.GET,
-                                                  params=params)
-        # Some BingX responses can arrive as raw strings (text/plain) or JSON strings; normalize to dict
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except Exception:
-                raise IOError(f"Unexpected snapshot response type (string) for {trading_pair}: {data[:120]}")
-
-        if not isinstance(data, dict):
-            raise IOError(f"Unexpected snapshot response format for {trading_pair}: type={type(data)}")
-
-        # Extract sub-payload and timestamp robustly
-        sub = data.get('data')
-        if sub is None:
-            # Some variants may place book arrays at top-level
-            if all(k in data for k in ("asks", "bids")):
-                sub = data
-            else:
-                raise IOError(f"Snapshot payload missing 'data' for {trading_pair}: keys={list(data.keys())}")
-
-        if not isinstance(sub, dict):
-            raise IOError(f"Unexpected 'data' payload type for {trading_pair}: type={type(sub)}")
-
-        ts = data.get('timestamp') or data.get('ts') or int(self._time() * 1e3)
-        try:
-            sub['timestamp'] = ts
-        except Exception:
-            # Ensure we can attach timestamp even if sub is a mapping-like
-            sub = dict(sub)
-            sub['timestamp'] = ts
-
-        # Do NOT trust REST sequence for BingX; let WS establish the baseline
-        sub['lastUpdateId'] = 0
-
-        return sub
-
-    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
-        snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
-        snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
-            snapshot,
-            snapshot_timestamp,
-            metadata={"trading_pair": trading_pair}
-        )
-        return snapshot_msg
-
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["symbol"])
+        """Legacy method for framework compatibility - not used in optimized flow"""
         trading_pair = raw_message["dataType"].split('@')[0]
-        # for trades in raw_message["data"]:
-        trade_message: OrderBookMessage = BingXOrderBook.trade_message_from_exchange(
+        trade_message = BingXOrderBook.trade_message_from_exchange(
             raw_message["data"], {"trading_pair": trading_pair})
         message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # self.logger().info(f"parse msg queue: {raw_message}")
+        """Legacy method for framework compatibility - not used in optimized flow"""
         trading_pair = raw_message.get('dataType').split('@')[0]
-        # for diff_message in raw_message["data"]:
-        #     order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
-        #         diff_message, diff_message["t"], {"trading_pair": trading_pair})
-        #     message_queue.put_nowait(order_book_message)
-        # Prefer server-provided timestamp when available
-        ws_time_ms = None
-        try:
-            if isinstance(raw_message.get('time'), (int, float)):
-                ws_time_ms = int(raw_message.get('time'))
-            elif isinstance(raw_message.get('ts'), (int, float)):
-                ws_time_ms = int(raw_message.get('ts'))
-            elif isinstance(raw_message.get('data', {}).get('t'), (int, float)):
-                ws_time_ms = int(raw_message.get('data', {}).get('t'))
-        except Exception:
-            ws_time_ms = None
-        time = (ws_time_ms * 1e-3) if ws_time_ms is not None else self._time()
-        order_book_message: OrderBookMessage = BingXOrderBook.diff_message_from_exchange(
-            raw_message, time, {"trading_pair": trading_pair})
+        ts_sec = self._extract_timestamp(raw_message, self._time())
+        order_book_message = BingXOrderBook.diff_message_from_exchange(
+            raw_message, ts_sec, {"trading_pair": trading_pair})
         message_queue.put_nowait(order_book_message)
 
+    @staticmethod
+    def _extract_timestamp(msg: Dict[str, Any], default_time: float) -> float:
+        """Fast timestamp extraction - call once per message"""
+        time_raw = msg.get("time") or msg.get("ts")
+        if isinstance(time_raw, (int, float)):
+            return float(time_raw) * 1e-3
+        return default_time
+
+    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        params = {
+            "symbol": trading_pair,
+            "limit": str(CONSTANTS.SNAPSHOT_DEPTH_LIMIT)
+        }
+        data = await self._connector._api_request(
+            path_url=CONSTANTS.SNAPSHOT_PATH_URL,
+            method=RESTMethod.GET,
+            params=params
+        )
+        
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                raise IOError(f"Invalid snapshot response for {trading_pair}")
+
+        if not isinstance(data, dict):
+            raise IOError(f"Unexpected snapshot format for {trading_pair}")
+
+        sub = data.get('data')
+        if sub is None:
+            if all(k in data for k in ("asks", "bids")):
+                sub = data
+            else:
+                raise IOError(f"Snapshot missing 'data' for {trading_pair}")
+
+        ts = data.get('timestamp') or data.get('ts') or int(self._time() * 1e3)
+        if not isinstance(sub, dict):
+            sub = dict(sub)
+        sub['timestamp'] = ts
+        sub['lastUpdateId'] = 0  # Don't trust REST sequence
+
+        return sub
+
+    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        snapshot = await self._request_order_book_snapshot(trading_pair)
+        snapshot_timestamp = float(snapshot["timestamp"]) * 1e-3
+        return BingXOrderBook.snapshot_message_from_exchange_rest(
+            snapshot, snapshot_timestamp, {"trading_pair": trading_pair}
+        )
+
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        This method runs continuously and request the full order book content from the exchange every hour.
-        The method uses the REST API from the exchange because it does not provide an endpoint to get the full order
-        book through websocket. With the information creates a snapshot messages that is added to the output queue
-        :param ev_loop: the event loop the method will run in
-        :param output: a queue to add the created snapshot messages
-        """
-        self._snapshot_output_queue = output  # Store reference for recovery
+        self._snapshot_output_queue = output
         while True:
             try:
-                await asyncio.wait_for(self._process_ob_snapshot(snapshot_queue=output), timeout=self.ONE_HOUR)
+                await asyncio.wait_for(
+                    self._process_ob_snapshot(snapshot_queue=output), 
+                    timeout=self.ONE_HOUR
+                )
             except asyncio.TimeoutError:
-                await self._take_full_order_book_snapshot(trading_pairs=self._trading_pairs, snapshot_queue=output)
+                await self._take_full_order_book_snapshot(self._trading_pairs, output)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().error("Unexpected error.", exc_info=True)
-                await self._take_full_order_book_snapshot(trading_pairs=self._trading_pairs, snapshot_queue=output)
+                self.logger().error("Snapshot processing error", exc_info=True)
+                await self._take_full_order_book_snapshot(self._trading_pairs, output)
                 await self._sleep(5.0)
 
     async def listen_for_subscriptions(self):
-        """
-        Connects to the trade events and order diffs websocket endpoints and listens to the messages sent by the
-        exchange. Each message is stored in its own queue.
-        """
         ws = None
         while True:
             try:
-                ws: WSAssistant = await self._api_factory.get_ws_assistant()
-                # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
+                ws = await self._api_factory.get_ws_assistant()
                 await ws.connect(
                     ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
                     ping_timeout=None,
@@ -201,413 +159,238 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
-                # Process messages continuously and only respond to server pings
                 await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().error(
-                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
+                    "WS error, reconnecting in 5s...",
                     exc_info=True,
                 )
-                await self._sleep(1.0)
+                await self._sleep(5.0)
             finally:
                 ws and await ws.disconnect()
 
     async def _subscribe_channels(self, ws: WSAssistant):
-        """
-        Subscribes to the trade events and diff orders events through the provided websocket connection.
-        Respects BingX's 200 subscription limit per connection by batching if needed.
-        :param ws: the websocket assistant used to connect to the exchange
-        """
-        try:
-            # BingX allows up to 200 subscriptions per websocket connection
-            MAX_SUBSCRIPTIONS_PER_CONNECTION = 200
-
-            # Calculate subscriptions needed: 2 per trading pair (trade + depth)
-            total_subscriptions_needed = len(self._trading_pairs) * 2
-
-            if total_subscriptions_needed > MAX_SUBSCRIPTIONS_PER_CONNECTION:
-                self.logger().warning(
-                    f"Total subscriptions ({total_subscriptions_needed}) exceeds BingX limit "
-                    f"({MAX_SUBSCRIPTIONS_PER_CONNECTION}) per connection. Consider reducing trading pairs."
-                )
-
-            # Subscribe to all trading pairs (BingX should handle the limit gracefully)
-            for trading_pair in self._trading_pairs:
-                trade_payload = {
-                    "id": f"trade_{trading_pair}",
-                    "reqType": "sub",
-                    "dataType": trading_pair + "@trade"
-                }
-                subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
-
-                depth_payload = {
-                    "id": f"depth_{trading_pair}",
-                    "reqType": "sub",
-                    "dataType": trading_pair + "@incrDepth"
-                }
-                subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
-
-                await ws.send(subscribe_trade_request)
-                await ws.send(subscribe_orderbook_request)
-
-                self.logger().info(f"Subscribed to public order book and trade channels of {trading_pair}...")
-            
-            # Rely on WS 'action=all' snapshot per BingX docs; use REST only for recovery
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...",
-                exc_info=True
-            )
-            raise
+        MAX_SUBS = 200
+        total_needed = len(self._trading_pairs) * 2
         
+        if total_needed > MAX_SUBS:
+            self.logger().warning(
+                f"Subscriptions ({total_needed}) exceed BingX limit ({MAX_SUBS})"
+            )
+
+        for trading_pair in self._trading_pairs:
+            trade_req = WSJSONRequest(payload={
+                "id": f"trade_{trading_pair}",
+                "reqType": "sub",
+                "dataType": f"{trading_pair}@trade"
+            })
+            depth_req = WSJSONRequest(payload={
+                "id": f"depth_{trading_pair}",
+                "reqType": "sub",
+                "dataType": f"{trading_pair}@incrDepth"
+            })
+            await ws.send(trade_req)
+            await ws.send(depth_req)
+
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
-        
+            
             if isinstance(data, str):
                 try:
                     data = json.loads(data)
                 except Exception:
                     continue
             
+            if not isinstance(data, dict):
+                continue
+                
+            # Skip success confirmations
             if data.get("msg") == "SUCCESS":
                 continue
             
             # Handle ping/pong
-            if data.get("ping"):
-                payload = {"pong": data.get("ping")}
-                if data.get("time") is not None:
-                    payload["time"] = data.get("time")
-                ping_request = WSJSONRequest(payload=payload)
-                await ws.send(request=ping_request)
+            if "ping" in data:
+                pong = {"pong": data["ping"]}
+                if "time" in data:
+                    pong["time"] = data["time"]
+                await ws.send(WSJSONRequest(payload=pong))
                 self._last_ws_message_sent_timestamp = self._time()
                 continue
             
-            # Process data messages
-            if data.get("dataType"):
-                symbol = data.get("dataType").split('@')[0]
-                event_type = data.get("dataType").split('@')[1]
-                data['symbol'] = symbol
-
-                # Reduced logging in hot path for performance
+            # Process market data
+            data_type = data.get("dataType")
+            if not data_type:
+                continue
                 
-                if event_type == "incrDepth" or event_type.startswith("depth"):
-                    # Handle incremental/full depth messages
-                    if event_type in ("incrDepth", "depth"):
-                        # Extract nested data from data.data
-                        data_node = data.get('data', {})
+            parts = data_type.split('@')
+            if len(parts) != 2:
+                continue
+                
+            symbol, event_type = parts
+            data['symbol'] = symbol
 
-                        # BingX sends messages with different structures
-                        # Some have 'action' field, others don't
-                        action = data_node.get('action')
-                        # Normalize last update id to int when possible
-                        last_update_id_raw = data_node.get('lastUpdateId') or data_node.get('version') or data_node.get('sequence')
-                        try:
-                            last_update_id = int(last_update_id_raw) if last_update_id_raw is not None else None
-                        except Exception:
-                            last_update_id = None
-
-                        # Per docs, only action == 'all' is a full snapshot
-                        if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
-                            # This is a WS full snapshot - initialize sequence tracking
-                            self.logger().info(
-                                f"{symbol}: Received WS full depth snapshot "
-                                f"(lastUpdateId={last_update_id})"
-                            )
-                            # Queue as snapshot for orderbook initialization (handle overflow)
-                            try:
-                                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                            except asyncio.QueueFull:
-                                self.logger().warning(f"{symbol}: Snapshot queue full, forcing recovery")
-                                await self._trigger_immediate_recovery(symbol)
-                            if last_update_id is not None:
-                                # Initialize sequence tracking from WS snapshot
-                                self._last_update_ids[symbol] = last_update_id
-                                # First incremental MUST be lastUpdateId + 1
-                                self._awaiting_first_update[symbol] = True
-                                # Clear any stale pending diffs
-                                self._pending_diffs.pop(symbol, None)
-                            else:
-                                # Malformed snapshot without sequence - log warning
-                                self.logger().warning(f"{symbol}: WS snapshot missing lastUpdateId")
-
-                        elif action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
-                            # This is an incremental update
-                            self.logger().debug(f"Processing incremental update for {symbol}")
-                            prev_id = self._last_update_ids.get(symbol)
-
-                            # If we haven't seen a snapshot yet, treat first diff as baseline (after REST bootstrap)
-                            if prev_id is None:
-                                if last_update_id is None:
-                                    self.logger().warning(
-                                        f"{symbol}: Incremental update missing lastUpdateId. Skipping. Data: {data_node}"
-                                    )
-                                    continue
-                                # No prior WS snapshot state; take first diff as baseline only if we have nothing
-                                self._last_update_ids[symbol] = last_update_id
-                                self._awaiting_first_update[symbol] = False
-                                try:
-                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                                except asyncio.QueueFull:
-                                    self.logger().warning(f"{symbol}: Diff queue full, forcing recovery")
-                                    await self._trigger_immediate_recovery(symbol)
-                                self.logger().info(f"{symbol}: Accepted first incremental as baseline (id={last_update_id})")
-                                await self._flush_pending_diffs(symbol)
-                                continue
-
-                            # Expected next id strictly prev + 1 per BingX
-                            expected_id = prev_id + 1 if prev_id is not None else None
-
-                            if last_update_id is None:
-                                # If BingX omitted id (shouldn't happen), skip to avoid corrupting sequence
-                                self.logger().warning(f"{symbol}: Incremental update without lastUpdateId. Skipping.")
-                                continue
-
-                            # If first update after snapshot, enforce expected = prev + 1
-                            if self._awaiting_first_update.get(symbol):
-                                if last_update_id != expected_id:
-                                    self.logger().warning(
-                                        f"{symbol}: First update id {last_update_id} != expected {expected_id}. Buffering to check for continuity."
-                                    )
-                                    # Buffer if within gap of 3 per BingX guidance
-                                    if expected_id is not None and 0 < (last_update_id - expected_id) <= 3:
-                                        self._pending_diffs.setdefault(symbol, {})[last_update_id] = data
-                                        self.logger().debug(f"{symbol}: Buffered first update (id={last_update_id})")
-                                        continue
-                                    else:
-                                        # Gap too large or negative - force recovery
-                                        self.logger().error(
-                                            f"{symbol}: First update gap too large ({last_update_id} vs {expected_id}). Recovering with REST snapshot."
-                                        )
-                                        await self._trigger_immediate_recovery(symbol)
-                                        continue
-                                # Accept first update
-                                self._awaiting_first_update[symbol] = False
-                                self.logger().info(f"{symbol}: First incremental update accepted (id={last_update_id})")
-
-                            # Handle in-order, ahead, and behind cases
-                            if last_update_id == expected_id:
-                                # Enqueue current in-order diff
-                                try:
-                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                                except asyncio.QueueFull:
-                                    self.logger().warning(f"{symbol}: Diff queue full during in-order accept, forcing recovery")
-                                    await self._trigger_immediate_recovery(symbol)
-                                self._last_update_ids[symbol] = last_update_id
-                                # After accepting, try flushing buffered contiguous diffs
-                                await self._flush_pending_diffs(symbol)
-                                self.logger().debug(f"Queued diff message for {symbol} (id={last_update_id})")
-                            elif last_update_id > expected_id:
-                                gap = last_update_id - expected_id
-                                if 0 < gap <= 3:
-                                    # Buffer and wait for missing ones
-                                    self._pending_diffs.setdefault(symbol, {})[last_update_id] = data
-                                    self.logger().debug(f"Buffered out-of-order diff for {symbol} (id={last_update_id}, expected={expected_id})")
-                                else:
-                                    self.logger().warning(
-                                        f"{symbol}: Sequence gap too large (id={last_update_id}, expected={expected_id}). Recovering."
-                                    )
-                                    await self._trigger_immediate_recovery(symbol)
-                            else:  # last_update_id < expected_id
-                                # Late or duplicate diff; drop
-                                self.logger().debug(f"Dropped stale diff for {symbol} (id={last_update_id}, expected={expected_id})")
-
-                        else:
-                            self.logger().warning(f"Unknown depth message format for {symbol}: {data_node}")
-                    
-                elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
+            if event_type in ("incrDepth", "depth"):
+                await self._handle_depth_message(data, symbol)
+            elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
+                try:
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
+                except asyncio.QueueFull:
+                    self.logger().warning(f"Trade queue full for {symbol}")
+
+    async def _handle_depth_message(self, data: Dict[str, Any], symbol: str):
+        """Optimized depth message handling with minimal branching"""
+        data_node = data.get('data', {})
+        action = data_node.get('action')
+        
+        # Extract update ID
+        last_update_id_raw = (
+            data_node.get('lastUpdateId') or 
+            data_node.get('version') or 
+            data_node.get('sequence')
+        )
+        
+        try:
+            last_update_id = int(last_update_id_raw) if last_update_id_raw else None
+        except (ValueError, TypeError):
+            last_update_id = None
+
+        # Handle full snapshot
+        if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
+            try:
+                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+            except asyncio.QueueFull:
+                self.logger().warning(f"{symbol}: Snapshot queue full")
+                await self._trigger_immediate_recovery(symbol)
+                return
+                
+            if last_update_id is not None:
+                self._last_update_ids[symbol] = last_update_id
+            return
+
+        # Handle incremental update
+        if action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
+            if last_update_id is None:
+                return  # Skip malformed update
+            
+            prev_id = self._last_update_ids.get(symbol)
+            
+            # Fast path: no previous state - accept first update as baseline
+            if prev_id is None:
+                self._last_update_ids[symbol] = last_update_id
+                try:
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                except asyncio.QueueFull:
+                    await self._trigger_immediate_recovery(symbol)
+                return
+            
+            # Fast path: expected sequence
+            if last_update_id == prev_id + 1:
+                self._last_update_ids[symbol] = last_update_id
+                try:
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                except asyncio.QueueFull:
+                    await self._trigger_immediate_recovery(symbol)
+                return
+            
+            # Slow path: gap detected - trigger recovery
+            if last_update_id != prev_id:
+                self.logger().warning(
+                    f"{symbol}: Gap detected (prev={prev_id}, got={last_update_id})"
+                )
+                await self._trigger_immediate_recovery(symbol)
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
         while True:
-            try:
-                json_msg = await message_queue.get()
-                # self.logger().info(f"data in queue: {json_msg}")
-                trading_pair = json_msg["symbol"]
-                # trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                #     symbol=json_msg["symbol"])
-                # Prefer server-provided time if present for monotonic update_ids
-                ts_sec = self._time()
-                try:
-                    if isinstance(json_msg.get("time"), (int, float)):
-                        ts_sec = float(json_msg.get("time")) * 1e-3
-                except Exception:
-                    pass
-                # Pass the full message structure for proper metadata handling
-                order_book_message: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_websocket(
-                    json_msg,  # Pass full message structure
-                    ts_sec,
-                    {"trading_pair": trading_pair}
-                )
-                # Reduced logging: only if debug enabled
-                if self.logger().isEnabledFor(logging.DEBUG):
-                    try:
-                        bids_len = len(order_book_message.content.get("bids", []))
-                        asks_len = len(order_book_message.content.get("asks", []))
-                        self.logger().debug(
-                            f"Snapshot message created for {trading_pair} - update_id={order_book_message.update_id}, "
-                            f"bids={bids_len}, asks={asks_len}")
-                    except Exception:
-                        pass
-                snapshot_queue.put_nowait(order_book_message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().error("Unexpected error when processing public order book updates from exchange")
-                raise
+            json_msg = await message_queue.get()
+            trading_pair = json_msg["symbol"]
+            
+            # Extract timestamp once
+            ts_sec = self._extract_timestamp(json_msg, self._time())
+            
+            order_book_message = BingXOrderBook.snapshot_message_from_exchange_websocket(
+                json_msg, ts_sec, {"trading_pair": trading_pair}
+            )
+            snapshot_queue.put_nowait(order_book_message)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        High-throughput diff consumer with batching to reduce per-message overhead.
-        """
+        """Optimized diff consumer with batching"""
         message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
+        
         while True:
             try:
-                # Block for at least one message
+                # Block for first message
                 json_msg = await message_queue.get()
                 trading_pair = json_msg["symbol"]
-
-                ts_sec = self._time()
-                if isinstance(json_msg.get("timestamp"), (int, float)):
-                    ts_sec = float(json_msg.get("timestamp")) * 1e-3
-                elif isinstance(json_msg.get("time"), (int, float)):
-                    ts_sec = float(json_msg.get("time")) * 1e-3
-
+                
+                # Extract timestamp once
+                ts_sec = self._extract_timestamp(json_msg, self._time())
+                
+                # Create metadata dict once (reused in diff_message_from_exchange)
+                metadata = {"trading_pair": trading_pair}
                 diff_message = BingXOrderBook.diff_message_from_exchange(
-                    json_msg,
-                    ts_sec,
-                    {"trading_pair": trading_pair}
+                    json_msg, ts_sec, metadata
                 )
                 output.put_nowait(diff_message)
 
-                # Drain remaining items in batches without awaiting between each get
-                drained = 0
-                max_batch = CONSTANTS.DIFF_BATCH_SIZE
-                while drained < max_batch:
+                # Drain queue without blocking
+                while True:
                     try:
                         json_msg = message_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-
+                    
                     trading_pair = json_msg["symbol"]
-                    ts_sec = self._time()
-                    if isinstance(json_msg.get("timestamp"), (int, float)):
-                        ts_sec = float(json_msg.get("timestamp")) * 1e-3
-                    elif isinstance(json_msg.get("time"), (int, float)):
-                        ts_sec = float(json_msg.get("time")) * 1e-3
-
+                    ts_sec = self._extract_timestamp(json_msg, self._time())
+                    metadata = {"trading_pair": trading_pair}
+                    
                     diff_message = BingXOrderBook.diff_message_from_exchange(
-                        json_msg,
-                        ts_sec,
-                        {"trading_pair": trading_pair}
+                        json_msg, ts_sec, metadata
                     )
                     output.put_nowait(diff_message)
-                    drained += 1
 
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().error(
-                    "Unexpected error processing incremental depth update",
-                    exc_info=True
-                )
-
-    async def _recover_orderbook_snapshot(self, trading_pair: str):
-        """
-        Request recovery by clearing state and waiting for next snapshot.
-        Uses REST snapshot for recovery since WS snapshots may not be reliable.
-        """
-        try:
-            self.logger().warning(
-                f"{trading_pair}: Detected sequence gap. "
-                "Clearing orderbook state. Will resync with REST snapshot."
-            )
-
-            # Clear state for this symbol
-            self._last_update_ids.pop(trading_pair, None)
-            self._awaiting_first_update.pop(trading_pair, None)
-
-            # Trigger REST snapshot recovery via the snapshot queue
-            # The _take_full_order_book_snapshot will be called by listen_for_order_book_snapshots
-
-        except Exception:
-            self.logger().exception(f"Error during {trading_pair} recovery")
+                self.logger().error("Diff processing error", exc_info=True)
 
     async def _trigger_immediate_recovery(self, trading_pair: str):
-        """
-        Clear local sequence state and immediately fetch a REST snapshot into the snapshot queue if available.
-        """
-        await self._recover_orderbook_snapshot(trading_pair)
-        if self._snapshot_output_queue is not None:
+        """Clear state and fetch REST snapshot"""
+        self._last_update_ids.pop(trading_pair, None)
+        
+        if self._snapshot_output_queue:
             try:
-                await self._take_full_order_book_snapshot([trading_pair], self._snapshot_output_queue)
+                await self._take_full_order_book_snapshot(
+                    [trading_pair], 
+                    self._snapshot_output_queue
+                )
             except Exception:
-                self.logger().exception(f"{trading_pair}: Failed immediate REST snapshot during recovery")
-
-    async def _flush_pending_diffs(self, trading_pair: str):
-        """
-        Attempt to flush buffered diffs in-order (prev+1) up to 3 deep.
-        """
-        try:
-            prev_id = self._last_update_ids.get(trading_pair)
-            if prev_id is None:
-                return
-            pending = self._pending_diffs.get(trading_pair) or {}
-            # Try to emit while next contiguous ids exist
-            while True:
-                next_id = prev_id + 1
-                if next_id in pending:
-                    data = pending.pop(next_id)
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                    self._last_update_ids[trading_pair] = next_id
-                    prev_id = next_id
-                else:
-                    break
-            # Clean empty map
-            if not pending:
-                self._pending_diffs.pop(trading_pair, None)
-            else:
-                self._pending_diffs[trading_pair] = pending
-        except Exception:
-            self.logger().exception(f"{trading_pair}: Error while flushing pending diffs")
+                self.logger().exception(f"{trading_pair}: Recovery failed")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
             try:
-                snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
-                snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
+                snapshot = await self._request_order_book_snapshot(trading_pair)
+                snapshot_timestamp = float(snapshot["timestamp"]) * 1e-3
 
-                # Do NOT initialize sequence from REST; accept next WS update as baseline
+                # Clear state for fresh start
                 self._last_update_ids.pop(trading_pair, None)
-                self._awaiting_first_update[trading_pair] = False
-                # Clear stale buffers
-                self._pending_diffs.pop(trading_pair, None)
-                self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (sequence ignored)")
 
-                snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
-                    snapshot,
-                    snapshot_timestamp,
-                    metadata={"trading_pair": trading_pair}
+                snapshot_msg = BingXOrderBook.snapshot_message_from_exchange_rest(
+                    snapshot, snapshot_timestamp, {"trading_pair": trading_pair}
                 )
                 snapshot_queue.put_nowait(snapshot_msg)
-                try:
-                    bids_len = len(snapshot_msg.content.get("bids", []))
-                    asks_len = len(snapshot_msg.content.get("asks", []))
-                except Exception:
-                    bids_len = asks_len = -1
-                self.logger().debug(
-                    f"Saved order book snapshot for {trading_pair} with update_id {snapshot_msg.update_id} "
-                    f"(bids={bids_len}, asks={asks_len})")
+                
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().error(f"Unexpected error fetching order book snapshot for {trading_pair}.",
-                                    exc_info=True)
+                self.logger().error(
+                    f"Snapshot fetch error for {trading_pair}",
+                    exc_info=True
+                )
                 await self._sleep(5.0)
 
     def _time(self):
