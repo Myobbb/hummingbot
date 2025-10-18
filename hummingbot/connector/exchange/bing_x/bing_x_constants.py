@@ -41,6 +41,16 @@ ORDER_INFO_PATH_URL = "/openApi/spot/v1/trade/orderInfo"
 
 WS_HEARTBEAT_TIME_INTERVAL = 5
 
+# Orderbook management
+ONE_HOUR = 60 * 60  # Periodic snapshot interval (seconds)
+SNAPSHOT_DEPTH_LIMIT = 1000  # Maximum depth levels per REST snapshot
+
+# BingX-specific WebSocket stream identifiers
+BINGX_SNAPSHOT_ACTION = "all"      # Full depth indicator in 'action' field
+BINGX_UPDATE_ACTION = "update"     # Incremental depth indicator in 'action' field
+BINGX_DEPTH_STREAM_SUFFIX = "@incrDepth"
+BINGX_TRADE_STREAM_SUFFIX = "@trade"
+
 # Order States
 ORDER_STATE = {
     "PENDING": OrderState.PENDING_CREATE,

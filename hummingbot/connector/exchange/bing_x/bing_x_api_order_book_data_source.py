@@ -73,7 +73,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         params = {
             "symbol": trading_pair,
-            "limit": "1000"
+            "limit": str(CONSTANTS.SNAPSHOT_DEPTH_LIMIT)
         }
         data = await self._connector._api_request(path_url=CONSTANTS.SNAPSHOT_PATH_URL,
                                                   method=RESTMethod.GET,
@@ -108,8 +108,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sub = dict(sub)
             sub['timestamp'] = ts
 
-        # Always set REST snapshot lastUpdateId to 0 to avoid sequence mismatch vs WS incrDepth
-        sub['lastUpdateId'] = 0
+        # Preserve REST sequence if present; otherwise set to 0 so next WS update becomes baseline
+        try:
+            rest_seq = sub.get('lastUpdateId') or sub.get('version') or sub.get('sequence')
+            if rest_seq is not None:
+                sub['lastUpdateId'] = int(rest_seq)
+            else:
+                sub['lastUpdateId'] = 0
+        except Exception:
+            sub['lastUpdateId'] = 0
 
         return sub
 
@@ -247,13 +254,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 self.logger().info(f"Subscribed to public order book and trade channels of {trading_pair}...")
             
-            # Immediately bootstrap via REST snapshot to ensure non-empty book if 'all' is delayed
-            try:
-                if self._snapshot_output_queue is not None:
-                    await self._take_full_order_book_snapshot(trading_pairs=self._trading_pairs,
-                                                              snapshot_queue=self._snapshot_output_queue)
-            except Exception:
-                self.logger().exception("Error bootstrapping order books via REST after subscription")
+            # Rely on WS 'action=all' snapshot per BingX docs; use REST only for recovery
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -312,40 +313,44 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             last_update_id = None
 
                         # Per docs, only action == 'all' is a full snapshot
-                        if action == "all":
-                            # This is a snapshot message
+                        if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
+                            # This is a WS full snapshot - initialize sequence tracking
                             self.logger().info(
-                                f"{symbol}: Received incremental depth snapshot "
+                                f"{symbol}: Received WS full depth snapshot "
                                 f"(lastUpdateId={last_update_id})"
                             )
+                            # Queue as snapshot for orderbook initialization
                             self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                            self.logger().debug(f"Queued snapshot for {symbol} with lastUpdateId {last_update_id}")
-                            if last_update_id:
+                            if last_update_id is not None:
+                                # Initialize sequence tracking from WS snapshot
                                 self._last_update_ids[symbol] = last_update_id
-                                # Track that we need to validate the first update
+                                # First incremental MUST be lastUpdateId + 1
                                 self._awaiting_first_update[symbol] = True
-                                # Clear any pending diffs on fresh snapshot
+                                # Clear any stale pending diffs
                                 self._pending_diffs.pop(symbol, None)
+                            else:
+                                # Malformed snapshot without sequence - log warning
+                                self.logger().warning(f"{symbol}: WS snapshot missing lastUpdateId")
 
-                        elif action == "update" or last_update_id is not None:
+                        elif action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
                             # This is an incremental update
                             self.logger().debug(f"Processing incremental update for {symbol}")
                             prev_id = self._last_update_ids.get(symbol)
 
                             # If we haven't seen a snapshot yet, treat first diff as baseline (after REST bootstrap)
                             if prev_id is None:
-                                if last_update_id is not None:
-                                    self._last_update_ids[symbol] = last_update_id
-                                    self._awaiting_first_update[symbol] = False
-                                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                                    self.logger().info(f"{symbol}: Accepted first incremental as baseline (id={last_update_id})")
-                                    await self._flush_pending_diffs(symbol)
-                                    continue
-                                else:
+                                if last_update_id is None:
                                     self.logger().warning(
-                                        f"{symbol}: Incremental update without lastUpdateId before snapshot. Skipping."
+                                        f"{symbol}: Incremental update missing lastUpdateId. Skipping. Data: {data_node}"
                                     )
                                     continue
+                                # No prior WS snapshot state; take first diff as baseline only if we have nothing
+                                self._last_update_ids[symbol] = last_update_id
+                                self._awaiting_first_update[symbol] = False
+                                self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                                self.logger().info(f"{symbol}: Accepted first incremental as baseline (id={last_update_id})")
+                                await self._flush_pending_diffs(symbol)
+                                continue
 
                             # Expected next id strictly prev + 1 per BingX
                             expected_id = prev_id + 1 if prev_id is not None else None
@@ -359,19 +364,23 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             if self._awaiting_first_update.get(symbol):
                                 if last_update_id != expected_id:
                                     self.logger().warning(
-                                        f"{symbol}: First update id {last_update_id} does not equal snapshot+1 {expected_id}. Attempting buffer/recovery."
+                                        f"{symbol}: First update id {last_update_id} != expected {expected_id}. Buffering to check for continuity."
                                     )
-                                    # Try buffering if within window, else recover
+                                    # Buffer if within gap of 3 per BingX guidance
                                     if expected_id is not None and 0 < (last_update_id - expected_id) <= 3:
                                         self._pending_diffs.setdefault(symbol, {})[last_update_id] = data
-                                        # Try to flush if contiguous
-                                        await self._flush_pending_diffs(symbol)
+                                        self.logger().debug(f"{symbol}: Buffered first update (id={last_update_id})")
                                         continue
                                     else:
+                                        # Gap too large or negative - force recovery
+                                        self.logger().error(
+                                            f"{symbol}: First update gap too large ({last_update_id} vs {expected_id}). Recovering with REST snapshot."
+                                        )
                                         await self._trigger_immediate_recovery(symbol)
                                         continue
-                                # First update accepted
+                                # Accept first update
                                 self._awaiting_first_update[symbol] = False
+                                self.logger().info(f"{symbol}: First incremental update accepted (id={last_update_id})")
 
                             # Handle in-order, ahead, and behind cases
                             if last_update_id == expected_id:
@@ -530,19 +539,21 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
                 snapshot_timestamp: float = float(snapshot["timestamp"]) * 1e-3
 
-                # Initialize internal state for this trading pair (same as WS snapshot processing)
-                last_update_id = snapshot.get("lastUpdateId")
-                # If REST snapshot has a non-zero sequence, start from it; else accept first diff as baseline
+                # Initialize/reset internal state for this trading pair
                 try:
-                    last_update_id = int(last_update_id) if last_update_id is not None else 0
+                    last_update_id = int(snapshot.get("lastUpdateId", 0))
                 except Exception:
                     last_update_id = 0
                 if last_update_id > 0:
+                    # Tentatively use REST sequence; first WS update must be lastUpdateId + 1
                     self._last_update_ids[trading_pair] = last_update_id
                     self._awaiting_first_update[trading_pair] = True
                 else:
+                    # No reliable sequence from REST; accept next WS update as baseline
                     self._last_update_ids.pop(trading_pair, None)
                     self._awaiting_first_update[trading_pair] = False
+                # Clear stale buffers
+                self._pending_diffs.pop(trading_pair, None)
                 self.logger().info(f"Bootstrapped {trading_pair} with REST snapshot (lastUpdateId={last_update_id})")
 
                 snapshot_msg: OrderBookMessage = BingXOrderBook.snapshot_message_from_exchange_rest(
