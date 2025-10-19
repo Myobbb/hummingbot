@@ -37,7 +37,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  throttler: Optional[AsyncThrottler] = None,
                  time_synchronizer: Optional[TimeSynchronizer] = None,
                  max_queue_size: Optional[int] = None):
+                 
         super().__init__(trading_pairs)
+        self._symbol_drop_count: Dict[str, int] = {}
         self._connector = connector
         self._domain = domain
         self._time_synchronizer = time_synchronizer
@@ -181,19 +183,21 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue = self._message_queue[self._diff_messages_queue_key]
         while True:
             try:
-                # Block for at least one item
-                diff_event = await message_queue.get()
-                await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
-                # Drain remaining items in batches without awaiting between each get
-                drained = 0
+                # Collect batch WITHOUT awaiting to drain queue faster
+                batch = [await message_queue.get()]  # Get first, blocking
                 max_batch = 500
-                while drained < max_batch:
+                
+                # Drain remaining without awaiting
+                while len(batch) < max_batch:
                     try:
-                        diff_event = message_queue.get_nowait()
+                        batch.append(message_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                
+                # Process batch - queue is now drained
+                for diff_event in batch:
                     await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
-                    drained += 1
+                    
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -408,51 +412,66 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 channel = self._diff_messages_queue_key
             else:
                 channel = None
-            if channel:
-                # Update per-pair timestamp for orderbook topics to track freshness
-                try:
-                    if topic and "orderbook" in topic:
-                        symbol = data["data"].get("s")
-                        if symbol:
-                            trading_pair = self._symbol_to_pair_cache.get(symbol)
-                            if trading_pair is None:
-                                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
-                                self._symbol_to_pair_cache[symbol] = trading_pair
-                            self._symbol_last_update_time[symbol] = self._time()
-                            # Enrich frame with trading_pair to avoid async lookups in parsers
+           # Enrich message with trading_pair to avoid async lookups in parsers (NO staleness update yet)
+            try:
+                if topic and "orderbook" in topic:
+                    symbol = data.get("data", {}).get("s")
+                    if symbol:
+                        # Only enrich if in cache - don't block WS loop with async lookup
+                        trading_pair = self._symbol_to_pair_cache.get(symbol)
+                        if trading_pair:
                             try:
                                 data["trading_pair"] = trading_pair
                             except Exception:
                                 pass
-                    elif topic and "publicTrade" in topic:
-                        # Trades: infer symbol from first item if available, enrich top-level with trading_pair
-                        trades = data.get("data", []) if isinstance(data, dict) else []
-                        if trades:
-                            ts = trades[0]
-                            symbol = ts.get("s") if isinstance(ts, dict) else None
-                            if symbol:
-                                tp = self._symbol_to_pair_cache.get(symbol)
-                                if tp is not None:
-                                    try:
-                                        data["trading_pair"] = tp
-                                    except Exception:
-                                        pass
-                except Exception as e:
-                    self.logger().warning(f"Failed to update staleness tracker for topic={topic}: {e}")
+                        # If not in cache, parser will do slow lookup (acceptable - keeps WS flowing)
+                        
+                elif topic and "publicTrade" in topic:
+                    trades = data.get("data", []) if isinstance(data, dict) else []
+                    if trades:
+                        ts = trades[0]
+                        symbol = ts.get("s") if isinstance(ts, dict) else None
+                        if symbol:
+                            tp = self._symbol_to_pair_cache.get(symbol)
+                            if tp is not None:
+                                try:
+                                    data["trading_pair"] = tp
+                                except Exception:
+                                    pass
+            except Exception as e:
+                self.logger().warning(f"Failed to enrich message for topic={topic}: {e}")
+
+                
+                # Move staleness update AFTER put_nowait succeeds
+            if channel:
                 try:
                     self._message_queue[channel].put_nowait(data)
-                    # Backlog diagnostics for active pairs: warn if queue > 80% capacity
-                    try:
-                        q = self._message_queue[channel]
-                        if hasattr(q, "qsize"):
-                            size = q.qsize()
-                            if size >= int(self._max_queue_size * 0.8):
-                                self.logger().warning(f"Bybit {channel} queue high water mark: size={size}/{self._max_queue_size}")
-                    except Exception:
-                        pass
+                    
+                    # NOW update staleness after we know message was queued
+                    if topic and "orderbook" in topic:
+                        symbol = data["data"].get("s")
+                        if symbol:
+                            self._symbol_last_update_time[symbol] = self._time()
+                            self._symbol_drop_count[symbol] = 0 
+                            
                 except asyncio.QueueFull:
-                    self.logger().warning(f"Message queue '{channel}' full; dropping message to prevent OOM")
-            # (no-op)
+                    self.logger().warning(f"Message queue '{channel}' full; dropping {topic}")
+                    
+                    if topic and "orderbook" in topic:
+                        symbol = data.get("data", {}).get("s")
+                        if symbol:
+                            # Force immediate staleness
+                            self._symbol_last_update_time[symbol] = self._time() - self._per_pair_stale_threshold - 1
+                            
+                            # Track consecutive drops for this symbol
+                            if not hasattr(self, '_symbol_drop_count'):
+                                self._symbol_drop_count = {}
+                            self._symbol_drop_count[symbol] = self._symbol_drop_count.get(symbol, 0) + 1
+                            
+                            # Emergency: if 50+ consecutive drops, force reconnect immediately
+                            if self._symbol_drop_count.get(symbol, 0) >= 50:
+                                raise ConnectionError(f"Queue overrun for {symbol} - {self._symbol_drop_count[symbol]} drops; reconnecting")
+         
 
     async def _wait_for_initial_subscribe_acks(self, ws: WSAssistant, timeout: float = 5.0):
         """
@@ -565,17 +584,21 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue = self._message_queue[self._trade_messages_queue_key]
         while True:
             try:
-                trade_event = await message_queue.get()
-                await self._parse_trade_message(raw_message=trade_event, message_queue=output)
-                drained = 0
+                # Collect batch WITHOUT awaiting to drain queue faster
+                batch = [await message_queue.get()]  # Get first, blocking
                 max_batch = 500
-                while drained < max_batch:
+                
+                # Drain remaining without awaiting
+                while len(batch) < max_batch:
                     try:
-                        trade_event = message_queue.get_nowait()
+                        batch.append(message_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                
+                # Process batch - queue is now drained
+                for trade_event in batch:
                     await self._parse_trade_message(raw_message=trade_event, message_queue=output)
-                    drained += 1
+                    
             except asyncio.CancelledError:
                 raise
             except Exception:
