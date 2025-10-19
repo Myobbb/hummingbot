@@ -301,21 +301,22 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self._pair_to_symbol_cache[trading_pair] = symbol
                 except Exception:
                     pass
+                """ #disabling public trades sub
                 trade_topic = self._get_trade_topic_from_symbol(symbol)
                 trade_payload = {
                     "op": "subscribe",
                     "args": [trade_topic]
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
-
+                await ws.send(subscribe_trade_request)
+                """
                 orderbook_topic = self._get_ob_topic_from_symbol(symbol, self._depth)
                 orderbook_payload = {
                     "op": "subscribe",
                     "args": [orderbook_topic]
                 }
-                subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=orderbook_payload)
 
-                await ws.send(subscribe_trade_request)
+                subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=orderbook_payload)
                 await ws.send(subscribe_orderbook_request)
             self.logger().info(f"Subscribed to public order book and trade channels for {len(self._trading_pairs)} pairs")
         except asyncio.CancelledError:

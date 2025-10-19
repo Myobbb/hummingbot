@@ -41,7 +41,7 @@ TRADE_CATEGORY = "spot"
 
 # Websocket event types
 # https://bybit-exchange.github.io/docs/v5/websocket/public/trade
-TRADE_EVENT_TYPE = "snapshot"  # Weird but true in V5
+TRADE_EVENT_TYPE = "snapshot"  # Weird but true in V5 $disabling public trades anyways  
 SNAPSHOT_EVENT_TYPE = "depth"
 # V5: https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook
 ORDERBOOK_DIFF_EVENT_TYPE = "delta"
