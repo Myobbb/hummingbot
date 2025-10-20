@@ -360,7 +360,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 try:
                                     self.logger().info(
                                         f"Orderbook/trade stream idle for {now - last_data:.1f}s "
-                                        f"(WS alive via pongs). Running resnapshot checks."
+                                        #f"(WS alive via pongs). Running resnapshot checks."
                                     )
                                 except Exception:
                                     pass
@@ -435,7 +435,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                # Pre-seed symbol -> trading pair cache to avoid per-message async lookups
+                # Pre-seed symbol -> trading pair cache to avoid per-message async lookups #
                 try:
                     self._symbol_to_pair_cache[symbol] = trading_pair
                     self._pair_to_symbol_cache[trading_pair] = symbol
@@ -642,7 +642,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             # Throttled warning if pair has had no orderbook updates for a while
             idle = now - last_ts
-            if idle >= 60.0:  # warn after 30s of silence
+            if idle >= 60.0:  # warn after 60s of silence
                 last_warn = self._symbol_last_warn_time.get(symbol or trading_pair, 0)
                 if (now - last_warn) >= 60.0:
                     try:
@@ -650,7 +650,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except Exception:
                         pass
                     self._symbol_last_warn_time[symbol or trading_pair] = now
-            if (now - last_ts) >= self._per_pair_stale_threshold:
+            if (now - last_ts) >= self._per_pair_stale_threshold and (now - last_ts) < 3 * self._per_pair_stale_threshold:
                 # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:
                     exchange_symbol = symbol or await self._connector.exchange_symbol_associated_to_pair(trading_pair)
@@ -669,29 +669,6 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             self.logger().warning(f"Failed to re-subscribe topic for {trading_pair}", exc_info=True)
                 except Exception:
                     self.logger().warning(f"Failed during re-subscribe attempt for {trading_pair}", exc_info=True)
-
-                # If still severely stale, inject a REST snapshot to heal book state
-                if (now - last_ts) >= (2 * self._per_pair_stale_threshold):
-                    try:
-                        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair=trading_pair)
-                        snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
-                        exchange_symbol = symbol or await self._connector.exchange_symbol_associated_to_pair(trading_pair)
-                        snapshot_queue.put_nowait({
-                            "type": CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE,
-                            "topic": f"orderbook.{self._depth}.{exchange_symbol}",
-                            "data": {
-                                "s": exchange_symbol,
-                                "b": snapshot.get("b"),
-                                "a": snapshot.get("a"),
-                                "u": snapshot.get("u"),
-                            },
-                            "ts": int(snapshot_timestamp * 1e3),
-                        })
-                        if symbol:
-                            self._symbol_last_update_time[symbol] = now
-                        self.logger().warning(f"Resnapshotted stale orderbook for {trading_pair} after {(now - last_ts):.0f}s inactivity.")
-                    except Exception:
-                        self.logger().warning(f"Failed to resnapshot stale orderbook for {trading_pair}", exc_info=True)
 
                 # Escalate to full WS reconnect if extreme staleness persists
                 if (now - last_ts) >= (3 * self._per_pair_stale_threshold):
