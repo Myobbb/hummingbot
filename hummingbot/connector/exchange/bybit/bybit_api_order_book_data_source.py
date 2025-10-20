@@ -442,8 +442,6 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception as e:
                 self.logger().warning(f"Failed to enrich message for topic={topic}: {e}")
 
-                
-                # Move staleness update AFTER put_nowait succeeds
             if channel:
                 try:
                     self._message_queue[channel].put_nowait(data)
