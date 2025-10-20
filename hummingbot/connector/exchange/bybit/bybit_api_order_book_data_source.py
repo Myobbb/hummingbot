@@ -349,7 +349,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                         # 3b) DATA IDLE (still getting pongs/acks) -> log + resnapshot, but stay connected
                         last_data = getattr(self, "_last_data_recv_ts", None)
-                        data_idle_threshold = max(5.0 * hb, 30.0)  # configurable if you like
+                        data_idle_threshold = 10
                         if last_data and (now - last_data) > data_idle_threshold:
                             # throttle idle logs to once per ~30s
                             if (now - self._last_idle_log_ts) > 30.0:
