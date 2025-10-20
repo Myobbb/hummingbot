@@ -664,7 +664,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         try:
                             await ws.send(WSJSONRequest({"op": "subscribe", "args": [topic]}))
                             self._symbol_last_resubscribe_time[exchange_symbol] = now
-                            self.logger().info2(f"Re-subscribed Bybit topic for {trading_pair} ({topic}) after staleness.")
+                            self.logger().info(f"Re-subscribed Bybit topic for {trading_pair} ({topic}) after staleness.")
                         except Exception:
                             self.logger().warning(f"Failed to re-subscribe topic for {trading_pair}", exc_info=True)
                 except Exception:
