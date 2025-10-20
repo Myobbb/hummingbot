@@ -196,13 +196,17 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             last_u = self._last_applied_u_by_symbol.get(symbol, -1)
             if u <= last_u:
                 return  # stale/duplicate; drop silently
-         
+        
             self._last_applied_u_by_symbol[symbol] = u
+            self._symbol_last_update_time[symbol] = self._time()
+            self._symbol_drop_count[symbol] = 0
+
         order_book_message: OrderBookMessage = BybitOrderBook.diff_message_from_exchange(
             raw_message['data'],
             raw_message["ts"] * 1e-3,
             {"trading_pair": trading_pair}
         )
+        
         message_queue.put_nowait(order_book_message)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
@@ -211,7 +215,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 # Block for at least one item to avoid hot-spinning
                 batch = [await message_queue.get()]
-                max_batch = 2000
+                max_batch = 20000
 
                 # 1) Flush pending, record flushed_u_by_symbol
                 pending = self._latest_diff_by_symbol
@@ -586,14 +590,14 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if channel:
                 try:
                     self._message_queue[channel].put_nowait(data)
-                    
+                    """ #moved to after u check
                     # NOW update staleness after we know message was queued
                     if topic and "orderbook" in topic:
                         symbol = data["data"].get("s")
                         if symbol:
                             self._symbol_last_update_time[symbol] = self._time()
                             self._symbol_drop_count[symbol] = 0 
-                            
+                            """
                 except asyncio.QueueFull:
                     self.logger().warning(f"Message queue '{channel}' full; dropping {topic}")
                     if topic and "orderbook" in topic:
@@ -704,6 +708,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 if symbol is not None and isinstance(u, int):
                     self._last_applied_u_by_symbol[symbol] = u
+                    self._latest_diff_by_symbol.pop(symbol, None)
 
                 trading_pair = json_msg.get("trading_pair")
                 if trading_pair is None:
