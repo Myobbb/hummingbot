@@ -80,7 +80,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_last_update_time: Dict[str, float] = {}
         # Minimum inactivity before a resnapshot is attempted (seconds)
         # Tighten threshold to recover faster from silent stream stalls
-        self._per_pair_stale_threshold: float = 60.0
+        self._per_pair_stale_threshold: float = 180.0
         # Cooldown between topic resubscriptions per symbol (seconds)
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 45.0
@@ -664,7 +664,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         try:
                             await ws.send(WSJSONRequest({"op": "subscribe", "args": [topic]}))
                             self._symbol_last_resubscribe_time[exchange_symbol] = now
-                            self.logger().info(f"Re-subscribed Bybit topic for {trading_pair} ({topic}) after staleness.")
+                            self.logger().info2(f"Re-subscribed Bybit topic for {trading_pair} ({topic}) after staleness.")
                         except Exception:
                             self.logger().warning(f"Failed to re-subscribe topic for {trading_pair}", exc_info=True)
                 except Exception:
