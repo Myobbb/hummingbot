@@ -39,6 +39,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  max_queue_size: Optional[int] = None):
                  
         super().__init__(trading_pairs)
+        self._last_applied_u_by_symbol: Dict[str, int] = {}
+        self._latest_diff_by_symbol: Dict[str, Dict[str, Any]] = {}
         self._symbol_drop_count: Dict[str, int] = {}
         self._connector = connector
         self._domain = domain
@@ -50,8 +52,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             domain=self._domain,
         )
         # Bounded queues to prevent unbounded growth under high load (configurable/scaled)
-        env_max = os.getenv("HUMMINGBOT_BYBIT_WS_QUEUE_MAXSIZE")
-        env_buffer_seconds = os.getenv("HUMMINGBOT_BYBIT_WS_QUEUE_BUFFER_SECONDS")
+        env_max = 50000
+        env_buffer_seconds = 120
         try:
             computed_updates_per_second = 50  # Bybit L50 can burst ~50 updates/sec
             buffer_seconds = int(env_buffer_seconds) if env_buffer_seconds is not None else 60
@@ -82,7 +84,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 45.0
         # Proactive reconnect window to avoid aged connections (seconds)
-        self._max_connection_age_seconds: float = 60.0 * 60.0 * 1.0  # 1 hours
+        self._max_connection_age_seconds: float = 60.0 * 60.0 * 12.0  #12 hours
         self._conn_start_time: Optional[float] = None
         # Track last ping req_id to correlate pong acks
         self._last_ping_req_id: Optional[str] = None
@@ -92,7 +94,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._pair_to_symbol_cache: Dict[str, str] = {}
         # Track repeated subscription failures to avoid reconnect loops
         self._subscription_failure_count: Dict[str, int] = defaultdict(int)
-        self._max_subscription_failures: int = 5
+        self._max_subscription_failures: int = 20
         # Throttled per-symbol warning timestamps to avoid log spam
         self._symbol_last_warn_time: Dict[str, float] = {}
 
@@ -131,7 +133,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         return snapshot_msg
 
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue): #disabled public trades stream
         data = raw_message.get("data", [])
         # Fast path: prefer enriched trading_pair, else cached symbol mapping, fallback to async lookup once
         trading_pair = raw_message.get("trading_pair")
@@ -169,6 +171,14 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         pass
         if trading_pair is None:
             return
+        symbol = raw_message.get("data", {}).get("s")
+        u = raw_message.get("data", {}).get("u")
+        if symbol is not None and isinstance(u, int):
+            last_u = self._last_applied_u_by_symbol.get(symbol, -1)
+            if u <= last_u:
+                return  # stale/duplicate; drop silently
+         
+            self._last_applied_u_by_symbol[symbol] = u
         order_book_message: OrderBookMessage = BybitOrderBook.diff_message_from_exchange(
             raw_message['data'],
             raw_message["ts"] * 1e-3,
@@ -177,31 +187,49 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue.put_nowait(order_book_message)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        High-throughput diff consumer with batching to reduce per-message await overhead.
-        """
         message_queue = self._message_queue[self._diff_messages_queue_key]
         while True:
             try:
-                # Collect batch WITHOUT awaiting to drain queue faster
-                batch = [await message_queue.get()]  # Get first, blocking
-                max_batch = 500
-                
-                # Drain remaining without awaiting
+                # Block for at least one item to avoid hot-spinning
+                batch = [await message_queue.get()]
+                max_batch = 2000
+
+                # 1) Flush pending, record flushed_u_by_symbol
+                pending = self._latest_diff_by_symbol
+                self._latest_diff_by_symbol = {}
+                flushed_symbols = set()
+                flushed_u_by_symbol: Dict[str, int] = {}
+
+                for symbol, diff_event in pending.items():
+                    u = ((diff_event.get("data") or {}).get("u") or 0)
+                    flushed_symbols.add(symbol)
+                    flushed_u_by_symbol[symbol] = u if isinstance(u, int) else 0
+                    await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+
+
+                # 2) Drain the queue without awaiting to form this tick's batch
                 while len(batch) < max_batch:
                     try:
                         batch.append(message_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-                
-                # Process batch - queue is now drained
+
+                # 3) rocess batch; skip only if not newer than flushed
                 for diff_event in batch:
+                    data = diff_event.get("data") or {}
+                    sym = data.get("s")
+                    if sym in flushed_symbols:
+                        u = data.get("u")
+                        if isinstance(u, int) and u <= flushed_u_by_symbol.get(sym, 0):
+                            continue  # older-or-equal than what we just applied
                     await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
-                    
+
+
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().exception("Unexpected error when processing Bybit order book diffs")
+
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
@@ -405,7 +433,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             event_type = data.get("type")
             topic = data.get("topic")
 
-            if event_type == CONSTANTS.TRADE_EVENT_TYPE and topic and "publicTrade" in topic:
+            if event_type == CONSTANTS.TRADE_EVENT_TYPE and topic and "publicTrade" in topic: #disabled
                 channel = self._trade_messages_queue_key
             elif event_type == CONSTANTS.ORDERBOOK_SNAPSHOT_EVENT_TYPE and topic and "orderbook" in topic:
                 channel = self._snapshot_messages_queue_key
@@ -455,21 +483,17 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             
                 except asyncio.QueueFull:
                     self.logger().warning(f"Message queue '{channel}' full; dropping {topic}")
-                    
                     if topic and "orderbook" in topic:
                         symbol = data.get("data", {}).get("s")
                         if symbol:
-                            # Force immediate staleness
+                            # 1) Record the *latest* diff for this symbol (overwrite)
+                            self._latest_diff_by_symbol[symbol] = data
+                            # 2) Mark symbol stale to trigger resub/snapshot logic as you already do
                             self._symbol_last_update_time[symbol] = self._time() - self._per_pair_stale_threshold - 1
-                            
-                            # Track consecutive drops for this symbol
-                            if not hasattr(self, '_symbol_drop_count'):
-                                self._symbol_drop_count = {}
                             self._symbol_drop_count[symbol] = self._symbol_drop_count.get(symbol, 0) + 1
-                            
-                            # Emergency: if 50+ consecutive drops, force reconnect immediately
-                            if self._symbol_drop_count.get(symbol, 0) >= 50:
+                            if self._symbol_drop_count[symbol] >= 50:
                                 raise ConnectionError(f"Queue overrun for {symbol} - {self._symbol_drop_count[symbol]} drops; reconnecting")
+
          
 
     async def _wait_for_initial_subscribe_acks(self, ws: WSAssistant, timeout: float = 5.0):
@@ -482,7 +506,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             pass
 
-    async def _resnapshot_stale_pairs_if_any(self, ws: WSAssistant, snapshot_queue: asyncio.Queue):
+    async def _resnapshot_stale_pairs_if_any(self, ws: WSAssistant, snapshot_queue: asyncio.Queue): 
         now = self._time()
         for trading_pair in list(self._trading_pairs):
             # Use Bybit symbol to detect staleness so other exchanges do not mask inactivity here
@@ -501,9 +525,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             # Throttled warning if pair has had no orderbook updates for a while
             idle = now - last_ts
-            if idle >= 30.0:  # warn after 30s of silence
+            if idle >= 60.0:  # warn after 30s of silence
                 last_warn = self._symbol_last_warn_time.get(symbol or trading_pair, 0)
-                if (now - last_warn) >= 30.0:
+                if (now - last_warn) >= 60.0:
                     try:
                         self.logger().warning(f"Bybit orderbook idle {idle:.0f}s for {trading_pair}")
                     except Exception:
@@ -562,6 +586,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 json_msg = await message_queue.get()
                 data = json_msg["data"]
+                symbol = data.get("s")
+                u = data.get("u")
+
+                if symbol is not None and isinstance(u, int):
+                    self._last_applied_u_by_symbol[symbol] = u
+
                 trading_pair = json_msg.get("trading_pair")
                 if trading_pair is None:
                     # Fallback lookup (infrequent path)
@@ -576,7 +606,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().error("Unexpected error when processing public order book updates from exchange")
                 raise
 
-    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue): #public trades stream disabled
         """
         High-throughput trade consumer with batching.
         """
@@ -585,14 +615,16 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 # Collect batch WITHOUT awaiting to drain queue faster
                 batch = [await message_queue.get()]  # Get first, blocking
-                max_batch = 500
+                max_batch = 2000
                 
                 # Drain remaining without awaiting
-                while len(batch) < max_batch:
+                while True:
                     try:
                         batch.append(message_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                if not batch:
+                    continue
                 
                 # Process batch - queue is now drained
                 for trade_event in batch:
