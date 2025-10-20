@@ -39,6 +39,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  max_queue_size: Optional[int] = None):
                  
         super().__init__(trading_pairs)
+        self._ws_consumer_task: Optional[asyncio.Task] = None
         self._last_applied_u_by_symbol: Dict[str, int] = {}
         self._latest_diff_by_symbol: Dict[str, Dict[str, Any]] = {}
         self._symbol_drop_count: Dict[str, int] = {}
@@ -97,6 +98,24 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._max_subscription_failures: int = 20
         # Throttled per-symbol warning timestamps to avoid log spam
         self._symbol_last_warn_time: Dict[str, float] = {}
+
+    async def _cancel_task_safely(self, task: Optional[asyncio.Task]):
+        if task is None:
+            return
+        if task.done():
+            try:
+                _ = task.exception()
+            except Exception:
+                pass
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -269,12 +288,75 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._wait_for_initial_subscribe_acks(ws, timeout=5.0)
                 self._last_ws_message_sent_timestamp = self._time()
                 self._conn_start_time = self._time()
+                self._last_ws_recv_ts = self._time() 
+
+                if self._ws_consumer_task is None or self._ws_consumer_task.done():
+                    self._ws_consumer_task = asyncio.create_task(self._process_ws_messages(ws=ws))
 
                 while True:
+                    # 1) schedule a ping tick without cancelling the consumer
+                    elapsed = self._time() - self._last_ws_message_sent_timestamp
+                    seconds_until_next_ping = max(0.0, CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL - elapsed)
+                    ping_timer = asyncio.create_task(asyncio.sleep(seconds_until_next_ping))
+
+                    done, pending = await asyncio.wait(
+                        {self._ws_consumer_task, ping_timer},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    # 2) If the consumer finished, bubble its exception and reconnect
+                    if self._ws_consumer_task in done:
+                        exc = None
+                        try:
+                            exc = self._ws_consumer_task.exception()
+                        except asyncio.CancelledError:
+                            raise
+                        finally:
+                            # ensure timer is cleaned up
+                            ping_timer.cancel()
+                        if exc:
+                            raise exc
+                        # If no exception, treat as EOF / unexpected end
+                        raise ConnectionError("Bybit WS consumer ended unexpectedly")
+
+                    # 3) Otherwise the ping timer fired first — run watchdog & ping logic
+                    #    Do not cancel the consumer; it keeps streaming.
+                    if ping_timer in done:
+                        ping_time = self._time()
+                        ping_req_id = str(int(ping_time * 1e3))
+                        payload = {"req_id": ping_req_id, "op": "ping"}
+                        try:
+                            await ws.send(request=WSJSONRequest(payload=payload))
+                            self._last_ws_message_sent_timestamp = ping_time
+                            self._last_ping_req_id = ping_req_id
+                        except Exception as e:
+                            # sending failed => treat as dead connection
+                            raise ConnectionError(f"Failed to send ping: {e}")
+
+                        # Watchdog checks run on every tick (cannot stall)
+                        last_recv = getattr(ws, "last_recv_time", None)   #should probably flip them, flip if inconsistency detected
+                        if last_recv is None:
+                            # fallback to our own timestamp if set by _process_ws_messages
+                            last_recv = getattr(self, "_last_ws_recv_ts", None)
+
+                        if last_recv and (self._time() - last_recv) > (2.5 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
+                            raise ConnectionError("Bybit public WS inactive for too long; reconnecting.")
+
+                        if self._conn_start_time is not None and (self._time() - self._conn_start_time) > self._max_connection_age_seconds:
+                            raise ConnectionError("Bybit public WS reached max connection age; reconnecting proactively.")
+
+                        await self._resnapshot_stale_pairs_if_any(
+                            ws=ws,
+                            snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
+                        )
+
+                        # loop continues with the same consumer task
+                    """
                     try:
                         seconds_until_next_ping = (CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL - (
                             self._time() - self._last_ws_message_sent_timestamp))
                         await asyncio.wait_for(self._process_ws_messages(ws=ws), timeout=seconds_until_next_ping)
+                    
                     except asyncio.TimeoutError:
                         ping_time = self._time()
                         ping_req_id = str(int(ping_time * 1e3))
@@ -297,6 +379,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             ws=ws,
                             snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
                         )
+                    """
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
@@ -313,7 +396,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(1.0)
             finally:
-                ws and await ws.disconnect()
+                try:
+                    await self._cancel_task_safely(self._ws_consumer_task)
+                finally:
+                    self._ws_consumer_task = None
+                    if ws:
+                        await ws.disconnect()
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -358,6 +446,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
+            self._last_ws_recv_ts = self._time()
             data = ws_response.data
             # Handle ping/pong acks from server (public channels may respond with op: "ping" + ret_msg: "pong")
             if data.get("op") in ("ping", "pong"):
