@@ -290,6 +290,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._conn_start_time = self._time()
                 self._last_ws_recv_ts = self._time() 
 
+                self._last_any_recv_ts = self._time()
+                self._last_data_recv_ts = self._time()
+                self._last_idle_log_ts = 0.0  # throttle idle logs
+
                 if self._ws_consumer_task is None or self._ws_consumer_task.done():
                     self._ws_consumer_task = asyncio.create_task(self._process_ws_messages(ws=ws))
 
@@ -304,7 +308,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         return_when=asyncio.FIRST_COMPLETED,
                     )
 
-                    # 2) If the consumer finished, bubble its exception and reconnect
+                    # 2) consumer finished -> reconnect
                     if self._ws_consumer_task in done:
                         exc = None
                         try:
@@ -312,15 +316,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         except asyncio.CancelledError:
                             raise
                         finally:
-                            # ensure timer is cleaned up
                             ping_timer.cancel()
                         if exc:
                             raise exc
-                        # If no exception, treat as EOF / unexpected end
                         raise ConnectionError("Bybit WS consumer ended unexpectedly")
 
-                    # 3) Otherwise the ping timer fired first — run watchdog & ping logic
-                    #    Do not cancel the consumer; it keeps streaming.
+                    # 3) ping tick -> ping + watchdog
                     if ping_timer in done:
                         ping_time = self._time()
                         ping_req_id = str(int(ping_time * 1e3))
@@ -330,27 +331,46 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             self._last_ws_message_sent_timestamp = ping_time
                             self._last_ping_req_id = ping_req_id
                         except Exception as e:
-                            # sending failed => treat as dead connection
+                            # sending failed => dead socket
                             raise ConnectionError(f"Failed to send ping: {e}")
 
-                        # Watchdog checks run on every tick (cannot stall)
-                        last_recv = getattr(ws, "last_recv_time", None)   #should probably flip them, flip if inconsistency detected
-                        if last_recv is None:
-                            # fallback to our own timestamp if set by _process_ws_messages
-                            last_recv = getattr(self, "_last_ws_recv_ts", None)
+                        # ---- Watchdog decisions ----
+                        now = self._time()
+                        hb = CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
 
-                        if last_recv and (self._time() - last_recv) > (2.5 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
-                            raise ConnectionError("Bybit public WS inactive for too long; reconnecting.")
+                        # Prefer our "any frame" timestamp; fall back to adapter if present
+                        last_any = getattr(self, "_last_any_recv_ts", None)
+                        if last_any is None:
+                            last_any = getattr(ws, "last_recv_time", None)
 
-                        if self._conn_start_time is not None and (self._time() - self._conn_start_time) > self._max_connection_age_seconds:
+                        # 3a) TRUE STALL (no frames incl. no pongs) -> reconnect
+                        if last_any and (now - last_any) > (2.5 * hb):
+                            raise ConnectionError("Bybit public WS inactive (no frames incl. pongs); reconnecting.")
+
+                        # 3b) DATA IDLE (still getting pongs/acks) -> log + resnapshot, but stay connected
+                        last_data = getattr(self, "_last_data_recv_ts", None)
+                        data_idle_threshold = max(5.0 * hb, 30.0)  # configurable if you like
+                        if last_data and (now - last_data) > data_idle_threshold:
+                            # throttle idle logs to once per ~30s
+                            if (now - self._last_idle_log_ts) > 30.0:
+                                try:
+                                    self.logger().info(
+                                        f"Orderbook/trade stream idle for {now - last_data:.1f}s "
+                                        f"(WS alive via pongs). Running resnapshot checks."
+                                    )
+                                except Exception:
+                                    pass
+                                self._last_idle_log_ts = now
+
+                            await self._resnapshot_stale_pairs_if_any(
+                                ws=ws,
+                                snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
+                            )
+
+                        if (self._conn_start_time is not None and
+                            (now - self._conn_start_time) > self._max_connection_age_seconds):
                             raise ConnectionError("Bybit public WS reached max connection age; reconnecting proactively.")
 
-                        await self._resnapshot_stale_pairs_if_any(
-                            ws=ws,
-                            snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
-                        )
-
-                        # loop continues with the same consumer task
                     """
                     try:
                         seconds_until_next_ping = (CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL - (
@@ -447,12 +467,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
             self._last_ws_recv_ts = self._time()
+            self._last_any_recv_ts = self._time()
+            
             data = ws_response.data
             # Handle ping/pong acks from server (public channels may respond with op: "ping" + ret_msg: "pong")
             if data.get("op") in ("ping", "pong"):
                 # Treat ack frames first (public spot acks: op=="ping" with ret_msg=="pong"; some channels: op=="pong")
                 if data.get("ret_msg") == "pong" or data.get("op") == "pong":
                     received_req_id = data.get("req_id")
+                    
                     if received_req_id is not None and self._last_ping_req_id is not None and received_req_id == self._last_ping_req_id:
                         try:
                             self.logger().debug(f"Bybit pong ack for ping {received_req_id}")
@@ -533,6 +556,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
            # Enrich message with trading_pair to avoid async lookups in parsers (NO staleness update yet)
             try:
                 if topic and "orderbook" in topic:
+                    self._last_data_recv_ts = self._time()
                     symbol = data.get("data", {}).get("s")
                     if symbol:
                         # Only enrich if in cache - don't block WS loop with async lookup
