@@ -221,6 +221,18 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 qsize = message_queue.qsize()
                 if qsize > int(0.8 * self._max_queue_size):
                     latest_by_symbol: Dict[str, Any] = {}
+                    # Include the first dequeued event in the coalesced set
+                    try:
+                        first_ev = batch[0]
+                        first_data = first_ev.get("data") or {}
+                        first_sym = first_data.get("s")
+                        if first_sym:
+                            latest_by_symbol[first_sym] = first_ev
+                    except Exception:
+                        pass
+                    # Drain remaining queue quickly while yielding cooperatively
+                    drained = 0
+                    slice_start = self._time()
                     while True:
                         try:
                             ev = message_queue.get_nowait()
@@ -230,6 +242,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         sym = data.get("s")
                         if sym:
                             latest_by_symbol[sym] = ev
+                        drained += 1
+                        if (drained % 2000) == 0 or (self._time() - slice_start) > 0.05:
+                            await asyncio.sleep(0)
+                            slice_start = self._time()
                     for ev in latest_by_symbol.values():
                         await self._parse_order_book_diff_message(raw_message=ev, message_queue=output)
                     await asyncio.sleep(0)
@@ -393,7 +409,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             if (now - self._last_idle_log_ts) > 30.0:
                                 try:
                                     self.logger().info(
-                                        f"Orderbook/trade stream idle for {now - last_data:.1f}s "
+                                        f"Orderbook stream idle for {now - last_data:.1f}s (WS alive via pongs)"
                                         #f"(WS alive via pongs). Running resnapshot checks."
                                     )
                                 except Exception:
