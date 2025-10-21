@@ -215,7 +215,25 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 # Block for at least one item to avoid hot-spinning
                 batch = [await message_queue.get()]
-                max_batch = 20000
+                max_batch = 5000
+
+
+                qsize = message_queue.qsize()
+                if qsize > int(0.8 * self._max_queue_size):
+                    latest_by_symbol: Dict[str, Any] = {}
+                    while True:
+                        try:
+                            ev = message_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        data = ev.get("data") or {}
+                        sym = data.get("s")
+                        if sym:
+                            latest_by_symbol[sym] = ev
+                    for ev in latest_by_symbol.values():
+                        await self._parse_order_book_diff_message(raw_message=ev, message_queue=output)
+                    await asyncio.sleep(0)
+                    continue
 
                 # 1) Flush pending, record flushed_u_by_symbol
                 pending = self._latest_diff_by_symbol
@@ -223,21 +241,32 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 flushed_symbols = set()
                 flushed_u_by_symbol: Dict[str, int] = {}
 
+                processed = 0
+                slice_start = self._time()
                 for symbol, diff_event in pending.items():
                     u = ((diff_event.get("data") or {}).get("u") or 0)
                     flushed_symbols.add(symbol)
                     flushed_u_by_symbol[symbol] = u if isinstance(u, int) else 0
                     await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+                    processed += 1
+                    # cooperative yield during large pending flushes
+                    if (processed % 1000) == 0 or (self._time() - slice_start) > 0.05:
+                        await asyncio.sleep(0)
+                        slice_start = self._time()
 
 
                 # 2) Drain the queue without awaiting to form this tick's batch
+                # Reset batch so the initially dequeued item is processed only once below
+                batch = [batch[0]]
                 while len(batch) < max_batch:
                     try:
                         batch.append(message_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
 
-                # 3) rocess batch; skip only if not newer than flushed
+                # 3) process batch; skip only if not newer than flushed
+                processed = 0
+                slice_start = self._time()
                 for diff_event in batch:
                     data = diff_event.get("data") or {}
                     sym = data.get("s")
@@ -246,6 +275,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         if isinstance(u, int) and u <= flushed_u_by_symbol.get(sym, 0):
                             continue  # older-or-equal than what we just applied
                     await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+                    processed += 1
+                    # cooperative yield during large batch processing
+                    if (processed % 1000) == 0 or (self._time() - slice_start) > 0.05:
+                        await asyncio.sleep(0)
+                        slice_start = self._time()
 
 
             except asyncio.CancelledError:
@@ -589,6 +623,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             if channel:
                 try:
+                    if channel == self._diff_messages_queue_key:
+                        q = self._message_queue[channel]
+                        if q.qsize() > int(0.9 * self._max_queue_size):
+                            sym = (data.get("data") or {}).get("s")
+                            if sym:
+                                self._latest_diff_by_symbol[sym] = data
+                                # skip enqueue (consumer will flush)
+                                continue
+        
                     self._message_queue[channel].put_nowait(data)
                     """ #moved to after u check
                     # NOW update staleness after we know message was queued
@@ -676,6 +719,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[self._snapshot_messages_queue_key]
+        count = 0
         while True:
             try:
                 json_msg = await message_queue.get()
@@ -695,6 +739,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
                     data, json_msg["ts"], {"trading_pair": trading_pair})
                 snapshot_queue.put_nowait(order_book_message)
+                count += 1
+                if (count % 1000) == 0:
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 raise
             except Exception:
