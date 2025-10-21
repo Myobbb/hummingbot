@@ -133,7 +133,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         params = {
             "category": self._category,
             "symbol": await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "limit": "1000"
+            # Bybit spot REST limit range is [1, 200]; align to configured depth but cap at 200
+            "limit": str(min(int(self._depth), 200))
         }
         data = await self._connector._api_request(
             path_url=CONSTANTS.SNAPSHOT_PATH_URL,
@@ -144,7 +145,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
-        snapshot_timestamp: float = float(snapshot["ts"]) * 1e-3
+        # Prefer engine time (cts) when present; fall back to ts
+        ts_ms = snapshot.get("cts") or snapshot.get("ts")
+        snapshot_timestamp: float = float(ts_ms) * 1e-3 if ts_ms is not None else self._time()
         snapshot_msg: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_rest(
             snapshot,
             snapshot_timestamp,
@@ -274,9 +277,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # 2) Drain the queue without awaiting to form this tick's batch
                 # Reset batch so the initially dequeued item is processed only once below
                 batch = [batch[0]]
+                drained = 0
+                slice_start = self._time()
                 while len(batch) < max_batch:
                     try:
                         batch.append(message_queue.get_nowait())
+                        drained += 1
+                        if (drained % 2000) == 0 or (self._time() - slice_start) > 0.05:
+                            await asyncio.sleep(0)
+                            slice_start = self._time()
                     except asyncio.QueueEmpty:
                         break
 
@@ -752,8 +761,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # Fallback lookup (infrequent path)
                     trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                         symbol=data["s"])
+                # Prefer engine time (cts) when present on WS snapshot; fall back to frame ts
+                ts_ms_ws = data.get("cts") or json_msg.get("ts") or data.get("ts")
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
-                    data, json_msg["ts"], {"trading_pair": trading_pair})
+                    data, (float(ts_ms_ws) * 1e-3) if ts_ms_ws is not None else self._time(), {"trading_pair": trading_pair})
                 snapshot_queue.put_nowait(order_book_message)
                 count += 1
                 if (count % 1000) == 0:
