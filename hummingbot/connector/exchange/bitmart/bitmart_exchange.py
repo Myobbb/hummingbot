@@ -61,7 +61,9 @@ class BitmartExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
 
         super().__init__(client_config_map)
-        self.real_time_balance_update = False
+        self.real_time_balance_update = True
+        # Track MARKET orders that have received at least one fill (to suppress cancel-after-fill and finalize early)
+        self._market_orders_with_fill = set()
 
     @property
     def authenticator(self):
@@ -186,17 +188,26 @@ class BitmartExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
 
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        api_params = {
+            "symbol": symbol,
+            "side": trade_type.name.lower(),
+            "type": order_type.name.lower(),
+            "client_order_id": order_id,
+        }
+
         if order_type is OrderType.MARKET:
-            price = await self._get_last_traded_price(trading_pair)
-        notionalValue: Decimal = (amount * Decimal(price))
-        api_params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
-                      "side": trade_type.name.lower(),
-                      "type": order_type.name.lower(),
-                      "size": f"{amount:f}",
-                      "price": f"{price:f}",
-                      "client_order_id": order_id,
-                      "notional": f"{notionalValue:f}",
-                      }
+            # Market BUY requires only notional; Market SELL requires only size. Do not send price for market orders
+            if trade_type is TradeType.BUY:
+                # Use strategy-provided price to size notional consistently with the computed base amount
+                notional_value: Decimal = (amount * Decimal(str(price)))
+                api_params["notional"] = f"{notional_value:f}"
+            else:
+                api_params["size"] = f"{amount:f}"
+        else:
+            # Limit orders require both size and price
+            api_params["size"] = f"{amount:f}"
+            api_params["price"] = f"{price:f}"
         order_result = await self._api_post(
             path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
             data=api_params,
@@ -314,6 +325,9 @@ class BitmartExchange(ExchangePyBase):
                 all_fills_response = await self._request_order_fills(order=order)
                 updates = self._create_order_fill_updates(order=order, fill_update=all_fills_response)
                 trade_updates.extend(updates)
+                # If MARKET order has any fills, record for early finalization
+                if updates and order.order_type == OrderType.MARKET:
+                    self._market_orders_with_fill.add(order.client_order_id)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
@@ -327,11 +341,26 @@ class BitmartExchange(ExchangePyBase):
         updated_order_data = await self._request_order_update(order=tracked_order)
 
         order_update = self._create_order_update(order=tracked_order, order_update=updated_order_data)
+
+        # Force FILLED for MARKET orders that already had any fills (ignore subsequent cancel-after-fill)
+        try:
+            if tracked_order.order_type == OrderType.MARKET and tracked_order.client_order_id in self._market_orders_with_fill:
+                order_update = OrderUpdate(
+                    client_order_id=order_update.client_order_id,
+                    exchange_order_id=order_update.exchange_order_id,
+                    trading_pair=order_update.trading_pair,
+                    update_timestamp=order_update.update_timestamp,
+                    new_state=OrderState.FILLED,
+                )
+        except Exception:
+            pass
         return order_update
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_update: Dict[str, Any]) -> List[TradeUpdate]:
         updates = []
-        fills_data = fill_update["data"]
+        fills_data = fill_update.get("data")
+        if not isinstance(fills_data, list):
+            return updates
 
         for fill_data in fills_data:
             fee = TradeFeeBase.new_spot_fee(
@@ -398,6 +427,20 @@ class BitmartExchange(ExchangePyBase):
                                 is_fill_candidate_by_amount = fillable_order.executed_amount_base < Decimal(
                                     each_event["filled_size"])
                                 if is_fill_candidate_by_state and is_fill_candidate_by_amount:
+                                    # For MARKET orders: finalize immediately on first fill and record indicator
+                                    try:
+                                        if fillable_order.order_type == OrderType.MARKET:
+                                            self._market_orders_with_fill.add(fillable_order.client_order_id)
+                                            forced_update = OrderUpdate(
+                                                trading_pair=fillable_order.trading_pair,
+                                                update_timestamp=event_timestamp,
+                                                new_state=OrderState.FILLED,
+                                                client_order_id=fillable_order.client_order_id,
+                                                exchange_order_id=each_event["order_id"],
+                                            )
+                                            self._order_tracker.process_order_update(order_update=forced_update)
+                                    except Exception:
+                                        pass
                                     try:
                                         trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
                                         trade_updates = self._create_order_fill_updates(
@@ -418,12 +461,53 @@ class BitmartExchange(ExchangePyBase):
                                     client_order_id=client_order_id,
                                     exchange_order_id=each_event["order_id"],
                                 )
-                                self._order_tracker.process_order_update(order_update=order_update)
+                                # For MARKET orders with any fills, suppress cancel-after-fill and finalize immediately
+                                if (updatable_order.order_type == OrderType.MARKET
+                                        and new_state == OrderState.CANCELED
+                                        and updatable_order.client_order_id in getattr(self, "_market_orders_with_fill", set())):
+                                    forced_update = OrderUpdate(
+                                        trading_pair=updatable_order.trading_pair,
+                                        update_timestamp=event_timestamp,
+                                        new_state=OrderState.FILLED,
+                                        client_order_id=client_order_id,
+                                        exchange_order_id=each_event["order_id"],
+                                    )
+                                    self._order_tracker.process_order_update(order_update=forced_update)
+                                else:
+                                    self._order_tracker.process_order_update(order_update=order_update)
 
                         except asyncio.CancelledError:
                             raise
                         except Exception:
                             self.logger().exception("Unexpected error in user stream listener loop.")
+
+                # Refer to https://developer-pro.bitmart.com/en/spot/#private-balance-change
+                elif event_type == CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME:
+                    for balance_event in execution_data:
+                        try:
+                            details = balance_event.get("balance_details") or []
+                            if isinstance(details, list) and len(details) > 0:
+                                for detail in details:
+                                    asset_name = str(detail.get("ccy") or detail.get("currency") or "")
+                                    available_str = str(detail.get("av_bal") or detail.get("available") or "0")
+                                    frozen_str = str(detail.get("fz_bal") or detail.get("frozen") or "0")
+                                    available = Decimal(available_str)
+                                    frozen = Decimal(frozen_str)
+                                    if asset_name:
+                                        self._account_available_balances[asset_name] = available
+                                        self._account_balances[asset_name] = available + frozen
+                            else:
+                                asset_name = str(balance_event.get("ccy") or balance_event.get("currency") or "")
+                                available_str = str(balance_event.get("av_bal") or balance_event.get("available") or "0")
+                                frozen_str = str(balance_event.get("fz_bal") or balance_event.get("frozen") or "0")
+                                available = Decimal(available_str)
+                                frozen = Decimal(frozen_str)
+                                if asset_name:
+                                    self._account_available_balances[asset_name] = available
+                                    self._account_balances[asset_name] = available + frozen
+                        except Exception:
+                            # Ignore malformed entries but keep processing
+                            continue
             except asyncio.CancelledError:
                 raise
             except Exception:

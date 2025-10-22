@@ -15,7 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate, OrderState
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -37,13 +37,34 @@ class HtxExchange(ExchangePyBase):
         htx_secret_key: str,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
+        htx_account_id: Optional[str] = None,
+        **_: Any,
     ):
         self.htx_api_key = htx_api_key
         self.htx_secret_key = htx_secret_key
         self._trading_pairs = trading_pairs
         self._trading_required = trading_required
         self._account_id = ""
+        self._account_id_from_config = False
         super().__init__(client_config_map=client_config_map)
+        # Prefer user-provided account id from config/env if available (improves private balances topic precision)
+        try:
+            import os
+            # Highest precedence: explicit ctor argument
+            cfg_id = htx_account_id if (isinstance(htx_account_id, (str, int)) and str(htx_account_id).strip()) else getattr(client_config_map, "htx_account_id", None)
+            if isinstance(cfg_id, (str, int)) and str(cfg_id).strip():
+                self._account_id = str(cfg_id).strip()
+                self._account_id_from_config = True
+            else:
+                env_id = os.getenv("HTX_ACCOUNT_ID", "").strip()
+                if env_id:
+                    self._account_id = env_id
+                    self._account_id_from_config = True
+        except Exception:
+            pass
+
+        # Debounced finalize for partial-filled orders: order_id -> asyncio.Task
+        self._partial_finalize_tasks: Dict[str, asyncio.Task] = {}
 
     @property
     def name(self) -> str:
@@ -98,26 +119,7 @@ class HtxExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
-    def get_fee(
-        self,
-        base_currency: str,
-        quote_currency: str,
-        order_type: OrderType,
-        order_side: TradeType,
-        amount: Decimal,
-        price: Decimal = s_decimal_NaN,
-        is_maker: Optional[bool] = None,
-    ):
-        return build_trade_fee(
-            self.name,
-            is_maker,
-            base_currency=base_currency,
-            quote_currency=quote_currency,
-            order_type=order_type,
-            order_side=order_side,
-            amount=amount,
-            price=price,
-        )
+    # Use base class get_fee -> _get_fee path; no need to override get_fee here
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # API documentation does not clarify the error message for timestamp related problems
@@ -343,8 +345,10 @@ class HtxExchange(ExchangePyBase):
                 await self._sleep(5.0)
 
     async def _process_order_update(self, msg: Dict[str, Any]):
-        client_order_id = msg["clientOrderId"]
-        order_status = msg["orderStatus"]
+        client_order_id = msg.get("clientOrderId")
+        if client_order_id is None:
+            return
+        order_status = msg.get("orderStatus")
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
             order_update = OrderUpdate(
@@ -355,8 +359,19 @@ class HtxExchange(ExchangePyBase):
             )
             self._order_tracker.process_order_update(order_update=order_update)
 
+            # Schedule/Cancel finalize based on status
+            try:
+                if order_status == "partial-filled":
+                    self._schedule_partial_finalize(client_order_id)
+                elif order_status in ("filled", "canceled", "rejected", "partial-canceled"):
+                    self._cancel_partial_finalize(client_order_id)
+            except Exception:
+                pass
+
     async def _process_trade_event(self, trade_event: Dict[str, Any]):
-        client_order_id = trade_event["clientOrderId"]
+        client_order_id = trade_event.get("clientOrderId")
+        if client_order_id is None:
+            return
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
 
         if tracked_order:
@@ -381,6 +396,12 @@ class HtxExchange(ExchangePyBase):
             )
             self._order_tracker.process_trade_update(trade_update)
 
+            # Any trade event indicates progress; reschedule partial finalize debounce
+            try:
+                self._schedule_partial_finalize(client_order_id)
+            except Exception:
+                pass
+
     async def _update_trading_fees(self):
         pass
 
@@ -403,9 +424,22 @@ class HtxExchange(ExchangePyBase):
         if not self._account_id:
             await self._update_account_id()
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        # HTX MARKET order semantics:
+        # - buy-market expects QUOTE notional in "amount"
+        # - sell-market expects BASE amount in "amount"
+        api_amount: Decimal = amount
+        if order_type is OrderType.MARKET and trade_type is TradeType.BUY:
+            effective_price: Decimal = price
+            if effective_price is None or effective_price.is_nan() or effective_price == s_decimal_0:
+                effective_price = self.get_price(trading_pair, True)
+            notional = amount * effective_price
+            trading_rule = self._trading_rules[trading_pair]
+            quote_increment = Decimal(trading_rule.min_quote_amount_increment)
+            # round down to nearest increment
+            api_amount = (notional // quote_increment) * quote_increment
         params = {
             "account-id": self._account_id,
-            "amount": f"{amount}",
+            "amount": f"{api_amount}",
             "client-order-id": order_id,
             "symbol": exchange_symbol,
             "type": f"{side}-{order_type_str}",
@@ -423,6 +457,41 @@ class HtxExchange(ExchangePyBase):
             return exchange_order_id, self.current_timestamp
         else:
             raise ValueError(f"Htx rejected the order {order_id} ({creation_response})")
+
+    def _cancel_partial_finalize(self, client_order_id: str) -> None:
+        try:
+            t = self._partial_finalize_tasks.pop(client_order_id, None)
+            if t and not t.done():
+                t.cancel()
+        except Exception:
+            pass
+
+    def _schedule_partial_finalize(self, client_order_id: str) -> None:
+        # Cancel existing task first (debounce)
+        self._cancel_partial_finalize(client_order_id)
+
+        async def _finalize_later():
+            try:
+                await asyncio.sleep(CONSTANTS.PARTIAL_FINALIZE_TIMEOUT_S)
+                # Double-check order still exists and remains partial/open
+                order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                if order is None:
+                    return
+                # Synthesize a filled update to unblock strategies
+                update = OrderUpdate(
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.FILLED,
+                    client_order_id=client_order_id,
+                )
+                self._order_tracker.process_order_update(order_update=update)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_finalize_later())
+        self._partial_finalize_tasks[client_order_id] = task
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         if tracked_order is None:
@@ -446,11 +515,13 @@ class HtxExchange(ExchangePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        path_url = CONSTANTS.MOST_RECENT_TRADE_URL
+        # Use per-symbol last trade endpoint matching HTX format
+        path_url = CONSTANTS.LAST_TRADE_URL
         params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair)}
-        resp_json = await self._api_get(
-            path_url=path_url,
-            params=params,
-        )
-        resp_record = resp_json["tick"]["data"][0]
-        return float(resp_record["price"])
+        resp_json = await self._api_get(path_url=path_url, params=params)
+        # Format: { status: "ok", ch: "market.symbol.trade.detail", tick: { data: [ { price, ... } ] } }
+        tick = resp_json.get("tick", {})
+        data = tick.get("data", [])
+        if not data:
+            raise ValueError(f"No last trade data for {trading_pair}")
+        return float(data[0].get("price"))

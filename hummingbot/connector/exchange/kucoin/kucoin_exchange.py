@@ -294,7 +294,11 @@ class KucoinExchange(ExchangePyBase):
                         elif order_event_type == "filled":
                             updated_status = OrderState.FILLED
                         elif order_event_type == "canceled":
-                            updated_status = OrderState.CANCELED
+                            filled_size = Decimal(execution_data.get("filledSize", "0"))
+                            if filled_size > 0:
+                                updated_status = OrderState.FILLED
+                            else:
+                                updated_status = OrderState.CANCELED
 
                         order_update = OrderUpdate(
                             trading_pair=updatable_order.trading_pair,

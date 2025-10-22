@@ -613,21 +613,19 @@ class ExecutorOrchestrator:
                 position.connector_name, position.trading_pair, PriceType.MidPrice)
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
-            # Update report with position data
-            report.realized_pnl_quote += position_summary.realized_pnl_quote - position_summary.cum_fees_quote
+            # Update report with position data (exclude fees/PnL as they are disabled)
             report.volume_traded += position_summary.volume_traded_quote
-            report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
             positions_summary.append(position_summary)
 
         # Set the positions summary (don't use dynamic attribute)
         report.positions_summary = positions_summary
 
-        # Calculate global PNL values
-        report.global_pnl_quote = report.unrealized_pnl_quote + report.realized_pnl_quote
-        report.global_pnl_pct = (report.global_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
-
-        # Calculate individual PNL percentages
-        report.unrealized_pnl_pct = (report.unrealized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
-        report.realized_pnl_pct = (report.realized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
+        # Force all PnL metrics to zero
+        report.unrealized_pnl_quote = Decimal("0")
+        report.realized_pnl_quote = Decimal("0")
+        report.global_pnl_quote = Decimal("0")
+        report.unrealized_pnl_pct = Decimal("0")
+        report.realized_pnl_pct = Decimal("0")
+        report.global_pnl_pct = Decimal("0")
 
         return report

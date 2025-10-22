@@ -209,58 +209,14 @@ class PerformanceMetrics:
         return buys, sells
 
     def _process_deducted_fees_impact_in_quote_vol(self, trade):
-        fee_percent = None
-        fee_type = ""
-        impact = s_decimal_0
-        if self._is_trade_fill(trade):
-            if trade.trade_fee.get("percent") is not None:
-                fee_percent = Decimal(trade.trade_fee.get("percent"))
-                fee_type = trade.trade_fee.get("fee_type")
-        else:  # assume this is Trade object
-            if trade.trade_fee.percent is not None:
-                fee_percent = Decimal(trade.trade_fee.percent)
-                fee_type = trade.trade_fee.type_descriptor_for_json()
-        if (fee_percent is not None) and (fee_type == DeductedFromReturnsTradeFee.type_descriptor_for_json()):
-            impact = Decimal(str(trade.amount)) * Decimal(str(trade.price)) * fee_percent * Decimal("-1")
-        return impact
+        # Fees are disabled at root; do not adjust volumes based on deducted fees
+        return s_decimal_0
 
     async def _calculate_fees(self, quote: str, trades: List[Any]):
-        for trade in trades:
-            fee_percent = None
-            trade_price = None
-            trade_amount = None
-            if self._is_trade_fill(trade):
-                if trade.trade_fee.get("percent") is not None:
-                    trade_price = Decimal(str(trade.price))
-                    trade_amount = Decimal(str(trade.amount))
-                    fee_percent = Decimal(str(trade.trade_fee["percent"]))
-                flat_fees = [TokenAmount(token=flat_fee["token"], amount=Decimal(flat_fee["amount"]))
-                             for flat_fee in trade.trade_fee.get("flat_fees", [])]
-            else:  # assume this is Trade object
-                if trade.trade_fee.percent is not None:
-                    trade_price = Decimal(trade.price)
-                    trade_amount = Decimal(trade.amount)
-                    fee_percent = Decimal(trade.trade_fee.percent)
-                flat_fees = trade.trade_fee.flat_fees
-
-            if fee_percent is not None:
-                self.fees[quote] += trade_price * trade_amount * fee_percent
-            for flat_fee in flat_fees:
-                self.fees[flat_fee.token] += flat_fee.amount
-
-        for fee_token, fee_amount in self.fees.items():
-            if fee_token == quote:
-                self.fee_in_quote += fee_amount
-            else:
-                rate_pair: str = combine_to_hb_trading_pair(fee_token, quote)
-                last_price = await RateOracle.get_instance().stored_or_live_rate(rate_pair)
-                if last_price is not None:
-                    self.fee_in_quote += fee_amount * last_price
-                else:
-                    self.logger().warning(
-                        f"Could not find exchange rate for {rate_pair} "
-                        f"using {RateOracle.get_instance()}. PNL value will be inconsistent."
-                    )
+        # Fees are disabled at root; keep structures but skip any computation or rate lookups
+        self.fees.clear()
+        self.fee_in_quote = s_decimal_0
+        return
 
     def _calculate_trade_pnl(self, buys: list, sells: list):
         self.trade_pnl = self.cur_value - self.hold_value
@@ -316,11 +272,15 @@ class PerformanceMetrics:
         self.cur_base_ratio_pct = self.divide(self.cur_base_bal * self.cur_price,
                                               (self.cur_base_bal * self.cur_price) + self.cur_quote_bal)
 
+        # Compute normally to avoid breaking dependent fields, then force PnL/returns to zero
         self.hold_value = (self.start_base_bal * self.cur_price) + self.start_quote_bal
         self.cur_value = (self.cur_base_bal * self.cur_price) + self.cur_quote_bal
         self._calculate_trade_pnl(buys, sells)
 
         await self._calculate_fees(quote, trades)
 
-        self.total_pnl = self.trade_pnl - self.fee_in_quote
-        self.return_pct = self.divide(self.total_pnl, self.hold_value)
+        # Force-disable P&L and return% at the root level
+        self.trade_pnl = s_decimal_0
+        self.fee_in_quote = s_decimal_0
+        self.total_pnl = s_decimal_0
+        self.return_pct = s_decimal_0
