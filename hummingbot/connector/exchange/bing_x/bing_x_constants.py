@@ -20,9 +20,9 @@ WSS_PRIVATE_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 
 # Websocket event types
 # Use explicit queue keys aligned with tracker defaults
-DIFF_EVENT_TYPE = "depth"
+DIFF_EVENT_TYPE = "order_book_diff"
 TRADE_EVENT_TYPE = "trade"
-SNAPSHOT_EVENT_TYPE = "depth"
+SNAPSHOT_EVENT_TYPE = "order_book_snapshot"
 
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/openApi/spot/v1/ticker/24hr"
@@ -43,12 +43,13 @@ WS_HEARTBEAT_TIME_INTERVAL = 5
 
 # Orderbook management
 ONE_HOUR = 60 * 60  # Periodic snapshot interval (seconds)
-DEFAULT_DEPTH_LEVEL = "100"  # Default orderbook depth level for WS stream
-
-# BingX WebSocket orderbook depth options (all update every 300ms)
-DEPTH_LEVEL_OPTIONS = ["5", "10", "20", "50", "100", "incrDepth"]
+SNAPSHOT_DEPTH_LIMIT = 1000  # Maximum depth levels per REST snapshot
+DIFF_BATCH_SIZE = 100  # Max diffs to process per iteration
 
 # BingX-specific WebSocket stream identifiers
+BINGX_SNAPSHOT_ACTION = "all"      # Full depth indicator in 'action' field
+BINGX_UPDATE_ACTION = "update"     # Incremental depth indicator in 'action' field
+BINGX_DEPTH_STREAM_SUFFIX = "@incrDepth"
 BINGX_TRADE_STREAM_SUFFIX = "@trade"
 
 # Order States
