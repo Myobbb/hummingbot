@@ -43,12 +43,13 @@ WS_HEARTBEAT_TIME_INTERVAL = 5
 
 # Orderbook management
 ONE_HOUR = 60 * 60  # Periodic snapshot interval (seconds)
-DEFAULT_DEPTH_LEVEL = "100"  # Default orderbook depth level for WS stream
-
-# BingX WebSocket orderbook depth options (all update every 300ms)
-DEPTH_LEVEL_OPTIONS = ["5", "10", "20", "50", "100", "incrDepth"]
+SNAPSHOT_DEPTH_LIMIT = 1000  # Maximum depth levels per REST snapshot
+DIFF_BATCH_SIZE = 100  # Max diffs to process per iteration
 
 # BingX-specific WebSocket stream identifiers
+BINGX_SNAPSHOT_ACTION = "all"      # Full depth indicator in 'action' field
+BINGX_UPDATE_ACTION = "update"     # Incremental depth indicator in 'action' field
+BINGX_DEPTH_STREAM_SUFFIX = "@incrDepth"
 BINGX_TRADE_STREAM_SUFFIX = "@trade"
 
 # Order States

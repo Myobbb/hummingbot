@@ -46,17 +46,17 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
         )
-        # Get configured depth level, default to 100
-        depth_config = getattr(connector._client_config, 'bingx_orderbook_depth', None)
-        self._depth_level = depth_config if depth_config else CONSTANTS.DEFAULT_DEPTH_LEVEL
-
         # Larger queue for high-frequency bursts
         MAX_QUEUE_SIZE = 10000
         self._message_queue: Dict[str, asyncio.Queue] = {
             CONSTANTS.SNAPSHOT_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
+            CONSTANTS.DIFF_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
             CONSTANTS.TRADE_EVENT_TYPE: asyncio.Queue(maxsize=MAX_QUEUE_SIZE),
         }
         self._last_ws_message_sent_timestamp = 0
+        # Simplified state tracking - only what we need
+        self._last_update_ids: Dict[str, int] = {}
+        self._received_initial_snapshot: Dict[str, bool] = {}
         self._snapshot_output_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self,
@@ -88,11 +88,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return default_time
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        # Use configured depth for REST snapshot, convert incrDepth to 1000
-        limit = "1000" if self._depth_level == "incrDepth" else self._depth_level
         params = {
             "symbol": trading_pair,
-            "limit": limit
+            "limit": str(CONSTANTS.SNAPSHOT_DEPTH_LIMIT)
         }
         data = await self._connector._api_request(
             path_url=CONSTANTS.SNAPSHOT_PATH_URL,
@@ -120,8 +118,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if not isinstance(sub, dict):
             sub = dict(sub)
         sub['timestamp'] = ts
-        # Use timestamp as update_id for REST snapshots
-        sub['lastUpdateId'] = int(ts)
+
+        # Use high timestamp-based ID to ensure REST snapshot is treated as newest.
+        # This prevents stale diffs from being replayed after recovery.
+        # REST snapshots don't have WS sequence numbers, so we use microsecond timestamp.
+        sub['lastUpdateId'] = int(self._time() * 1e6)
 
         return sub
 
@@ -178,17 +179,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_channels(self, ws: WSAssistant):
         MAX_SUBS = 200
         total_needed = len(self._trading_pairs) * 2
-
+        
         if total_needed > MAX_SUBS:
             self.logger().warning(
                 f"Subscriptions ({total_needed}) exceed BingX limit ({MAX_SUBS})"
             )
-
-        # Build depth stream suffix based on configured level
-        if self._depth_level == "incrDepth":
-            depth_suffix = "@incrDepth"
-        else:
-            depth_suffix = f"@depth{self._depth_level}"
 
         for trading_pair in self._trading_pairs:
             trade_req = WSJSONRequest(payload={
@@ -199,14 +194,10 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             depth_req = WSJSONRequest(payload={
                 "id": f"depth_{trading_pair}",
                 "reqType": "sub",
-                "dataType": f"{trading_pair}{depth_suffix}"
+                "dataType": f"{trading_pair}@incrDepth"
             })
             await ws.send(trade_req)
             await ws.send(depth_req)
-
-        self.logger().info(
-            f"Subscribed to {len(self._trading_pairs)} trading pairs with depth level: {self._depth_level}"
-        )
 
     async def _process_ws_messages(self, ws: WSAssistant):
         async for ws_response in ws.iter_messages():
@@ -255,42 +246,93 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().warning(f"Trade queue full for {symbol}")
 
     async def _handle_depth_message(self, data: Dict[str, Any], symbol: str):
-        """
-        Handle orderbook depth messages from WebSocket.
-        For @depth streams: all messages are snapshots, queue directly.
-        For @incrDepth stream: handle action="all" (snapshot) and action="update" (diff).
-        """
+        """Optimized depth message handling with BingX API compliance"""
         data_node = data.get('data', {})
+        action = data_node.get('action')
 
-        # For incrDepth stream, check action field
-        if self._depth_level == "incrDepth":
-            action = data_node.get('action')
+        # Extract update ID
+        last_update_id_raw = (
+            data_node.get('lastUpdateId') or
+            data_node.get('version') or
+            data_node.get('sequence')
+        )
 
-            # incrDepth snapshot (action="all")
-            if action == "all":
-                try:
-                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-                except asyncio.QueueFull:
-                    self.logger().warning(f"{symbol}: Snapshot queue full")
+        try:
+            last_update_id = int(last_update_id_raw) if last_update_id_raw else None
+        except (ValueError, TypeError):
+            last_update_id = None
+
+        # Handle full snapshot (action="all")
+        if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
+            try:
+                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+            except asyncio.QueueFull:
+                self.logger().warning(f"{symbol}: Snapshot queue full")
+                await self._trigger_immediate_recovery(symbol)
                 return
 
-            # incrDepth diff (action="update") - not used in default mode
-            # Legacy code handles this if user explicitly chooses incrDepth
-            # For now, skip diff processing to keep code simple
+            if last_update_id is not None:
+                self._last_update_ids[symbol] = last_update_id
+
+            # Mark that we've received initial snapshot for this symbol
+            self._received_initial_snapshot[symbol] = True
             return
 
-        # For @depth streams: all messages are full snapshots (no action field)
-        # Queue directly to snapshot queue for fast processing
-        try:
-            self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-        except asyncio.QueueFull:
-            self.logger().warning(f"{symbol}: Snapshot queue full, dropping oldest")
-            # For real-time snapshots, newest is more important than oldest
-            try:
-                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].get_nowait()
-                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                pass
+        # Handle incremental update (action="update")
+        if action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
+            if last_update_id is None:
+                return  # Skip malformed update
+
+            prev_id = self._last_update_ids.get(symbol)
+
+            # If no previous ID, check if we've received initial snapshot
+            if prev_id is None:
+                # Before initial snapshot: skip updates (BingX sends action="all" first)
+                if not self._received_initial_snapshot.get(symbol, False):
+                    self.logger().debug(
+                        f"{symbol}: Skipping update before initial snapshot (id={last_update_id})"
+                    )
+                    return
+
+                # After initial snapshot but state cleared (post-recovery): accept as new baseline
+                self.logger().info(
+                    f"{symbol}: Resyncing after recovery, accepting update as baseline (id={last_update_id})"
+                )
+                self._last_update_ids[symbol] = last_update_id
+                try:
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                except asyncio.QueueFull:
+                    self.logger().error(f"{symbol}: Diff queue full during resync")
+                return
+
+            # Duplicate message - skip silently for speed
+            if last_update_id == prev_id:
+                return
+
+            # Old/out-of-order message - skip with debug log
+            if last_update_id < prev_id:
+                self.logger().debug(
+                    f"{symbol}: Skipping old update (prev={prev_id}, got={last_update_id})"
+                )
+                return
+
+            # Expected sequence - fast path
+            if last_update_id == prev_id + 1:
+                self._last_update_ids[symbol] = last_update_id
+                try:
+                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
+                except asyncio.QueueFull:
+                    self.logger().error(f"{symbol}: Diff queue full, triggering recovery")
+                    await self._trigger_immediate_recovery(symbol)
+                return
+
+            # Forward gap detected - trigger recovery
+            gap_size = last_update_id - prev_id - 1
+            self.logger().warning(
+                f"{symbol}: Sequence gap detected (prev={prev_id}, got={last_update_id}, "
+                f"missing={gap_size}). Triggering REST snapshot recovery."
+            )
+            await self._trigger_immediate_recovery(symbol)
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
@@ -307,34 +349,74 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             snapshot_queue.put_nowait(order_book_message)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        Framework-required method for diff updates.
+        """Optimized diff consumer with batching"""
+        message_queue = self._message_queue[CONSTANTS.DIFF_EVENT_TYPE]
+        
+        while True:
+            try:
+                # Block for first message
+                json_msg = await message_queue.get()
+                trading_pair = json_msg["symbol"]
+                
+                # Extract timestamp once
+                ts_sec = self._extract_timestamp(json_msg, self._time())
+                
+                # Create metadata dict once (reused in diff_message_from_exchange)
+                metadata = {"trading_pair": trading_pair}
+                diff_message = BingXOrderBook.diff_message_from_exchange(
+                    json_msg, ts_sec, metadata
+                )
+                output.put_nowait(diff_message)
 
-        For @depth streams: No diffs, all updates are snapshots (this method does nothing).
-        For @incrDepth stream: Would process diffs, but not implemented in simplified version.
+                # Drain queue without blocking
+                while True:
+                    try:
+                        json_msg = message_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    
+                    trading_pair = json_msg["symbol"]
+                    ts_sec = self._extract_timestamp(json_msg, self._time())
+                    metadata = {"trading_pair": trading_pair}
+                    
+                    diff_message = BingXOrderBook.diff_message_from_exchange(
+                        json_msg, ts_sec, metadata
+                    )
+                    output.put_nowait(diff_message)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Diff processing error", exc_info=True)
+
+    async def _trigger_immediate_recovery(self, trading_pair: str):
         """
-        if self._depth_level != "incrDepth":
-            # Snapshot-only mode: no diffs to process, just wait indefinitely
-            self.logger().info(
-                f"Using @depth{self._depth_level} (snapshot-only), diff processing disabled for speed"
-            )
-            while True:
-                await asyncio.sleep(3600)  # Sleep forever
-        else:
-            # incrDepth mode would need diff processing here
-            # For simplicity, we don't implement it - user should use @depth for speed
-            self.logger().warning(
-                "incrDepth selected but diff processing not implemented. "
-                "Use depth 5/10/20/50/100 for optimized snapshot-based updates."
-            )
-            while True:
-                await asyncio.sleep(3600)
+        Recover from sequence gap using REST snapshot.
+
+        Recovery flow:
+        1. Clear WS sequence state (next update will be accepted as new baseline)
+        2. Fetch REST snapshot with high update_id (prevents stale diff replay)
+        3. Next WS update will resync via baseline acceptance in _handle_depth_message
+        """
+        self._last_update_ids.pop(trading_pair, None)
+
+        if self._snapshot_output_queue:
+            try:
+                await self._take_full_order_book_snapshot(
+                    [trading_pair],
+                    self._snapshot_output_queue
+                )
+            except Exception:
+                self.logger().exception(f"{trading_pair}: Recovery failed")
 
     async def _take_full_order_book_snapshot(self, trading_pairs: List[str], snapshot_queue: asyncio.Queue):
         for trading_pair in trading_pairs:
             try:
                 snapshot = await self._request_order_book_snapshot(trading_pair)
                 snapshot_timestamp = float(snapshot["timestamp"]) * 1e-3
+
+                # Clear state for fresh start
+                self._last_update_ids.pop(trading_pair, None)
 
                 snapshot_msg = BingXOrderBook.snapshot_message_from_exchange_rest(
                     snapshot, snapshot_timestamp, {"trading_pair": trading_pair}
