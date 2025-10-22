@@ -32,9 +32,7 @@ class MexcExchange(ExchangePyBase):
 
     web_utils = web_utils
 
-    SHORT_POLL_INTERVAL = 120.0 
-    LONG_POLL_INTERVAL = 600.0  #extended to advoid rate limiting, long one is the default, short is a fallback for when <tick_interval_limit since last ws bal update
-    TICK_INTERVAL_LIMIT = 180.0
+  
 
 
     def __init__(self,
