@@ -76,6 +76,13 @@ class BingXConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    bingx_orderbook_depth: str = Field(
+        default="100",
+        json_schema_extra={
+            "prompt": "Enter orderbook depth level (5/10/20/50/100/incrDepth)",
+            "prompt_on_new": False,
+        }
+    )
     model_config = ConfigDict(title="bing_x")
 
 
