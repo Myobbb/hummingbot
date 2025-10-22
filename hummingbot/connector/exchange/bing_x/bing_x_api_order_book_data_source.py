@@ -191,17 +191,19 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             depth_suffix = f"@depth{self._depth_level}"
 
         for trading_pair in self._trading_pairs:
+            """
             trade_req = WSJSONRequest(payload={
                 "id": f"trade_{trading_pair}",
                 "reqType": "sub",
                 "dataType": f"{trading_pair}@trade"
             })
+            """
             depth_req = WSJSONRequest(payload={
                 "id": f"depth_{trading_pair}",
                 "reqType": "sub",
                 "dataType": f"{trading_pair}{depth_suffix}"
             })
-            await ws.send(trade_req)
+            #await ws.send(trade_req)
             await ws.send(depth_req)
 
         self.logger().info(

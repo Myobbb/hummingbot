@@ -20,9 +20,9 @@ WSS_PRIVATE_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 
 # Websocket event types
 # Use explicit queue keys aligned with tracker defaults
-DIFF_EVENT_TYPE = "order_book_diff"
+DIFF_EVENT_TYPE = "depth"
 TRADE_EVENT_TYPE = "trade"
-SNAPSHOT_EVENT_TYPE = "order_book_snapshot"
+SNAPSHOT_EVENT_TYPE = "depth"
 
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/openApi/spot/v1/ticker/24hr"
