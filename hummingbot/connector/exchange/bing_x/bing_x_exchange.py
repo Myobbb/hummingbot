@@ -451,6 +451,7 @@ class BingXExchange(ExchangePyBase):
                 elif event_message.get("e") == "ACCOUNT_UPDATE":
                     # Ignore non-spot reasons per BingX docs (e.g., INIT, FUNDING_FEE)
                     reason = str(event_message.get("a", {}).get("m", "")).upper()
+                    self._last_ws_balance_update_ts = self.current_timestamp
                     if reason in ("INIT", "FUNDING_FEE"):
                         continue
                     balances = event_message["a"]["B"]
@@ -460,8 +461,8 @@ class BingXExchange(ExchangePyBase):
                         total_balance = Decimal(str(balance_entry["wb"]))
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
-                    # Mark last WS balance update time
-                    self._last_ws_balance_update_ts = self.current_timestamp
+                  
+                    
                         
             except asyncio.CancelledError:
                 raise
