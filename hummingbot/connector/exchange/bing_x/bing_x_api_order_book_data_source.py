@@ -281,16 +281,20 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         # For @depth streams: all messages are full snapshots (no action field)
         # Queue directly to snapshot queue for fast processing
-        try:
-            self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-        except asyncio.QueueFull:
-            self.logger().warning(f"{symbol}: Snapshot queue full, dropping oldest")
-            # For real-time snapshots, newest is more important than oldest
+        # Use a loop to handle race conditions when queue is full
+        while True:
             try:
-                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].get_nowait()
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                pass
+                break  # Successfully added, exit loop
+            except asyncio.QueueFull:
+                # Drop oldest message to make room for newest snapshot
+                try:
+                    self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].get_nowait()
+                    # Continue loop to try adding again
+                except asyncio.QueueEmpty:
+                    # Race condition: queue was emptied by consumer between checks
+                    # Continue loop to try adding the message again
+                    continue
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
