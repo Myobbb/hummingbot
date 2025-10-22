@@ -174,7 +174,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_channels(self, ws: WSAssistant):
         MAX_SUBS = 200
         total_needed = len(self._trading_pairs) * 2
-        
+
         if total_needed > MAX_SUBS:
             self.logger().warning(
                 f"Subscriptions ({total_needed}) exceed BingX limit ({MAX_SUBS})"
@@ -189,7 +189,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             depth_req = WSJSONRequest(payload={
                 "id": f"depth_{trading_pair}",
                 "reqType": "sub",
-                "dataType": f"{trading_pair}@incrDepth"
+                "dataType": f"{trading_pair}@depth{CONSTANTS.BINGX_DEPTH_LEVEL}"
             })
             await ws.send(trade_req)
             await ws.send(depth_req)
@@ -228,11 +228,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             parts = data_type.split('@')
             if len(parts) != 2:
                 continue
-                
+
             symbol, event_type = parts
             data['symbol'] = symbol
 
-            if event_type in ("incrDepth", "depth"):
+            # Handle depth messages (market depth or incremental depth)
+            if event_type.startswith("depth"):
                 await self._handle_depth_message(data, symbol)
             elif event_type == CONSTANTS.TRADE_EVENT_TYPE:
                 try:
@@ -241,66 +242,16 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().warning(f"Trade queue full for {symbol}")
 
     async def _handle_depth_message(self, data: Dict[str, Any], symbol: str):
-        """Optimized depth message handling with minimal branching"""
-        data_node = data.get('data', {})
-        action = data_node.get('action')
-        
-        # Extract update ID
-        last_update_id_raw = (
-            data_node.get('lastUpdateId') or 
-            data_node.get('version') or 
-            data_node.get('sequence')
-        )
-        
+        """
+        Handle market depth messages (full snapshots only).
+        Market depth endpoint sends full snapshots every 300ms, no incremental updates.
+        """
+        # All depth messages from @depth endpoint are full snapshots
         try:
-            last_update_id = int(last_update_id_raw) if last_update_id_raw else None
-        except (ValueError, TypeError):
-            last_update_id = None
-
-        # Handle full snapshot
-        if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
-            try:
-                self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
-            except asyncio.QueueFull:
-                self.logger().warning(f"{symbol}: Snapshot queue full")
-                await self._trigger_immediate_recovery(symbol)
-                return
-                
-            if last_update_id is not None:
-                self._last_update_ids[symbol] = last_update_id
-            return
-
-        # Handle incremental update
-        if action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
-            if last_update_id is None:
-                return  # Skip malformed update
-            
-            prev_id = self._last_update_ids.get(symbol)
-            
-            # Fast path: no previous state - accept first update as baseline
-            if prev_id is None:
-                self._last_update_ids[symbol] = last_update_id
-                try:
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                except asyncio.QueueFull:
-                    await self._trigger_immediate_recovery(symbol)
-                return
-            
-            # Fast path: expected sequence
-            if last_update_id == prev_id + 1:
-                self._last_update_ids[symbol] = last_update_id
-                try:
-                    self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
-                except asyncio.QueueFull:
-                    await self._trigger_immediate_recovery(symbol)
-                return
-            
-            # Slow path: gap detected - trigger recovery
-            if last_update_id != prev_id:
-                self.logger().warning(
-                    f"{symbol}: Gap detected (prev={prev_id}, got={last_update_id})"
-                )
-                await self._trigger_immediate_recovery(symbol)
+            self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
+        except asyncio.QueueFull:
+            self.logger().warning(f"{symbol}: Snapshot queue full")
+            # If queue is full, log but don't trigger recovery since next snapshot will arrive in 300ms
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
