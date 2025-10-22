@@ -56,6 +56,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ws_message_sent_timestamp = 0
         # Simplified state tracking - only what we need
         self._last_update_ids: Dict[str, int] = {}
+        self._received_initial_snapshot: Dict[str, bool] = {}
         self._snapshot_output_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self,
@@ -117,7 +118,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if not isinstance(sub, dict):
             sub = dict(sub)
         sub['timestamp'] = ts
-        sub['lastUpdateId'] = 0  # Don't trust REST sequence
+
+        # Use high timestamp-based ID to ensure REST snapshot is treated as newest.
+        # This prevents stale diffs from being replayed after recovery.
+        # REST snapshots don't have WS sequence numbers, so we use microsecond timestamp.
+        sub['lastUpdateId'] = int(self._time() * 1e6)
 
         return sub
 
@@ -241,23 +246,23 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().warning(f"Trade queue full for {symbol}")
 
     async def _handle_depth_message(self, data: Dict[str, Any], symbol: str):
-        """Optimized depth message handling with minimal branching"""
+        """Optimized depth message handling with BingX API compliance"""
         data_node = data.get('data', {})
         action = data_node.get('action')
-        
+
         # Extract update ID
         last_update_id_raw = (
-            data_node.get('lastUpdateId') or 
-            data_node.get('version') or 
+            data_node.get('lastUpdateId') or
+            data_node.get('version') or
             data_node.get('sequence')
         )
-        
+
         try:
             last_update_id = int(last_update_id_raw) if last_update_id_raw else None
         except (ValueError, TypeError):
             last_update_id = None
 
-        # Handle full snapshot
+        # Handle full snapshot (action="all")
         if action == CONSTANTS.BINGX_SNAPSHOT_ACTION:
             try:
                 self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE].put_nowait(data)
@@ -265,42 +270,69 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().warning(f"{symbol}: Snapshot queue full")
                 await self._trigger_immediate_recovery(symbol)
                 return
-                
+
             if last_update_id is not None:
                 self._last_update_ids[symbol] = last_update_id
+
+            # Mark that we've received initial snapshot for this symbol
+            self._received_initial_snapshot[symbol] = True
             return
 
-        # Handle incremental update
+        # Handle incremental update (action="update")
         if action == CONSTANTS.BINGX_UPDATE_ACTION or last_update_id is not None:
             if last_update_id is None:
                 return  # Skip malformed update
-            
+
             prev_id = self._last_update_ids.get(symbol)
-            
-            # Fast path: no previous state - accept first update as baseline
+
+            # If no previous ID, check if we've received initial snapshot
             if prev_id is None:
+                # Before initial snapshot: skip updates (BingX sends action="all" first)
+                if not self._received_initial_snapshot.get(symbol, False):
+                    self.logger().debug(
+                        f"{symbol}: Skipping update before initial snapshot (id={last_update_id})"
+                    )
+                    return
+
+                # After initial snapshot but state cleared (post-recovery): accept as new baseline
+                self.logger().info(
+                    f"{symbol}: Resyncing after recovery, accepting update as baseline (id={last_update_id})"
+                )
                 self._last_update_ids[symbol] = last_update_id
                 try:
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                 except asyncio.QueueFull:
-                    await self._trigger_immediate_recovery(symbol)
+                    self.logger().error(f"{symbol}: Diff queue full during resync")
                 return
-            
-            # Fast path: expected sequence
+
+            # Duplicate message - skip silently for speed
+            if last_update_id == prev_id:
+                return
+
+            # Old/out-of-order message - skip with debug log
+            if last_update_id < prev_id:
+                self.logger().debug(
+                    f"{symbol}: Skipping old update (prev={prev_id}, got={last_update_id})"
+                )
+                return
+
+            # Expected sequence - fast path
             if last_update_id == prev_id + 1:
                 self._last_update_ids[symbol] = last_update_id
                 try:
                     self._message_queue[CONSTANTS.DIFF_EVENT_TYPE].put_nowait(data)
                 except asyncio.QueueFull:
+                    self.logger().error(f"{symbol}: Diff queue full, triggering recovery")
                     await self._trigger_immediate_recovery(symbol)
                 return
-            
-            # Slow path: gap detected - trigger recovery
-            if last_update_id != prev_id:
-                self.logger().warning(
-                    f"{symbol}: Gap detected (prev={prev_id}, got={last_update_id})"
-                )
-                await self._trigger_immediate_recovery(symbol)
+
+            # Forward gap detected - trigger recovery
+            gap_size = last_update_id - prev_id - 1
+            self.logger().warning(
+                f"{symbol}: Sequence gap detected (prev={prev_id}, got={last_update_id}, "
+                f"missing={gap_size}). Triggering REST snapshot recovery."
+            )
+            await self._trigger_immediate_recovery(symbol)
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE]
@@ -358,13 +390,20 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().error("Diff processing error", exc_info=True)
 
     async def _trigger_immediate_recovery(self, trading_pair: str):
-        """Clear state and fetch REST snapshot"""
+        """
+        Recover from sequence gap using REST snapshot.
+
+        Recovery flow:
+        1. Clear WS sequence state (next update will be accepted as new baseline)
+        2. Fetch REST snapshot with high update_id (prevents stale diff replay)
+        3. Next WS update will resync via baseline acceptance in _handle_depth_message
+        """
         self._last_update_ids.pop(trading_pair, None)
-        
+
         if self._snapshot_output_queue:
             try:
                 await self._take_full_order_book_snapshot(
-                    [trading_pair], 
+                    [trading_pair],
                     self._snapshot_output_queue
                 )
             except Exception:
