@@ -352,6 +352,7 @@ class CreateCommand:
                 "binance": "bn",
                 "bitget": "bg",
                 "bitmart": "bm",
+                'okx': 'okx',
             }
             return m.get((connector or "").lower())
 
