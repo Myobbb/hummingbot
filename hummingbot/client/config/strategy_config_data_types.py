@@ -12,7 +12,7 @@ from hummingbot.client.settings import AllConnectorSettings
 
 class BaseStrategyConfigMap(BaseClientModel):
     strategy: str = Field(
-        default="arbitrage_m",
+        default=...,
         json_schema_extra={
             "prompt": "Enter the strategy name (e.g., market_making, arbitrage): ",
             "prompt_on_new": True,
