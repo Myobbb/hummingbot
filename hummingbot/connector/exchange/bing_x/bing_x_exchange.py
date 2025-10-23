@@ -628,7 +628,7 @@ class BingXExchange(ExchangePyBase):
             return
         if self._last_ws_balance_update_ts > 0 and (now - self._last_ws_balance_update_ts) < self.WS_BALANCE_FRESHNESS_WINDOW:
             return
-        if self._last_rest_balance_ts > 0 and (now - self._last_rest_balance_ts) < self.BALANCE_REST_MIN_INTERVAL:
+        if self._last_rest_balance_ts > 0 and (now - self._last_rest_balance_ts) < self.BALANCE_REST_MIN_INTERVAL * 10:
             return
 
         account_info = await self._api_request(
