@@ -10,6 +10,8 @@ from hummingbot.client.settings import AllConnectorSettings, gateway_connector_t
 from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.utils.market_price import get_last_price
 
+from hummingbot.client.config.config_helpers import get_connector_class
+
 
 class UserBalances:
     __instance = None
