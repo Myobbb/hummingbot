@@ -33,7 +33,7 @@ def _parse_additional_markets(raw) -> List[Tuple[str, str]]:
     return items
 
 
-def start(self):
+async def start(self):
     """Initialize and start the arbitrage_m strategy"""
     try:
         # Extract configuration values
@@ -97,13 +97,13 @@ def start(self):
             if pair not in conn_to_pairs[conn]:
                 conn_to_pairs[conn].append(pair)
         market_names: List[Tuple[str, List[str]]] = [(conn, pairs) for conn, pairs in conn_to_pairs.items()]
-        self.initialize_markets(market_names)
+        await self.initialize_markets(market_names)
 
         # Create MarketTradingPairTuples for each connector/pair
         tuples: List[MarketTradingPairTuple] = []
         for conn, pair in all_conns_pairs:
             base, quote = pair.split("-")
-            data = [self.markets[conn], pair, base, quote]
+            data = [self.connector_manager.connectors[conn], pair, base, quote]
             tuples.append(MarketTradingPairTuple(*data))
         self.market_trading_pair_tuples = tuples
 
