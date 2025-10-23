@@ -1,7 +1,7 @@
 import asyncio
 from decimal import Decimal
+from typing import TYPE_CHECKING, Any, AsyncIterable, Dict, List, Optional
 
-from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -22,6 +22,8 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
+if TYPE_CHECKING:
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 
 class HtxExchange(ExchangePyBase):
@@ -30,7 +32,7 @@ class HtxExchange(ExchangePyBase):
 
     def __init__(
         self,
-        
+        client_config_map: "ClientConfigAdapter",
         htx_api_key: str,
         htx_secret_key: str,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
@@ -51,7 +53,7 @@ class HtxExchange(ExchangePyBase):
         try:
             import os
             # Highest precedence: explicit ctor argument
-            cfg_id = htx_account_id if (isinstance(htx_account_id, (str, int)) and str(htx_account_id).strip()) else getattr(balance_asset_limit.get("htx", {}).get("htx_account_id", None))
+            cfg_id = htx_account_id if (isinstance(htx_account_id, (str, int)) and str(htx_account_id).strip()) else getattr(client_config_map, "htx_account_id", None)
             if isinstance(cfg_id, (str, int)) and str(cfg_id).strip():
                 self._account_id = str(cfg_id).strip()
                 self._account_id_from_config = True
