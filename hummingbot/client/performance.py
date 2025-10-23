@@ -295,6 +295,10 @@ class PerformanceMetrics:
         :param current_balances: current user account balance
         """
 
+        # DISABLED: Skip all P&L calculations, fee calculations, and oracle rate calls
+        # This surgically disables the entire P&L calculation pipeline at the source
+        return
+
         base, quote = split_hb_trading_pair(trading_pair)
         buys, sells = self._preprocess_trades_and_group_by_type(trades)
 

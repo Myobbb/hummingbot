@@ -580,8 +580,8 @@ class ExecutorOrchestrator:
         report = PerformanceReport()
         cached_report = self.cached_performance.get(controller_id, PerformanceReport())
 
-        # Start with cached values (from DB)
-        report.realized_pnl_quote = cached_report.realized_pnl_quote
+        # Start with cached values (from DB) - skip P&L since it's disabled
+        # report.realized_pnl_quote = cached_report.realized_pnl_quote  # DISABLED
         report.volume_traded = cached_report.volume_traded
         report.close_type_counts = cached_report.close_type_counts.copy() if cached_report.close_type_counts else {}
 
@@ -591,10 +591,12 @@ class ExecutorOrchestrator:
 
         for executor in active_executors:
             executor_info = executor.executor_info
-            if not executor_info.is_done:
-                report.unrealized_pnl_quote += executor_info.net_pnl_quote
-            else:
-                report.realized_pnl_quote += executor_info.net_pnl_quote
+            # DISABLED: Skip P&L accumulation since it will be forced to zero anyway
+            # if not executor_info.is_done:
+            #     report.unrealized_pnl_quote += executor_info.net_pnl_quote
+            # else:
+            #     report.realized_pnl_quote += executor_info.net_pnl_quote
+            if executor_info.is_done:
                 if executor_info.close_type:
                     report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type, 0) + 1
 
