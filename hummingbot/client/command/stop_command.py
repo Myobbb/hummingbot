@@ -39,14 +39,29 @@ class StopCommand:
         if not skip_order_cancellation:
             await self.trading_core.cancel_outstanding_orders()
 
-        # Stop clock if running to halt all iterators (connectors, etc.)
+        # Remove all connectors
+        connector_names = list(self.trading_core.connectors.keys())
+        for name in connector_names:
+            try:
+                self.trading_core.remove_connector(name)
+            except Exception as e:
+                self.logger().error(f"Error stopping connector {name}: {e}")
+
+        # Stop clock if running
         if self.trading_core._is_running:
             await self.trading_core.stop_clock()
 
-        # Stop markets recorder to stop background persistence processes
+        # Stop markets recorder
         if self.trading_core.markets_recorder:
             self.trading_core.markets_recorder.stop()
             self.trading_core.markets_recorder = None
 
-        # Preserve connectors and strategy metadata to avoid unloading on stop
-        self.notify("Strategy stopped.")
+        # Clear strategy references
+        self.trading_core.strategy = None
+        self.trading_core.strategy_name = None
+        self.trading_core.strategy_config_map = None
+        self.trading_core._strategy_file_name = None
+        self.trading_core._config_source = None
+        self.trading_core._config_data = None
+
+        self.notify("Hummingbot stopped.")
