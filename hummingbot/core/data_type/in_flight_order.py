@@ -313,8 +313,19 @@ class InFlightOrder:
         :param exchange: The exchange being used. If specified the logic will try to use the order book to get the rate
         :return: the cumulative fee paid for all partial fills in the specified token
         """
-        # Fees are globally disabled; avoid conversion and any rate lookups
-        return s_decimal_0
+        total_fee_in_token = Decimal("0")
+        try:
+            for trade_update in self.order_fills.values():
+                total_fee_in_token += trade_update.fee.fee_amount_in_token(
+                    trading_pair=self.trading_pair,
+                    price=trade_update.fill_price,
+                    order_amount=trade_update.fill_base_amount,
+                    token=token,
+                    exchange=exchange
+                )
+        except Exception as e:
+            self.logger().error(f"Error calculating fee paid in {token}: {e}")
+        return total_fee_in_token
 
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:
         """

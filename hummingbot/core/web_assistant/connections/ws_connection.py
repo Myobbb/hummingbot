@@ -18,9 +18,6 @@ class WSConnection:
         self._connected = False
         self._message_timeout: Optional[float] = None
         self._last_recv_time = 0
-        # Diagnostics
-        self._ws_url: Optional[str] = None
-        self._heartbeat: Optional[float] = None
 
     @property
     def last_recv_time(self) -> float:
@@ -39,9 +36,6 @@ class WSConnection:
         max_msg_size: Optional[int] = None
     ):
         self._ensure_not_connected()
-        # Track connection parameters for improved diagnostics on close
-        self._ws_url = ws_url
-        self._heartbeat = ping_timeout
         self._connection = await self._client_session.ws_connect(
             ws_url,
             headers=ws_headers,
@@ -57,9 +51,6 @@ class WSConnection:
             await self._connection.close()
         self._connection = None
         self._connected = False
-        # Clear diagnostics
-        self._ws_url = None
-        self._heartbeat = None
 
     async def send(self, request: WSRequest):
         self._ensure_connected()
@@ -121,23 +112,9 @@ class WSConnection:
             if self._connected:
                 close_code = self._connection.close_code
                 await self.disconnect()
-                # Enrich error with diagnostics to aid troubleshooting
-                try:
-                    last_age = (time.time() - self._last_recv_time) if self._last_recv_time else None
-                except Exception:
-                    last_age = None
-                diag_parts = [
-                    f"Close code = {close_code}",
-                    f"msg data: {msg.data}",
-                ]
-                if self._ws_url:
-                    diag_parts.append(f"url: {self._ws_url}")
-                if last_age is not None:
-                    diag_parts.append(f"last_recv_age: {int(last_age)}s")
-                if self._heartbeat is not None:
-                    diag_parts.append(f"heartbeat: {self._heartbeat}s")
-                detail = "; ".join(diag_parts)
-                raise ConnectionError(f"The WS connection was closed unexpectedly. {detail}")
+                raise ConnectionError(
+                    f"The WS connection was closed unexpectedly. Close code = {close_code} msg data: {msg.data}"
+                )
             msg = None
         return msg
 
