@@ -23,6 +23,8 @@ class UserBalances:
             init_params = conn_setting.conn_init_parameters(
                 trading_pairs=gateway_connector_trading_pairs(conn_setting.name),
                 api_keys=api_details,
+                balance_asset_limit=client_config_map.balance_asset_limit,
+                rate_limits_share_pct=client_config_map.rate_limits_share_pct,
             )
 
             # collect trading pairs from the gateway connector settings
