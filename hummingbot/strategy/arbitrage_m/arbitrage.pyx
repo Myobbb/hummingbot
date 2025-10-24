@@ -672,44 +672,67 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pass
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
-        """Check if ready for new orders - simplified"""
+        """Check if ready for new orders - optimized for market orders"""
         cdef:
             double time_elapsed
             string order_id_str
             object order_id
+            bint is_market_order
 
         # Check pending orders
         for market_tuple in market_tuples:
-            # Only check limit orders - market orders fill quickly and don't need tracking
-            # Cancellations are handled by the order_timeout logic
-            for orders in [self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {})]:
-                if orders:
-                    # Snapshot keys to avoid 'dictionary changed size during iteration' when tracker updates arrive
-                    for order_id in list(orders):
-                        order_id_str = self._to_cpp_str(order_id)
-                        
-                        # Track new orders
-                        if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
-                            self._order_timestamps[order_id_str] = self._current_timestamp
-                        
-                        time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
-                        
-                        # Check timeout
-                        if time_elapsed > self._order_timeout:
-                            self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
-                            self._order_timestamps.erase(order_id_str)
-                            
-                      
-                            
-                            # Force removal from tracker to unblock trading
-                            self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
-                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            continue  # Skip to next order, don't return False for this timed-out orde
-                        else:
-                            # Still waiting
-                            if time_elapsed > self._order_warning_delay:
-                                self.logger().warning(f"Order {order_id} pending for {time_elapsed:.2f}s")
-                            return False
+            # Check both limit and market orders, but handle market orders differently
+            # Market orders: only enforce timeout for cancelled orders, don't wait for fills
+            # Limit orders: wait for completion as normal
+            limit_orders = self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {})
+            market_orders = self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})
+
+            # Check limit orders first - these block trading
+            if limit_orders:
+                for order_id in list(limit_orders):
+                    order_id_str = self._to_cpp_str(order_id)
+
+                    # Track new orders
+                    if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
+                        self._order_timestamps[order_id_str] = self._current_timestamp
+
+                    time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
+
+                    # Check timeout
+                    if time_elapsed > self._order_timeout:
+                        self.logger().warning(f"Limit order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
+                        self._order_timestamps.erase(order_id_str)
+                        self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
+                        continue
+                    else:
+                        # Limit order still pending - block trading
+                        if time_elapsed > self._order_warning_delay:
+                            self.logger().warning(f"Limit order {order_id} pending for {time_elapsed:.2f}s")
+                        return False
+
+            # Check market orders - only enforce timeout, don't wait for fills
+            if market_orders:
+                for order_id in list(market_orders):
+                    order_id_str = self._to_cpp_str(order_id)
+
+                    # Track new orders
+                    if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
+                        self._order_timestamps[order_id_str] = self._current_timestamp
+
+                    time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
+
+                    # Only check for timeout - this catches cancelled orders
+                    if time_elapsed > self._order_timeout:
+                        self.logger().warning(f"Market order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
+                        self._order_timestamps.erase(order_id_str)
+                        self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                        # Enforce cooldown period for cancelled/timed-out orders
+                        try:
+                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
+                        except Exception:
+                            pass
+                        # Don't return False here - let cooldown check below handle blocking
+                    # For market orders under timeout: assume they're filling, don't block
             
             # Check cool-off period
             if market_tuple in self._last_trade_timestamps:
