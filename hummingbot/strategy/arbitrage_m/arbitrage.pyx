@@ -94,7 +94,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     def init_params(self,
                     market_pairs: List[ArbitrageMMarketPair],
                     min_profitability: Decimal,
-                    logging_options: int = OPTION_LOG_ORDER_COMPLETED,
+                    logging_options: int = OPTION_LOG_STATUS_REPORT,
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 10.0,
                     order_timeout: float = 600.0,
@@ -615,12 +615,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
-                self.logger().info(f"{order_type} order {order_id} completed in {time_elapsed:.2f}s")
+                self.logger().info(f"{market_pair_tuple[0].name}: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
                 self._order_timestamps.erase(order_id_str)
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(
-                    logging.INFO,
+                    logging.debug,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
             # If this was a buy-in buy order, remove its pending base from tracking
