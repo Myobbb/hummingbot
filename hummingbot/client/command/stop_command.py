@@ -22,10 +22,7 @@ class StopCommand:
         self.logger().info("stop command initiated.")
         self.notify("\nWinding down...")
 
-        # Restore App Nap on macOS.
-        if platform.system() == "Darwin":
-            import appnope
-            appnope.nap()
+
 
         # Handle script strategy specific cleanup first
         if self.trading_core.strategy and isinstance(self.trading_core.strategy, ScriptStrategyBase):
@@ -39,14 +36,11 @@ class StopCommand:
         if not skip_order_cancellation:
             await self.trading_core.cancel_outstanding_orders()
 
-        # Stop clock if running to halt all iterators (connectors, etc.)
-        if self.trading_core._is_running:
-            await self.trading_core.stop_clock()
+        # Keep clock running to preserve connector state (order books, user streams, etc.)
+        # This allows the strategy to be restarted with 'start' without re-importing
 
-        # Stop markets recorder to stop background persistence processes
-        if self.trading_core.markets_recorder:
-            self.trading_core.markets_recorder.stop()
-            self.trading_core.markets_recorder = None
+        # Note: We do NOT stop the clock or connectors here to allow quick restart
+        # The connectors stay connected and ready, enabling seamless restart
 
-        # Preserve connectors and strategy metadata to avoid unloading on stop
+        # Preserve strategy metadata and connectors to avoid unloading on stop
         self.notify("Strategy stopped.")
