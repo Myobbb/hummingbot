@@ -95,18 +95,54 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        diff_data: [str, Any] = raw_message["result"]
-        timestamp: float = (diff_data["t"]) * 1e-3
-        update_id: int = diff_data["u"]
+        result_payload = raw_message.get("result")
+        if isinstance(result_payload, list):
+            for item in result_payload:
+                await self._emit_single_obu_update(item, message_queue)
+        else:
+            await self._emit_single_obu_update(result_payload, message_queue)
 
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=diff_data["s"])
+    async def _emit_single_obu_update(self, diff_data: Dict[str, Any], message_queue: asyncio.Queue):
+        if not isinstance(diff_data, dict):
+            return
+        # timestamp in ms per Gate, default to now if absent
+        try:
+            t_val = diff_data.get("t")
+            t_ms = int(t_val) if t_val is not None else int(self._time() * 1e3)
+        except Exception:
+            t_ms = int(self._time() * 1e3)
+        timestamp: float = t_ms * 1e-3
+        try:
+            update_id: int = int(diff_data.get("u", 0))
+        except Exception:
+            update_id = 0
+
+        # For Order Book V2, "s" can be a stream identifier like "ob.BTC_USDT.50".
+        stream_name = str(diff_data.get("s", ""))
+        ex_symbol = stream_name.split(".")[1] if "." in stream_name else stream_name
+        if not ex_symbol:
+            return
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+
+        # Accept both v2 incremental and potential full snapshot variations
+        bids = diff_data.get("b") or diff_data.get("bids") or []
+        asks = diff_data.get("a") or diff_data.get("asks") or []
+
+        # Some messages might be heartbeat/keepalive without book deltas
+        if not bids and not asks and update_id == 0:
+            return
+
+        try:
+            first_update_id = int(diff_data.get("U", update_id))
+        except Exception:
+            first_update_id = update_id
 
         order_book_message_content = {
             "trading_pair": trading_pair,
             "update_id": update_id,
-            "first_update_id": diff_data["U"],
-            "bids": diff_data["b"],
-            "asks": diff_data["a"],
+            "first_update_id": first_update_id,
+            "bids": bids,
+            "asks": asks,
         }
         diff_message: OrderBookMessage = OrderBookMessage(
             OrderBookMessageType.DIFF,
@@ -137,7 +173,7 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "time": int(self._time()),
                     "channel": CONSTANTS.ORDERS_UPDATE_ENDPOINT_NAME,
                     "event": "subscribe",
-                    "payload": [symbol, "100ms"]
+                    "payload": [f"ob.{symbol}.{CONSTANTS.ORDER_BOOK_V2_LEVEL}"]
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
 
@@ -145,6 +181,16 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await ws.send(subscribe_orderbook_request)
 
                 self.logger().info("Subscribed to public order book and trade channels...")
+            # Kick off periodic application ping to keep the connection active
+            try:
+                await ws.send(WSJSONRequest(payload={
+                    "time": int(self._time()),
+                    "channel": "spot.ping",
+                    "event": "",
+                    "payload": [],
+                }))
+            except Exception:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -152,6 +198,9 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        # Ignore application-level pong to avoid misrouting
+        if event_message.get("channel") == CONSTANTS.PONG_CHANNEL_NAME:
+            return ""
         channel = ""
         if event_message.get("error") is not None:
             err_msg = event_message.get("error", {}).get("message", event_message.get("error"))
