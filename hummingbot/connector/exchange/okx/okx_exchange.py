@@ -34,8 +34,7 @@ class OkxExchange(ExchangePyBase):
                  trading_required: bool = True,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
-                 okx_registration_sub_domain: str = "www",
-                 **kwargs):
+                 okx_registration_sub_domain: str = "www"):
         """
         :param okx_registration_sub_domain: The subdomain to use - options are "www" (default), "app" (US users), or "my" (EEA users)
                               See: https://github.com/ccxt/ccxt/issues/24601
