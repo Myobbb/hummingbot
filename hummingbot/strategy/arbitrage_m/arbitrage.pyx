@@ -158,6 +158,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Clear order tracking
         self._order_timestamps.clear()
+        self._completed_orders.clear()
 
         # Buy-in params/state
         self._buy_in_enabled = buy_in_enabled
@@ -588,7 +589,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
 
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
-        """Unified order completion handler"""
+        """Unified order completion handler""" #only processes first fill per order
         cdef:
             str order_id = order_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
@@ -599,8 +600,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if market_pair_tuple is None:
             #self.logger().warning(f"{order_type} order {order_id} completed but market pair not found")
             return
+
+        # Check if we've already processed this order's completion
+        # This prevents duplicate logging for partial fills
+        if self._completed_orders.find(order_id_str) != self._completed_orders.end():
+            # Already processed this order, skip
+            return
             
         try:
+            # Mark this order as completed (first fill counts as completed)
+            self._completed_orders.insert(order_id_str) #only processes first fill per order
+            
             self._last_trade_timestamps[market_pair_tuple] = self._current_timestamp
             
             # Check completion time
@@ -1454,18 +1464,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double timestamp
             
         # Only clean up if we have orders to check
-        if self._order_timestamps.size() == 0:
+        if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
             return
             
-        # Find old entries
+        # Find old entries in order timestamps
         for order_id_str, timestamp in self._order_timestamps:
             if timestamp < cutoff:
                 to_remove.append(order_id_str)
         
-        # Remove old entries
+        # Remove old entries #from both tracking structures
         for order_id_str in to_remove:
             self._order_timestamps.erase(order_id_str)
-            # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount
+            # Also remove from completed orders set
+            self._completed_orders.erase(order_id_str)
+
+            # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount 
             try:
                 oid = order_id_str.decode('utf-8')
             except Exception:

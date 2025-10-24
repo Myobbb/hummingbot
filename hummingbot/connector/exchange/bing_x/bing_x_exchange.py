@@ -263,11 +263,11 @@ class BingXExchange(ExchangePyBase):
             is_auth_required=True,
             trading_pair=trading_pair,
         )
-        self.logger().info(f"Bing_x order_result: {order_result}")
+        #self.logger().info(f"Bing_x order_result: {order_result}")
         if "data" not in order_result:
             self.logger().error(f"Bing_x API error response: {order_result}")
             raise ValueError(f"Bing_x rejected order: {order_result}")
-            
+
         o_id = str(order_result["data"]["orderId"])
         transact_time = int(order_result["data"]["transactTime"]) * 1e-3
         return (o_id, transact_time)
