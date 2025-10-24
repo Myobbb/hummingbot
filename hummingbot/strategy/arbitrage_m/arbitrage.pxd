@@ -32,7 +32,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         bint _all_markets_ready
         double _last_timestamp
         double _status_debounce_until
-        dict _last_trade_timestamps
+        double _last_global_trade_timestamp
         dict _last_failure_timestamps
         double _last_cleanup_timestamp
         double _last_conv_rates_logged

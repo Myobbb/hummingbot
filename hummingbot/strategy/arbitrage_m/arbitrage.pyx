@@ -66,7 +66,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     def __cinit__(self):
         # Defensive defaults so attributes exist even if init_params isn't called yet
         try:
-            self._last_trade_timestamps = {}
+            self._last_global_trade_timestamp = 0.0
         except Exception:
             pass
         try:
@@ -134,7 +134,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._all_markets_ready = False
         self._last_timestamp = 0
         self._status_debounce_until = 0
-        self._last_trade_timestamps = {}
+        self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
@@ -611,7 +611,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str) #only processes first fill per order
             
-            self._last_trade_timestamps[market_pair_tuple] = self._current_timestamp
+            self._last_global_trade_timestamp = self._current_timestamp
             
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
@@ -682,55 +682,46 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pass
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
-        """Check if ready for new orders - simplified"""
+        """Check if ready for new orders - global delay across all markets"""
         cdef:
             double time_elapsed
+            double time_left
             string order_id_str
             object order_id
-            bint is_market_order
             
-        # Check pending orders
+        # Global cooldown check - applies to ALL market pairs
+        if self._last_global_trade_timestamp > 0:
+            time_left = (self._last_global_trade_timestamp + 
+                    self._next_trade_delay - self._current_timestamp)
+            if time_left > 0:
+                return False
+        
+        # Check pending orders for timeout (not for blocking new trades)
         for market_tuple in market_tuples:
-            # Market orders: only enforce timeout for cancelled orders, don't wait for fills
-            # Limit orders: wait for completion as normal
-
             market_orders = self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})
-
-
-            # Check market orders - only enforce timeout, don't wait for fills
+            
             if market_orders:
                 for order_id in list(market_orders):
                     order_id_str = self._to_cpp_str(order_id)
-
+                    
                     # Track new orders
                     if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
                         self._order_timestamps[order_id_str] = self._current_timestamp
-
+                    
                     time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
-
+                    
                     # Only check for timeout - this catches cancelled orders
                     if time_elapsed > self._order_timeout:
                         self.logger().warning(f"Market order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
                         self._order_timestamps.erase(order_id_str)
                         self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                        # Enforce cooldown period for cancelled/timed-out orders
-                        try:
-                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
-                        except Exception:
-                            pass
-                        # Don't return False here - let cooldown check below handle blocking
-                    # For market orders under timeout: assume they're filling, don't block
+                        # Enforce global cooldown for cancelled/timed-out orders
+                        self._last_global_trade_timestamp = self._current_timestamp
             
-            # Check cool-off period
-            if market_tuple in self._last_trade_timestamps:
-                time_left = (self._last_trade_timestamps[market_tuple] + 
-                           self._next_trade_delay - self._current_timestamp)
-                if time_left > 0:
-                    return False
             # Failure cooldown window (treat placement errors like cancels/timeouts)
             if market_tuple in self._last_failure_timestamps:
                 time_left = (self._last_failure_timestamps[market_tuple] +
-                           self._order_timeout - self._current_timestamp)
+                        self._order_timeout - self._current_timestamp)
                 if time_left > 0:
                     return False
                 else:
