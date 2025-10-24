@@ -379,26 +379,40 @@ class MarketsRecorder:
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
-                order_record: Order = Order(id=evt.order_id,
-                                            config_file_path=self._config_file_path,
-                                            strategy=self._strategy_name,
-                                            market=market.display_name,
-                                            symbol=evt.trading_pair,
-                                            base_asset=base_asset,
-                                            quote_asset=quote_asset,
-                                            creation_timestamp=timestamp,
-                                            order_type=evt.type.name,
-                                            amount=Decimal(evt.amount),
-                                            leverage=evt.leverage if evt.leverage else 1,
-                                            price=Decimal(evt.price) if evt.price == evt.price else Decimal(0),
-                                            position=evt.position if evt.position else PositionAction.NIL.value,
-                                            last_status=event_type.name,
-                                            last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id)
+                # Check if order already exists to prevent UNIQUE constraint violation
+                existing_order: Optional[Order] = session.query(Order).filter(Order.id == evt.order_id).one_or_none()
+
+                if existing_order is None:
+                    # Order doesn't exist, create new order record
+                    order_record: Order = Order(id=evt.order_id,
+                                                config_file_path=self._config_file_path,
+                                                strategy=self._strategy_name,
+                                                market=market.display_name,
+                                                symbol=evt.trading_pair,
+                                                base_asset=base_asset,
+                                                quote_asset=quote_asset,
+                                                creation_timestamp=timestamp,
+                                                order_type=evt.type.name,
+                                                amount=Decimal(evt.amount),
+                                                leverage=evt.leverage if evt.leverage else 1,
+                                                price=Decimal(evt.price) if evt.price == evt.price else Decimal(0),
+                                                position=evt.position if evt.position else PositionAction.NIL.value,
+                                                last_status=event_type.name,
+                                                last_update_timestamp=timestamp,
+                                                exchange_order_id=evt.exchange_order_id)
+                    session.add(order_record)
+                else:
+                    # Order exists, update relevant fields if needed
+                    order_record = existing_order
+                    order_record.last_status = event_type.name
+                    order_record.last_update_timestamp = timestamp
+                    # Update exchange_order_id if it wasn't set before
+                    if order_record.exchange_order_id is None and evt.exchange_order_id:
+                        order_record.exchange_order_id = evt.exchange_order_id
+
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
                                                         status=event_type.name)
-                session.add(order_record)
                 session.add(order_status)
                 market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
                 self.save_market_states(self._config_file_path, market, session=session)
