@@ -611,7 +611,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str) #only processes first fill per order
             
-            self._last_global_trade_timestamp = self._current_timestamp
             
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
@@ -942,16 +941,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Track orders
             buy_id_str = self._to_cpp_str(buy_order_id)
             sell_id_str = self._to_cpp_str(sell_order_id)
+
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
-            
-            # Log order placement latency for monitoring
-            placement_latency = self._current_timestamp - order_start_time
-            if placement_latency > 0.1:  # Log if latency exceeds 100ms
-                self.logger().warning(
-                    f"High order placement latency detected: {placement_latency:.3f}s. "
-                    f"Consider colocating servers or optimizing network connectivity.")
 
+            self._last_global_trade_timestamp = order_start_time
+          
+            
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                               object buy_market_tuple,
                                                               object sell_market_tuple,
@@ -1332,6 +1328,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
+        self._last_global_trade_timestamp = self._current_timestamp
         # Track pending base to avoid stale underestimation until fills settle
         try:
             self._pending_buyin_orders[buy_order_id] = (asset_key, float(quantized_amount))
