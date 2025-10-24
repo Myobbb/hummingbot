@@ -30,10 +30,10 @@ class OkxExchange(ExchangePyBase):
                  okx_api_key: str,
                  okx_secret_key: str,
                  okx_passphrase: str,
-                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
-                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  okx_registration_sub_domain: str = "www"):
         """
         :param okx_registration_sub_domain: The subdomain to use - options are "www" (default), "app" (US users), or "my" (EEA users)
