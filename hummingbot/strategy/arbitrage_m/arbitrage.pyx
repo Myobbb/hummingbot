@@ -677,12 +677,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double time_elapsed
             string order_id_str
             object order_id
-            
+
         # Check pending orders
         for market_tuple in market_tuples:
-            # Check both limit and market orders
-            for orders in [self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {}),
-                          self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})]:
+            # Only check limit orders - market orders fill quickly and don't need tracking
+            # Cancellations are handled by the order_timeout logic
+            for orders in [self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {})]:
                 if orders:
                     # Snapshot keys to avoid 'dictionary changed size during iteration' when tracker updates arrive
                     for order_id in list(orders):
