@@ -155,9 +155,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._last_rate_update = 0
         
         
-        
+
         # Clear order tracking
         self._order_timestamps.clear()
+        self._completed_orders.clear()
 
         # Buy-in params/state
         self._buy_in_enabled = buy_in_enabled
@@ -588,27 +589,36 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
 
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
-        """Unified order completion handler"""
+        """Unified order completion handler - only processes first fill per order"""
         cdef:
             str order_id = order_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
             double time_elapsed
             string order_id_str = self._to_cpp_str(order_id)
             str order_type = "Buy" if is_buy else "Sell"
-            
+
         if market_pair_tuple is None:
             #self.logger().warning(f"{order_type} order {order_id} completed but market pair not found")
             return
-            
+
+        # Check if we've already processed this order's completion
+        # This prevents duplicate logging for partial fills
+        if self._completed_orders.find(order_id_str) != self._completed_orders.end():
+            # Already processed this order, skip
+            return
+
         try:
+            # Mark this order as completed (first fill counts as completed)
+            self._completed_orders.insert(order_id_str)
+
             self._last_trade_timestamps[market_pair_tuple] = self._current_timestamp
-            
+
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
                 self.logger().info(f"{order_type} order {order_id} completed in {time_elapsed:.2f}s")
                 self._order_timestamps.erase(order_id_str)
-            
+
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(
                     logging.INFO,
@@ -625,7 +635,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self._pending_buyin_by_asset.pop(asset_key, None)
                 except Exception:
                     pass
-                
+
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
@@ -1452,19 +1462,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
             list to_remove = []
             string order_id_str
             double timestamp
-            
+
         # Only clean up if we have orders to check
-        if self._order_timestamps.size() == 0:
+        if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
             return
-            
-        # Find old entries
+
+        # Find old entries in order timestamps
         for order_id_str, timestamp in self._order_timestamps:
             if timestamp < cutoff:
                 to_remove.append(order_id_str)
-        
-        # Remove old entries
+
+        # Remove old entries from both tracking structures
         for order_id_str in to_remove:
             self._order_timestamps.erase(order_id_str)
+            # Also remove from completed orders set
+            self._completed_orders.erase(order_id_str)
             # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount
             try:
                 oid = order_id_str.decode('utf-8')
@@ -1480,7 +1492,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self._pending_buyin_by_asset.pop(asset_key, None)
                 except Exception:
                     pass
-        
+
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
             self.logger().warning(f"Tracked orders exceed limit: {self._order_timestamps.size()}")

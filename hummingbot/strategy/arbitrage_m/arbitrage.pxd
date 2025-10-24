@@ -4,6 +4,7 @@ from libc.stdint cimport int64_t
 from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
 from libcpp.pair cimport pair
+from libcpp.set cimport set as cpp_set
 
 cdef class ArbitrageMStrategy(StrategyBase):
     """
@@ -55,9 +56,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         dict _pending_buyin_by_asset
         dict _pending_buyin_orders
         
-        
+
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
+        # Track completed orders to avoid duplicate completion logging
+        cpp_set[string] _completed_orders
         # Cached taker order types per market to avoid repeated Python calls
         dict _taker_order_type_by_market
 
