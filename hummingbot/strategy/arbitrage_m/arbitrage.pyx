@@ -691,7 +691,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         """Check ALL pending orders for timeouts, regardless of which markets are being considered for trading"""
         cdef:
             double time_elapsed
-            double timeout_threshold  # ← MOVED HERE
+            double timeout_threshold  
             string order_id_str
             object order_id
             object market_tuple
@@ -717,7 +717,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
 
                     # Determine timeout based on whether order was pre-marked as complete (market order)
-                    cdef double timeout_threshold
+                    
                     if self._completed_orders.find(order_id_str) != self._completed_orders.end():
                         # Market order: short timeout (10s) just to catch cancellations
                         timeout_threshold = 10.0
