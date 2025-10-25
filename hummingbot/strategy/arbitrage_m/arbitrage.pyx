@@ -652,14 +652,32 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if market_pair is None:
             return
         
-        # Remove virtual completion for cancelled market orders
+        # Full cleanup for cancelled orders (same as timeout handler)
+        self._order_timestamps.erase(order_id_str)
         self._completed_orders.erase(order_id_str)
+        
+        # Stop tracking the order
+        self._sb_order_tracker.c_stop_tracking_market_order(market_pair, order_id)
+        
+        # Clean up pending buy-in tracking if applicable
+        try:
+            pend = self._pending_buyin_orders.pop(order_id, None)
+            if pend is not None:
+                asset_key, amt = pend
+                self._pending_buyin_by_asset[asset_key] = max(
+                    0.0, 
+                    float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
+                )
+                if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                    self._pending_buyin_by_asset.pop(asset_key, None)
+        except Exception:
+            pass
         
         # Enforce cooldown on cancellations (treat like failures)
         self._last_global_trade_timestamp = self._current_timestamp
         
         self.logger().warning(
-            f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED")
+            f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -1376,6 +1394,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
         self._last_global_trade_timestamp = self._current_timestamp
+
         # Track pending base to avoid stale underestimation until fills settle
         try:
             self._pending_buyin_orders[buy_order_id] = (asset_key, float(quantized_amount))
@@ -1383,6 +1402,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         except Exception:
             pass
 
+        # MARKET ORDERS: Assume instant fill - only track briefly to catch cancellations
+        if order_type == OrderType.MARKET:
+            self._completed_orders.insert(buy_id_str)
+            self.logger().debug(f"{market.name}: Buy-in order {buy_order_id} treated as filled (market order)")
+            
         # Check if target reached after placing (aggregate across all markets)
         # Use the same reliable bid lookup as above
         last_bid = self.c_get_reference_bid_for_asset(asset_key)
