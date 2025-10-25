@@ -353,6 +353,7 @@ class CreateCommand:
                 "bitget": "bg",
                 "bitmart": "bm",
                 'okx': 'okx',
+                'bing_x': 'bing',
             }
             return m.get((connector or "").lower())
 
