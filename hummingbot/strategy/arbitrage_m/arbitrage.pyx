@@ -674,7 +674,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pass
         
         # Enforce cooldown on cancellations (treat like failures)
-        self._last_global_trade_timestamp = self._current_timestamp
+        self._last_failure_timestamps[market_pair] = self._current_timestamp
         
         self.logger().warning(
             f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
@@ -1406,7 +1406,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if order_type == OrderType.MARKET:
             self._completed_orders.insert(buy_id_str)
             self.logger().debug(f"{market.name}: Buy-in order {buy_order_id} treated as filled (market order)")
-            
+
         # Check if target reached after placing (aggregate across all markets)
         # Use the same reliable bid lookup as above
         last_bid = self.c_get_reference_bid_for_asset(asset_key)
