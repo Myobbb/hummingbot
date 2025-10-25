@@ -691,6 +691,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         """Check ALL pending orders for timeouts, regardless of which markets are being considered for trading"""
         cdef:
             double time_elapsed
+            double timeout_threshold  # ← MOVED HERE
             string order_id_str
             object order_id
             object market_tuple
