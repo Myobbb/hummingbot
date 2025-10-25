@@ -117,8 +117,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
     cdef c_did_fail_order(self, object order_failed_event)
     cdef c_did_complete_buy_order(self, object buy_order_completed_event)
     cdef c_did_complete_sell_order(self, object sell_order_completed_event)
+    cdef c_did_cancel_order_tracker(self, object order_cancelled_event)
     
     # Maintenance
+    cdef void c_check_all_order_timeouts(self)
     cdef void c_cleanup_old_orders(self)
 
 # Single optimized function for finding profitable orders
