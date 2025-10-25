@@ -608,12 +608,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Check if we've already processed this order's completion
         # This prevents duplicate logging for partial fills
         if self._completed_orders.find(order_id_str) != self._completed_orders.end():
-            # Already processed this order, skip
+            # Already processed - this is normal for market orders (late exchange confirmation)
             return
             
         try:
             # Mark this order as completed (first fill counts as completed)
-            self._completed_orders.insert(order_id_str) #only processes first fill per order
+            self._completed_orders.insert(order_id_str)
             
             
             # Check completion time
@@ -643,20 +643,23 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
     cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
-        """Keep MARKET orders tracked after cancel to enforce order_timeout buffer; stop LIMITs as usual."""
+        """Handle cancelled orders - critical for catching failed market orders."""
         cdef:
             str order_id = order_cancelled_event.order_id
+            string order_id_str = self._to_cpp_str(order_id)
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
-            object maybe_market_order
 
         if market_pair is None:
             return
-        # If this is a MARKET order, keep it tracked so c_ready_for_new_orders enforces _order_timeout buffer.
-        # LIMIT orders are stopped immediately (not used in this strategy but kept for completeness).
-        maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
-        if maybe_market_order is not None:
-            return
-        self.c_stop_tracking_limit_order(market_pair, order_id)
+        
+        # Remove virtual completion for cancelled market orders
+        self._completed_orders.erase(order_id_str)
+        
+        # Enforce cooldown on cancellations (treat like failures)
+        self._last_global_trade_timestamp = self._current_timestamp
+        
+        self.logger().warning(
+            f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -712,13 +715,29 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
                     time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
 
-                    # Check for timeout - this catches cancelled orders
-                    if time_elapsed > self._order_timeout:
-                        self.logger().warning(f"Market order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
-                        self._order_timestamps.erase(order_id_str)
-                        self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                        # Enforce global cooldown for cancelled/timed-out orders
-                        self._last_global_trade_timestamp = self._current_timestamp
+                    # Determine timeout based on whether order was pre-marked as complete (market order)
+                    cdef double timeout_threshold
+                    if self._completed_orders.find(order_id_str) != self._completed_orders.end():
+                        # Market order: short timeout (10s) just to catch cancellations
+                        timeout_threshold = 10.0
+                    else:
+                        # Limit order or unconfirmed: full timeout
+                        timeout_threshold = self._order_timeout
+
+                    # Check for timeout
+                    if time_elapsed > timeout_threshold:
+                        if timeout_threshold <= 10.0:
+                            # Market order cleanup - not a real timeout, just housekeeping
+                            self._order_timestamps.erase(order_id_str)
+                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                        else:
+                            # Actual timeout - log warning and enforce cooldown
+                            self.logger().warning(f"Order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
+                            self._order_timestamps.erase(order_id_str)
+                            self._completed_orders.erase(order_id_str)  # Remove from completed if it was there
+                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                            # Enforce global cooldown for cancelled/timed-out orders
+                            self._last_global_trade_timestamp = self._current_timestamp
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """Check if ready for new orders - global delay across all markets"""
@@ -962,6 +981,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._order_timestamps[sell_id_str] = order_start_time
 
             self._last_global_trade_timestamp = order_start_time
+
+            if buy_order_type == OrderType.MARKET:
+                self._completed_orders.insert(buy_id_str)
+                self.logger().debug(f"{buy_market.name}: Buy order {buy_order_id} treated as filled (market order)")
+                
+            if sell_order_type == OrderType.MARKET:
+                self._completed_orders.insert(sell_id_str)
+                self.logger().debug(f"{sell_market.name}: Sell order {sell_order_id} treated as filled (market order)")
+
+
+            
           
             
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
