@@ -39,11 +39,11 @@ class BingXExchange(ExchangePyBase):
     # Short fallback window to auto-finalize MARKET orders in REST polling if WS finalization missed (seconds)
     FILLED_FALLBACK_TIMEOUT = 2.0
     # Minimum interval between REST balance snapshots; rely on WS in-between
-    BALANCE_REST_MIN_INTERVAL = 1200.0
+    BALANCE_REST_MIN_INTERVAL = 180.0
     # Consider WS balance fresh for this window; skip REST fetch while fresh
-    WS_BALANCE_FRESHNESS_WINDOW = 600.0
+    WS_BALANCE_FRESHNESS_WINDOW = 60.0
     # Fallback backoff when exchange returns 100410 without unlock timestamp (seconds)
-    RATE_LIMIT_FALLBACK_BACKOFF_SEC = 1800.0
+    RATE_LIMIT_FALLBACK_BACKOFF_SEC = 600.0
 
     def __init__(self,
        
