@@ -36,6 +36,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  throttler: Optional[AsyncThrottler] = None,
                  time_synchronizer: Optional[TimeSynchronizer] = None):
+                 
         super().__init__(trading_pairs)
         self._connector = connector
         self._domain = domain
@@ -57,6 +58,53 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Simplified state tracking - only what we need
         self._last_update_ids: Dict[str, int] = {}
         self._snapshot_output_queue: Optional[asyncio.Queue] = None
+
+        self._level_first_seen: Dict[str, float] = {}  # key: "pair_side_price" -> timestamp
+        self._enable_anti_spoofing = CONSTANTS.ENABLE_ANTI_SPOOFING
+
+    def _is_level_stable(self, price: str, side: str, trading_pair: str, current_time: float) -> bool:
+        """Check if price level has existed for minimum duration (500ms = ~2 snapshots)"""
+        if not self._enable_anti_spoofing:
+            return True
+            
+        key = f"{trading_pair}_{side}_{price}"
+        
+        if key not in self._level_first_seen:
+            self._level_first_seen[key] = current_time
+            return False
+        
+        time_existed_ms = (current_time - self._level_first_seen[key]) * 1000
+        return time_existed_ms >= CONSTANTS.SPOOFING_MIN_CONFIRMATION_TIME_MS
+
+    def _filter_stable_levels(self, 
+                             bids: List[List[str]], 
+                             asks: List[List[str]],
+                             trading_pair: str,
+                             timestamp: float) -> tuple:
+        """Filter out levels that haven't persisted long enough"""
+        if not self._enable_anti_spoofing:
+            return bids, asks
+        
+        # Clean up stale entries (levels not seen in last 5 seconds)
+        cutoff_time = timestamp - 5.0
+        self._level_first_seen = {
+            k: v for k, v in self._level_first_seen.items() 
+            if v > cutoff_time
+        }
+        
+        stable_bids = [
+            [price, qty] for price, qty in bids 
+            if self._is_level_stable(price, "bid", trading_pair, timestamp)
+        ]
+        
+        stable_asks = [
+            [price, qty] for price, qty in asks 
+            if self._is_level_stable(price, "ask", trading_pair, timestamp)
+        ]
+        
+        return stable_bids, stable_asks
+    
+
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -262,6 +310,25 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Extract timestamp once
             ts_sec = self._extract_timestamp(json_msg, self._time())
             
+            # SURGICAL: Filter spoof levels before creating message
+            if self._enable_anti_spoofing and "data" in json_msg:
+                data_node = json_msg["data"]
+                raw_bids = data_node.get("bids") or data_node.get("b") or []
+                raw_asks = data_node.get("asks") or data_node.get("a") or []
+                
+                normalized_bids = BingXOrderBook._normalize_levels(raw_bids)
+                normalized_asks = BingXOrderBook._normalize_levels(raw_asks)
+                
+                # Filter for stable levels only
+                stable_bids, stable_asks = self._filter_stable_levels(
+                    normalized_bids, normalized_asks, trading_pair, ts_sec
+                )
+                
+                # Replace in message
+                json_msg["data"]["bids"] = stable_bids
+                json_msg["data"]["asks"] = stable_asks
+            
+            # Original logic preserved: create and queue message
             order_book_message = BingXOrderBook.snapshot_message_from_exchange_websocket(
                 json_msg, ts_sec, {"trading_pair": trading_pair}
             )
@@ -280,14 +347,32 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Extract timestamp once
                 ts_sec = self._extract_timestamp(json_msg, self._time())
                 
-                # Create metadata dict once (reused in diff_message_from_exchange)
+                # SURGICAL: Filter spoof levels before creating message
+                if self._enable_anti_spoofing and "data" in json_msg:
+                    data_node = json_msg["data"]
+                    raw_bids = data_node.get("bids") or data_node.get("b") or []
+                    raw_asks = data_node.get("asks") or data_node.get("a") or []
+                    
+                    normalized_bids = BingXOrderBook._normalize_levels(raw_bids)
+                    normalized_asks = BingXOrderBook._normalize_levels(raw_asks)
+                    
+                    # Filter for stable levels only
+                    stable_bids, stable_asks = self._filter_stable_levels(
+                        normalized_bids, normalized_asks, trading_pair, ts_sec
+                    )
+                    
+                    # Replace in message
+                    json_msg["data"]["bids"] = stable_bids
+                    json_msg["data"]["asks"] = stable_asks
+                
+                # CRITICAL: Create metadata dict once (reused in diff_message_from_exchange)
                 metadata = {"trading_pair": trading_pair}
                 diff_message = BingXOrderBook.diff_message_from_exchange(
                     json_msg, ts_sec, metadata
                 )
                 output.put_nowait(diff_message)
 
-                # Drain queue without blocking
+                # Drain queue without blocking (original batch logic)
                 while True:
                     try:
                         json_msg = message_queue.get_nowait()
@@ -296,8 +381,24 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     
                     trading_pair = json_msg["symbol"]
                     ts_sec = self._extract_timestamp(json_msg, self._time())
-                    metadata = {"trading_pair": trading_pair}
                     
+                    # Apply same filtering
+                    if self._enable_anti_spoofing and "data" in json_msg:
+                        data_node = json_msg["data"]
+                        raw_bids = data_node.get("bids") or data_node.get("b") or []
+                        raw_asks = data_node.get("asks") or data_node.get("a") or []
+                        
+                        normalized_bids = BingXOrderBook._normalize_levels(raw_bids)
+                        normalized_asks = BingXOrderBook._normalize_levels(raw_asks)
+                        
+                        stable_bids, stable_asks = self._filter_stable_levels(
+                            normalized_bids, normalized_asks, trading_pair, ts_sec
+                        )
+                        
+                        json_msg["data"]["bids"] = stable_bids
+                        json_msg["data"]["asks"] = stable_asks
+                    
+                    metadata = {"trading_pair": trading_pair}
                     diff_message = BingXOrderBook.diff_message_from_exchange(
                         json_msg, ts_sec, metadata
                     )
@@ -307,7 +408,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception:
                 self.logger().error("Diff processing error", exc_info=True)
-
+                
     async def _trigger_immediate_recovery(self, trading_pair: str):
         """Clear state and fetch REST snapshot"""
         self._last_update_ids.pop(trading_pair, None)
