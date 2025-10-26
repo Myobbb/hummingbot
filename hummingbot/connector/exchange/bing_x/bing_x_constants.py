@@ -120,7 +120,7 @@ RATE_LIMITS = {
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
 
     # Hard cap balance endpoint globally to 1 request per 30 seconds
-    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=1, time_interval=30,
+    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=1, time_interval=3,
               linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
     RateLimit(limit_id=MY_TRADES_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,

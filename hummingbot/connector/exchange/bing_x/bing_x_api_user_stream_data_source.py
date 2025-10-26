@@ -247,7 +247,9 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         self._last_listen_key_ping_ts = int(time.time())
                 else:
                     # Sleep shorter to ensure timely renewal regardless of drift
-                    await self._sleep(max(5, self.LISTEN_KEY_KEEP_ALIVE_INTERVAL // 6))
+                    next_renewal = self._last_listen_key_ping_ts + self.LISTEN_KEY_KEEP_ALIVE_INTERVAL
+                    sleep_duration = max(5, next_renewal - int(time.time()))
+                    await self._sleep(min(sleep_duration, 300))  # Cap at 5 minutes
         finally:
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
