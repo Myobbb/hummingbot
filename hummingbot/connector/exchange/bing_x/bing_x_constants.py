@@ -143,4 +143,4 @@ BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
 SOURCE_KEY = 'Hummingbot'
 
 ENABLE_ANTI_SPOOFING = True  
-SPOOFING_MIN_CONFIRMATION_TIME_MS = 500  # Must exist for 500ms (~2 snapshots at 300ms interval)
+SPOOFING_MIN_CONFIRMATION_TIME_MS = 601
