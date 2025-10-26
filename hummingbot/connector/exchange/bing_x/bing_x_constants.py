@@ -142,5 +142,5 @@ SYMBOL_PATH_URL = "/spot/v1/common/symbols" #should remove and stop using?
 BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
 SOURCE_KEY = 'Hummingbot'
 
-ENABLE_ANTI_SPOOFING = True  
+ENABLE_ANTI_SPOOFING = False  
 SPOOFING_MIN_CONFIRMATION_TIME_MS = 601
