@@ -97,7 +97,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     logging_options: int = OPTION_LOG_STATUS_REPORT,
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 2.0,
-                    order_timeout: float = 600.0,
+                    order_timeout: float = 300.0,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
                     secondary_to_primary_quote_conversion_rate: Decimal = Decimal("1"),
@@ -1314,8 +1314,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Require quote balance to spend and a minimal edge
         if quote_bal <= 0:
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: no quote balance to spend")
             return False
 
         res = self.c_find_best_buyin_amount(
@@ -1358,8 +1356,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     buy_market_tuple.trading_pair,
                     Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))))
         if quantized_amount <= Decimal("0"):
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: quantized amount is zero after affordability check")
             return False
 
         # Enforce minimum notional like normal arbitrage orders
@@ -1368,8 +1364,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
             if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
                 return False
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in skipped on {pair_str}: order notional {volume_usd:.6f} < min {self._min_order_usd:.6f}")
             return False
 
         try:
