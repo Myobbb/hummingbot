@@ -141,6 +141,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._last_recv_time = self._time()
         async for ws_response in ws.iter_messages():
             data = utils.decompress_ws_message(ws_response.data)
+
+            # Handle ping/pong heartbeat
+            if data.get("ping"):
+                pong_payload = {
+                    "pong": data.get("ping"),
+                    "time": data.get("time")
+                }
+                pong_request = WSJSONRequest(payload=pong_payload)
+                await ws.send(request=pong_request)
+                continue  # Don't process ping as a data message
+
+            # Process actual data messages
             if data.get("e") == "ACCOUNT_UPDATE":
                 output.put_nowait(data)
             elif (data.get("dataType") == "spot.executionReport"):
@@ -187,7 +199,11 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 return_err=True,
                 throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
-            self.logger().info(data)
+            # Check if response indicates the listen key was not found
+            if isinstance(data, dict) and data.get("code") == 100204:
+                self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
+                return False
+            self.logger().info(f"Listen key renewed successfully: {data}")
 
         except asyncio.CancelledError:
             raise
@@ -210,7 +226,11 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
                     success: bool = await self._ping_listen_key()
                     if not success:
-                        self.logger().error("Error occurred renewing listen key ...")
+                        self.logger().error("Error occurred renewing listen key, will create a new one...")
+                        # Invalidate current key to force creation of new one
+                        self._current_listen_key = None
+                        self._listen_key_initialized_event.clear()
+                        # Break to trigger reconnection
                         break
                     else:
                         self.logger().info(f"Refreshed listen key {self._current_listen_key}.")

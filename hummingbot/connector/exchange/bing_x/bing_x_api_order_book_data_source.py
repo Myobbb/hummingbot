@@ -201,9 +201,12 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # self.logger().info(f"data process: {data}")
             if data.get("ping"):
                 # self.logger().info("send pong through websocket")
-                payload = "pong"
-                ping_request = WSJSONRequest(payload=payload)
-                await ws.send(request=ping_request)
+                pong_payload = {
+                    "pong": data.get("ping"),
+                    "time": data.get("time")
+                }
+                pong_request = WSJSONRequest(payload=pong_payload)
+                await ws.send(request=pong_request)
             elif data.get("dataType"):
                 symbol = data.get("dataType").split('@')[0]
                 event_type = data.get("dataType").split('@')[1]
