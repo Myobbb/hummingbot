@@ -259,6 +259,15 @@ class InFlightOrder:
         Returns this InFlightOrder as a JSON object.
         :return: JSON object
         """
+        try:
+            cumulative_fee_paid_base = float(self.cumulative_fee_paid(self.base_asset))
+        except Exception:
+            cumulative_fee_paid_base = 0.0
+
+        try:
+            cumulative_fee_paid_quote = float(self.cumulative_fee_paid(self.quote_asset))
+        except Exception:
+            cumulative_fee_paid_quote = 0.0
         return {
             "client_order_id": self.client_order_id,
             "exchange_order_id": self.exchange_order_id,
@@ -275,8 +284,8 @@ class InFlightOrder:
             "creation_timestamp": self.creation_timestamp,
             "last_update_timestamp": self.last_update_timestamp,
             "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
-            "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
-            "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),
+            "cumulative_fee_paid_base": cumulative_fee_paid_base,
+            "cumulative_fee_paid_quote": cumulative_fee_paid_quote,
         }
 
     def to_limit_order(self) -> LimitOrder:
@@ -324,7 +333,7 @@ class InFlightOrder:
                     exchange=exchange
                 )
         except Exception as e:
-            self.logger().error(f"Error calculating fee paid in {token}: {e}")
+            self.logger().debug(f"Could not calculate fee paid in {token}: {e}")
         return total_fee_in_token
 
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:

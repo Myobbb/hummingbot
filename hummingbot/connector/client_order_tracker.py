@@ -282,7 +282,7 @@ class ClientOrderTracker:
                         tracked_order.wait_until_completely_filled(), timeout=self.TRADE_FILLS_WAIT_TIMEOUT
                     )
                 except asyncio.TimeoutError:
-                    self.logger().warning(
+                    self.logger().debug(
                         f"The order fill updates did not arrive on time for {tracked_order.client_order_id}. "
                         f"The complete update will be processed with incomplete information."
                     )
@@ -408,7 +408,7 @@ class ClientOrderTracker:
                              trade_id: str,
                              exchange_order_id: str):
         if prev_executed_amount_base < tracked_order.executed_amount_base:
-            self.logger().info(
+            self.logger().debug(
                 f"The {tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} "
                 f"amounting to {tracked_order.executed_amount_base}/{tracked_order.amount} {tracked_order.base_asset} "
                 f"has been filled at {fill_price} {tracked_order.quote_asset}."
@@ -432,7 +432,7 @@ class ClientOrderTracker:
 
         elif tracked_order.is_filled:
             self._trigger_completed_event(tracked_order)
-            self.logger().info(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
+            self.logger().debug(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
 
         elif tracked_order.is_failure:
             self._trigger_failure_event(tracked_order, order_update)
