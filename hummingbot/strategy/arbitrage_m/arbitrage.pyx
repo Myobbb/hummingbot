@@ -723,7 +723,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             return
 
         # Check each market tuple's orders
-        for market_tuple, market_orders in all_market_orders.items():
+        for market_tuple, market_orders in list(all_market_orders.items()):
             if market_orders:
                 for order_id in list(market_orders):
                     order_id_str = self._to_cpp_str(order_id)
