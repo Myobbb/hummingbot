@@ -42,6 +42,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
         self._current_listen_key = None
+        self._connected_listen_key = None  # Track which key the WS is connected with
         self._manage_listen_key_task = None
 
     @classmethod
@@ -71,19 +72,22 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
+                # Store which key we're connected with
+                self._connected_listen_key = self._current_listen_key
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
-                
+
                 # Simply process messages continuously - no timeout logic needed
                 # BingX server sends pings every 5 seconds, we respond in _process_ws_messages
                 await self._process_ws_messages(ws=ws, output=output)
-                
+
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().exception("Unexpected error while listening to user stream. Retrying after 5 seconds...")
             finally:
                 # Make sure no background task is leaked.
+                self._connected_listen_key = None
                 ws and await ws.disconnect()
                 await self._sleep(5)
 
@@ -131,8 +135,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_ws_messages(self, ws: WSAssistant, output: asyncio.Queue):
         self._last_recv_time = self._time()
         async for ws_response in ws.iter_messages():
+            # CRITICAL: Check if listen key changed - if so, reconnect immediately
+            if (self._connected_listen_key is not None and
+                self._current_listen_key is not None and
+                self._connected_listen_key != self._current_listen_key):
+                self.logger().warning(
+                    f"Listen key changed from {self._connected_listen_key[:8]}... to "
+                    f"{self._current_listen_key[:8]}... - reconnecting with new key"
+                )
+                raise ConnectionError("Listen key changed - reconnection required")
+
             data = utils.decompress_ws_message(ws_response.data)
-            
+
             # Respond to server heartbeat ping per BingX spec
             # https://bingx-api.github.io/docs/#/en-us/spot/socket/#Heartbeats
             if isinstance(data, dict) and "ping" in data:
@@ -150,7 +164,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self.logger().error(f"Failed to send pong: {e}")
                     raise  # This will exit the method and trigger reconnection
                 continue
-            
+
             # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":
                 # Ignore funding/non-spot reasons per requirement
