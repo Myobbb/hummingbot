@@ -233,14 +233,18 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
+            except ConnectionError as connection_exception:
+                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
             except Exception:
                 self.logger().error(
-                    "WS error, reconnecting in 5s...",
+                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
                     exc_info=True,
                 )
-                await self._sleep(5.0)
+               
             finally:
+                await self._sleep(5.0)
                 ws and await ws.disconnect()
+                
 
     async def _subscribe_channels(self, ws: WSAssistant):
         MAX_SUBS = 200
@@ -404,7 +408,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     
                     trading_pair = json_msg["symbol"]
                     ts_sec = self._extract_timestamp(json_msg, self._time())
-                    
+
                     if self._enable_anti_spoofing and "data" in json_msg:
                         data_node = json_msg["data"]
                         raw_bids = data_node.get("bids") or data_node.get("b") or []
