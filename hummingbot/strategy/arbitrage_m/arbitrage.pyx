@@ -624,7 +624,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(
-                    logging.debug,
+                    logging.DEBUG,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
             # If this was a buy-in buy order, remove its pending base from tracking
@@ -1056,6 +1056,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double buy_quote_balance
             double sell_base_balance
             double conv_rate = 1.0
+            pair[int, double] gate_res
+
+
         # Early uniform gate: skip any Python balance calls if top-of-book fails
         gate_res = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, self._min_profitability)
         if not gate_res.first:
@@ -1098,6 +1101,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double total_cost = 0.0
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
+            double avg_sell_price_orig, avg_buy_price, profitability
         
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             # Apply constraints
@@ -1426,6 +1430,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cdef:
             double conv_rate = 1.0
             double spend_cap = min(buy_quote_balance, max_spend_quote)
+            pair[int, double] gate_res2
         if spend_cap <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
 
@@ -1483,6 +1488,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
             double remaining_quote
+            double avg_bid_adj, avg_bid_orig, avg_ask, profitability
 
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             remaining_quote = spend_cap - total_cost
