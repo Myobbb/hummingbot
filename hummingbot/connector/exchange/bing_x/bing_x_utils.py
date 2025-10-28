@@ -28,13 +28,32 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
 
 def decompress_ws_message(message):
-    if isinstance(message, bytes):
-        compressed_data = gzip.GzipFile(fileobj=io.BytesIO(message), mode='rb')
-        decompressed_data = compressed_data.read()
-        utf8_data = decompressed_data.decode('utf-8')
-        return json.loads(utf8_data)
-    else:
-        return message
+    """
+    Robustly handle BingX WS frames which may be gzip-compressed bytes or plain JSON (bytes/str).
+    Falls back gracefully if content is not gzip.
+    """
+    try:
+        if isinstance(message, bytes):
+            # First, try gzip
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(message), mode='rb') as gz:
+                    decompressed = gz.read()
+                return json.loads(decompressed.decode('utf-8'))
+            except Exception:
+                # Not gzip or bad gzip; try plain UTF-8 JSON
+                try:
+                    return json.loads(message.decode('utf-8'))
+                except Exception:
+                    return {}
+        elif isinstance(message, str):
+            try:
+                return json.loads(message)
+            except Exception:
+                return {}
+        else:
+            return message
+    except Exception:
+        return {}
 
 
 class BingXConfigMap(BaseConnectorConfigMap):
