@@ -116,3 +116,4 @@ UNKNOWN_ORDER_ERROR_CODE = -2011
 UNKNOWN_ORDER_MESSAGE = "Unknown order sent"
 TIMESTAMP_RELATED_ERROR_CODE = 700003
 TIMESTAMP_RELATED_ERROR_MESSAGE = "Timestamp for this request is outside of the recvWindow"
+ORDER_CANCELLED_MESSAGE = "Order cancelled"

@@ -131,9 +131,10 @@ class MexcExchange(ExchangePyBase):
         ) and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
-            cancelation_exception
-        ) and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+        error_str = str(cancelation_exception)
+        return (str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in error_str and
+                (CONSTANTS.UNKNOWN_ORDER_MESSAGE in error_str or
+                 CONSTANTS.ORDER_CANCELLED_MESSAGE in error_str))
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(

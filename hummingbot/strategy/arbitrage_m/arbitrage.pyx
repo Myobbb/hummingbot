@@ -739,17 +739,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
                         if timeout_threshold <= 10.0:
-                            # Market order cleanup - not a real timeout, just housekeeping
+                            # Market order cleanup - if still being tracked after 10s, something went wrong
+                            # Treat as a potential failure and enforce cooldown
+                            self.logger().debug(f"Market order {order_id} on {market_tuple[0].name} still tracked after {time_elapsed:.2f}s - cleaning up")
                             self._order_timestamps.erase(order_id_str)
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                            # Enforce failure cooldown for this market to prevent rapid retries
+                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
                         else:
                             # Actual timeout - log warning and enforce cooldown
                             self.logger().warning(f"Order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
                             self._order_timestamps.erase(order_id_str)
                             self._completed_orders.erase(order_id_str)  # Remove from completed if it was there
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            # Enforce global cooldown for cancelled/timed-out orders
-                            self._last_global_trade_timestamp = self._current_timestamp
+                            # Enforce failure cooldown for this market
+                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """Check if ready for new orders - global delay across all markets"""
