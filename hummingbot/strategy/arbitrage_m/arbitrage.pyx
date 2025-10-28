@@ -237,6 +237,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         cdef double base_conv = 1.0
         cdef double quote_conv = 1.0
+        cdef double base_rate = 1.0
+        cdef double quote_rate = 1.0
         cdef object primary_first = self._market_pairs[0].first
         cdef object primary_second = self._market_pairs[0].second
 
@@ -247,7 +249,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 base_conv = self.c_get_conversion_rate(True)
             elif (buy_market_tuple.base_asset == primary_second.base_asset and
                   sell_market_tuple.base_asset == primary_first.base_asset):
-                cdef double base_rate = self.c_get_conversion_rate(True)
+                base_rate = self.c_get_conversion_rate(True)
                 base_conv = 1.0 / base_rate if base_rate != 0 else 0.0
             else:
                 base_conv = float(RateOracle.get_instance().get_pair_rate(
@@ -260,7 +262,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 quote_conv = self.c_get_conversion_rate(False)
             elif (buy_market_tuple.quote_asset == primary_second.quote_asset and
                   sell_market_tuple.quote_asset == primary_first.quote_asset):
-                cdef double quote_rate = self.c_get_conversion_rate(False)
+                quote_rate = self.c_get_conversion_rate(False)
                 quote_conv = 1.0 / quote_rate if quote_rate != 0 else 0.0
             else:
                 quote_conv = float(RateOracle.get_instance().get_pair_rate(
