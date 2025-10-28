@@ -64,24 +64,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
         return logging.getLogger(__name__)
 
     def __cinit__(self):
-        # Defensive defaults so attributes exist even if init_params isn't called yet
-        try:
-            self._last_global_trade_timestamp = 0.0
-        except Exception:
-            pass
-        try:
-            self._last_failure_timestamps = {}
-        except Exception:
-            pass
-        try:
-            self._pending_buyin_by_asset = {}
-        except Exception:
-            pass
-        try:
-            self._pending_buyin_orders = {}
-        except Exception:
-            pass
-        # Safe basic defaults for timers and caches
+        # Initialize defaults so attributes exist even if init_params isn't called yet
+        self._last_global_trade_timestamp = 0.0
+        self._last_failure_timestamps = {}
+        self._pending_buyin_by_asset = {}
+        self._pending_buyin_orders = {}
+        # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
         self._status_debounce_until = 0
@@ -185,9 +173,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
             for _m in all_markets:
                 try:
                     self._taker_order_type_by_market[_m] = _m.get_taker_order_type()
-                except Exception:
-                    pass
-        except Exception:
+                except Exception as e:
+                    self.logger().warning(f"Failed to cache taker order type for {_m.name}: {e}")
+        except Exception as e:
+            self.logger().warning(f"Failed to initialize taker order type cache: {e}")
             self._taker_order_type_by_market = {}
     
     cdef void _validate_configuration(self):
@@ -258,7 +247,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 base_conv = self.c_get_conversion_rate(True)
             elif (buy_market_tuple.base_asset == primary_second.base_asset and
                   sell_market_tuple.base_asset == primary_first.base_asset):
-                base_conv = 1.0 / self.c_get_conversion_rate(True) if self.c_get_conversion_rate(True) != 0 else 0.0
+                cdef double base_rate = self.c_get_conversion_rate(True)
+                base_conv = 1.0 / base_rate if base_rate != 0 else 0.0
             else:
                 base_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
@@ -270,7 +260,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 quote_conv = self.c_get_conversion_rate(False)
             elif (buy_market_tuple.quote_asset == primary_second.quote_asset and
                   sell_market_tuple.quote_asset == primary_first.quote_asset):
-                quote_conv = 1.0 / self.c_get_conversion_rate(False) if self.c_get_conversion_rate(False) != 0 else 0.0
+                cdef double quote_rate = self.c_get_conversion_rate(False)
+                quote_conv = 1.0 / quote_rate if quote_rate != 0 else 0.0
             else:
                 quote_conv = float(RateOracle.get_instance().get_pair_rate(
                     f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
@@ -1704,6 +1695,7 @@ cdef list c_find_profitable_arbitrage_orders(
                 ask_leftover -= step_amount
             else:
                 inc(ask_it)
+                levels_processed += 1  
                 if ask_it == ask_end:
                     break
                 ask_entry = deref(ask_it)
