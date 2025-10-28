@@ -470,8 +470,14 @@ cdef class StrategyBase(TimeIterator):
         cdef:
             str order_id = order_cancelled_event.order_id
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+            object maybe_market_order
 
-        self.c_stop_tracking_limit_order(market_pair, order_id)
+        # Determine whether the cancelled order was a MARKET or LIMIT order and stop tracking accordingly
+        maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
+        if maybe_market_order is not None:
+            self.c_stop_tracking_market_order(market_pair, order_id)
+        else:
+            self.c_stop_tracking_limit_order(market_pair, order_id)
 
     cdef c_did_expire_order_tracker(self, object order_expired_event):
         self.c_did_cancel_order_tracker(order_expired_event)

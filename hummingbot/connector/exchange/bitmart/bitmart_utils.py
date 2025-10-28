@@ -1,4 +1,5 @@
 import zlib
+import gzip
 from decimal import Decimal
 from typing import Any, Dict
 
@@ -28,12 +29,28 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
 # Decompress WebSocket messages
 def decompress_ws_message(message):
-    if not isinstance(message, bytes):
+    if not isinstance(message, (bytes, bytearray)):
         return message
-    decompress = zlib.decompressobj(-zlib.MAX_WBITS)
-    inflated = decompress.decompress(message)
-    inflated += decompress.flush()
-    return inflated.decode('UTF-8')
+    # Try gzip first (some Bitmart WS routes send gzip), then raw DEFLATE, then regular zlib, then plain bytes
+    try:
+        return gzip.decompress(message).decode('utf-8')
+    except Exception:
+        pass
+    try:
+        decompress = zlib.decompressobj(-zlib.MAX_WBITS)
+        inflated = decompress.decompress(message)
+        inflated += decompress.flush()
+        return inflated.decode('utf-8')
+    except Exception:
+        pass
+    try:
+        return zlib.decompress(message).decode('utf-8')
+    except Exception:
+        pass
+    try:
+        return bytes(message).decode('utf-8')
+    except Exception:
+        return message
 
 
 def compress_ws_message(message):
