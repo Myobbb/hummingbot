@@ -24,7 +24,11 @@ SERVER_TIME_URL = "spot/time"
 
 TRADES_ENDPOINT_NAME = "spot.trades"
 ORDER_SNAPSHOT_ENDPOINT_NAME = "spot.order_book"
-ORDERS_UPDATE_ENDPOINT_NAME = "spot.order_book_update"
+# Order Book V2 update channel
+ORDERS_UPDATE_ENDPOINT_NAME = "spot.obu"
+
+# Order Book V2 subscription level (supported: 50, 400)
+ORDER_BOOK_V2_LEVEL = 50
 USER_TRADES_ENDPOINT_NAME = "spot.usertrades"
 USER_ORDERS_ENDPOINT_NAME = "spot.orders"
 USER_BALANCE_ENDPOINT_NAME = "spot.balances"
