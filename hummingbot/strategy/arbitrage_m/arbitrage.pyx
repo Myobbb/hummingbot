@@ -927,6 +927,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     sell_req2)
             quantized_amount = min(quantized_amount, q_buy2, q_sell2)
 
+        # Apply max_order_size cap from trading rules (surgical addition for exchange compliance)
+        try:
+            buy_trading_rule = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
+            sell_trading_rule = sell_market._trading_rules.get(sell_market_tuple.trading_pair)
+            if buy_trading_rule is not None and buy_trading_rule.max_order_size > Decimal("0"):
+                if quantized_amount > buy_trading_rule.max_order_size:
+                    quantized_amount = min(quantized_amount, buy_trading_rule.max_order_size)
+            if sell_trading_rule is not None and sell_trading_rule.max_order_size > Decimal("0"):
+                if quantized_amount > sell_trading_rule.max_order_size:
+                    quantized_amount = min(quantized_amount, sell_trading_rule.max_order_size)
+        except Exception:
+            pass  # Fail gracefully if trading rules unavailable; balance caps already applied
+
         # Check minimum order size after any safety caps
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self._min_order_usd:
@@ -1358,6 +1371,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))))
         if quantized_amount <= Decimal("0"):
             return False
+
+        # Apply max_order_size cap from trading rules (surgical addition for exchange compliance)
+        try:
+            buy_trading_rule = market._trading_rules.get(buy_market_tuple.trading_pair)
+            if buy_trading_rule is not None and buy_trading_rule.max_order_size > Decimal("0"):
+                if quantized_amount > buy_trading_rule.max_order_size:
+                    quantized_amount = min(quantized_amount, buy_trading_rule.max_order_size)
+        except Exception:
+            pass  # Fail gracefully if trading rules unavailable
 
         # Enforce minimum notional like normal arbitrage orders
         cdef double volume_usd = float(quantized_amount) * buy_price
