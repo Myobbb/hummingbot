@@ -119,8 +119,8 @@ RATE_LIMITS = {
               linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
 
-    # Hard cap balance endpoint globally to 1 request per 30 seconds
-    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=1, time_interval=3,
+    # Balance endpoint: 2/s per UID (per BingX API docs)
+    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=2, time_interval=ONE_SECOND,
               linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
     RateLimit(limit_id=MY_TRADES_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
@@ -135,11 +135,6 @@ HBOT_BROKER_ID = "hummingbot"
 HBOT_ORDER_ID = "t-HBOT"
 
 REST_URL = "https://open-api.bingx.com/openApi"
-
-
-SYMBOL_PATH_URL = "/spot/v1/common/symbols" #should remove and stop using?
-
-BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
 SOURCE_KEY = 'Hummingbot'
 
 ENABLE_ANTI_SPOOFING = False  
