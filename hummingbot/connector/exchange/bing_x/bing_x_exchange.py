@@ -489,7 +489,30 @@ class BingXExchange(ExchangePyBase):
             method=RESTMethod.GET,
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
             is_auth_required=True)
-        balances = account_info["data"]["balances"]
+        # Be tolerant to unexpected payloads from the API
+        balances = None
+        if isinstance(account_info, dict):
+            data_obj = account_info.get("data")
+            if isinstance(data_obj, dict) and "balances" in data_obj:
+                balances = data_obj.get("balances")
+            elif "balances" in account_info:
+                balances = account_info.get("balances")
+        if not isinstance(balances, list):
+            # Gracefully skip update when payload is not as expected, but log useful diagnostics for debugging
+            payload_type = type(account_info).__name__
+            top_keys = list(account_info.keys()) if isinstance(account_info, dict) else None
+            reason = "missing 'balances' key"
+            if isinstance(account_info, dict):
+                if isinstance(account_info.get("data"), dict) and "balances" not in account_info["data"]:
+                    reason = "missing 'data.balances' key"
+                elif "data" not in account_info and "balances" not in account_info:
+                    reason = "missing both 'data' and 'balances'"
+            payload_preview = str(account_info)
+            if len(payload_preview) > 800:
+                payload_preview = payload_preview[:800] + "... [truncated]"
+            self.logger().error(
+                f"Unexpected balances payload ({reason}); type={payload_type}, keys={top_keys}, preview={payload_preview}")
+            return
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
             free_balance = Decimal(str(balance_entry["free"]))
