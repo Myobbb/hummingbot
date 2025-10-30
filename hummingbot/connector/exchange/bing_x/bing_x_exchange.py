@@ -291,8 +291,8 @@ class BingXExchange(ExchangePyBase):
                 min_order_size = Decimal(min_notional_size / last_traded_price)  # rule.get("minQty") is deprecated for now
                 max_order_size = Decimal(max_notional_size / last_traded_price)  # rule.get("maxQty") is deprecated for now
 
-                # Debug logging for NUMI-USDT pair
-                if trading_pair == "NUMI-USDT":
+                # Debug logging for ASSET-USDT pair
+                if trading_pair == "XXXXXXX-USDT": #debug
                     self.logger().info(
                         f"[DEBUG] Trading rules for {trading_pair}:\n"
                         f"  Raw exchange data: {rule}\n"
