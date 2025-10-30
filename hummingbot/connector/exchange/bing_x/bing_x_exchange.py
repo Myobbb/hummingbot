@@ -589,6 +589,15 @@ class BingXExchange(ExchangePyBase):
                     headers=local_headers,
                     throttler_limit_id=limit_id if limit_id else path_url,
                 )
+                # Handle BingX soft rate-limit responses that come with HTTP 200 but error code in payload
+                if isinstance(request_result, dict):
+                    err_code = request_result.get("code")
+                    err_msg = str(request_result.get("msg", "")).lower()
+                    if err_code in (100410, ) or ("rate limit" in err_msg or "rate limited" in err_msg):
+                        self.logger().warning(
+                            f"BingX rate limited (code={err_code}, msg={request_result.get('msg')}). Retrying shortly...")
+                        await self._sleep(1.0)
+                        continue
                 return request_result
             except IOError as request_exception:
                 last_exception = request_exception
@@ -599,7 +608,10 @@ class BingXExchange(ExchangePyBase):
                     raise
 
         # Failed even after the last retry
-        raise last_exception
+        if last_exception is not None:
+            raise last_exception
+        # If we got here due to repeated soft rate limits without exceptions
+        raise IOError("BingX: repeated rate limit responses")
 
 
 async def execute_request_with_content_type_none(
