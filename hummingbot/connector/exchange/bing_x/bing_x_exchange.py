@@ -47,7 +47,6 @@ class BingXExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._last_trades_poll_bingx_timestamp = 1.0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -563,17 +562,6 @@ class BingXExchange(ExchangePyBase):
             "Accept": "application/json"
         }
 
-        # request_result = await rest_assistant.execute_request(
-        #     url=url,
-        #     params=params,
-        #     data=data,
-        #     method=method,
-        #     is_auth_required=is_auth_required,
-        #     return_err=return_err,
-        #     headers=local_headers,
-        #     throttler_limit_id=limit_id if limit_id else path_url,
-        # )
-        # return request_result
         for _ in range(2):
             try:
                 # Replacing the execute_request method in the rest_assistant object to work with text/plain content type.
@@ -589,15 +577,6 @@ class BingXExchange(ExchangePyBase):
                     headers=local_headers,
                     throttler_limit_id=limit_id if limit_id else path_url,
                 )
-                # Handle BingX soft rate-limit responses that come with HTTP 200 but error code in payload
-                if isinstance(request_result, dict):
-                    err_code = request_result.get("code")
-                    err_msg = str(request_result.get("msg", "")).lower()
-                    if err_code in (100410, ) or ("rate limit" in err_msg or "rate limited" in err_msg):
-                        self.logger().warning(
-                            f"BingX rate limited (code={err_code}, msg={request_result.get('msg')}). Retrying shortly...")
-                        await self._sleep(1.0)
-                        continue
                 return request_result
             except IOError as request_exception:
                 last_exception = request_exception
@@ -608,10 +587,7 @@ class BingXExchange(ExchangePyBase):
                     raise
 
         # Failed even after the last retry
-        if last_exception is not None:
-            raise last_exception
-        # If we got here due to repeated soft rate limits without exceptions
-        raise IOError("BingX: repeated rate limit responses")
+        raise last_exception
 
 
 async def execute_request_with_content_type_none(
