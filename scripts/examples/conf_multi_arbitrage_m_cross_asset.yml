@@ -1,0 +1,67 @@
+# Multi-Strategy Orchestrator - Cross-Asset Arbitrage
+# ===================================================
+# This configuration demonstrates cross-asset arbitrage where trading pairs
+# have different quote or base assets (e.g., BTC-USD vs BTC-USDT).
+#
+# Use Cases:
+# - Arbitrage between USDT and USD quoted pairs
+# - Arbitrage between different base assets (with oracle conversion)
+# - Geographic arbitrage (e.g., KRW vs USD pairs)
+#
+# The orchestrator handles conversion rates automatically via:
+# - Rate Oracle: Live conversion rates from external price feeds
+# - Fixed Rates: Manually specified conversion rates (faster but less accurate)
+
+script_file_name: multi_strategy_orchestrator.py
+
+markets:
+  binance:
+    - BTC-USDT
+    - ETH-USDT
+  kucoin:
+    - BTC-USDT
+    - ETH-USDT
+
+arbitrage_m_strategies:
+  # Strategy 1: Same assets, using oracle for real-time conversion
+  - name: "btc_oracle_conversion"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: BTC-USDT
+    min_profitability: 0.5
+    # Use oracle for real-time conversion rates (recommended)
+    use_oracle_conversion_rate: true
+    next_trade_delay_interval: 2.0
+    buy_in_enabled: false
+
+  # Strategy 2: Fixed conversion rates (faster but less accurate)
+  - name: "eth_fixed_conversion"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: ETH-USDT
+    secondary_trading_pair: ETH-USDT
+    min_profitability: 0.5
+    # Use fixed conversion rates (no external API calls needed)
+    use_oracle_conversion_rate: false
+    # If trading BTC-USDT on primary vs BTC-USDC on secondary:
+    # secondary_to_primary_quote_conversion_rate: 0.9999  # USDC to USDT
+    # For same-asset pairs, these are 1.0 (default)
+    secondary_to_primary_base_conversion_rate: 1.0
+    secondary_to_primary_quote_conversion_rate: 1.0
+    next_trade_delay_interval: 2.0
+    buy_in_enabled: false
+
+  # Strategy 3: Aggressive settings with buy-in
+  - name: "btc_high_frequency"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: BTC-USDT
+    min_profitability: 0.3  # Lower threshold for more trades
+    use_oracle_conversion_rate: true
+    next_trade_delay_interval: 1.0  # Faster execution
+    order_timeout: 180.0  # Shorter timeout
+    buy_in_enabled: true
+    buy_in_target_usd: 200.0
+    buy_in_min_profitability: 0.003  # 0.3% for buy-in

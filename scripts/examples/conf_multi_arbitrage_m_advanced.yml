@@ -1,0 +1,67 @@
+# Multi-Strategy Orchestrator - Advanced Configuration
+# ====================================================
+# This configuration demonstrates running multiple arbitrage_m strategies
+# across 3 exchanges (Binance, KuCoin, MEXC) with shared websockets.
+#
+# Advanced Features Demonstrated:
+# - Multiple exchanges (3)
+# - Multiple trading pairs (BTC-USDT, ETH-USDT)
+# - Additional markets for triangular arbitrage opportunities
+# - Buy-in module enabled for some strategies
+# - Different profitability thresholds per strategy
+#
+# Resource Savings:
+# - Without orchestrator: 9 websocket connections (3 strategies × 3 exchanges)
+# - With orchestrator: 3 websocket connections (1 per exchange, shared)
+
+script_file_name: multi_strategy_orchestrator.py
+
+# All markets needed across all strategies
+markets:
+  binance:
+    - BTC-USDT
+    - ETH-USDT
+  kucoin:
+    - BTC-USDT
+    - ETH-USDT
+  mexc:
+    - BTC-USDT
+    - ETH-USDT
+
+arbitrage_m_strategies:
+  # Strategy 1: BTC arbitrage Binance <-> KuCoin (conservative, no buy-in)
+  - name: "btc_binance_kucoin_conservative"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: BTC-USDT
+    min_profitability: 0.8  # Higher threshold = more conservative
+    next_trade_delay_interval: 3.0
+    buy_in_enabled: false
+
+  # Strategy 2: BTC arbitrage Binance <-> MEXC (aggressive, with buy-in)
+  - name: "btc_binance_mexc_aggressive"
+    primary_market: binance
+    secondary_market: mexc
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: BTC-USDT
+    min_profitability: 0.3  # Lower threshold = more aggressive
+    next_trade_delay_interval: 1.5
+    buy_in_enabled: true
+    buy_in_target_usd: 150.0  # Maintain $150 worth of BTC
+    buy_in_min_profitability: 0.005  # 0.5% min profit for buy-in trades
+
+  # Strategy 3: ETH arbitrage across all 3 exchanges with additional markets
+  - name: "eth_multi_exchange"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: ETH-USDT
+    secondary_trading_pair: ETH-USDT
+    min_profitability: 0.5
+    next_trade_delay_interval: 2.0
+    buy_in_enabled: true
+    buy_in_target_usd: 100.0
+    # Additional markets enable triangular arbitrage opportunities
+    # This strategy can trade Binance->KuCoin, Binance->MEXC, KuCoin->MEXC, etc.
+    additional_markets:
+      - mexc:ETH-USDT

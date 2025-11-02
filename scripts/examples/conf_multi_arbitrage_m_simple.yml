@@ -1,0 +1,46 @@
+# Multi-Strategy Orchestrator - Simple Configuration
+# =================================================
+# This configuration runs 2 arbitrage_m strategies simultaneously
+# while sharing websocket connections to Binance and KuCoin.
+#
+# Resource Savings:
+# - Without orchestrator: 2 Binance WS + 2 KuCoin WS = 4 connections
+# - With orchestrator: 1 Binance WS + 1 KuCoin WS = 2 connections
+#
+# Both strategies use the same websocket connections for market data
+# and order management, reducing resource usage and rate limit pressure.
+
+# Script configuration
+script_file_name: multi_strategy_orchestrator.py
+
+# All markets needed across all strategies
+# The orchestrator will create ONE connector per exchange
+markets:
+  binance:
+    - BTC-USDT
+    - ETH-USDT
+  kucoin:
+    - BTC-USDT
+    - ETH-USDT
+
+# Strategy instances
+arbitrage_m_strategies:
+  # Strategy 1: BTC arbitrage between Binance and KuCoin
+  - name: "btc_binance_kucoin"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: BTC-USDT
+    min_profitability: 0.5  # 0.5% minimum profit
+    next_trade_delay_interval: 2.0
+    buy_in_enabled: false
+
+  # Strategy 2: ETH arbitrage between Binance and KuCoin
+  - name: "eth_binance_kucoin"
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: ETH-USDT
+    secondary_trading_pair: ETH-USDT
+    min_profitability: 0.5  # 0.5% minimum profit
+    next_trade_delay_interval: 2.0
+    buy_in_enabled: false
