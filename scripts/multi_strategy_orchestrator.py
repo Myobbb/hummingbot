@@ -368,14 +368,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         Each strategy's c_tick() is called independently. The strategies share
         the same connectors but maintain separate state and logic.
-        """
-        if not self.ready_to_trade:
-            self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
-            if not self.ready_to_trade:
-                for con in [c for c in self.connectors.values() if not c.ready]:
-                    self.logger().warning(f"{con.name} is not ready. Please wait...")
-                return
 
+        Note: ready_to_trade is already checked by the inherited tick() method
+        from ScriptStrategyBase, so we don't need to check it again here.
+        """
+        # Get current timestamp from TimeIterator property
+        # This was set by TimeIterator.c_tick() before tick() was called
         current_timestamp = self.current_timestamp
 
         # Tick each strategy independently
