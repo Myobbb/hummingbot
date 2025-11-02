@@ -116,14 +116,41 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return ws
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
-        snapshot_timestamp: float = time.time()
-        snapshot_msg: OrderBookMessage = MexcOrderBook.snapshot_message_from_exchange(
-            snapshot,
-            snapshot_timestamp,
-            metadata={"trading_pair": trading_pair}
-        )
-        return snapshot_msg
+        # Retry logic for order book snapshot fetch to handle transient network errors (e.g., 504)
+        max_retries = 5
+        retry_delay = 2  # Start with 2 seconds
+        last_exception = None
+
+        for attempt in range(max_retries):
+            try:
+                snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
+                snapshot_timestamp: float = time.time()
+                snapshot_msg: OrderBookMessage = MexcOrderBook.snapshot_message_from_exchange(
+                    snapshot,
+                    snapshot_timestamp,
+                    metadata={"trading_pair": trading_pair}
+                )
+                if attempt > 0:
+                    self.logger().info(f"Successfully fetched order book snapshot for {trading_pair} after {attempt + 1} attempts")
+                return snapshot_msg
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    self.logger().warning(
+                        f"Failed to fetch order book snapshot for {trading_pair} "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {retry_delay} seconds..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30)  # Exponential backoff, max 30s
+                else:
+                    self.logger().error(
+                        f"Failed to fetch order book snapshot for {trading_pair} "
+                        f"after {max_retries} attempts: {e}"
+                    )
+
+        # All retries failed, re-raise the last exception
+        raise last_exception
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if isinstance(raw_message, dict) and "code" not in raw_message:
