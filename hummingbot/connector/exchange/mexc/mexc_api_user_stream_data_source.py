@@ -143,10 +143,34 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
             while True:
                 now = int(time.time())
                 if self._current_listen_key is None:
-                    self._current_listen_key = await self._get_listen_key()
-                    self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
-                    self._listen_key_initialized_event.set()
-                    self._last_listen_key_ping_ts = int(time.time())
+                    # Retry logic for initial listen key fetch to handle transient network errors (e.g., 504)
+                    max_retries = 5
+                    retry_delay = 2  # Start with 2 seconds
+                    for attempt in range(max_retries):
+                        try:
+                            self._current_listen_key = await self._get_listen_key()
+                            self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
+                            self._listen_key_initialized_event.set()
+                            self._last_listen_key_ping_ts = int(time.time())
+                            break  # Success, exit retry loop
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                self.logger().warning(
+                                    f"Failed to get listen key (attempt {attempt + 1}/{max_retries}): {e}. "
+                                    f"Retrying in {retry_delay} seconds..."
+                                )
+                                await self._sleep(retry_delay)
+                                retry_delay = min(retry_delay * 2, 30)  # Exponential backoff, max 30s
+                            else:
+                                # All retries failed, log error and re-raise to trigger outer retry loop
+                                self.logger().error(
+                                    f"Failed to get listen key after {max_retries} attempts: {e}. "
+                                    "Will retry from scratch."
+                                )
+                                raise
+                    # If we got the listen key, continue to the keep-alive logic
+                    if self._current_listen_key is None:
+                        continue
 
                 elapsed = now - self._last_listen_key_ping_ts
                 if elapsed >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
@@ -199,9 +223,19 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
-        self._manage_listen_key_task and self._manage_listen_key_task.cancel()
+        # Cancel the listen key management task if it exists
+        if self._manage_listen_key_task and not self._manage_listen_key_task.done():
+            self._manage_listen_key_task.cancel()
+            try:
+                await self._manage_listen_key_task
+            except asyncio.CancelledError:
+                pass
+        self._manage_listen_key_task = None
+        # Reset listen key state for clean restart
         self._current_listen_key = None
         self._listen_key_initialized_event.clear()
+        self._last_listen_key_ping_ts = 0
+        self.logger().info("User stream interrupted, state reset for reconnection")
         await self._sleep(5)
 
     def _decode_private_pb_payload(self, payload: bytes):
