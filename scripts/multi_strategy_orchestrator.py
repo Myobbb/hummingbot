@@ -28,9 +28,28 @@ How Websocket Sharing Works:
 4. Connector broadcasts events to all registered listeners
 5. Strategies operate independently, sharing the underlying connection
 
+Critical Implementation Details:
+-------------------------------
+FIXED - Lifecycle Management:
+- The orchestrator bypasses ScriptStrategyBase.__init__() to avoid double event listener registration
+- Strategies are initialized in __init__() but started later in start() when clock is available
+- Each strategy gets proper c_start(clock, timestamp) call with clock reference
+- Strategies are stopped with c_stop(clock) using the SAME clock from start()
+
+Event Listener Pattern:
+- Orchestrator itself does NOT register event listeners (no add_markets call)
+- Only V1 strategies register listeners via c_add_markets() during init_params()
+- Multiple strategies can safely share connectors via observer pattern
+
+Clock Management:
+- Orchestrator is registered with clock (only orchestrator, not individual strategies)
+- Orchestrator's start() is called by clock → starts all V1 strategies
+- Orchestrator's on_tick() is called by clock → manually ticks all V1 strategies
+- Orchestrator's on_stop() is called by clock → stops all V1 strategies
+
 Example Usage:
 -------------
-See conf/scripts/multi_arbitrage_m_shared_ws.yml for configuration
+See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 
 """
 
@@ -160,13 +179,22 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                        These connectors are SHARED across all strategies
             config: Orchestrator configuration
         """
-        super().__init__(connectors, config)
+        # FIX #1: Initialize base WITHOUT calling add_markets()
+        # The orchestrator itself doesn't need event listeners - only the V1 strategies do
+        # We manually set the required attributes instead of calling super().__init__()
+        from hummingbot.strategy.strategy_py_base import StrategyPyBase
+        StrategyPyBase.__init__(self)  # Initialize StrategyBase/TimeIterator
+
+        self.connectors: Dict[str, ConnectorBase] = connectors
         self.config: MultiStrategyOrchestratorConfig = config
+        self.ready_to_trade: bool = False
 
         # Storage for V1 strategy instances
         self.strategies: List[V1StrategyInstance] = []
+        self._strategies_started: bool = False  # FIX #2: Track whether strategies have been started
+        self._strategy_clock = None  # FIX #3: Store clock reference for strategies
 
-        # Initialize all configured strategies
+        # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
 
         self.logger().info(f"MultiStrategyOrchestrator initialized with {len(self.strategies)} strategies")
@@ -299,6 +327,41 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             f"min_profit={config.min_profitability}%"
         )
 
+    def start(self, clock, timestamp: float):
+        """
+        FIX #2 & #4: Start the orchestrator and all V1 strategies with proper clock management.
+
+        This is called by the Clock system after the orchestrator is registered.
+        We use this opportunity to start all V1 strategies with the clock.
+
+        Args:
+            clock: The clock instance managing this orchestrator
+            timestamp: Current timestamp
+        """
+        # Store clock reference for lifecycle management
+        self._strategy_clock = clock
+        self._last_timestamp = timestamp
+
+        # Start all V1 strategies with the clock
+        if not self._strategies_started:
+            self.logger().info(f"Starting {len(self.strategies)} V1 strategies with clock...")
+
+            for strategy_instance in self.strategies:
+                try:
+                    self.logger().info(f"Starting strategy: {strategy_instance.name}")
+                    # Call c_start() which will:
+                    # 1. Call StrategyBase.c_start() - initializes base state
+                    # 2. Call strategy.start() - strategy-specific initialization
+                    strategy_instance.strategy.c_start(clock, timestamp)
+                except Exception as e:
+                    self.logger().error(
+                        f"Error starting strategy '{strategy_instance.name}': {e}",
+                        exc_info=True
+                    )
+
+            self._strategies_started = True
+            self.logger().info(f"All strategies started successfully")
+
     def on_tick(self):
         """
         Main tick function - tick all strategies.
@@ -307,7 +370,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         the same connectors but maintain separate state and logic.
         """
         if not self.ready_to_trade:
-            return
+            self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
+            if not self.ready_to_trade:
+                for con in [c for c in self.connectors.values() if not c.ready]:
+                    self.logger().warning(f"{con.name} is not ready. Please wait...")
+                return
 
         current_timestamp = self.current_timestamp
 
@@ -325,25 +392,36 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     async def on_stop(self):
         """
-        Clean shutdown of all strategies.
+        FIX #3: Clean shutdown of all strategies using the correct clock reference.
 
         Each strategy's stop() is called to clean up its event listeners
         and cancel any pending orders.
         """
         self.logger().info("Stopping MultiStrategyOrchestrator...")
 
-        for strategy_instance in self.strategies:
-            try:
-                self.logger().info(f"Stopping strategy: {strategy_instance.name}")
-                # Stop the strategy (removes event listeners)
-                strategy_instance.strategy.stop(self._clock)
-            except Exception as e:
-                self.logger().error(
-                    f"Error stopping strategy '{strategy_instance.name}': {e}",
-                    exc_info=True
-                )
+        # Stop all V1 strategies with the SAME clock they were started with
+        if self._strategies_started and self._strategy_clock is not None:
+            for strategy_instance in self.strategies:
+                try:
+                    self.logger().info(f"Stopping strategy: {strategy_instance.name}")
+                    # Call c_stop() with the correct clock reference
+                    # This will:
+                    # 1. Call StrategyBase.c_stop() - removes event listeners
+                    # 2. Call strategy.stop() - strategy-specific cleanup
+                    strategy_instance.strategy.c_stop(self._strategy_clock)
+                except Exception as e:
+                    self.logger().error(
+                        f"Error stopping strategy '{strategy_instance.name}': {e}",
+                        exc_info=True
+                    )
 
-        await super().on_stop()
+            self._strategies_started = False
+            self.logger().info(f"All strategies stopped successfully")
+        else:
+            self.logger().warning("Strategies were never started or clock not available")
+
+        # Note: We don't call super().on_stop() because we bypassed super().__init__()
+        # The orchestrator itself has minimal cleanup needs
 
         self.logger().info("MultiStrategyOrchestrator stopped")
 
