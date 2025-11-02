@@ -350,10 +350,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             for strategy_instance in self.strategies:
                 try:
                     self.logger().info(f"Starting strategy: {strategy_instance.name}")
-                    # Call c_start() which will:
-                    # 1. Call StrategyBase.c_start() - initializes base state
-                    # 2. Call strategy.start() - strategy-specific initialization
-                    strategy_instance.strategy.c_start(clock, timestamp)
+                    # Some V1 strategies expose only Python-level start/stop; avoid calling c_start/c_stop from Python
+                    if hasattr(strategy_instance.strategy, "start"):
+                        strategy_instance.strategy.start(clock, timestamp)
                 except Exception as e:
                     self.logger().error(
                         f"Error starting strategy '{strategy_instance.name}': {e}",
@@ -403,11 +402,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             for strategy_instance in self.strategies:
                 try:
                     self.logger().info(f"Stopping strategy: {strategy_instance.name}")
-                    # Call c_stop() with the correct clock reference
-                    # This will:
-                    # 1. Call StrategyBase.c_stop() - removes event listeners
-                    # 2. Call strategy.stop() - strategy-specific cleanup
-                    strategy_instance.strategy.c_stop(self._strategy_clock)
+                    if hasattr(strategy_instance.strategy, "stop"):
+                        strategy_instance.strategy.stop(self._strategy_clock)
                 except Exception as e:
                     self.logger().error(
                         f"Error stopping strategy '{strategy_instance.name}': {e}",
