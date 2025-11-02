@@ -59,6 +59,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
+from hummingbot.client.config.config_data_types import BaseClientModel
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict
@@ -109,7 +110,7 @@ class ArbitrageMInstanceConfig(BaseModel):
     additional_markets: List[str] = Field(default_factory=list, description="Additional markets as 'exchange:PAIR' (e.g., ['mexc:BTC-USDT'])")
 
 
-class MultiStrategyOrchestratorConfig(ScriptConfigBase):
+class MultiStrategyOrchestratorConfig(BaseClientModel):
     """Configuration for multi-strategy orchestrator"""
     script_file_name: str = "multi_strategy_orchestrator.py"
 
