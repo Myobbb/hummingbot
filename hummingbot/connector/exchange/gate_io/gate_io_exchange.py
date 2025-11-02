@@ -1,6 +1,7 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -20,9 +21,6 @@ from hummingbot.core.data_type.user_stream_tracker_data_source import UserStream
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class GateIoExchange(ExchangePyBase):
     DEFAULT_DOMAIN = ""
@@ -33,9 +31,11 @@ class GateIoExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
+              
                  gate_io_api_key: str,
                  gate_io_secret_key: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = DEFAULT_DOMAIN):
@@ -51,7 +51,9 @@ class GateIoExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
 
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
+        # Track orders for which we have already scheduled a post-finish fills fetch
+        self._fills_fetch_scheduled = set()
 
     @property
     def authenticator(self):
@@ -208,6 +210,8 @@ class GateIoExchange(ExchangePyBase):
                 "time_in_force": "ioc",
             })
             if trade_type.name.lower() == 'buy':
+                # For market buy, Gate expects quote currency amount.
+                # Use the strategy-provided price when available; fallback to VWAP only if price is NaN.
                 if price.is_nan():
                     price = self.get_price_for_volume(
                         trading_pair,
@@ -441,6 +445,24 @@ class GateIoExchange(ExchangePyBase):
 
         order_update = self._create_order_update_with_order_status_data(order_status=order_msg, order=tracked_order)
         self._order_tracker.process_order_update(order_update=order_update)
+        # If WS indicates order finished, proactively fetch any missing fills within ClientOrderTracker's wait window
+        try:
+            event_type = order_msg.get("event")
+            finish_as = order_msg.get("finish_as")
+            if event_type == "finish" and finish_as in ("filled", "ioc"):
+                if tracked_order.client_order_id in self._fills_fetch_scheduled:
+                    return
+                async def _fetch_missing_fills():
+                    try:
+                        updates = await self._all_trade_updates_for_order(tracked_order)
+                        for upd in updates:
+                            self._order_tracker.process_trade_update(upd)
+                    except Exception:
+                        return
+                asyncio.create_task(_fetch_missing_fills())
+                self._fills_fetch_scheduled.add(tracked_order.client_order_id)
+        except Exception:
+            pass
 
     def _create_trade_update_with_order_fill_data(
             self,
@@ -485,6 +507,21 @@ class GateIoExchange(ExchangePyBase):
                 order_fill=trade,
                 order=tracked_order)
             self._order_tracker.process_trade_update(trade_update)
+            # If order finished and we may have missed earlier fills, proactively fetch remaining fills once
+            try:
+                finish_as = trade.get("finish_as") or None
+                event = trade.get("event") or None
+                if event == "finish" and finish_as in ("filled", "ioc"):
+                    async def _fetch_missing_fills():
+                        try:
+                            updates = await self._all_trade_updates_for_order(tracked_order)
+                            for upd in updates:
+                                self._order_tracker.process_trade_update(upd)
+                        except Exception:
+                            return
+                    asyncio.create_task(_fetch_missing_fills())
+            except Exception:
+                pass
 
     def _process_balance_message(self, balance_update):
         local_asset_names = set(self._account_balances.keys())

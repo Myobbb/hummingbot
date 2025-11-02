@@ -64,15 +64,18 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                        for trading_pair in self._trading_pairs]
 
+            # Subscribe to private order progress for all tracked symbols and to balance updates
+            subscribe_args = [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME}:{symbol}" for symbol in symbols]
+            subscribe_args.append(CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME + ":BALANCE_UPDATE")
             payload = {
                 "op": "subscribe",
-                "args": [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME}:{symbol}" for symbol in symbols]
+                "args": subscribe_args
             }
             subscribe_request: WSJSONRequest = WSJSONRequest(payload=payload)
 
             async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
                 await websocket_assistant.send(subscribe_request)
-            self.logger().info("Subscribed to private account and orders channels...")
+            self.logger().info("Subscribed to private balance and orders channels...")
         except asyncio.CancelledError:
             raise
         except Exception:
