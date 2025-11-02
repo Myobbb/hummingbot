@@ -352,7 +352,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     self.logger().info(f"Starting strategy: {strategy_instance.name}")
                     # Some V1 strategies expose only Python-level start/stop; avoid calling c_start/c_stop from Python
                     if hasattr(strategy_instance.strategy, "start"):
-                        strategy_instance.strategy.start(clock, timestamp)
+                        # V1 strategies expect start(clock) (no timestamp)
+                        strategy_instance.strategy.start(clock)
                 except Exception as e:
                     self.logger().error(
                         f"Error starting strategy '{strategy_instance.name}': {e}",
@@ -379,9 +380,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Tick each strategy independently
         for strategy_instance in self.strategies:
             try:
-                # Call the strategy's c_tick() method
-                # This is a C-level Cython call for performance
-                strategy_instance.strategy.c_tick(current_timestamp)
+                # Call the Python-level tick() method
+                strategy_instance.strategy.tick(current_timestamp)
             except Exception as e:
                 self.logger().error(
                     f"Error ticking strategy '{strategy_instance.name}': {e}",
@@ -469,6 +469,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if hasattr(strategy, 'tracked_limit_orders'):
                     active_orders = len([o for o in strategy.tracked_limit_orders if o[1].is_open])
                     lines.append(f"  Active Orders: {active_orders}")
+                # One-line best profitable direction (parsed from strategy's own status)
+                if hasattr(strategy, 'format_status'):
+                    try:
+                        st = strategy.format_status()
+                        for ln in st.split("\n"):
+                            stripped = ln.strip()
+                            if stripped.startswith("best:"):
+                                lines.append(f"  {stripped}")
+                                break
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger().debug(f"Could not get strategy stats: {e}")
 
