@@ -251,16 +251,17 @@ class PerformanceMetrics:
         for fee_token, fee_amount in self.fees.items():
             if fee_token == quote:
                 self.fee_in_quote += fee_amount
-            else:
-                rate_pair: str = combine_to_hb_trading_pair(fee_token, quote)
-                last_price = await RateOracle.get_instance().stored_or_live_rate(rate_pair)
-                if last_price is not None:
-                    self.fee_in_quote += fee_amount * last_price
-                else:
-                    self.logger().warning(
-                        f"Could not find exchange rate for {rate_pair} "
-                        f"using {RateOracle.get_instance()}. PNL value will be inconsistent."
-                    )
+            # DISABLED: Fee conversion removed - only count fees in quote currency
+            # else:
+            #     rate_pair: str = combine_to_hb_trading_pair(fee_token, quote)
+            #     last_price = await RateOracle.get_instance().stored_or_live_rate(rate_pair)
+            #     if last_price is not None:
+            #         self.fee_in_quote += fee_amount * last_price
+            #     else:
+            #         self.logger().warning(
+            #             f"Could not find exchange rate for {rate_pair} "
+            #             f"using {RateOracle.get_instance()}. PNL value will be inconsistent."
+            #         )
 
     def _calculate_trade_pnl(self, buys: list, sells: list):
         self.trade_pnl = self.cur_value - self.hold_value
@@ -294,10 +295,6 @@ class PerformanceMetrics:
         :param trades: the list of TradeFill or Trade object
         :param current_balances: current user account balance
         """
-
-        # DISABLED: Skip all P&L calculations, fee calculations, and oracle rate calls
-        # This surgically disables the entire P&L calculation pipeline at the source
-        return
 
         base, quote = split_hb_trading_pair(trading_pair)
         buys, sells = self._preprocess_trades_and_group_by_type(trades)

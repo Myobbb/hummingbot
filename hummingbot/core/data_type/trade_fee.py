@@ -210,9 +210,10 @@ class TradeFeeBase(ABC):
             amount_from_percentage: Decimal = (price * order_amount) * self.percent
             if self._are_tokens_interchangeable(quote, token):
                 fee_amount += amount_from_percentage
-            else:
-                conversion_rate: Decimal = self._get_exchange_rate(trading_pair, exchange, rate_source)
-                fee_amount += amount_from_percentage / conversion_rate
+            # DISABLED: Fee conversion removed - return 0 when conversion would be required
+            # else:
+            #     conversion_rate: Decimal = self._get_exchange_rate(trading_pair, exchange, rate_source)
+            #     fee_amount += amount_from_percentage / conversion_rate
         for flat_fee in self.flat_fees:
             if self._are_tokens_interchangeable(flat_fee.token, token):
                 # No need to convert the value
@@ -221,10 +222,11 @@ class TradeFeeBase(ABC):
                   and (self._are_tokens_interchangeable(quote, token))):
                 # In this case instead of looking for the rate we use directly the price in the parameters
                 fee_amount += flat_fee.amount * price
-            else:
-                conversion_pair: str = combine_to_hb_trading_pair(base=flat_fee.token, quote=token)
-                conversion_rate: Decimal = self._get_exchange_rate(conversion_pair, exchange, rate_source)
-                fee_amount += flat_fee.amount * conversion_rate
+            # DISABLED: Fee conversion removed - return 0 when conversion would be required
+            # else:
+            #     conversion_pair: str = combine_to_hb_trading_pair(base=flat_fee.token, quote=token)
+            #     conversion_rate: Decimal = self._get_exchange_rate(conversion_pair, exchange, rate_source)
+            #     fee_amount += flat_fee.amount * conversion_rate
         return fee_amount
 
     def _are_tokens_interchangeable(self, first_token: str, second_token: str):
@@ -235,10 +237,7 @@ class TradeFeeBase(ABC):
             {"WAVAX", "AVAX"},
             {"WONE", "ONE"},
             {"USDC", "USDC.E"},
-            {"WBTC", "BTC"},
-            {"USOL", "SOL"},
-            {"UETH", "ETH"},
-            {"UBTC", "BTC"}
+            {"WBTC", "BTC"}
         ]
         return first_token == second_token or any(({first_token, second_token} <= interchangeable_pair
                                                    for interchangeable_pair
