@@ -54,6 +54,7 @@ See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 """
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, List, Optional, Set, Tuple
@@ -425,64 +426,157 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Format status output for all strategies.
         """
         if not self.ready_to_trade:
+            # Show only non-ready connectors if available
+            not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
+            if not_ready:
+                return "\n".join(["Connectors not ready:"] + [f"  {n}" for n in not_ready])
             return "Market connectors are not ready."
 
         lines = []
-        lines.append("\n" + "=" * 80)
-        lines.append("MULTI-STRATEGY ORCHESTRATOR STATUS")
-        lines.append(f"Running {len(self.strategies)} strategies with SHARED websocket connections")
-        lines.append("=" * 80)
 
-        # Show shared connectors
-        lines.append("\nShared Connectors:")
-        for connector_name, connector in self.connectors.items():
-            status = "✓ READY" if connector.ready else "✗ NOT READY"
-            lines.append(f"  {connector_name}: {status}")
-
-        # Balance overview
+        # Balances on top
         balance_df = self.get_balance_df()
         lines.extend(["\nBalances:"] + ["  " + line for line in balance_df.to_string(index=False).split("\n")])
 
-        # Active orders across all strategies
-        try:
-            orders_df = self.active_orders_df()
-            lines.extend(["\nActive Orders:"] + ["  " + line for line in orders_df.to_string(index=False).split("\n")])
-        except ValueError:
-            lines.append("\nNo active orders")
+        # One-line per strategy; collect optional sections for the bottom
+        buyin_sections = []
 
-        # Individual strategy status
         for i, strategy_instance in enumerate(self.strategies, 1):
-            lines.append(f"\n{'-' * 80}")
-            lines.append(f"Strategy {i}: {strategy_instance.name}")
-            lines.append(f"{'-' * 80}")
+            name = strategy_instance.name
 
-            config = strategy_instance.config
-            lines.append(f"  Type: arbitrage_m")
-            lines.append(f"  Markets: {config['primary_market']}/{config['primary_trading_pair']} <-> "
-                        f"{config['secondary_market']}/{config['secondary_trading_pair']}")
-            lines.append(f"  Min Profitability: {config['min_profitability']}%")
-            lines.append(f"  Buy-in Enabled: {config['buy_in_enabled']}")
+            # Build compact markets string (works with many markets)
+            markets_str = self._format_markets_compact(strategy_instance.market_pairs)
 
-            # Get strategy-specific stats if available
+            # Min profitability (percentage string stored in config)
+            min_prof = strategy_instance.config.get('min_profitability')
+
+            best_prof_str = "n/a"
+            status_blob = None
             try:
                 strategy = strategy_instance.strategy
-                if hasattr(strategy, 'tracked_limit_orders'):
-                    active_orders = len([o for o in strategy.tracked_limit_orders if o[1].is_open])
-                    lines.append(f"  Active Orders: {active_orders}")
-                # One-line best profitable direction (parsed from strategy's own status)
                 if hasattr(strategy, 'format_status'):
-                    try:
-                        st = strategy.format_status()
-                        for ln in st.split("\n"):
-                            stripped = ln.strip()
-                            if stripped.startswith("best:"):
-                                lines.append(f"  {stripped}")
-                                break
-                    except Exception:
-                        pass
+                    status_blob = strategy.format_status()
+                    for ln in status_blob.split("\n"):
+                        stripped = ln.strip()
+                        if stripped.startswith("best:") and "->" in stripped:
+                            try:
+                                best_prof_str = stripped.split("->", 1)[1].strip()
+                            except Exception:
+                                best_prof_str = stripped
+                            break
             except Exception as e:
-                self.logger().debug(f"Could not get strategy stats: {e}")
+                self.logger().debug(f"Could not get strategy stats for '{name}': {e}")
+
+            if min_prof is not None:
+                lines.append(f"{i}. {name}: {markets_str} | min {min_prof}% | best {best_prof_str}")
+            else:
+                lines.append(f"{i}. {name}: {markets_str} | best {best_prof_str}")
+
+            # Extract buy-in details only when active
+            if status_blob is not None:
+                bi_lines = self._extract_buyin_lines(status_blob)
+                if bi_lines:
+                    buyin_sections.append((name, bi_lines))
+
+        if buyin_sections:
+            lines.append("\nBuy-in active:")
+            for name, blines in buyin_sections:
+                lines.append(f"  {name}:")
+                lines.extend([f"    {ln}" for ln in blines])
+
+        # Only show connectors not ready; omit when all ready
+        not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
+        if not_ready:
+            lines.append("\nConnectors not ready:")
+            for n in not_ready:
+                lines.append(f"  {n}")
 
         lines.append("\n" + "=" * 80)
 
         return "\n".join(lines)
+
+    # --- compact status helpers ---
+    def _exchange_priority(self) -> Dict[str, int]:
+        # Lower index means higher priority
+        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bitmart', 'bing_x', 'okx', 'bitget']
+        return {name: idx for idx, name in enumerate(order)}
+
+    def _display_exchange_name(self, name: str) -> str:
+        """Trim everything after the first underscore for display (e.g., gate_io -> gate)."""
+        try:
+            if "_" in name:
+                return name.split("_", 1)[0]
+            return name
+        except Exception:
+            return name
+
+    def _format_markets_compact(self, market_tuples: List[MarketTradingPairTuple]) -> str:
+        """Return compact markets string for the instance.
+        - All same base: "BASE-QUOTE ex1_ex2_ex3"
+        - Mixed bases:   "BASE-QUOTE ex1_ex2(BASE2)_ex3(BASE3)"
+        """
+        if not market_tuples:
+            return "-"
+
+        triples: List[Tuple[str, str, str]] = []  # (exchange, base, quote)
+        for t in market_tuples:
+            try:
+                triples.append((t.market.name, t.base_asset, t.quote_asset))
+            except Exception:
+                try:
+                    base, quote = str(t.trading_pair).split("-")
+                except Exception:
+                    base, quote = getattr(t, 'base_asset', '?'), getattr(t, 'quote_asset', '?')
+                triples.append((getattr(t.market, 'name', '?'), base, quote))
+
+        base_counts = Counter([b for _, b, _ in triples])
+        quote_counts = Counter([q for _, _, q in triples])
+
+        # Pick most common base; tie-break using highest-priority exchange that lists it
+        prio = self._exchange_priority()
+        def best_prio_for_base(b: str) -> int:
+            ranks = [prio.get(ex, 10_000) for ex, bb, _ in triples if bb == b]
+            return min(ranks) if ranks else 10_000
+
+        if base_counts:
+            max_ct = max(base_counts.values())
+            base_candidates = [b for b, c in base_counts.items() if c == max_ct]
+            global_base = min(base_candidates, key=best_prio_for_base)
+        else:
+            global_base = triples[0][1]
+
+        global_quote = quote_counts.most_common(1)[0][0] if quote_counts else triples[0][2]
+
+        # Order exchanges by configured priority (same priority rule as tie-break for base)
+        triples_sorted = sorted(triples, key=lambda x: prio.get(x[0], 10_000))
+        parts: List[str] = []
+        for ex, base, _q in triples_sorted:
+            disp = self._display_exchange_name(ex)
+            if base == global_base:
+                parts.append(disp)
+            else:
+                parts.append(f"{disp}({base})")
+
+        return f"{global_base}-{global_quote} {'_'.join(parts)}"
+
+    def _extract_buyin_lines(self, status_blob: str) -> List[str]:
+        """Extract the buy-in header and asset rows from a strategy status output.
+        Returns [] when buy-in is not active (no section present)."""
+        if not status_blob:
+            return []
+        raw_lines = status_blob.split("\n")
+        out: List[str] = []
+        collecting = False
+        for raw in raw_lines:
+            s = raw.strip()
+            if s.startswith("Buy-in:"):
+                out.append(s)
+                collecting = True
+                continue
+            if collecting:
+                if raw.startswith("    ") and s:
+                    out.append(s)
+                    continue
+                if out:
+                    break
+        return out
