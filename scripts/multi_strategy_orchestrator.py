@@ -54,6 +54,7 @@ See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 """
 
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
@@ -309,7 +310,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             hb_app_notification=True,
             buy_in_enabled=config.buy_in_enabled,
             buy_in_target_usd=config.buy_in_target_usd,
-            buy_in_min_profitability=config.buy_in_min_profitability,
+            buy_in_min_profitability=float(config.buy_in_min_profitability) / 100.0,
         )
 
         # Store strategy instance
@@ -441,42 +442,37 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # One-line per strategy; collect optional sections for the bottom
         buyin_sections = []
 
-        for i, strategy_instance in enumerate(self.strategies, 1):
-            name = strategy_instance.name
+        for strategy_instance in self.strategies:
+            strategy_name = strategy_instance.name
 
-            # Build compact markets string (works with many markets)
+            # Compact markets string
             markets_str = self._format_markets_compact(strategy_instance.market_pairs)
 
-            # Min profitability (percentage string stored in config)
-            min_prof = strategy_instance.config.get('min_profitability')
+            # Min profitability (percentage in config)
+            min_prof_value = strategy_instance.config.get('min_profitability')
+            min_prof_str = self._format_min_percent(min_prof_value) if min_prof_value is not None else None
 
-            best_prof_str = "n/a"
+            # Best profitability from strategy status
             status_blob = None
+            best_prof_str = "n/a"
             try:
                 strategy = strategy_instance.strategy
                 if hasattr(strategy, 'format_status'):
                     status_blob = strategy.format_status()
-                    for ln in status_blob.split("\n"):
-                        stripped = ln.strip()
-                        if stripped.startswith("best:") and "->" in stripped:
-                            try:
-                                best_prof_str = stripped.split("->", 1)[1].strip()
-                            except Exception:
-                                best_prof_str = stripped
-                            break
+                    best_prof_str = self._parse_best_profitability(status_blob) or best_prof_str
             except Exception as e:
-                self.logger().debug(f"Could not get strategy stats for '{name}': {e}")
+                self.logger().debug(f"Could not get strategy stats for '{strategy_name}': {e}")
 
-            if min_prof is not None:
-                lines.append(f"{i}. {name}: {markets_str} | min {min_prof}% | best {best_prof_str}")
+            if min_prof_str is not None:
+                lines.append(f"{markets_str} | min {min_prof_str} | best {best_prof_str}")
             else:
-                lines.append(f"{i}. {name}: {markets_str} | best {best_prof_str}")
+                lines.append(f"{markets_str} | best {best_prof_str}")
 
             # Extract buy-in details only when active
             if status_blob is not None:
                 bi_lines = self._extract_buyin_lines(status_blob)
                 if bi_lines:
-                    buyin_sections.append((name, bi_lines))
+                    buyin_sections.append((strategy_name, bi_lines))
 
         if buyin_sections:
             lines.append("\nBuy-in active:")
@@ -570,6 +566,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         for raw in raw_lines:
             s = raw.strip()
             if s.startswith("Buy-in:"):
+                # Reformat min_prof to one decimal if present
+                try:
+                    # Example: Buy-in: target=1000.000000 min_prof=2.50%
+                    m = re.search(r"min_prof\s*=\s*([0-9]+(?:\.[0-9]+)?)%", s)
+                    if m:
+                        val = float(m.group(1))
+                        s = re.sub(r"min_prof\s*=\s*([0-9]+(?:\.[0-9]+)?)%",
+                                   f"min_prof={val:.1f}%", s)
+                except Exception:
+                    pass
                 out.append(s)
                 collecting = True
                 continue
@@ -580,3 +586,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if out:
                     break
         return out
+
+    def _parse_best_profitability(self, status_blob: str) -> Optional[str]:
+        """Parse the 'best:' line and return only the trailing profitability piece after '->'."""
+        if not status_blob:
+            return None
+        try:
+            for ln in status_blob.split("\n"):
+                stripped = ln.strip()
+                if stripped.startswith("best:") and "->" in stripped:
+                    try:
+                        return stripped.split("->", 1)[1].strip()
+                    except Exception:
+                        return stripped
+        except Exception:
+            return None
+        return None
+
+    def _format_min_percent(self, value) -> str:
+        """Format a percent value with one decimal, keeping input flexibility (str/float/Decimal)."""
+        try:
+            return f"{float(value):.1f}%"
+        except Exception:
+            return f"{value}%"
