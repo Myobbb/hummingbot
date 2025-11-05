@@ -45,20 +45,27 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # No per-channel silence tracking (keep minimal state)
         self._suppress_reconnect_logs = False
 
-    def _is_ws_close_code_1003_exception(self, exc: Exception) -> bool:
-        """
-        Return True if the given exception string indicates a WebSocket closed event with code 1000 or 1003.
-        We match the diagnostic message produced by the shared WS connection layer. Treat 1000 (normal closure)
-        and 1003 (unsupported data / policy) as expected reconnect scenarios to avoid noisy error logs.
-        """
+        # Track transient disconnects to emit a single concise INFO after successful resubscribe
+        self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
         try:
             text = str(exc)
         except Exception:
-            return False
-        if "Close code = 1000" in text or "Close code = 1003" in text:
-            return True
+            return None
         match = re.search(r"Close code\s*=\s*(\d+)", text)
-        return bool(match and match.group(1) in {"1000", "1003"})
+        return match.group(1) if match else None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        """
+        Returns True for close codes typically associated with transient network/CDN resets
+        that should be auto-recovered without noisy error logs.
+        """
+        code = self._extract_close_code(exc)
+        # Treat these as transient: 1000 normal closure, 1001 going away, 1003 policy,
+        # 1005 no status, 1006 abnormal closure (often network), 1012 service restart,
+        # 1013 try again later
+        return code in {"1000", "1001", "1003", "1005", "1006", "1012", "1013"}
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -130,15 +137,24 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception as e:
                 self._reconnect_attempts += 1
-                # Silence disconnect/reconnect logs for WS close code 1003
-                if not self._is_ws_close_code_1003_exception(e):
+                # For transient close codes, defer noisy logs and emit a concise INFO after resubscribe
+                if self._is_transient_ws_close_exception(e):
+                    code = self._extract_close_code(e)
+                    self._pending_reconnect_notice = {
+                        "code": code or "unknown",
+                        "t0": time.time(),
+                    }
+                    # Avoid extra subscription DEBUG spam on the next cycle
+                    self._suppress_reconnect_logs = True
+                    # Keep only a terse debug here to aid deep troubleshooting if needed
+                    self.logger().debug(
+                        f"Transient WS close detected (code={code}); attempting fast reconnect..."
+                    )
+                else:
                     self.logger().error(
                         f"Unexpected error with WebSocket connection. Retrying... Error: {e}",
                         exc_info=True
                     )
-                else:
-                    # Flag next subscription cycle to avoid logging reconnection spam
-                    self._suppress_reconnect_logs = True
                 # No backoff; reconnect immediately
             finally:
                 if ws is not None:
@@ -307,7 +323,19 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(subscribe_trade_request)
                 
 
-            if not self._suppress_reconnect_logs:
+            if self._pending_reconnect_notice is not None:
+                try:
+                    elapsed = max(0.0, time.time() - self._pending_reconnect_notice.get("t0", time.time()))
+                    code = self._pending_reconnect_notice.get("code", "unknown")
+                    self.logger().info(
+                        f"WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
+                        f"subscribed to public orderbook and trade channels"
+                    )
+                finally:
+                    self._pending_reconnect_notice = None
+                    # Clear suppression after successful resubscribe
+                    self._suppress_reconnect_logs = False
+            elif not self._suppress_reconnect_logs:
                 self.logger().info("Subscribed to public orderbook and trade channels...")
             
         except asyncio.CancelledError:
