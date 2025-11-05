@@ -146,13 +146,27 @@ class OrderBookTracker:
         '''
         Updates last trade price for all order books through REST API, it is to initiate last_trade_price and as
         fall-back mechanism for when the web socket update channel fails.
+
+        Monitors both trade events AND order book diff updates. If BOTH streams have not received updates
+        in 3 minutes, triggers REST fallback. This prevents false positives on low-volume trading pairs
+        where order book updates are streaming but no trades occur.
         '''
         await self._order_books_initialized.wait()
         while True:
             try:
-                outdateds = [t_pair for t_pair, o_book in self._order_books.items()
-                             if o_book.last_applied_trade < time.perf_counter() - (60. * 3)
-                             and o_book.last_trade_price_rest_updated < time.perf_counter() - 5]
+                # Check if BOTH trade stream AND orderbook diff stream are stale (no updates in 3 minutes)
+                # This avoids false positives on low-volume pairs where order books update but trades are rare
+                current_time = time.perf_counter()
+                three_minutes_ago = current_time - (60. * 3)
+                five_seconds_ago = current_time - 5
+
+                outdateds = [
+                    t_pair for t_pair, o_book in self._order_books.items()
+                    if (o_book.last_applied_trade < three_minutes_ago and
+                        o_book.last_applied_diff < three_minutes_ago and
+                        o_book.last_trade_price_rest_updated < five_seconds_ago)
+                ]
+
                 if outdateds:
                     args = {"trading_pairs": outdateds}
                     if self._domain is not None:
