@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import re
 import time
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import hummingbot.connector.exchange.bybit.bybit_constants as CONSTANTS
 import hummingbot.connector.exchange.bybit.bybit_web_utils as web_utils
@@ -40,6 +41,10 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             auth=self._auth)
         self._ws_assistant: Optional[WSAssistant] = None
         self._last_ws_message_sent_timestamp = 0
+        # Reconnect/error handling state
+        self._reconnect_attempts: int = 0
+        self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
+        self._suppress_reconnect_logs: bool = False
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -68,6 +73,9 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant(self._domain)
                 await self._subscribe_channels(ws)
+                # Reset attempts on successful connection + subscribe
+                self._reconnect_attempts = 0
+                self._suppress_reconnect_logs = False
                 self._last_ws_message_sent_timestamp = self._time()
                 while True:
                     try:
@@ -84,12 +92,32 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             raise ConnectionError("Bybit private WS inactive for too long; reconnecting.")
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().exception("Unexpected error while listening to user stream. Retrying after 5 seconds...")
+            except Exception as e:
+                self._reconnect_attempts += 1
+                if self._is_transient_ws_close_exception(e):
+                    code = self._extract_close_code(e)
+                    # Defer noisy logs; emit concise INFO after resubscribe
+                    self._pending_reconnect_notice = {"code": code or "unknown", "t0": time.time()}
+                    self._suppress_reconnect_logs = True
+                    try:
+                        self.logger().warning(
+                            f"Bybit private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                    except Exception:
+                        pass
+                    backoff = self._backoff_seconds(transient=True)
+                else:
+                    self.logger().error(
+                        "Unexpected error while listening to user stream. Will retry.",
+                        exc_info=True,
+                    )
+                    backoff = self._backoff_seconds(transient=False)
             finally:
                 # Make sure no background task is leaked.
                 ws and await ws.disconnect()
-                await self._sleep(1)
+                try:
+                    await self._sleep(backoff if 'backoff' in locals() else 1.0)
+                except Exception:
+                    await self._sleep(1.0)
 
     async def _ping_server(self, ws: WSAssistant):
         ping_time = self._time()
@@ -127,8 +155,19 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await ws.send(subscribe_orders_request)
             await ws.send(subscribe_executions_request)
             await ws.send(subscribe_wallet_request)
-
-            self.logger().info("Subscribed to private orders, executions and wallet channels")
+            if self._pending_reconnect_notice is not None:
+                try:
+                    elapsed = max(0.0, self._time() - self._pending_reconnect_notice.get("t0", self._time()))
+                    code = self._pending_reconnect_notice.get("code", "unknown")
+                    self.logger().info(
+                        f"Bybit private WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
+                        f"subscribed to private channels"
+                    )
+                finally:
+                    self._pending_reconnect_notice = None
+                    self._suppress_reconnect_logs = False
+            else:
+                self.logger().info("Subscribed to private orders, executions and wallet channels")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -162,7 +201,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     else:
                         try:
                             acked = data.get("args") or data.get("topic") or "<unknown>"
-                            self.logger().info(f"Bybit private subscribe acknowledged: {acked}")
+                            if not self._suppress_reconnect_logs:
+                                self.logger().info(f"Bybit private subscribe acknowledged: {acked}")
                         except Exception:
                             pass
                 elif data.get("op") == "ping":
@@ -194,6 +234,26 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             if channel:
                 data["channel"] = channel
                 output.put_nowait(data)
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        return match.group(1) if match else None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        code = self._extract_close_code(exc)
+        # Treat common network/service resets as transient
+        return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
+
+    def _backoff_seconds(self, transient: bool) -> float:
+        if transient:
+            return 1.0
+        # Exponential backoff for non-transient issues, capped at 30s
+        exponent = min(self._reconnect_attempts, 5)
+        return float(min(30, 2 ** max(1, exponent)))
 
     async def _process_ws_auth_msg(self, data: dict):
         if not data.get("success"):
