@@ -476,19 +476,35 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     buyin_sections.append((strategy_name, bi_lines))
 
         if rows:
-            markets_w = max(len(r["markets"]) for r in rows)
+            # Compute widths for pair and exchange columns to align neatly
+            def split_pair_ex(s: str) -> Tuple[str, str]:
+                try:
+                    pair, rest = s.split(" ", 1)
+                    return pair, rest
+                except Exception:
+                    return s, ""
+
+            pair_ex_rows: List[Tuple[str, str]] = [split_pair_ex(r["markets"]) for r in rows]
+            pair_w = max((len(p) for p, _ in pair_ex_rows), default=0)
+            ex_w = max((len(e) for _, e in pair_ex_rows), default=0)
+
             # Width for the entire "min X%" field; rows without min will be padded with spaces
             try:
                 min_w = max((len(r["min"]) for r in rows), default=0)
             except Exception:
                 min_w = 0
 
-            for r in rows:
+            for (pair_part, ex_part), r in zip(pair_ex_rows, rows):
+                if ex_w > 0:
+                    markets_fmt = f"{pair_part:<{pair_w}} {ex_part:<{ex_w}}"
+                else:
+                    markets_fmt = f"{pair_part:<{pair_w}}"
+
                 if min_w > 0:
                     min_field = f"{r['min']:<{min_w}}" if r['min'] else (" " * min_w)
-                    lines.append(f"{r['markets']:<{markets_w}} | {min_field} | best {r['best']}")
+                    lines.append(f"{markets_fmt} | {min_field} | best {r['best']}")
                 else:
-                    lines.append(f"{r['markets']:<{markets_w}} | best {r['best']}")
+                    lines.append(f"{markets_fmt} | best {r['best']}")
 
         if buyin_sections:
             lines.append("\nBuy-in active:")
