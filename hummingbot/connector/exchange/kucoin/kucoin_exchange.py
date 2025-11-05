@@ -310,6 +310,22 @@ class KucoinExchange(ExchangePyBase):
                         self._order_tracker.process_order_update(order_update=order_update)
 
                 elif event_type == "message" and event_subject == CONSTANTS.BALANCE_EVENT_TYPE:
+                    # Only update spot balances from spot account events.
+                    # KuCoin relationEvent indicates the account source: main.*, trade.*, trade_hf.*, margin.*, etc.
+                    relation_event = str(execution_data.get("relationEvent", "") or "")
+                    allowed_prefix = "trade_hf." if self.domain == "hft" else "trade."
+                    if not relation_event.startswith(allowed_prefix):
+                        # Ignore funding (main.*) and margin/isolated events; we only track spot balances here.
+                        continue
+
+                    # Skip hold events that do not change available balance to avoid noisy churn
+                    if relation_event.endswith("hold"):
+                        try:
+                            if str(execution_data.get("availableChange", "0")) in ("0", "0.0", "0.00"):
+                                continue
+                        except Exception:
+                            pass
+
                     currency = execution_data["currency"]
                     available_balance = Decimal(execution_data["available"])
                     total_balance = Decimal(execution_data["total"])
