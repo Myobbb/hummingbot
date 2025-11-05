@@ -438,21 +438,22 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Balances on top
         balance_df = self.get_balance_df()
         lines.extend(["\nBalances:"] + ["  " + line for line in balance_df.to_string(index=False).split("\n")])
+    
+        lines.append("")
 
         # One-line per strategy; collect optional sections for the bottom
         buyin_sections = []
 
+        # Collect row data first to compute column widths for aligned output
+        rows: List[Dict[str, str]] = []
         for strategy_instance in self.strategies:
             strategy_name = strategy_instance.name
 
-            # Compact markets string
             markets_str = self._format_markets_compact(strategy_instance.market_pairs)
 
-            # Min profitability (percentage in config)
             min_prof_value = strategy_instance.config.get('min_profitability')
             min_prof_str = self._format_min_percent(min_prof_value) if min_prof_value is not None else None
 
-            # Best profitability from strategy status
             status_blob = None
             best_prof_str = "n/a"
             try:
@@ -463,16 +464,31 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except Exception as e:
                 self.logger().debug(f"Could not get strategy stats for '{strategy_name}': {e}")
 
-            if min_prof_str is not None:
-                lines.append(f"{markets_str} | min {min_prof_str} | best {best_prof_str}")
-            else:
-                lines.append(f"{markets_str} | best {best_prof_str}")
+            rows.append({
+                "markets": markets_str,
+                "min": f"min {min_prof_str}" if min_prof_str is not None else "",
+                "best": best_prof_str,
+            })
 
-            # Extract buy-in details only when active
             if status_blob is not None:
                 bi_lines = self._extract_buyin_lines(status_blob)
                 if bi_lines:
                     buyin_sections.append((strategy_name, bi_lines))
+
+        if rows:
+            markets_w = max(len(r["markets"]) for r in rows)
+            # Width for the entire "min X%" field; rows without min will be padded with spaces
+            try:
+                min_w = max((len(r["min"]) for r in rows), default=0)
+            except Exception:
+                min_w = 0
+
+            for r in rows:
+                if min_w > 0:
+                    min_field = f"{r['min']:<{min_w}}" if r['min'] else (" " * min_w)
+                    lines.append(f"{r['markets']:<{markets_w}} | {min_field} | best {r['best']}")
+                else:
+                    lines.append(f"{r['markets']:<{markets_w}} | best {r['best']}")
 
         if buyin_sections:
             lines.append("\nBuy-in active:")
