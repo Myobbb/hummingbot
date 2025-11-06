@@ -196,6 +196,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.strategies: List[V1StrategyInstance] = []
         self._strategies_started: bool = False  # FIX #2: Track whether strategies have been started
         self._strategy_clock = None  # FIX #3: Store clock reference for strategies
+        # Streamlined readiness logging and deferred start helpers
+        self._last_not_ready_names: Set[str] = set()
+        self._last_ready_log_time: float = 0.0
+        self._ready_announce_done: bool = False
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -345,25 +349,69 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._strategy_clock = clock
         self._last_timestamp = timestamp
 
-        # Start all V1 strategies with the clock
-        if not self._strategies_started:
-            self.logger().info(f"Starting {len(self.strategies)} V1 strategies with clock...")
+        # If connectors are already ready, start immediately; otherwise defer until tick detects readiness
+        try:
+            all_ready = all(getattr(c, 'ready', False) for c in self.connectors.values())
+        except Exception:
+            all_ready = False
 
-            for strategy_instance in self.strategies:
-                try:
-                    self.logger().info(f"Starting strategy: {strategy_instance.name}")
-                    # Some V1 strategies expose only Python-level start/stop; avoid calling c_start/c_stop from Python
-                    if hasattr(strategy_instance.strategy, "start"):
-                        # V1 strategies expect start(clock) (no timestamp)
-                        strategy_instance.strategy.start(clock)
-                except Exception as e:
-                    self.logger().error(
-                        f"Error starting strategy '{strategy_instance.name}': {e}",
-                        exc_info=True
-                    )
+        if all_ready:
+            self._start_all_strategies_if_needed()
+        else:
+            self.logger().info(
+                f"Deferring start of {len(self.strategies)} V1 strategies until connectors are ready..."
+            )
 
-            self._strategies_started = True
-            self.logger().info(f"All strategies started successfully")
+    def tick(self, timestamp: float):
+        """Override base tick to reduce startup log spam and start strategies only when ready.
+
+        - Aggregates and throttles readiness logs to once every 2s or on change.
+        - Starts V1 strategies only after all connectors are ready.
+        """
+        try:
+            not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
+        except Exception:
+            not_ready = list(self.connectors.keys())
+
+        if not_ready:
+            # Throttle and aggregate logs
+            names_set = set(not_ready)
+            if names_set != self._last_not_ready_names or (timestamp - self._last_ready_log_time) >= 2.0:
+                self.logger().info(
+                    f"Waiting for connectors ({len(not_ready)}): {', '.join(not_ready)}"
+                )
+                self._last_not_ready_names = names_set
+                self._last_ready_log_time = timestamp
+            # Stay idle until connectors are ready
+            return
+
+        # All connectors ready
+        if not self.ready_to_trade:
+            self.ready_to_trade = True
+            if not self._ready_announce_done:
+                self.logger().info("All connectors ready. Starting strategies and entering trading loop.")
+                self._ready_announce_done = True
+            self._start_all_strategies_if_needed()
+
+        # Delegate to base tick to preserve normal runtime cadence/behavior
+        return super().tick(timestamp)
+
+    def _start_all_strategies_if_needed(self):
+        if self._strategies_started:
+            return
+        self.logger().info(f"Starting {len(self.strategies)} V1 strategies with clock...")
+        for strategy_instance in self.strategies:
+            try:
+                self.logger().info(f"Starting strategy: {strategy_instance.name}")
+                if hasattr(strategy_instance.strategy, "start"):
+                    strategy_instance.strategy.start(self._strategy_clock)
+            except Exception as e:
+                self.logger().error(
+                    f"Error starting strategy '{strategy_instance.name}': {e}",
+                    exc_info=True
+                )
+        self._strategies_started = True
+        self.logger().info("All strategies started successfully")
 
     def on_tick(self):
         """
