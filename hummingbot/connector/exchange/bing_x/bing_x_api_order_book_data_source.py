@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
@@ -11,7 +12,7 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -64,6 +65,9 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         self._confirmed_bids: Dict[str, Dict[str, str]] = {}  # pair -> {price: qty}
         self._confirmed_asks: Dict[str, Dict[str, str]] = {}  # pair -> {price: qty}
+
+        # Reconnect state for graceful handling of transient close codes (e.g., 1006)
+        self._reconnect_attempts: int = 0
 
     def _is_level_stable(self, price: str, side: str, trading_pair: str, current_time: float) -> bool:
         """Check if price level has existed for minimum duration (500ms = ~2 snapshots)"""
@@ -219,6 +223,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def listen_for_subscriptions(self):
         ws = None
         while True:
+            reconnect_delay = 1.0
             try:
                 ws = await self._api_factory.get_ws_assistant()
                 await ws.connect(
@@ -233,16 +238,24 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
-            except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
-            except Exception:
-                self.logger().error(
-                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
-                    exc_info=True,
-                )
-               
+            except (ConnectionError, Exception) as e:
+                # Handle transient WS close codes (1006 etc.) more gracefully
+                self._reconnect_attempts += 1
+                code = self._extract_close_code(e)
+                if self._is_transient_ws_close_exception(e):
+                    try:
+                        self.logger().warning(f"BingX public WS transient close (code={code or 'unknown'}). Reconnecting...")
+                    except Exception:
+                        pass
+                    reconnect_delay = self._backoff_seconds(transient=True)
+                else:
+                    try:
+                        self.logger().error("Error in public WS loop; reconnecting...", exc_info=True)
+                    except Exception:
+                        pass
+                    reconnect_delay = self._backoff_seconds(transient=False)
             finally:
-                await self._sleep(5.0)
+                await self._sleep(reconnect_delay)
                 ws and await ws.disconnect()
                 
 
@@ -274,7 +287,16 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data = utils.decompress_ws_message(ws_response.data)
             
             if isinstance(data, str):
+                # Fallback: detect raw ping text frames per BingX examples
                 try:
+                    if "ping" in data.lower():
+                        try:
+                            # Per docs examples, reply with plain text Pong for raw ping frames
+                            await ws.send(WSPlainTextRequest(payload="Pong"))
+                            self._last_ws_message_sent_timestamp = self._time()
+                            continue
+                        except Exception:
+                            raise
                     data = json.loads(data)
                 except Exception:
                     continue
@@ -288,11 +310,15 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
             # Handle ping/pong
             if "ping" in data:
-                pong = {"pong": data["ping"]}
-                if "time" in data:
-                    pong["time"] = data["time"]
-                await ws.send(WSJSONRequest(payload=pong))
-                self._last_ws_message_sent_timestamp = self._time()
+                try:
+                    pong = {"pong": data["ping"]}
+                    if "time" in data:
+                        pong["time"] = data["time"]
+                    await ws.send(WSJSONRequest(payload=pong))
+                    self._last_ws_message_sent_timestamp = self._time()
+                except Exception:
+                    # Sending pong failed -> force reconnect
+                    raise
                 continue
             
             # Process market data
@@ -315,6 +341,28 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(data)
                 except asyncio.QueueFull:
                     self.logger().warning(f"Trade queue full for {symbol}")
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        if match:
+            return match.group(1)
+        if "1006" in text:
+            return "1006"
+        return None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        code = self._extract_close_code(exc)
+        return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
+
+    def _backoff_seconds(self, transient: bool) -> float:
+        if transient:
+            return 1.0
+        exponent = min(self._reconnect_attempts, 5)
+        return float(min(30, 2 ** max(1, exponent)))
 
     async def _handle_depth_message(self, data: Dict[str, Any], symbol: str):
         """

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import re
 from typing import Optional
 
 import hummingbot.connector.exchange.bing_x.bing_x_constants as CONSTANTS
@@ -10,7 +11,7 @@ from hummingbot.connector.exchange.bing_x.bing_x_auth import BingXAuth
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -45,6 +46,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connected_listen_key = None  # Track which key the WS is connected with
         self._manage_listen_key_task = None
         self._listen_key_lock: asyncio.Lock = asyncio.Lock()  # Prevent concurrent key creation
+        self._reconnect_attempts: int = 0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -71,6 +73,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         ws = None
         while True:
+            reconnect_delay = 1.0
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
                 # Store which key we're connected with
@@ -84,15 +87,20 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             except asyncio.CancelledError:
                 raise
-            except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
-            except Exception:
-                self.logger().exception("Unexpected error while listening to user stream. Retrying after 5 seconds...")
+            except (ConnectionError, Exception) as e:
+                self._reconnect_attempts += 1
+                code = self._extract_close_code(e)
+                if self._is_transient_ws_close_exception(e):
+                    self.logger().warning(f"BingX private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                    reconnect_delay = self._backoff_seconds(transient=True)
+                else:
+                    self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
+                    reconnect_delay = self._backoff_seconds(transient=False)
             finally:
                 # Make sure no background task is leaked.
                 self._connected_listen_key = None
                 ws and await ws.disconnect()
-                await self._sleep(5)
+                await self._sleep(reconnect_delay)
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -150,23 +158,40 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             data = utils.decompress_ws_message(ws_response.data)
 
-            # Respond to server heartbeat ping per BingX spec
-            # https://bingx-api.github.io/docs/#/en-us/spot/socket/#Heartbeats
+            # Respond to server heartbeat ping per BingX spec (JSON or raw text frames)
             if isinstance(data, dict) and "ping" in data:
                 try:
                     pong_payload = {"pong": data.get("ping")}
-                    # Include time in response if provided by server
                     if data.get("time") is not None:
                         pong_payload["time"] = data.get("time")
-                    pong_request = WSJSONRequest(payload=pong_payload)
-                    await ws.send(request=pong_request)
+                    await ws.send(request=WSJSONRequest(payload=pong_payload))
                     self._last_ws_message_sent_timestamp = self._time()
-                    self.logger().debug(f"Responded to ping: {data.get('ping')}")
                 except Exception as e:
-                    # CRITICAL FIX: Failed pong must trigger reconnection
                     self.logger().error(f"Failed to send pong: {e}")
-                    raise  # This will exit the method and trigger reconnection
+                    raise
                 continue
+
+            # Fallback: detect raw text ping frames
+            try:
+                raw = None
+                if isinstance(ws_response.data, bytes):
+                    try:
+                        raw = ws_response.data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw = None
+                elif isinstance(ws_response.data, str):
+                    raw = ws_response.data
+                if raw and ("ping" in raw.lower()):
+                    try:
+                        # Per docs examples, reply with plain text Pong for raw ping frames
+                        await ws.send(request=WSPlainTextRequest(payload="Pong"))
+                        self._last_ws_message_sent_timestamp = self._time()
+                        continue
+                    except Exception as e:
+                        self.logger().error(f"Failed to send Pong (raw): {e}")
+                        raise
+            except Exception:
+                pass
 
             # Process actual data events
             if data.get("e") == "ACCOUNT_UPDATE":
@@ -177,6 +202,28 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 output.put_nowait(data)
             elif data.get("dataType") == "spot.executionReport":
                 output.put_nowait(data)
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        if match:
+            return match.group(1)
+        if "1006" in text:
+            return "1006"
+        return None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        code = self._extract_close_code(exc)
+        return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
+
+    def _backoff_seconds(self, transient: bool) -> float:
+        if transient:
+            return 1.0
+        exponent = min(self._reconnect_attempts, 5)
+        return float(min(30, 2 ** max(1, exponent)))
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:
