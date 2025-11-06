@@ -53,6 +53,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
     Optimized arbitrage strategy with clean, uniform implementation.
     Uses doubles internally for performance, converts to Decimal only for external APIs.
     """
+    cdef:
+        object _orders_with_fills  # Python set of order_ids that received at least one fill
     
     OPTION_LOG_STATUS_REPORT = 1 << 0
     OPTION_LOG_CREATE_ORDER = 1 << 1
