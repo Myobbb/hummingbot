@@ -1,5 +1,6 @@
 import asyncio
 import time
+import re
 import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
@@ -98,6 +99,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._max_subscription_failures: int = 20
         # Throttled per-symbol warning timestamps to avoid log spam
         self._symbol_last_warn_time: Dict[str, float] = {}
+        # Reconnection/error handling state
+        self._reconnect_attempts: int = 0
+        self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
+        self._suppress_reconnect_logs: bool = False
 
     async def _cancel_task_safely(self, task: Optional[asyncio.Task]):
         if task is None:
@@ -466,18 +471,33 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
-                # Expected reconnect scenarios (inactive socket, proactive age-based reconnect, etc.)
-                try:
-                    self.logger().warning(f"Bybit public WS reconnecting: {connection_exception}")
-                except Exception:
-                    pass
-                await self._sleep(1.0)
+                # Expected reconnect scenarios (inactive socket, proactive age-based reconnect, close codes, etc.)
+                self._reconnect_attempts += 1
+                backoff = 1.0
+                if self._is_transient_ws_close_exception(connection_exception):
+                    code = self._extract_close_code(connection_exception)
+                    self._pending_reconnect_notice = {"code": code or "unknown", "t0": self._time()}
+                    self._suppress_reconnect_logs = True
+                    try:
+                        self.logger().warning(
+                            f"Bybit public WS transient close (code={code or 'unknown'}). Reconnecting...")
+                    except Exception:
+                        pass
+                    backoff = self._backoff_seconds(transient=True)
+                else:
+                    try:
+                        self.logger().warning(f"Bybit public WS reconnecting: {connection_exception}")
+                    except Exception:
+                        pass
+                    backoff = self._backoff_seconds(transient=False)
+                await self._sleep(backoff)
             except Exception:
+                self._reconnect_attempts += 1
                 self.logger().error(
-                    "Unexpected error occurred when listening to order book streams. Retrying in 1 second...",
+                    "Unexpected error occurred when listening to order book streams.",
                     exc_info=True,
                 )
-                await self._sleep(1.0)
+                await self._sleep(self._backoff_seconds(transient=False))
             finally:
                 try:
                     await self._cancel_task_safely(self._ws_consumer_task)
@@ -517,7 +537,19 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=orderbook_payload)
                 await ws.send(subscribe_orderbook_request)
-            self.logger().info(f"Subscribed to public order book and trade channels for {len(self._trading_pairs)} pairs")
+            if self._pending_reconnect_notice is not None:
+                try:
+                    elapsed = max(0.0, self._time() - self._pending_reconnect_notice.get("t0", self._time()))
+                    code = self._pending_reconnect_notice.get("code", "unknown")
+                    self.logger().info(
+                        f"Bybit public WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
+                        f"subscribed to public orderbook channels"
+                    )
+                finally:
+                    self._pending_reconnect_notice = None
+                    self._suppress_reconnect_logs = False
+            else:
+                self.logger().info(f"Subscribed to public order book and trade channels for {len(self._trading_pairs)} pairs")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -860,3 +892,23 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
         except Exception:
             self.logger().warning(f"Retry subscribe failed for topic {topic}", exc_info=True)
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        return match.group(1) if match else None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        code = self._extract_close_code(exc)
+        # Treat common network/service resets as transient
+        return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
+
+    def _backoff_seconds(self, transient: bool) -> float:
+        if transient:
+            return 1.0
+        # Exponential backoff for non-transient issues, capped at 30s
+        exponent = min(self._reconnect_attempts, 5)
+        return float(min(30, 2 ** max(1, exponent)))

@@ -69,6 +69,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._last_failure_timestamps = {}
         self._pending_buyin_by_asset = {}
         self._pending_buyin_orders = {}
+        # Track whether a given order_id has received any fill events
+        self._orders_with_fills = set()
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -147,6 +149,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Clear order tracking
         self._order_timestamps.clear()
         self._completed_orders.clear()
+        try:
+            self._orders_with_fills.clear()
+        except Exception:
+            pass
 
         # Buy-in params/state
         self._buy_in_enabled = buy_in_enabled
@@ -607,6 +613,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         try:
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str)
+            # Clean fill marker since completion supersedes partials
+            try:
+                self._orders_with_fills.discard(order_id)
+            except Exception:
+                pass
             
             
             # Check completion time
@@ -635,16 +646,37 @@ cdef class ArbitrageMStrategy(StrategyBase):
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
+    cdef c_did_fill_order(self, object order_filled_event):
+        """Track that an order has received at least one fill."""
+        cdef:
+            str order_id = order_filled_event.order_id
+            object order_type = order_filled_event.order_type
+        try:
+            if order_type == OrderType.MARKET:
+                self._orders_with_fills.add(order_id)
+        except Exception:
+            # Best-effort tracking only
+            pass
+
     cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
         """Handle cancelled orders - critical for catching failed market orders."""
         cdef:
             str order_id = order_cancelled_event.order_id
             string order_id_str = self._to_cpp_str(order_id)
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+            object maybe_market_order
+            bint has_any_fill = False
 
         if market_pair is None:
             return
         
+        # Determine whether the cancelled order was a MARKET or LIMIT order
+        maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
+        try:
+            has_any_fill = order_id in self._orders_with_fills
+        except Exception:
+            has_any_fill = False
+
         # Full cleanup for cancelled orders (same as timeout handler)
         self._order_timestamps.erase(order_id_str)
         self._completed_orders.erase(order_id_str)
@@ -665,12 +697,30 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     self._pending_buyin_by_asset.pop(asset_key, None)
         except Exception:
             pass
-        
-        # Enforce cooldown on cancellations (treat like failures)
-        self._last_failure_timestamps[market_pair] = self._current_timestamp
-        
-        self.logger().warning(
-            f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
+        # Decide cooldown/logging based on order type and fill state
+        if maybe_market_order is not None:
+            # MARKET order cancellation
+            # If the market order had any fill(s), treat as complete and DO NOT enforce cooldown
+            if has_any_fill:
+                try:
+                    self._orders_with_fills.discard(order_id)
+                except Exception:
+                    pass
+                try:
+                    self.logger().info(
+                        f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was cancelled after fills - treating as complete (no cooldown)")
+                except Exception:
+                    pass
+            else:
+                # No fills at all -> enforce cooldown like a failure
+                self._last_failure_timestamps[market_pair] = self._current_timestamp
+                self.logger().warning(
+                    f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
+        else:
+            # LIMIT order or unknown type -> keep previous behavior (enforce cooldown)
+            self._last_failure_timestamps[market_pair] = self._current_timestamp
+            self.logger().warning(
+                f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -739,13 +789,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
                         if timeout_threshold <= 10.0:
-                            # Market order cleanup - if still being tracked after 10s, something went wrong
-                            # Treat as a potential failure and enforce cooldown
-                            self.logger().debug(f"Market order {order_id} on {market_tuple[0].name} still tracked after {time_elapsed:.2f}s - cleaning up")
+                            # Market order cleanup - treat as complete if we've seen any fills
+                            # Do not enforce failure cooldown for market orders with partial/full fills
+                            self.logger().info(f"Market order {order_id} on {market_tuple[0].name} tracked for {time_elapsed:.2f}s - treating as complete and cleaning up")
                             self._order_timestamps.erase(order_id_str)
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            # Enforce failure cooldown for this market to prevent rapid retries
-                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
+                            try:
+                                self._orders_with_fills.discard(order_id)
+                            except Exception:
+                                pass
                         else:
                             # Actual timeout - log warning and enforce cooldown
                             self.logger().warning(f"Order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
