@@ -67,6 +67,18 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # 1013 try again later
         return code in {"1000", "1001", "1003", "1005", "1006", "1012", "1013"}
 
+    def _is_ws_close_code_1003_exception(self, exc: Exception) -> bool:
+        """
+        Returns True if the exception indicates WS close code 1003 (unsupported data / policy violation).
+        We treat it specially to avoid noisy logs and allow the outer loop to reconnect quietly.
+        """
+        try:
+            text = str(exc)
+        except Exception:
+            return False
+        # Matches formats raised by WSConnection._check_msg_closed_type and aiohttp errors.
+        return ("Close code = 1003" in text) or ("code=1003" in text)
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
 
@@ -77,7 +89,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         connection_params = {
             "ws_url": ws_url,
             "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
-            "message_timeout": 60,
+            # Do not enforce a client-side receive timeout; HTX sends server pings every ~5s.
+            # Rely on _keep_alive_loop inactivity checks to recycle stale connections.
+            "message_timeout": None,
             "ws_headers": {"Accept-Encoding": "gzip"},
             "max_msg_size": 32 * 1024 * 1024,
         }
@@ -400,6 +414,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pong_request = WSJSONRequest(payload=pong_payload)
             await websocket_assistant.send(request=pong_request)
             # Record server ping receipt
+            self._last_pong_timestamp = time.time()
             return
         
         # HTX v2 format
@@ -410,6 +425,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pong = {"action": "pong", "data": {"ts": ts} if ts else {}}
             await websocket_assistant.send(WSJSONRequest(payload=pong))
             # Record server ping receipt
+            self._last_pong_timestamp = time.time()
             return
         
         # Handle subscription confirmations and errors
