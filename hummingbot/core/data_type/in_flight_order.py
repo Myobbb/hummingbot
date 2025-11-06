@@ -204,6 +204,18 @@ class InFlightOrder:
         )
 
     @property
+    def has_any_fills(self) -> bool:
+        """
+        Returns True if the order has any fills at all, regardless of completion status.
+        Useful for market orders where partial fills should be treated as complete.
+
+        For example, a market order for 1.0 units that only filled 0.6 units would have:
+        - is_filled: False (not completely filled)
+        - has_any_fills: True (some fills occurred)
+        """
+        return self.executed_amount_base > s_decimal_0
+
+    @property
     def is_failure(self) -> bool:
         return self.current_state == OrderState.FAILED
 
