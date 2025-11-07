@@ -785,8 +785,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     # Determine timeout based on whether order was pre-marked as complete (market order)
                     
                     if self._completed_orders.find(order_id_str) != self._completed_orders.end():
-                        # Market order: short timeout (10s) just to catch cancellations
-                        timeout_threshold = 10.0
+                        # Market order: short timeout (180s) just to catch cancellations
+                        timeout_threshold = 180.0
                     else:
                         # Limit order or unconfirmed: full timeout
                         timeout_threshold = self._order_timeout
