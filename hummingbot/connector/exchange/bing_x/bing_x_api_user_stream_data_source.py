@@ -19,7 +19,7 @@ from hummingbot.logger import HummingbotLogger
 
 class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
-    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800
+    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1500
 
     _bausds_logger: Optional[HummingbotLogger] = None
 
@@ -89,13 +89,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 raise
             except (ConnectionError, Exception) as e:
                 self._reconnect_attempts += 1
-                code = self._extract_close_code(e)
-                if self._is_transient_ws_close_exception(e):
-                    self.logger().warning(f"BingX private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                # Treat listen key rotations as expected, not errors
+                if isinstance(e, ConnectionError) and "Listen key changed" in str(e):
+                    self.logger().info("Listen key rotated; reconnecting with new key")
                     reconnect_delay = self._backoff_seconds(transient=True)
                 else:
-                    self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
-                    reconnect_delay = self._backoff_seconds(transient=False)
+                    code = self._extract_close_code(e)
+                    if self._is_transient_ws_close_exception(e):
+                        self.logger().warning(f"BingX private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                        reconnect_delay = self._backoff_seconds(transient=True)
+                    else:
+                        self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
+                        reconnect_delay = self._backoff_seconds(transient=False)
             finally:
                 # Make sure no background task is leaked.
                 self._connected_listen_key = None
@@ -352,7 +357,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             if not success:
                                 # _ping_listen_key already cleared the key if it was 404
                                 # Just log and continue - next iteration will create new key
-                                self.logger().error("Error occurred renewing listen key, will get a new one...")
+                                self.logger().warning("Error occurred renewing listen key, will get a new one...")
                                 await self._sleep(5)  # Brief delay before retry
                                 continue
                             else:
@@ -426,9 +431,43 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 pass  # Ignore any exception from the task
             self._manage_listen_key_task = None
 
+        # Best-effort: delete the previous connected listen key if it differs from the current one
+        try:
+            old_connected = self._connected_listen_key
+            if old_connected and old_connected != self._current_listen_key:
+                await self._delete_listen_key(old_connected)
+        except Exception:
+            # Non-fatal cleanup
+            self.logger().debug("Best-effort listen key delete failed (ignored)")
+
         # Clear listen key state - use lock to prevent race conditions
         async with self._listen_key_lock:
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
 
         await self._sleep(5)
+
+    async def _delete_listen_key(self, listen_key: str) -> None:
+        """Best-effort deletion of a listen key to clean up server state."""
+        if not listen_key:
+            return
+        try:
+            await web_utils.api_request(
+                path=CONSTANTS.USER_STREAM_PATH_URL,
+                api_factory=self._api_factory,
+                throttler=self._throttler,
+                time_synchronizer=None,
+                domain=self._domain,
+                params={"listenKey": listen_key},
+                method=RESTMethod.DELETE,
+                is_auth_required=True,
+                return_err=False,
+                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
+                headers=self._auth.header_for_authentication(),
+            )
+            self.logger().debug(f"Deleted stale listen key {listen_key}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Silently ignore failures to delete
+            self.logger().debug(f"Failed to delete listen key {listen_key} (ignored)")
