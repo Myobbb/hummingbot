@@ -162,6 +162,7 @@ class ClientOrderTracker:
             elif order.is_failure:
                 # Previously, failed orders were re-added as "lost" to continue polling.
                 # Lost order recovery is disabled; do not repopulate the lost orders list.
+                pass
 
     def fetch_tracked_order(self, client_order_id: str) -> Optional[InFlightOrder]:
         return self._in_flight_orders.get(client_order_id, None)
