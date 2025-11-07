@@ -71,7 +71,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         while True:
             try:
-                ws: WSAssistant = await self._connected_websocket_assistant(self._domain)
+                ws: Optional[WSAssistant] = None
+                ws = await self._connected_websocket_assistant(self._domain)
                 await self._subscribe_channels(ws)
                 # Reset attempts on successful connection + subscribe
                 self._reconnect_attempts = 0
@@ -94,14 +95,17 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 raise
             except Exception as e:
                 self._reconnect_attempts += 1
-                if self._is_transient_ws_close_exception(e):
+                if self._is_transient_ws_close_exception(e) or self._is_pong_timeout_exception(e):
                     code = self._extract_close_code(e)
                     # Defer noisy logs; emit concise INFO after resubscribe
                     self._pending_reconnect_notice = {"code": code or "unknown", "t0": time.time()}
                     self._suppress_reconnect_logs = True
                     try:
-                        self.logger().warning(
-                            f"Bybit private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                        if self._is_pong_timeout_exception(e):
+                            self.logger().warning("Bybit private WS PONG not received within expected time. Reconnecting...")
+                        else:
+                            self.logger().warning(
+                                f"Bybit private WS transient close (code={code or 'unknown'}). Reconnecting...")
                     except Exception:
                         pass
                     backoff = self._backoff_seconds(transient=True)
@@ -113,7 +117,11 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     backoff = self._backoff_seconds(transient=False)
             finally:
                 # Make sure no background task is leaked.
-                ws and await ws.disconnect()
+                try:
+                    if ws is not None:
+                        await ws.disconnect()
+                except Exception:
+                    pass
                 try:
                     await self._sleep(backoff if 'backoff' in locals() else 1.0)
                 except Exception:
@@ -208,11 +216,15 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 elif data.get("op") == "ping":
                     # Respond to server-initiated pings to keep the connection healthy
                     try:
-                        pong_payload = {"op": "pong"}
-                        if "req_id" in data:
-                            pong_payload["req_id"] = data["req_id"]
-                        elif "ts" in data:
-                            pong_payload["req_id"] = data["ts"]
+                        # Private WS expects pong with args array per Bybit docs
+                        pong_arg = None
+                        if "ts" in data:
+                            pong_arg = str(data["ts"])
+                        elif "req_id" in data:
+                            pong_arg = str(data["req_id"])
+                        else:
+                            pong_arg = str(int(self._time() * 1000))
+                        pong_payload = {"op": "pong", "args": [pong_arg]}
                         await ws.send(WSJSONRequest(pong_payload))
                         self._last_ws_message_sent_timestamp = self._time()
                     except Exception:
@@ -248,6 +260,14 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # Treat common network/service resets as transient
         return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
 
+    def _is_pong_timeout_exception(self, exc: Exception) -> bool:
+        try:
+            text = str(exc)
+        except Exception:
+            return False
+        # Raised by aiohttp heartbeat when protocol-level PONG is not received
+        return "No PONG received" in text
+
     def _backoff_seconds(self, transient: bool) -> float:
         if transient:
             return 1.0
@@ -271,7 +291,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws_url = f"{CONSTANTS.WSS_PRIVATE_URL[domain]}?max_active_time=5m"
         await ws.connect(
             ws_url=ws_url,
-            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL
+            # Disable protocol-level heartbeat; Bybit uses JSON ping/pong acks
+            ping_timeout=None
         )
         await self._authenticate_connection(ws)
         return ws

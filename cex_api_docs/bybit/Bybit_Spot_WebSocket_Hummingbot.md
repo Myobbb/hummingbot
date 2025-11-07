@@ -23,13 +23,14 @@ This document summarizes Bybit V5 API behavior relevant to Hummingbot’s Bybit 
 ## Heartbeats (liveness)
 ### Public WebSocket
 - Client ping: Hummingbot sends an application-level ping every 20s: `{ "op": "ping", "req_id": "<ms-timestamp>" }`.
-- Server response: Bybit ack may arrive as `{ "op": "pong", "req_id": "..." }` or `{ "op": "ping", "ret_msg": "pong" }` depending on channel behavior. Hummingbot treats both as valid acks.
-- Server-initiated ping: If server sends `{ "op": "ping", ... }`, client replies with `{ "op": "pong", "req_id": "<echo ts|req_id>" }`.
+- Server response: Bybit ack may arrive as `{ "op": "pong" }` or `{ "op": "ping", "ret_msg": "pong" }` depending on channel behavior. Hummingbot treats both as valid acks.
+- Server-initiated ping: If server sends `{ "op": "ping", ... }`, client replies with `{ "op": "pong" }` (public) or the exchange-expected form for that channel.
 - Watchdog: If no frames (including pong/acks) for > ~2.5 heartbeats, Hummingbot reconnects the public WS. If data is idle but acks still arrive, Hummingbot resnapshots/resubscribes topics without reconnecting.
 
 ### Private WebSocket
 - Client ping: Hummingbot sends `{ "op": "ping", "req_id": "<ms-timestamp>" }` every ~20s.
-- Server-initiated ping: Hummingbot replies `{ "op": "pong", "req_id": "..." }`.
+- Server response (ack): Bybit private channels reply with `{ "op": "pong", "args": ["<timestamp>"] }`.
+- Server-initiated ping: Hummingbot replies `{ "op": "pong", "args": ["<echo ts|req_id>"] }` as per Bybit private WS docs.
 - Watchdog: If no frames for > ~2 heartbeats, Hummingbot reconnects the private WS.
 
 References: `WebSocket Stream` (see Public/Private sections in Bybit V5 docs) [`https://bybit-exchange.github.io/docs/v5/intro`]
@@ -164,7 +165,7 @@ Doc: `https://bybit-exchange.github.io/docs/v5/enum#orderstatus`
 ## Notes specific to Hummingbot implementation
 - Category is always `spot` for all relevant REST/WS operations.
 - Public orderbook depth used on WS is L50 (`orderbook.50.{symbol}`); REST snapshots cap at `limit<=200`.
-- Private WS connection URL includes an optional `?max_active_time=5m` query to hint session longevity; not required by Bybit.
+- Private WS connection URL includes `?max_active_time=5m` to customize session alive time (Bybit supports 30s..600s). 
 - Hummingbot proactively resubscribes/resnapshots on per-symbol staleness, and reconnects WS if heartbeats are missed.
 
 ## References

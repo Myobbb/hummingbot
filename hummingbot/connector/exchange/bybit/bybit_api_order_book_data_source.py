@@ -349,7 +349,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
                 await ws.connect(
                     ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
-                    ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+                    # Disable protocol-level heartbeat; rely on JSON ping/pong and watchdogs
+                    ping_timeout=None,
                 )
                 await self._subscribe_channels(ws)
                 # Wait briefly to allow subscribe acks without consuming messages
