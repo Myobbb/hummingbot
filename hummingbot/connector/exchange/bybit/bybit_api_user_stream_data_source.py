@@ -89,13 +89,13 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     except asyncio.TimeoutError:
                         await self._ping_server(ws)
                         # Watchdog: if no frames received in > 2 heartbeats, force reconnect
-                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
+                        if ws.last_recv_time and (self._time() - ws.last_recv_time) > (2.5 * CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL):
                             raise ConnectionError("Bybit private WS inactive for too long; reconnecting.")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._reconnect_attempts += 1
-                if self._is_transient_ws_close_exception(e) or self._is_pong_timeout_exception(e):
+                if self._is_transient_ws_close_exception(e) or self._is_pong_timeout_exception(e) or self._is_inactivity_reconnect_exception(e):
                     code = self._extract_close_code(e)
                     # Defer noisy logs; emit concise INFO after resubscribe
                     self._pending_reconnect_notice = {"code": code or "unknown", "t0": time.time()}
@@ -103,6 +103,8 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     try:
                         if self._is_pong_timeout_exception(e):
                             self.logger().warning("Bybit private WS PONG not received within expected time. Reconnecting...")
+                        elif self._is_inactivity_reconnect_exception(e):
+                            self.logger().warning("Bybit private WS inactive; reconnecting...")
                         else:
                             self.logger().warning(
                                 f"Bybit private WS transient close (code={code or 'unknown'}). Reconnecting...")
@@ -267,6 +269,13 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
             return False
         # Raised by aiohttp heartbeat when protocol-level PONG is not received
         return "No PONG received" in text
+
+    def _is_inactivity_reconnect_exception(self, exc: Exception) -> bool:
+        try:
+            text = str(exc)
+        except Exception:
+            return False
+        return "inactive for too long" in text
 
     def _backoff_seconds(self, transient: bool) -> float:
         if transient:
