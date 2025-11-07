@@ -160,8 +160,8 @@ class ClientOrderTracker:
             if order.is_open:
                 self.start_tracking_order(order)
             elif order.is_failure:
-                # If the order is marked as failed but is still in the tracking states, it was a lost order
-                self._lost_orders[order.client_order_id] = order
+                # Previously, failed orders were re-added as "lost" to continue polling.
+                # Lost order recovery is disabled; do not repopulate the lost orders list.
 
     def fetch_tracked_order(self, client_order_id: str) -> Optional[InFlightOrder]:
         return self._in_flight_orders.get(client_order_id, None)
@@ -237,8 +237,7 @@ class ClientOrderTracker:
                 # Only mark the order as failed if it has not been marked as done already asynchronously
                 if tracked_order.current_state not in [OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED]:
                     self.logger().warning(
-                        f"The order {client_order_id}({tracked_order.exchange_order_id}) will be "
-                        f"considered lost. Please check its status in the exchange."
+                        f"The order {client_order_id}({tracked_order.exchange_order_id}) was not found repeatedly and will be failed."
                     )
                     order_update: OrderUpdate = OrderUpdate(
                         client_order_id=client_order_id,
@@ -247,8 +246,9 @@ class ClientOrderTracker:
                         new_state=OrderState.FAILED,
                     )
                     await self._process_order_update(order_update)
-                    del self._cached_orders[client_order_id]
-                    self._lost_orders[tracked_order.client_order_id] = tracked_order
+                    # Do not add to lost orders; lost-order recovery is disabled.
+                    if client_order_id in self._cached_orders:
+                        del self._cached_orders[client_order_id]
         else:
             lost_order = self._lost_orders.get(client_order_id)
             if lost_order is not None:

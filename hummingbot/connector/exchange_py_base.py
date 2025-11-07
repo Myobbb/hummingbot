@@ -681,7 +681,8 @@ class ExchangePyBase(ExchangeBase, ABC):
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
             self._user_stream_tracker_task = self._create_user_stream_tracker_task()
             self._user_stream_event_listener_task = safe_ensure_future(self._user_stream_event_listener())
-            self._lost_orders_update_task = safe_ensure_future(self._lost_orders_update_polling_loop())
+            # Lost order recovery loop disabled by design: we no longer attempt to recover or
+            # continuously poll for orders considered lost by the tracker.
 
     async def check_network(self) -> NetworkStatus:
         """

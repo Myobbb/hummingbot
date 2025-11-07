@@ -15,7 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate, OrderState
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -272,6 +272,10 @@ class BybitExchange(ExchangePyBase):
             headers={"referer": CONSTANTS.HBOT_BROKER_ID},
         )
         if response["retCode"] != 0:
+            # If the exchange reports the order no longer exists, treat as already canceled
+            msg = str(response.get("retMsg", ""))
+            if "does not exist" in msg or "not exist" in msg or "Not Found" in msg:
+                return True
             raise ValueError(f"{response['retMsg']}")
         if isinstance(response, dict) and "orderLinkId" in response["result"]:
             return True
@@ -503,7 +507,14 @@ class BybitExchange(ExchangePyBase):
             limit_id=CONSTANTS.GET_ORDERS_PATH_URL
         )
         if not len(updated_order_data["result"]["list"]):
-            raise ValueError(f"No order found for {client_order_id} or {exchange_order_id}")
+            # Treat missing order as a terminal failure to avoid lost-order recovery attempts
+            return OrderUpdate(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=OrderState.FAILED,
+            )
         order_data = updated_order_data["result"]["list"][0]
         order_status = order_data["orderStatus"]
 

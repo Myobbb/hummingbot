@@ -69,7 +69,7 @@ ORDER_STATE = {
 WS_ORDER_STATE = {
     1: OrderState.OPEN,
     2: OrderState.FILLED,
-    3: OrderState.FILLED, #part_filled
+    3: OrderState.PARTIALLY_FILLED, # part_filled
     4: OrderState.CANCELED,
     5: OrderState.OPEN,
 }
