@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.bitmart import (
@@ -10,7 +11,7 @@ from hummingbot.connector.exchange.bitmart import (
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
+    _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 20.0
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -30,6 +33,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         super().__init__(trading_pairs)
         self._connector: BitmartExchange = connector
         self._api_factory = api_factory
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._reconnect_attempts: int = 0
+        self._last_ping_sent_time: float = 0.0
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -157,22 +163,21 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                        for trading_pair in self._trading_pairs]
 
-            payload = {
-                "op": "subscribe",
-                "args": [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols]
-            }
-            subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=payload)
+            # BitMart allows up to 20 topics per subscription message
+            trade_topics = [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols]
+            depth_topics = [f"{CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME}:{symbol}" for symbol in symbols]
 
-            payload = {
-                "op": "subscribe",
-                "args": [f"{CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME}:{symbol}" for symbol in symbols]
-            }
-            subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=payload)
+            async def send_chunked(topics: List[str]):
+                CHUNK_SIZE = 20
+                for i in range(0, len(topics), CHUNK_SIZE):
+                    chunk = topics[i:i + CHUNK_SIZE]
+                    payload = {"op": "subscribe", "args": chunk}
+                    req = WSJSONRequest(payload=payload)
+                    async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                        await ws.send(req)
 
-            async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                await ws.send(subscribe_trade_request)
-            async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                await ws.send(subscribe_orderbook_request)
+            await send_chunked(trade_topics)
+            await send_chunked(depth_topics)
 
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
@@ -182,25 +187,40 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
-        async for ws_response in websocket_assistant.iter_messages():
-            data: Dict[str, Any] = ws_response.data
-            decompressed_data = utils.decompress_ws_message(data)
-            try:
-                if isinstance(decompressed_data, str):
-                    json_data = json.loads(decompressed_data)
-                else:
-                    json_data = decompressed_data
-            except Exception:
-                self.logger().warning(f"Invalid event message received through the order book data source "
-                                      f"connection ({decompressed_data})")
-                continue
+        # Start keepalive task
+        self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
+        try:
+            async for ws_response in websocket_assistant.iter_messages():
+                data: Dict[str, Any] = ws_response.data
+                decompressed_data = utils.decompress_ws_message(data)
+                try:
+                    if isinstance(decompressed_data, str):
+                        # Gracefully ignore plain-text 'pong'
+                        if decompressed_data.strip().lower() == "pong":
+                            continue
+                        json_data = json.loads(decompressed_data)
+                    else:
+                        json_data = decompressed_data
+                except Exception:
+                    # Ignore unparsable frames (e.g., raw pongs)
+                    continue
 
-            if "errorCode" in json_data or "errorMessage" in json_data:
-                raise ValueError(f"Error message received in the order book data source: {json_data}")
+                # Handle exchange error messages gracefully
+                if isinstance(json_data, dict) and ("errorCode" in json_data or "errorMessage" in json_data):
+                    # Convert to ConnectionError to trigger reconnect with backoff at higher level
+                    raise ConnectionError(f"BitMart WS error: {json_data}")
 
-            channel: str = self._channel_originating_message(event_message=json_data)
-            if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key]:
-                self._message_queue[channel].put_nowait(json_data)
+                channel: str = self._channel_originating_message(event_message=json_data)
+                if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key]:
+                    self._message_queue[channel].put_nowait(json_data)
+        finally:
+            if self._keepalive_task is not None and not self._keepalive_task.done():
+                self._keepalive_task.cancel()
+                try:
+                    await self._keepalive_task
+                except Exception:
+                    pass
+            self._keepalive_task = None
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""
@@ -216,7 +236,71 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_CONNECT):
+            # Disable protocol ping frames; use text 'ping' keepalive per BitMart docs
             await ws.connect(
                 ws_url=CONSTANTS.WSS_PUBLIC_URL,
-                ping_timeout=CONSTANTS.WS_PING_TIMEOUT)
+                ping_timeout=None,
+                message_timeout=60,
+                ws_headers={"Accept-Encoding": "gzip"},
+            )
         return ws
+
+    async def _keepalive_ping_loop(self, ws: WSAssistant):
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                # If idle for >= interval, send text 'ping'
+                last_recv = getattr(ws, "last_recv_time", 0) or 0
+                now = time.time()
+                # Send at most one ping per interval and only when idle
+                if (now - last_recv) >= self._PING_INTERVAL_SECONDS and (now - self._last_ping_sent_time) >= self._PING_INTERVAL_SECONDS:
+                    try:
+                        await ws.send(WSPlainTextRequest(payload="ping"))
+                        self._last_ping_sent_time = now
+                    except Exception:
+                        # Force reconnect by raising
+                        raise
+                # If still no messages beyond max idle threshold, force reconnect
+                if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
+                    raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Bubble up to reconnect loop
+            raise
+
+    async def listen_for_subscriptions(self):
+        """
+        Override to add graceful transient reconnect/backoff and keepalive-driven reconnects.
+        """
+        ws: Optional[WSAssistant] = None
+        while True:
+            reconnect_delay = 1.0
+            try:
+                ws = await self._connected_websocket_assistant()
+                await self._subscribe_channels(ws)
+                await self._process_websocket_messages(websocket_assistant=ws)
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, Exception) as e:
+                # Inspect close codes to decide transient backoff
+                text = str(e)
+                code = None
+                try:
+                    if "Close code" in text:
+                        code = text.split("Close code =")[1].split()[0]
+                except Exception:
+                    pass
+                is_transient = any(tok in text for tok in ["1000", "1001", "1005", "1006", "1012", "1013"])
+                if is_transient:
+                    self.logger().warning(f"BitMart public WS transient close ({code or 'unknown'}). Reconnecting...")
+                    reconnect_delay = 1.0
+                else:
+                    self.logger().error("BitMart public WS error; reconnecting...", exc_info=True)
+                    self._reconnect_attempts += 1
+                    exponent = min(self._reconnect_attempts, 5)
+                    reconnect_delay = float(min(30, 2 ** max(1, exponent)))
+            finally:
+                await self._sleep(reconnect_delay)
+                ws and await ws.disconnect()

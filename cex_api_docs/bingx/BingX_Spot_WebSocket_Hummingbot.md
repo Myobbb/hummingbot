@@ -15,6 +15,10 @@ Notes:
 - Hummingbot disables protocol-level ping frames and relies on JSON-level heartbeats.
 - WS frames may be gzip-compressed. Hummingbot sends `Accept-Encoding: gzip` and transparently decompresses.
 
+### Connection limits
+- Max ~200 topics per WebSocket connection (Spot). If you need more, split subscriptions across multiple connections.
+- Reference: Connection Limits (Spot WS) [`https://bingx-api.github.io/docs/#/en-us/spot/socket/#Connection%20Limits`]
+
 ### REST Base URLs
 - **Mainnet**: `https://open-api.bingx.com`
 
@@ -41,8 +45,10 @@ Reference: Heartbeats (Spot WS) [`https://bingx-api.github.io/docs/#/en-us/spot/
 - Private WS uses a listen key instead of WS-op authentication.
 - Create listen key (REST, signed): `POST /openApi/user/auth/userDataStream`
 - Keep-alive (REST, signed): `PUT /openApi/user/auth/userDataStream?listenKey=<key>`
+- Delete listen key (REST, signed): `DELETE /openApi/user/auth/userDataStream?listenKey=<key>`
 - Connect WS with `?listenKey=<key>` on the same market WS endpoint to receive private updates.
 - Hummingbot manages listen key lifecycle in the background: create, periodically renew, and rotate on 404/not found.
+  - Implementation detail: Hummingbot renews approximately every 25 minutes to avoid expiry-related 404s.
 
 Reference: User Data Stream / Listen Key [`https://bingx-api.github.io/docs/#/en-us/spot/changelog`]
 
@@ -98,6 +104,8 @@ Reference: Spot topics and payloads [`https://bingx-api.github.io/docs/#/en-us/s
   - Path: `/openApi/user/auth/userDataStream` (POST, signed)
 - **Keep-alive listen key**
   - Path: `/openApi/user/auth/userDataStream` (PUT, signed; param `listenKey`)
+- **Delete listen key**
+  - Path: `/openApi/user/auth/userDataStream` (DELETE, signed; param `listenKey`)
 - **Place order**
   - Path: `/openApi/spot/v1/trade/order` (POST, signed)
   - Fields (spot): `symbol`, `side=BUY|SELL`, `type=LIMIT|MARKET`, `quantity`, `price` (for LIMIT), `newClientOrderId`
