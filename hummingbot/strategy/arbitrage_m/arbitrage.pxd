@@ -61,6 +61,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         unordered_map[string, double] _order_timestamps
         # Track completed orders to avoid duplicate completion logging
         cpp_set[string] _completed_orders
+        # Track orders that have received at least one fill (Python set of order_ids)
+        set _orders_with_fills
         # Cached taker order types per market to avoid repeated Python calls
         dict _taker_order_type_by_market
 
