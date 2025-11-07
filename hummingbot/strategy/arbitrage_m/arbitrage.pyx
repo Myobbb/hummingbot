@@ -764,6 +764,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object market_tuple
             dict all_market_orders
             dict market_orders
+            bint has_any_fill
 
         # Get ALL market orders across ALL market tuples
         try:
@@ -796,7 +797,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     if time_elapsed > timeout_threshold:
                         if timeout_threshold <= 10.0:
                             # Market order cleanup after short window
-                            cdef bint has_any_fill = False
                             try:
                                 has_any_fill = (order_id in self._orders_with_fills)
                             except Exception:
