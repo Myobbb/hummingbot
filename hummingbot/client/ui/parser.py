@@ -83,6 +83,14 @@ def load_parser(hummingbot: "HummingbotApplication", command_tabs) -> ThrowingAr
     status_parser.add_argument("--live", default=False, action="store_true", dest="live", help="Show status updates")
     status_parser.set_defaults(func=hummingbot.status)
 
+    control_parser = subparsers.add_parser("control", help="Control individual strategies in multi-strategy orchestrators")
+    control_parser.add_argument("action", nargs="?", default=None,
+                                choices=["list", "pause", "resume", "pause_all", "resume_all"],
+                                help="Action to perform: list, pause, resume, pause_all, resume_all")
+    control_parser.add_argument("identifier", nargs="?", default=None,
+                                help="Strategy name or token symbol (for pause/resume actions)")
+    control_parser.set_defaults(func=hummingbot.control)
+
     history_parser = subparsers.add_parser("history", help="See the past performance of the current bot")
     history_parser.add_argument("-d", "--days", type=float, default=0, dest="days",
                                 help="How many days in the past (can be decimal value)")
