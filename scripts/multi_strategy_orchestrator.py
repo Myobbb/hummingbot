@@ -8,6 +8,7 @@ while sharing websocket connections to the same exchanges. This provides:
 2. Rate Limit Optimization: All strategies share the same connection pool
 3. Memory Savings: Order books and market data cached once and shared
 4. Compatibility: Works with existing V1 Cython strategies without modification
+5. Runtime Control: Pause/resume individual strategies without stopping the bot
 
 Architecture:
 -----------
@@ -51,6 +52,40 @@ Example Usage:
 -------------
 See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 
+Runtime Control:
+---------------
+From the Hummingbot Python console (>>>), you can control individual strategies:
+
+# Pause a specific arbitrage_m strategy
+>>> self.strategy.pause_strategy("arb_bsx_gate_bitmart")
+INFO - Pausing strategy: arb_bsx_gate_bitmart
+INFO - Strategy 'arb_bsx_gate_bitmart' paused successfully
+
+# Resume a paused strategy
+>>> self.strategy.resume_strategy("arb_bsx_gate_bitmart")
+INFO - Resuming strategy: arb_bsx_gate_bitmart
+INFO - Strategy 'arb_bsx_gate_bitmart' resumed successfully
+
+# List all strategies with status
+>>> self.strategy.list_strategies()
+{
+  'arb_bsx_gate_bitmart': {
+    'status': 'RUNNING',
+    'paused': False,
+    'primary_market': 'gate_io',
+    'secondary_market': 'bitmart',
+    'min_profitability': 1.9,
+    'best_profitability': '2.1%'
+  },
+  ...
+}
+
+# Pause all strategies
+>>> self.strategy.pause_all_strategies()
+
+# Resume all strategies
+>>> self.strategy.resume_all_strategies()
+
 """
 
 import logging
@@ -58,7 +93,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -82,6 +117,7 @@ class V1StrategyInstance:
     name: str
     config: Dict
     market_pairs: List[MarketTradingPairTuple]
+    paused: bool = False  # Runtime pause state
 
 
 class ArbitrageMInstanceConfig(BaseModel):
@@ -427,8 +463,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # This was set by TimeIterator.c_tick() before tick() was called
         current_timestamp = self.current_timestamp
 
-        # Tick each strategy independently
+        # Tick each strategy independently (skip paused strategies)
         for strategy_instance in self.strategies:
+            # Skip ticking if strategy is paused
+            if strategy_instance.paused:
+                continue
+
             try:
                 # Call the Python-level tick() method
                 strategy_instance.strategy.tick(current_timestamp)
@@ -470,6 +510,134 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info("MultiStrategyOrchestrator stopped")
 
+    def pause_strategy(self, strategy_name: str) -> bool:
+        """
+        Pause a specific arbitrage_m strategy by name.
+
+        Args:
+            strategy_name: The name of the strategy to pause (from config)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        if strategy_instance.paused:
+            self.logger().warning(f"Strategy '{strategy_name}' is already paused")
+            return False
+
+        self.logger().info(f"Pausing strategy: {strategy_name}")
+        strategy_instance.paused = True
+
+        # Cancel any open orders for this strategy
+        try:
+            if hasattr(strategy_instance.strategy, "cancel_all_orders"):
+                strategy_instance.strategy.cancel_all_orders()
+                self.logger().info(f"Cancelled all open orders for '{strategy_name}'")
+        except Exception as e:
+            self.logger().warning(f"Error cancelling orders for '{strategy_name}': {e}")
+
+        self.logger().info(f"Strategy '{strategy_name}' paused successfully")
+        return True
+
+    def resume_strategy(self, strategy_name: str) -> bool:
+        """
+        Resume a paused arbitrage_m strategy by name.
+
+        Args:
+            strategy_name: The name of the strategy to resume
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        if not strategy_instance.paused:
+            self.logger().warning(f"Strategy '{strategy_name}' is already running")
+            return False
+
+        self.logger().info(f"Resuming strategy: {strategy_name}")
+        strategy_instance.paused = False
+        self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
+        return True
+
+    def pause_all_strategies(self) -> None:
+        """Pause all running strategies."""
+        self.logger().info("Pausing all strategies...")
+        for strategy_instance in self.strategies:
+            if not strategy_instance.paused:
+                self.pause_strategy(strategy_instance.name)
+
+    def resume_all_strategies(self) -> None:
+        """Resume all paused strategies."""
+        self.logger().info("Resuming all strategies...")
+        for strategy_instance in self.strategies:
+            if strategy_instance.paused:
+                self.resume_strategy(strategy_instance.name)
+
+    def list_strategies(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get a summary of all strategies and their statuses.
+
+        Returns:
+            Dictionary mapping strategy_name to strategy info
+        """
+        strategy_summary = {}
+        for strategy_instance in self.strategies:
+            status = "PAUSED" if strategy_instance.paused else "RUNNING"
+
+            # Try to get profitability info
+            best_prof_str = "n/a"
+            try:
+                if hasattr(strategy_instance.strategy, 'format_status'):
+                    status_blob = strategy_instance.strategy.format_status()
+                    best_prof_str = self._parse_best_profitability(status_blob) or best_prof_str
+            except Exception:
+                pass
+
+            strategy_summary[strategy_instance.name] = {
+                "status": status,
+                "paused": strategy_instance.paused,
+                "primary_market": strategy_instance.config.get('primary_market', 'N/A'),
+                "secondary_market": strategy_instance.config.get('secondary_market', 'N/A'),
+                "primary_pair": strategy_instance.config.get('primary_trading_pair', 'N/A'),
+                "secondary_pair": strategy_instance.config.get('secondary_trading_pair', 'N/A'),
+                "min_profitability": strategy_instance.config.get('min_profitability', 'N/A'),
+                "best_profitability": best_prof_str,
+            }
+
+        return strategy_summary
+
     def format_status(self) -> str:
         """
         Format status output for all strategies.
@@ -483,10 +651,35 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         lines = []
 
-        # Balances on top
+        # Runtime Control Commands at the top
+        lines.append("\n" + "=" * 80)
+        lines.append("STRATEGY CONTROL (Python Console)")
+        lines.append("=" * 80)
+        lines.append("Available commands (use Python console '>>>'):")
+        lines.append("  self.strategy.pause_strategy('strategy_name')     # Pause specific arbitrage_m")
+        lines.append("  self.strategy.resume_strategy('strategy_name')    # Resume specific arbitrage_m")
+        lines.append("  self.strategy.pause_all_strategies()              # Pause all strategies")
+        lines.append("  self.strategy.resume_all_strategies()             # Resume all strategies")
+        lines.append("  self.strategy.list_strategies()                   # Show strategy summary")
+        lines.append("")
+
+        # Strategy Status Summary
+        running_count = sum(1 for s in self.strategies if not s.paused)
+        paused_count = sum(1 for s in self.strategies if s.paused)
+        lines.append(f"Strategies: {running_count} running, {paused_count} paused")
+
+        # Show paused status indicator for each strategy
+        for strategy_instance in self.strategies:
+            status_icon = "▶" if not strategy_instance.paused else "⏸"
+            status_text = "RUNNING" if not strategy_instance.paused else "PAUSED"
+            lines.append(f"  {status_icon} {strategy_instance.name}: {status_text}")
+
+        lines.append("=" * 80)
+
+        # Balances
         balance_df = self.get_balance_df()
         lines.extend(["\nBalances:"] + ["  " + line for line in balance_df.to_string(index=False).split("\n")])
-    
+
         lines.append("")
 
         # One-line per strategy; collect optional sections for the bottom
@@ -504,13 +697,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             status_blob = None
             best_prof_str = "n/a"
-            try:
-                strategy = strategy_instance.strategy
-                if hasattr(strategy, 'format_status'):
-                    status_blob = strategy.format_status()
-                    best_prof_str = self._parse_best_profitability(status_blob) or best_prof_str
-            except Exception as e:
-                self.logger().debug(f"Could not get strategy stats for '{strategy_name}': {e}")
+
+            # Show "PAUSED" instead of profitability if strategy is paused
+            if strategy_instance.paused:
+                best_prof_str = "PAUSED"
+            else:
+                try:
+                    strategy = strategy_instance.strategy
+                    if hasattr(strategy, 'format_status'):
+                        status_blob = strategy.format_status()
+                        best_prof_str = self._parse_best_profitability(status_blob) or best_prof_str
+                except Exception as e:
+                    self.logger().debug(f"Could not get strategy stats for '{strategy_instance.name}': {e}")
 
             rows.append({
                 "markets": markets_str,
