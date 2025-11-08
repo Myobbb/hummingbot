@@ -54,25 +54,24 @@ See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 
 Runtime Control:
 ---------------
-The script provides easy-to-use functions accessible from Hummingbot's Python console:
+From Hummingbot's Python console (>>>), import all functions with one line:
 
-# Pause/resume by full strategy name
->>> pause("arb_bsx_gate_bitmart")
->>> resume("arb_bsx_gate_bitmart")
+>>> from scripts.multi_strategy_orchestrator import *
 
-# Pause/resume by token symbol (easier!)
->>> pause("BSX")       # Pauses any strategy trading BSX
->>> resume("BSX")      # Resumes BSX strategy
+Then use simple commands:
 
-# List all strategies
->>> list_arb()
+>>> pause("BSX")          # Pause by token symbol (easiest!)
+>>> resume("BSX")         # Resume by token
+>>> list_arb()            # List all strategies with details
+>>> pause_all()           # Pause everything
+>>> resume_all()          # Resume everything
+>>> help_arb()            # Show help and available strategies
 
-# Pause/resume all
->>> pause_all()
->>> resume_all()
+Functions work by name or token:
+>>> pause("arb_bsx_gate_bitmart")  # Full strategy name
+>>> pause("BSX")                    # Or just the token symbol
 
-These functions automatically find the orchestrator instance, so you don't need
-to type long paths like `app.trading_core.strategy.pause_strategy()`
+The strategy automatically shows available commands when it starts.
 
 """
 
@@ -96,6 +95,9 @@ from hummingbot.strategy.strategy_base import StrategyBase
 
 
 logger = None
+
+# Export convenience functions for easy import
+__all__ = ['pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'MultiStrategyOrchestrator']
 
 # Global reference to orchestrator instance for convenience functions
 _orchestrator_instance: Optional['MultiStrategyOrchestrator'] = None
@@ -190,6 +192,17 @@ def resume_all() -> None:
     """
     orchestrator = _get_orchestrator()
     orchestrator.resume_all_strategies()
+
+
+def help_arb() -> None:
+    """
+    Show runtime control help and available strategies.
+
+    Example:
+        >>> help_arb()
+    """
+    orchestrator = _get_orchestrator()
+    orchestrator.show_help()
 
 
 @dataclass
@@ -329,18 +342,39 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info(f"MultiStrategyOrchestrator initialized with {len(self.strategies)} strategies")
         self.logger().info(f"Shared connectors: {list(self.connectors.keys())}")
         self.logger().info("")
+        self._show_runtime_help()
+
+    def _show_runtime_help(self):
+        """Display runtime control help message."""
         self.logger().info("=" * 70)
-        self.logger().info("Runtime Control Available!")
+        self.logger().info("RUNTIME CONTROL AVAILABLE")
         self.logger().info("=" * 70)
-        self.logger().info("From Python console (>>>), import functions:")
-        self.logger().info("  from scripts.multi_strategy_orchestrator import pause, resume, list_arb")
+        self.logger().info("To control strategies, first run this in Python console (>>>):")
         self.logger().info("")
-        self.logger().info("Then use:")
-        self.logger().info("  pause('BSX')     # Pause by token")
-        self.logger().info("  resume('BSX')    # Resume by token")
-        self.logger().info("  list_arb()       # List strategies")
+        self.logger().info("  from scripts.multi_strategy_orchestrator import *")
+        self.logger().info("")
+        self.logger().info("Then you can use these commands:")
+        self.logger().info("  pause('BSX')          # Pause strategy trading BSX")
+        self.logger().info("  resume('BSX')         # Resume BSX strategy")
+        self.logger().info("  list_arb()            # Show all strategies")
+        self.logger().info("  pause_all()           # Pause all strategies")
+        self.logger().info("  resume_all()          # Resume all strategies")
+        self.logger().info("")
+        self.logger().info("Strategies found:")
+        for s in self.strategies:
+            # Extract token from first trading pair
+            try:
+                pair = s.market_pairs[0].trading_pair
+                token = pair.split('-')[0] if '-' in pair else pair
+                self.logger().info(f"  - {s.name} (token: {token})")
+            except:
+                self.logger().info(f"  - {s.name}")
         self.logger().info("=" * 70)
         self.logger().info("")
+
+    def show_help(self):
+        """Show runtime control help (can be called from console)."""
+        self._show_runtime_help()
 
     def _initialize_arbitrage_m_strategies(self):
         """Initialize all arbitrage_m strategy instances"""
@@ -841,17 +875,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Runtime Control Commands at the top
         lines.append("\n" + "=" * 80)
-        lines.append("STRATEGY CONTROL (Python Console)")
+        lines.append("STRATEGY CONTROL (Python Console >>>)")
         lines.append("=" * 80)
-        lines.append("Import: from scripts.multi_strategy_orchestrator import pause, resume, list_arb")
+        lines.append("First run: from scripts.multi_strategy_orchestrator import *")
         lines.append("")
         lines.append("Commands:")
         lines.append("  pause('BSX')         # Pause by token symbol")
         lines.append("  resume('BSX')        # Resume by token")
-        lines.append("  pause('arb_name')    # Or pause by full strategy name")
         lines.append("  list_arb()           # List all strategies")
         lines.append("  pause_all()          # Pause all")
         lines.append("  resume_all()         # Resume all")
+        lines.append("  help_arb()           # Show this help")
         lines.append("")
 
         # Strategy Status Summary
