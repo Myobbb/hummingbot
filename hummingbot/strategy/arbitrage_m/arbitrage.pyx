@@ -71,6 +71,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._pending_buyin_orders = {}
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
+        # Keep recent order -> market pair mapping for late events
+        self._recent_order_market_pair = {}
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -151,6 +153,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._completed_orders.clear()
         try:
             self._orders_with_fills.clear()
+        except Exception:
+            pass
+        try:
+            self._recent_order_market_pair.clear()
         except Exception:
             pass
 
@@ -599,10 +605,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double time_elapsed
             string order_id_str = self._to_cpp_str(order_id)
             str order_type = "Buy" if is_buy else "Sell"
+            object cooldown_tuple = market_pair_tuple
             
         if market_pair_tuple is None:
             #self.logger().warning(f"{order_type} order {order_id} completed but market pair not found")
-            return
+            try:
+                cooldown_tuple = self._recent_order_market_pair.get(order_id)
+            except Exception:
+                cooldown_tuple = None
+            if cooldown_tuple is None:
+                return
 
         # Check if we've already processed this order's completion
         # This prevents duplicate logging for partial fills
@@ -616,6 +628,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Clean fill marker since completion supersedes partials
             try:
                 self._orders_with_fills.discard(order_id)
+            except Exception:
+                pass
+            # If any cooldown was set earlier for this market tuple due to cancel/timeout, remove it now
+            try:
+                if cooldown_tuple is not None and cooldown_tuple in self._last_failure_timestamps:
+                    self._last_failure_timestamps.pop(cooldown_tuple, None)
+                    try:
+                        self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
             
@@ -652,11 +674,29 @@ cdef class ArbitrageMStrategy(StrategyBase):
             str order_id = order_filled_event.order_id
             object order_type = order_filled_event.order_type
             string order_id_str = self._to_cpp_str(order_id)
+            object market_pair_tuple
         # Track fills for any order type (we only change cooldown logic for MARKET)
         try:
             self._orders_with_fills.add(order_id)
         except Exception:
             pass
+        # If we previously enforced cooldown due to cancel/timeout, remove it upon seeing fills
+        market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+        if market_pair_tuple is None:
+            try:
+                market_pair_tuple = self._recent_order_market_pair.get(order_id)
+            except Exception:
+                market_pair_tuple = None
+        if market_pair_tuple is not None:
+            try:
+                if market_pair_tuple in self._last_failure_timestamps:
+                    self._last_failure_timestamps.pop(market_pair_tuple, None)
+                    try:
+                        self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         if order_type == OrderType.MARKET:
             if self._completed_orders.find(order_id_str) == self._completed_orders.end():
                 self._completed_orders.insert(order_id_str)
@@ -686,6 +726,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._completed_orders.erase(order_id_str)
         
         # Stop tracking the order
+        # Remember mapping for possible late events
+        try:
+            self._recent_order_market_pair[order_id] = market_pair
+        except Exception:
+            pass
         self._sb_order_tracker.c_stop_tracking_market_order(market_pair, order_id)
         
         # Clean up pending buy-in tracking if applicable
@@ -793,7 +838,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
-                        if timeout_threshold <= 10.0:
+                        if self._completed_orders.find(order_id_str) != self._completed_orders.end():
                             # Market order cleanup after short window
                             try:
                                 has_any_fill = (order_id in self._orders_with_fills)
@@ -801,6 +846,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                                 has_any_fill = False
                             # Stop tracking regardless
                             self._order_timestamps.erase(order_id_str)
+                            # Remember mapping for late events before removing
+                            try:
+                                self._recent_order_market_pair[order_id] = market_tuple
+                            except Exception:
+                                pass
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
                             if has_any_fill:
                                 try:

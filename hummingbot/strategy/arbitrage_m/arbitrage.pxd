@@ -63,6 +63,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         cpp_set[string] _completed_orders
         # Track orders that have received at least one fill (Python set of order_ids)
         set _orders_with_fills
+        # Recent order -> market pair mapping to resolve late events after tracker cleanup
+        dict _recent_order_market_pair
         # Cached taker order types per market to avoid repeated Python calls
         dict _taker_order_type_by_market
 
