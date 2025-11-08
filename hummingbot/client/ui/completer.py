@@ -78,6 +78,7 @@ class HummingbotCompleter(Completer):
         self._controller_completer = self.get_available_controllers()
         self._rate_oracle_completer = WordCompleter(list(RATE_ORACLE_SOURCES.keys()), ignore_case=True)
         self._mqtt_completer = WordCompleter(["start", "stop", "restart"], ignore_case=True)
+        self._control_completer = WordCompleter(["list", "pause", "resume", "pause_all", "resume_all"], ignore_case=True)
         self._gateway_chains = GATEWAY_CHAINS
         self._gateway_networks = []
         self._list_gateway_wallets_parameters = {"wallets": [], "chain": ""}
@@ -428,6 +429,10 @@ class HummingbotCompleter(Completer):
         text_before_cursor: str = document.text_before_cursor
         return text_before_cursor.startswith("mqtt ")
 
+    def _complete_control_arguments(self, document: Document) -> bool:
+        text_before_cursor: str = document.text_before_cursor
+        return text_before_cursor.startswith("control ")
+
     def get_completions(self, document: Document, complete_event: CompleteEvent):
         """
         Get completions for the current scope. This is the defining function for the completer
@@ -618,6 +623,10 @@ class HummingbotCompleter(Completer):
 
         elif self._complete_mqtt_arguments(document):
             for c in self._mqtt_completer.get_completions(document, complete_event):
+                yield c
+
+        elif self._complete_control_arguments(document):
+            for c in self._control_completer.get_completions(document, complete_event):
                 yield c
 
         else:
