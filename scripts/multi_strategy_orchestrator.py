@@ -347,28 +347,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     def _show_runtime_help(self):
         """Display runtime control help message."""
         self.logger().info("=" * 70)
-        self.logger().info("RUNTIME CONTROL AVAILABLE")
+        self.logger().info("RUNTIME CONTROL COMMANDS")
         self.logger().info("=" * 70)
-        self.logger().info("To control strategies, first run this in Python console (>>>):")
+        self.logger().info("Available commands:")
+        self.logger().info("  control list                # List all strategies")
+        self.logger().info("  control pause <token>       # Pause strategy (e.g., control pause BSX)")
+        self.logger().info("  control resume <token>      # Resume strategy")
+        self.logger().info("  control pause_all           # Pause all strategies")
+        self.logger().info("  control resume_all          # Resume all strategies")
         self.logger().info("")
-        self.logger().info("  from scripts.multi_strategy_orchestrator import *")
-        self.logger().info("")
-        self.logger().info("Then you can use these commands:")
-        self.logger().info("  pause('BSX')          # Pause strategy trading BSX")
-        self.logger().info("  resume('BSX')         # Resume BSX strategy")
-        self.logger().info("  list_arb()            # Show all strategies")
-        self.logger().info("  pause_all()           # Pause all strategies")
-        self.logger().info("  resume_all()          # Resume all strategies")
-        self.logger().info("")
-        self.logger().info("Strategies found:")
-        for s in self.strategies:
-            # Extract token from first trading pair
-            try:
-                pair = s.market_pairs[0].trading_pair
-                token = pair.split('-')[0] if '-' in pair else pair
-                self.logger().info(f"  - {s.name} (token: {token})")
-            except:
-                self.logger().info(f"  - {s.name}")
+        self.logger().info(f"Loaded {len(self.strategies)} strateg{'y' if len(self.strategies) == 1 else 'ies'}")
         self.logger().info("=" * 70)
         self.logger().info("")
 
@@ -887,33 +875,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         lines = []
 
-        # Runtime Control Commands at the top
-        lines.append("\n" + "=" * 80)
-        lines.append("STRATEGY CONTROL (Python Console >>>)")
-        lines.append("=" * 80)
-        lines.append("First run: from scripts.multi_strategy_orchestrator import *")
-        lines.append("")
-        lines.append("Commands:")
-        lines.append("  pause('BSX')         # Pause by token symbol")
-        lines.append("  resume('BSX')        # Resume by token")
-        lines.append("  list_arb()           # List all strategies")
-        lines.append("  pause_all()          # Pause all")
-        lines.append("  resume_all()         # Resume all")
-        lines.append("  help_arb()           # Show this help")
-        lines.append("")
-
         # Strategy Status Summary
         running_count = sum(1 for s in self.strategies if not s.paused)
         paused_count = sum(1 for s in self.strategies if s.paused)
-        lines.append(f"Strategies: {running_count} running, {paused_count} paused")
-
-        # Show paused status indicator for each strategy
-        for strategy_instance in self.strategies:
-            status_icon = "▶" if not strategy_instance.paused else "⏸"
-            status_text = "RUNNING" if not strategy_instance.paused else "PAUSED"
-            lines.append(f"  {status_icon} {strategy_instance.name}: {status_text}")
-
-        lines.append("=" * 80)
+        lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
 
         # Balances
         balance_df = self.get_balance_df()
@@ -1003,8 +968,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             lines.append("\nConnectors not ready:")
             for n in not_ready:
                 lines.append(f"  {n}")
-
-        lines.append("\n" + "=" * 80)
 
         return "\n".join(lines)
 
