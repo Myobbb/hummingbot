@@ -813,19 +813,33 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
         return True
 
-    def pause_all_strategies(self) -> None:
-        """Pause all running strategies."""
+    def pause_all_strategies(self) -> int:
+        """Pause all running strategies.
+
+        Returns:
+            Number of strategies that were paused
+        """
         self.logger().info("Pausing all strategies...")
+        count = 0
         for strategy_instance in self.strategies:
             if not strategy_instance.paused:
-                self.pause_strategy(strategy_instance.name)
+                if self.pause_strategy(strategy_instance.name):
+                    count += 1
+        return count
 
-    def resume_all_strategies(self) -> None:
-        """Resume all paused strategies."""
+    def resume_all_strategies(self) -> int:
+        """Resume all paused strategies.
+
+        Returns:
+            Number of strategies that were resumed
+        """
         self.logger().info("Resuming all strategies...")
+        count = 0
         for strategy_instance in self.strategies:
             if strategy_instance.paused:
-                self.resume_strategy(strategy_instance.name)
+                if self.resume_strategy(strategy_instance.name):
+                    count += 1
+        return count
 
     def list_strategies(self) -> Dict[str, Dict[str, Any]]:
         """
