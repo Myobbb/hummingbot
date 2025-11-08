@@ -217,7 +217,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Only monitor inactivity and recycle the connection if needed.
                 now = time.time()
                 if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 180:
-                    self.logger().error("Inactivity threshold exceeded, disconnecting")
+                    self.logger().warning("Inactivity threshold exceeded, disconnecting")
                     await ws.disconnect()
                     break
 

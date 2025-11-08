@@ -217,6 +217,9 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 if (now - websocket_assistant.last_recv_time) > 45:
                     await websocket_assistant.disconnect()
                     break
+            except ConnectionError:
+                # Underlying WS closed (e.g., normal or transient closure). Exit cleanly and let outer loop reconnect.
+                break
             except asyncio.CancelledError:
                 raise
             except Exception:
