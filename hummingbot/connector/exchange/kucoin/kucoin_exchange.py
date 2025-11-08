@@ -1,7 +1,7 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
@@ -25,18 +25,18 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 
 class KucoinExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
+                
                  kucoin_api_key: str,
                  kucoin_passphrase: str,
                  kucoin_secret_key: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
@@ -47,7 +47,7 @@ class KucoinExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_order_fill_ts_s: float = 0
-        super().__init__(client_config_map=client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
     def authenticator(self):
@@ -294,7 +294,11 @@ class KucoinExchange(ExchangePyBase):
                         elif order_event_type == "filled":
                             updated_status = OrderState.FILLED
                         elif order_event_type == "canceled":
-                            updated_status = OrderState.CANCELED
+                            filled_size = Decimal(execution_data.get("filledSize", "0"))
+                            if filled_size > 0:
+                                updated_status = OrderState.FILLED
+                            else:
+                                updated_status = OrderState.CANCELED
 
                         order_update = OrderUpdate(
                             trading_pair=updatable_order.trading_pair,
@@ -306,6 +310,22 @@ class KucoinExchange(ExchangePyBase):
                         self._order_tracker.process_order_update(order_update=order_update)
 
                 elif event_type == "message" and event_subject == CONSTANTS.BALANCE_EVENT_TYPE:
+                    # Only update spot balances from spot account events.
+                    # KuCoin relationEvent indicates the account source: main.*, trade.*, trade_hf.*, margin.*, etc.
+                    relation_event = str(execution_data.get("relationEvent", "") or "")
+                    allowed_prefix = "trade_hf." if self.domain == "hft" else "trade."
+                    if not relation_event.startswith(allowed_prefix):
+                        # Ignore funding (main.*) and margin/isolated events; we only track spot balances here.
+                        continue
+
+                    # Skip hold events that do not change available balance to avoid noisy churn
+                    if relation_event.endswith("hold"):
+                        try:
+                            if str(execution_data.get("availableChange", "0")) in ("0", "0.0", "0.00"):
+                                continue
+                        except Exception:
+                            pass
+
                     currency = execution_data["currency"]
                     available_balance = Decimal(execution_data["available"])
                     total_balance = Decimal(execution_data["total"])
