@@ -396,6 +396,107 @@ class StrategyV2Base(ScriptStrategyBase):
     def set_position_mode(self, connector: str, position_mode: PositionMode):
         self.connectors[connector].set_position_mode(position_mode)
 
+    def pause_controller(self, controller_id: str) -> bool:
+        """
+        Pause a specific controller by its ID.
+
+        :param controller_id: The ID of the controller to pause
+        :return: True if successful, False otherwise
+        """
+        if controller_id not in self.controllers:
+            self.logger().error(f"Controller '{controller_id}' not found. Available controllers: {list(self.controllers.keys())}")
+            return False
+
+        controller = self.controllers[controller_id]
+        if controller.status != RunnableStatus.RUNNING:
+            self.logger().warning(f"Controller '{controller_id}' is already paused/stopped (status: {controller.status})")
+            return False
+
+        self.logger().info(f"Pausing controller: {controller_id}")
+        controller.stop()
+
+        # Stop all active executors for this controller
+        executors_to_stop = self.filter_executors(
+            executors=self.get_executors_by_controller(controller_id),
+            filter_func=lambda x: x.is_active and not x.is_trading
+        )
+        if executors_to_stop:
+            self.executor_orchestrator.execute_actions([
+                StopExecutorAction(controller_id=controller_id, executor_id=executor.id)
+                for executor in executors_to_stop
+            ])
+
+        self.logger().info(f"Controller '{controller_id}' paused successfully")
+        return True
+
+    def resume_controller(self, controller_id: str) -> bool:
+        """
+        Resume a paused controller by its ID.
+
+        :param controller_id: The ID of the controller to resume
+        :return: True if successful, False otherwise
+        """
+        if controller_id not in self.controllers:
+            self.logger().error(f"Controller '{controller_id}' not found. Available controllers: {list(self.controllers.keys())}")
+            return False
+
+        controller = self.controllers[controller_id]
+        if controller.status == RunnableStatus.RUNNING:
+            self.logger().warning(f"Controller '{controller_id}' is already running")
+            return False
+
+        self.logger().info(f"Resuming controller: {controller_id}")
+        controller.start()
+        self.logger().info(f"Controller '{controller_id}' resumed successfully")
+        return True
+
+    def pause_all_controllers(self) -> None:
+        """Pause all running controllers."""
+        self.logger().info("Pausing all controllers...")
+        for controller_id in list(self.controllers.keys()):
+            self.pause_controller(controller_id)
+
+    def resume_all_controllers(self) -> None:
+        """Resume all paused controllers."""
+        self.logger().info("Resuming all controllers...")
+        for controller_id in list(self.controllers.keys()):
+            self.resume_controller(controller_id)
+
+    def get_controller_status(self, controller_id: str) -> Optional[RunnableStatus]:
+        """
+        Get the status of a specific controller.
+
+        :param controller_id: The ID of the controller
+        :return: RunnableStatus or None if controller not found
+        """
+        if controller_id not in self.controllers:
+            return None
+        return self.controllers[controller_id].status
+
+    def list_controllers(self) -> Dict[str, Dict[str, any]]:
+        """
+        Get a summary of all controllers and their statuses.
+
+        :return: Dictionary mapping controller_id to controller info
+        """
+        controller_summary = {}
+        for controller_id, controller in self.controllers.items():
+            performance = self.get_performance_report(controller_id)
+            executors = self.get_executors_by_controller(controller_id)
+            active_executors = [e for e in executors if e.is_active]
+
+            controller_summary[controller_id] = {
+                "status": controller.status,
+                "type": controller.config.controller_type,
+                "name": controller.config.controller_name,
+                "active_executors": len(active_executors),
+                "total_executors": len(executors),
+                "global_pnl": performance.global_pnl_quote if performance else Decimal("0"),
+                "volume_traded": performance.volume_traded if performance else Decimal("0"),
+            }
+
+        return controller_summary
+
     @staticmethod
     def filter_executors(executors: List[ExecutorInfo], filter_func: Callable[[ExecutorInfo], bool]) -> List[ExecutorInfo]:
         return [executor for executor in executors if filter_func(executor)]
