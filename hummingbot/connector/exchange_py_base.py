@@ -484,7 +484,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             update_timestamp=update_timestamp,
             new_state=OrderState.OPEN,
         )
-        self._order_tracker.process_order_update(order_update)
+        await self._order_tracker._process_order_update(order_update)
 
         return exchange_order_id
 
