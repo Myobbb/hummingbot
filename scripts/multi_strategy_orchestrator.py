@@ -93,7 +93,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -520,6 +520,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
         strategy_instance = next(
             (s for s in self.strategies if s.name == strategy_name),
             None
@@ -560,6 +565,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
         strategy_instance = next(
             (s for s in self.strategies if s.name == strategy_name),
             None
@@ -595,7 +605,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if strategy_instance.paused:
                 self.resume_strategy(strategy_instance.name)
 
-    def list_strategies(self) -> Dict[str, Dict[str, any]]:
+    def list_strategies(self) -> Dict[str, Dict[str, Any]]:
         """
         Get a summary of all strategies and their statuses.
 
@@ -698,7 +708,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         status_blob = strategy.format_status()
                         best_prof_str = self._parse_best_profitability(status_blob) or best_prof_str
                 except Exception as e:
-                    self.logger().debug(f"Could not get strategy stats for '{strategy_name}': {e}")
+                    self.logger().debug(f"Could not get strategy stats for '{strategy_instance.name}': {e}")
 
             rows.append({
                 "markets": markets_str,
