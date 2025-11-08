@@ -88,14 +88,15 @@ class MarketsRecorder:
         self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
         self._market_data_collection_task: Optional[asyncio.Task] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
-        for market in self._markets:
-            trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
-            market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
-                                                                               tf.exchange_trade_id,
-                                                                               tf.symbol) for tf in trade_fills})
-
-            exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
-            market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
+        # DISABLED: Loading missing orders from previous runs to prevent duplicate trade fill errors
+        # for market in self._markets:
+        #     trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
+        #     market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
+        #                                                                        tf.exchange_trade_id,
+        #                                                                        tf.symbol) for tf in trade_fills})
+        #
+        #     exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
+        #     market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
 
         self._create_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_create_order)
         self._fill_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_fill_order)
@@ -188,16 +189,17 @@ class MarketsRecorder:
         if market not in self._markets:
             self._markets.append(market)
 
-            # Add trade fills from recorder
-            trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
-            market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
-                                                                               tf.exchange_trade_id,
-                                                                               tf.symbol) for tf in trade_fills
-                                                         if tf.market == market.name})
-
-            # Add exchange order IDs
-            exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
-            market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
+            # DISABLED: Loading missing orders from previous runs to prevent duplicate trade fill errors
+            # # Add trade fills from recorder
+            # trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
+            # market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
+            #                                                                    tf.exchange_trade_id,
+            #                                                                    tf.symbol) for tf in trade_fills
+            #                                              if tf.market == market.name})
+            #
+            # # Add exchange order IDs
+            # exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
+            # market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
 
             # Add event listeners
             for event_pair in self._event_pairs:
