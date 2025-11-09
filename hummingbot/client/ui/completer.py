@@ -78,7 +78,7 @@ class HummingbotCompleter(Completer):
         self._controller_completer = self.get_available_controllers()
         self._rate_oracle_completer = WordCompleter(list(RATE_ORACLE_SOURCES.keys()), ignore_case=True)
         self._mqtt_completer = WordCompleter(["start", "stop", "restart"], ignore_case=True)
-        self._control_completer = WordCompleter(["list", "pause", "resume", "pause_all", "resume_all"], ignore_case=True)
+        self._control_completer = WordCompleter(["list", "pause", "resume", "pause_all", "resume_all", "remove"], ignore_case=True)
         self._gateway_chains = GATEWAY_CHAINS
         self._gateway_networks = []
         self._list_gateway_wallets_parameters = {"wallets": [], "chain": ""}
