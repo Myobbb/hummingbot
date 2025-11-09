@@ -1156,36 +1156,80 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             # Add trading pair to connector if not already present
                             if hasattr(connector, 'trading_pairs') and pair not in connector.trading_pairs:
                                 connector.trading_pairs.append(pair)
-                                self.logger().info(f"Requesting {exchange} to subscribe to {pair}")
+                                self.logger().info(f"Added {pair} to {exchange} trading pairs list")
                         except Exception as e:
                             self.logger().warning(f"Could not add {pair} to {exchange}: {e}")
 
-            # Schedule auto-resume after order books have time to populate
-            # We'll resume after a few seconds to give connectors time to fetch order books
+            # Schedule smart auto-resume that checks for order book readiness
             strategy_name = strategy_config['name']
             self.logger().info(
                 f"Strategy '{strategy_name}' added in PAUSED state. "
-                f"Waiting for order books to populate..."
+                f"Will check order book availability and auto-resume when ready."
             )
 
             # Import asyncio for scheduling
             import asyncio
 
-            async def auto_resume_strategy():
-                # Wait 5 seconds for order books to populate
-                await asyncio.sleep(5.0)
+            async def smart_auto_resume_strategy():
+                """Poll for order book availability and resume when ready."""
+                max_wait_time = 60.0  # Max 60 seconds
+                check_interval = 2.0   # Check every 2 seconds
+                elapsed_time = 0.0
 
-                # Resume the strategy
-                success = self.resume_strategy(strategy_name)
-                if success:
-                    self.logger().info(f"Strategy '{strategy_name}' auto-resumed after order books populated")
-                else:
-                    self.logger().warning(f"Failed to auto-resume strategy '{strategy_name}'")
+                while elapsed_time < max_wait_time:
+                    await asyncio.sleep(check_interval)
+                    elapsed_time += check_interval
 
-            # Schedule the auto-resume coroutine
-            asyncio.create_task(auto_resume_strategy())
+                    # Check if all required order books exist
+                    all_ready = True
+                    missing_books = []
 
-            self.logger().info(f"Strategy '{strategy_name}' added successfully (will auto-resume in 5s)")
+                    for exchange, pairs in new_markets.items():
+                        if exchange in self.connectors:
+                            connector = self.connectors[exchange]
+                            for pair in pairs:
+                                try:
+                                    # Try to get the order book - will raise if not exists
+                                    if hasattr(connector, 'get_order_book'):
+                                        connector.get_order_book(pair)
+                                except Exception:
+                                    all_ready = False
+                                    missing_books.append(f"{exchange}:{pair}")
+
+                    if all_ready:
+                        # All order books are ready, resume the strategy
+                        success = self.resume_strategy(strategy_name)
+                        if success:
+                            self.logger().info(
+                                f"Strategy '{strategy_name}' auto-resumed after {elapsed_time:.0f}s "
+                                f"(order books ready)"
+                            )
+                        else:
+                            self.logger().warning(f"Failed to auto-resume strategy '{strategy_name}'")
+                        return
+
+                    # Still waiting
+                    if int(elapsed_time) % 10 == 0:  # Log every 10 seconds
+                        self.logger().info(
+                            f"Still waiting for order books ({elapsed_time:.0f}s): "
+                            f"{', '.join(missing_books[:3])}{'...' if len(missing_books) > 3 else ''}"
+                        )
+
+                # Timeout reached - warn user
+                self.logger().warning(
+                    f"Timeout waiting for order books after {max_wait_time:.0f}s. "
+                    f"Strategy '{strategy_name}' remains PAUSED. "
+                    f"Missing: {', '.join(missing_books[:5])}. "
+                    f"Use 'control resume {strategy_name}' to resume manually or restart the bot."
+                )
+
+            # Schedule the smart auto-resume coroutine
+            asyncio.create_task(smart_auto_resume_strategy())
+
+            self.logger().info(
+                f"Strategy '{strategy_name}' added successfully. "
+                f"Monitoring order books for auto-resume (max 60s wait)."
+            )
             return True
 
         except Exception as e:
