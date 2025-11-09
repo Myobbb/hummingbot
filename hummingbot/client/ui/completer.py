@@ -432,6 +432,10 @@ class HummingbotCompleter(Completer):
     def _complete_control_arguments(self, document: Document) -> bool:
         text_before_cursor: str = document.text_before_cursor
         return text_before_cursor.startswith("control ")
+        
+    def _complete_control_add_config(self, document: Document) -> bool:
+        text_before_cursor: str = document.text_before_cursor
+        return text_before_cursor.startswith("control add ")
 
     def get_completions(self, document: Document, complete_event: CompleteEvent):
         """
@@ -459,6 +463,10 @@ class HummingbotCompleter(Completer):
             for c in self._controller_completer.get_completions(document, complete_event):
                 yield c
 
+        elif self._complete_control_add_config(document):
+            for c in self._path_completer.get_completions(document, complete_event):
+                yield c
+ 
         elif self._complete_paths(document):
             for c in self._path_completer.get_completions(document, complete_event):
                 yield c
