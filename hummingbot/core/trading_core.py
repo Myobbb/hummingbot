@@ -442,8 +442,18 @@ class TradingCore:
                 # Assume it's in the script config directory
                 config_path = SCRIPT_STRATEGY_CONF_DIR_PATH / config_file_path
 
+            # Ensure path is absolute
+            if not config_path.is_absolute():
+                config_path = config_path.resolve()
+
             with open(config_path, 'r') as file:
-                return yaml.safe_load(file)
+                config_data = yaml.safe_load(file) or {}
+
+            # Inject the resolved config file path into the config data
+            # This allows scripts to know where their config came from
+            config_data['config_file_path'] = str(config_path)
+
+            return config_data
         except Exception as e:
             self.logger().warning(f"Failed to load config file {config_file_path}: {e}")
             return {}
