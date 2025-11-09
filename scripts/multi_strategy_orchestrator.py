@@ -697,6 +697,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Unexpected error during connector teardown: {e}", exc_info=True)
 
+        # Reset readiness flags for a clean next start
+        try:
+            self.ready_to_trade = False
+            self._ready_announce_done = False
+            self._last_not_ready_names = set()
+        except Exception:
+            pass
+
         self.logger().info("MultiStrategyOrchestrator stopped")
 
     def _find_strategy_by_token(self, token_symbol: str) -> Optional[V1StrategyInstance]:
