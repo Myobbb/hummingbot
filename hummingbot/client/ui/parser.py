@@ -85,10 +85,10 @@ def load_parser(hummingbot: "HummingbotApplication", command_tabs) -> ThrowingAr
 
     control_parser = subparsers.add_parser("control", help="Control individual strategies in multi-strategy orchestrators")
     control_parser.add_argument("action", nargs="?", default=None,
-                                choices=["list", "pause", "resume", "pause_all", "resume_all"],
-                                help="Action to perform: list, pause, resume, pause_all, resume_all")
+                                choices=["list", "pause", "resume", "pause_all", "resume_all", "remove"],
+                                help="Action to perform: list, pause, resume, pause_all, resume_all, remove")
     control_parser.add_argument("identifier", nargs="?", default=None,
-                                help="Strategy name or token symbol (for pause/resume actions)")
+                                help="Strategy name or token symbol (for pause/resume/remove actions)")
     control_parser.set_defaults(func=hummingbot.control)
 
     history_parser = subparsers.add_parser("history", help="See the past performance of the current bot")
