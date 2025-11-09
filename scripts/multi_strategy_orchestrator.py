@@ -54,34 +54,52 @@ See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
 
 Runtime Control:
 ---------------
-From Hummingbot's Python console (>>>), import all functions with one line:
+There are TWO ways to control strategies:
+
+Method 1: CLI Commands (easiest, recommended)
+----------------------------------------------
+Use the 'control' command from the Hummingbot prompt:
+
+control list                  # List all strategies with status
+control pause BSX             # Pause by token symbol
+control resume BSX            # Resume by token symbol
+control pause_all             # Pause all strategies
+control resume_all            # Resume all strategies
+control remove BSX            # Remove strategy (edits config file!)
+
+Commands work by name or token:
+control pause arb_bsx_gate_bitmart   # Full strategy name
+control pause BSX                     # Or just token symbol
+control remove BSX                    # Same for remove
+
+Method 2: Python Console Functions
+-----------------------------------
+From Hummingbot's Python console (>>>), import all functions:
 
 >>> from scripts.multi_strategy_orchestrator import *
 
-Then use simple commands:
-
->>> pause("BSX")          # Pause by token symbol (easiest!)
+Then use Python functions:
+>>> pause("BSX")          # Pause by token symbol
 >>> resume("BSX")         # Resume by token
+>>> remove("BSX")         # Remove strategy (edits config file!)
 >>> list_arb()            # List all strategies with details
 >>> pause_all()           # Pause everything
 >>> resume_all()          # Resume everything
->>> help_arb()            # Show help and available strategies
-
-Functions work by name or token:
->>> pause("arb_bsx_gate_bitmart")  # Full strategy name
->>> pause("BSX")                    # Or just the token symbol
 
 The strategy automatically shows available commands when it starts.
 
 """
 
 import logging
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import yaml
 from pydantic import BaseModel, Field
 from hummingbot.client.config.config_data_types import BaseClientModel
 
@@ -97,7 +115,7 @@ from hummingbot.strategy.strategy_base import StrategyBase
 logger = None
 
 # Export convenience functions for easy import
-__all__ = ['pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'MultiStrategyOrchestrator']
+__all__ = ['pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove', 'MultiStrategyOrchestrator']
 
 # Global reference to orchestrator instance for convenience functions
 _orchestrator_instance: Optional['MultiStrategyOrchestrator'] = None
@@ -205,6 +223,24 @@ def help_arb() -> None:
     orchestrator.show_help()
 
 
+def remove(identifier: str) -> bool:
+    """
+    Remove a strategy by name or token symbol, updating the config file.
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> remove("arb_bsx_gate_bitmart")  # By full name
+        >>> remove("BSX")                    # By token symbol
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.remove_strategy_by_identifier(identifier)
+
+
 @dataclass
 class V1StrategyInstance:
     """Wrapper for a V1 strategy instance with metadata"""
@@ -257,6 +293,12 @@ class MultiStrategyOrchestratorConfig(BaseClientModel):
     arbitrage_m_strategies: List[ArbitrageMInstanceConfig] = Field(
         default_factory=list,
         description="List of arbitrage_m strategy configurations to run"
+    )
+
+    # Config file path (for runtime editing)
+    config_file_path: Optional[str] = Field(
+        default=None,
+        description="Path to the YAML config file (set automatically on load)"
     )
 
 
@@ -355,6 +397,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("  control resume <token>      # Resume strategy")
         self.logger().info("  control pause_all           # Pause all strategies")
         self.logger().info("  control resume_all          # Resume all strategies")
+        self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
         self.logger().info("")
         self.logger().info(f"Loaded {len(self.strategies)} strateg{'y' if len(self.strategies) == 1 else 'ies'}")
         self.logger().info("=" * 70)
@@ -828,6 +871,212 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if self.resume_strategy(strategy_instance.name):
                     count += 1
         return count
+
+    def remove_strategy_by_identifier(self, identifier: str) -> bool:
+        """
+        Remove a strategy by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match (silently)
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.remove_strategy(identifier)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.remove_strategy(strategy_instance.name)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def remove_strategy(self, strategy_name: str) -> bool:
+        """
+        Remove a specific arbitrage_m strategy by name.
+
+        This will:
+        1. Stop and remove the strategy from memory
+        2. Update the config file to remove the strategy
+        3. Remove markets that are no longer used by any remaining strategies
+
+        Args:
+            strategy_name: The name of the strategy to remove (from config)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        self.logger().info(f"Removing strategy: {strategy_name}")
+
+        # Step 1: Stop the strategy if it's running
+        try:
+            if self._strategies_started and self._strategy_clock is not None:
+                self.logger().info(f"Stopping strategy before removal: {strategy_name}")
+                if hasattr(strategy_instance.strategy, "stop"):
+                    strategy_instance.strategy.stop(self._strategy_clock)
+                if hasattr(strategy_instance.strategy, "cancel_all_orders"):
+                    strategy_instance.strategy.cancel_all_orders()
+        except Exception as e:
+            self.logger().warning(f"Error stopping strategy '{strategy_name}': {e}")
+
+        # Step 2: Collect market info before removal
+        removed_markets = self._get_strategy_markets(strategy_instance)
+
+        # Step 3: Remove from in-memory list
+        self.strategies = [s for s in self.strategies if s.name != strategy_name]
+        self.logger().info(f"Strategy '{strategy_name}' removed from memory")
+
+        # Step 4: Update the config file
+        if self.config.config_file_path:
+            try:
+                self._update_config_file(strategy_name, removed_markets)
+                self.logger().info(f"Config file updated: {self.config.config_file_path}")
+            except Exception as e:
+                self.logger().error(f"Failed to update config file: {e}", exc_info=True)
+                return False
+        else:
+            self.logger().warning("Config file path not set, skipping file update")
+
+        self.logger().info(f"Strategy '{strategy_name}' removed successfully")
+        return True
+
+    def _get_strategy_markets(self, strategy_instance: V1StrategyInstance) -> Dict[str, Set[str]]:
+        """
+        Get all markets used by a strategy.
+
+        Returns:
+            Dict mapping exchange name to set of trading pairs
+        """
+        markets = {}
+        for market_pair in strategy_instance.market_pairs:
+            exchange_name = market_pair.market.name
+            trading_pair = market_pair.trading_pair
+
+            if exchange_name not in markets:
+                markets[exchange_name] = set()
+            markets[exchange_name].add(trading_pair)
+
+        return markets
+
+    def _get_markets_still_in_use(self) -> Dict[str, Set[str]]:
+        """
+        Get all markets still used by remaining strategies.
+
+        Returns:
+            Dict mapping exchange name to set of trading pairs
+        """
+        markets_in_use = {}
+
+        for strategy_instance in self.strategies:
+            for market_pair in strategy_instance.market_pairs:
+                exchange_name = market_pair.market.name
+                trading_pair = market_pair.trading_pair
+
+                if exchange_name not in markets_in_use:
+                    markets_in_use[exchange_name] = set()
+                markets_in_use[exchange_name].add(trading_pair)
+
+        return markets_in_use
+
+    def _update_config_file(self, strategy_name: str, removed_markets: Dict[str, Set[str]]):
+        """
+        Update the YAML config file to remove the strategy and unused markets.
+
+        Args:
+            strategy_name: Name of the strategy to remove
+            removed_markets: Markets that were used by the removed strategy
+        """
+        config_path = Path(self.config.config_file_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        # Read current config
+        with open(config_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
+
+        if not yaml_data:
+            raise ValueError("Config file is empty or invalid")
+
+        # Remove strategy from arbitrage_m_strategies
+        if 'arbitrage_m_strategies' in yaml_data:
+            original_count = len(yaml_data['arbitrage_m_strategies'])
+            yaml_data['arbitrage_m_strategies'] = [
+                s for s in yaml_data['arbitrage_m_strategies']
+                if s.get('name') != strategy_name
+            ]
+            new_count = len(yaml_data['arbitrage_m_strategies'])
+            self.logger().info(
+                f"Removed strategy from config: {original_count} -> {new_count} strategies"
+            )
+
+        # Determine which markets are still in use
+        markets_still_in_use = self._get_markets_still_in_use()
+
+        # Remove markets that are no longer used
+        if 'markets' in yaml_data:
+            markets_to_remove = {}
+
+            for exchange, pairs in removed_markets.items():
+                still_used = markets_still_in_use.get(exchange, set())
+                unused_pairs = pairs - still_used
+
+                if unused_pairs:
+                    markets_to_remove[exchange] = unused_pairs
+
+            # Remove unused pairs from the YAML
+            for exchange, unused_pairs in markets_to_remove.items():
+                if exchange in yaml_data['markets']:
+                    original_pairs = yaml_data['markets'][exchange]
+                    if isinstance(original_pairs, list):
+                        yaml_data['markets'][exchange] = [
+                            p for p in original_pairs
+                            if p not in unused_pairs
+                        ]
+
+                        # Remove exchange entirely if no pairs left
+                        if not yaml_data['markets'][exchange]:
+                            del yaml_data['markets'][exchange]
+                            self.logger().info(f"Removed exchange '{exchange}' (no pairs remaining)")
+                        else:
+                            self.logger().info(
+                                f"Removed pairs from '{exchange}': {unused_pairs}"
+                            )
+
+        # Write updated config back to file
+        with open(config_path, 'w') as f:
+            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
 
     def list_strategies(self) -> Dict[str, Dict[str, Any]]:
         """
