@@ -675,8 +675,27 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         else:
             self.logger().warning("Strategies were never started or clock not available")
 
-        # Note: We don't call super().on_stop() because we bypassed super().__init__()
-        # The orchestrator itself has minimal cleanup needs
+        # Proactively teardown connectors so a subsequent start recreates fresh WS subscriptions and trading pairs
+        try:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            app = HummingbotApplication.main_application()
+            trading_core = getattr(app, "trading_core", None)
+            if trading_core:
+                connector_names = list(self.connectors.keys())
+                if connector_names:
+                    self.logger().info(f"Tearing down connectors: {connector_names}")
+                    # Remove each connector via TradingCore to ensure proper stop + clock/recorder cleanup
+                    for name in connector_names:
+                        try:
+                            trading_core.remove_connector(name)
+                        except Exception as e:
+                            self.logger().warning(f"Failed to remove connector {name}: {e}")
+                    # Clear our local pool so a new start receives a fresh set from TradingCore
+                    self.connectors.clear()
+            else:
+                self.logger().warning("TradingCore not available; connectors will remain alive after stop.")
+        except Exception as e:
+            self.logger().error(f"Unexpected error during connector teardown: {e}", exc_info=True)
 
         self.logger().info("MultiStrategyOrchestrator stopped")
 
