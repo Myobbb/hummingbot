@@ -1142,23 +1142,134 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             self._merge_strategy_into_config(strategy_config, new_markets)
 
-            # Add the new strategy to the running orchestrator in PAUSED state
-            # This prevents order book errors while connectors subscribe to new trading pairs
-            self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**strategy_config), paused=True)
+            # Ensure connectors are updated/created for all new markets so order books subscribe properly
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            app = HummingbotApplication.main_application()
+            trading_core = getattr(app, "trading_core", None)
+            connector_manager = getattr(trading_core, "connector_manager", None) if trading_core else None
 
-            # Request connectors to add the new trading pairs
-            # This triggers subscription to order books for the new pairs
+            if connector_manager is None:
+                self.logger().error("ConnectorManager not available; cannot subscribe to new trading pairs at runtime.")
+                return False
+
+            # Determine which exchanges need updates or creation
+            pairs_to_add_by_exchange: Dict[str, List[str]] = {}
+            exchanges_to_create: Dict[str, List[str]] = {}
             for exchange, pairs in new_markets.items():
                 if exchange in self.connectors:
-                    connector = self.connectors[exchange]
-                    for pair in pairs:
+                    existing_pairs = []
+                    try:
+                        existing_pairs = list(getattr(self.connectors[exchange], "trading_pairs", []))
+                    except Exception:
+                        existing_pairs = []
+                    missing = [p for p in pairs if p not in existing_pairs]
+                    if missing:
+                        pairs_to_add_by_exchange[exchange] = missing
+                else:
+                    exchanges_to_create[exchange] = list(pairs)
+
+            affected_exchanges = set(pairs_to_add_by_exchange.keys()) | set(exchanges_to_create.keys())
+
+            # If we need to update/create connectors, do it and then reinitialize strategies to bind to new connector instances
+            if affected_exchanges:
+                self.logger().info(f"Updating connector subscriptions for exchanges: {sorted(list(affected_exchanges))}")
+
+                # Remove affected existing connectors from the clock to let them stop cleanly
+                for exchange in pairs_to_add_by_exchange.keys():
+                    try:
+                        if exchange in self.connectors and self._strategy_clock is not None:
+                            self._strategy_clock.remove_iterator(self.connectors[exchange])
+                    except Exception as e:
+                        self.logger().warning(f"Could not remove {exchange} from clock before update: {e}")
+
+                # Update existing connectors to include missing pairs (recreate under the hood)
+                for exchange, add_pairs in pairs_to_add_by_exchange.items():
+                    try:
+                        self.logger().info(f"Adding trading pairs to {exchange}: {add_pairs}")
+                        connector_manager.add_trading_pairs(exchange, add_pairs)
+                    except Exception as e:
+                        self.logger().error(f"Failed to update {exchange} trading pairs {add_pairs}: {e}", exc_info=True)
+                        return False
+
+                # Create entirely new connectors if needed
+                for exchange, pairs in exchanges_to_create.items():
+                    try:
+                        self.logger().info(f"Creating connector {exchange} with pairs: {pairs}")
+                        connector_manager.create_connector(exchange, pairs, trading_required=True)
+                    except Exception as e:
+                        self.logger().error(f"Failed to create connector {exchange}: {e}", exc_info=True)
+                        return False
+
+                # Fetch updated/new connector instances, add them to clock and markets recorder, and update our pool
+                for exchange in affected_exchanges:
+                    try:
+                        new_connector = connector_manager.get_connector(exchange)
+                        if new_connector is None:
+                            self.logger().error(f"Connector {exchange} not found after update.")
+                            return False
+                        # Replace in our shared pool
+                        self.connectors[exchange] = new_connector
+                        # Add to clock so it starts ticking immediately
+                        if self._strategy_clock is not None:
+                            self._strategy_clock.add_iterator(new_connector)
+                        # Add to markets recorder
+                        if getattr(trading_core, "markets_recorder", None):
+                            trading_core.markets_recorder.add_market(new_connector)
+                    except Exception as e:
+                        self.logger().error(f"Failed to finalize connector {exchange} update: {e}", exc_info=True)
+                        return False
+
+                # Rebuild ALL strategies (old + new) to bind to the updated connector objects
+                try:
+                    # Snapshot existing configs and pause state
+                    existing = [(s.config, s.paused, s.name) for s in self.strategies]
+
+                    # Stop and clean old strategy instances
+                    for strategy_instance in self.strategies:
                         try:
-                            # Add trading pair to connector if not already present
-                            if hasattr(connector, 'trading_pairs') and pair not in connector.trading_pairs:
-                                connector.trading_pairs.append(pair)
-                                self.logger().info(f"Added {pair} to {exchange} trading pairs list")
+                            if hasattr(strategy_instance.strategy, "stop") and self._strategy_clock is not None:
+                                strategy_instance.strategy.stop(self._strategy_clock)
+                            if hasattr(strategy_instance.strategy, "cancel_all_orders"):
+                                strategy_instance.strategy.cancel_all_orders()
                         except Exception as e:
-                            self.logger().warning(f"Could not add {pair} to {exchange}: {e}")
+                            self.logger().warning(f"Error stopping strategy '{strategy_instance.name}': {e}")
+
+                    # Compose the new full list (existing + the one being added now)
+                    full_list: List[Tuple[Dict[str, Any], bool]] = []
+                    for conf_dict, paused, _name in existing:
+                        full_list.append((conf_dict, paused))
+                    full_list.append((strategy_config, True))  # add the new strategy in PAUSED state
+
+                    # Reset and rebuild
+                    self.strategies = []
+                    for conf_dict, paused in full_list:
+                        self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**conf_dict), paused=paused)
+
+                    # If strategies were already started, start new instances with the current clock
+                    if self._strategies_started and self._strategy_clock is not None:
+                        for strategy_instance in self.strategies:
+                            try:
+                                if hasattr(strategy_instance.strategy, "start"):
+                                    strategy_instance.strategy.start(self._strategy_clock)
+                            except Exception as e:
+                                self.logger().error(
+                                    f"Error starting strategy '{strategy_instance.name}' after rebuild: {e}",
+                                    exc_info=True
+                                )
+                        self.logger().info("All strategies rebound to updated connectors and started.")
+                    else:
+                        self.logger().info("Strategies rebuilt; will be started by orchestrator when ready.")
+                except Exception as e:
+                    self.logger().error(f"Failed to rebuild strategies after connector updates: {e}", exc_info=True)
+                    return False
+            else:
+                # No connector changes needed; just add the new strategy in PAUSED state and start it if orchestrator already started
+                self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**strategy_config), paused=True)
+                if self._strategies_started and self._strategy_clock is not None:
+                    try:
+                        self.strategies[-1].strategy.start(self._strategy_clock)
+                    except Exception as e:
+                        self.logger().warning(f"Failed to start newly added strategy immediately: {e}")
 
             # Schedule smart auto-resume that checks for order book readiness
             strategy_name = strategy_config['name']
