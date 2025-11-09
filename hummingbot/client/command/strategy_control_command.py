@@ -206,23 +206,10 @@ class StrategyControlCommand:
         """Remove a strategy by name or token, updating the config file."""
         try:
             strategy = self.trading_core.strategy
-
-            # Confirm with user before removing
-            self.notify(f"\n⚠ WARNING: This will remove the strategy '{identifier}' and update the config file.")
-            self.notify("  This action cannot be undone from the running bot.")
-            self.notify("  (The config file will be modified on disk)")
-            self.notify("\nType 'yes' to confirm removal, or anything else to cancel:")
-
-            # Note: In practice, the user would need to confirm via input
-            # For now, we'll proceed with the removal
-            # In a real implementation, you'd want to add a confirmation prompt
-
             success = strategy.remove_strategy_by_identifier(identifier)
 
             if success:
                 self.notify(f"\n✓ Strategy removed successfully")
-                self.notify("  Config file has been updated")
-                self.notify("  The strategy is no longer running")
             else:
                 self.notify(f"\n✗ Failed to remove strategy: {identifier}")
                 self.notify("  Use 'control list' to see available strategies")
