@@ -684,6 +684,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 connector_names = list(self.connectors.keys())
                 if connector_names:
                     self.logger().info(f"Tearing down connectors: {connector_names}")
+                    # Ensure outstanding orders are cancelled before connectors are removed
+                    try:
+                        await trading_core.cancel_outstanding_orders()
+                    except Exception as e:
+                        self.logger().warning(f"Failed to cancel outstanding orders before teardown: {e}")
                     # Remove each connector via TradingCore to ensure proper stop + clock/recorder cleanup
                     for name in connector_names:
                         try:
