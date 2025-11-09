@@ -416,7 +416,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except Exception as e:
                 self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
 
-    def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig):
+    def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
         Add an arbitrage_m strategy instance.
 
@@ -425,6 +425,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         2. Creates an ArbitrageMStrategy instance
         3. Initializes it with the config
         4. The strategy's c_add_markets() call registers event listeners
+
+        Args:
+            config: Strategy configuration
+            paused: Whether to start the strategy in paused state (useful for runtime additions)
         """
         self.logger().info(f"Adding arbitrage_m strategy: {config.name}")
 
@@ -523,7 +527,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy=strategy,
             name=config.name,
             config=config.dict(),
-            market_pairs=market_tuples
+            market_pairs=market_tuples,
+            paused=paused  # Set initial pause state
         )
         self.strategies.append(strategy_instance)
 
@@ -1137,10 +1142,50 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             self._merge_strategy_into_config(strategy_config, new_markets)
 
-            # Add the new strategy to the running orchestrator
-            self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**strategy_config))
+            # Add the new strategy to the running orchestrator in PAUSED state
+            # This prevents order book errors while connectors subscribe to new trading pairs
+            self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**strategy_config), paused=True)
 
-            self.logger().info(f"Strategy '{strategy_config['name']}' added successfully")
+            # Request connectors to add the new trading pairs
+            # This triggers subscription to order books for the new pairs
+            for exchange, pairs in new_markets.items():
+                if exchange in self.connectors:
+                    connector = self.connectors[exchange]
+                    for pair in pairs:
+                        try:
+                            # Add trading pair to connector if not already present
+                            if hasattr(connector, 'trading_pairs') and pair not in connector.trading_pairs:
+                                connector.trading_pairs.append(pair)
+                                self.logger().info(f"Requesting {exchange} to subscribe to {pair}")
+                        except Exception as e:
+                            self.logger().warning(f"Could not add {pair} to {exchange}: {e}")
+
+            # Schedule auto-resume after order books have time to populate
+            # We'll resume after a few seconds to give connectors time to fetch order books
+            strategy_name = strategy_config['name']
+            self.logger().info(
+                f"Strategy '{strategy_name}' added in PAUSED state. "
+                f"Waiting for order books to populate..."
+            )
+
+            # Import asyncio for scheduling
+            import asyncio
+
+            async def auto_resume_strategy():
+                # Wait 5 seconds for order books to populate
+                await asyncio.sleep(5.0)
+
+                # Resume the strategy
+                success = self.resume_strategy(strategy_name)
+                if success:
+                    self.logger().info(f"Strategy '{strategy_name}' auto-resumed after order books populated")
+                else:
+                    self.logger().warning(f"Failed to auto-resume strategy '{strategy_name}'")
+
+            # Schedule the auto-resume coroutine
+            asyncio.create_task(auto_resume_strategy())
+
+            self.logger().info(f"Strategy '{strategy_name}' added successfully (will auto-resume in 5s)")
             return True
 
         except Exception as e:
