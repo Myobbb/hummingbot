@@ -398,6 +398,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("  control pause_all           # Pause all strategies")
         self.logger().info("  control resume_all          # Resume all strategies")
         self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
+        self.logger().info("  control add <file>          # Add strategy from conf/strategies/")
         self.logger().info("")
         self.logger().info(f"Loaded {len(self.strategies)} strateg{'y' if len(self.strategies) == 1 else 'ies'}")
         self.logger().info("=" * 70)
@@ -1077,6 +1078,199 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Write updated config back to file
         with open(config_path, 'w') as f:
             yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+    async def add_strategy_from_file(self, config_file: str) -> bool:
+        """
+        Add a strategy from a single-strategy config file.
+
+        This will:
+        1. Load the single-strategy config file from conf/strategies/
+        2. Convert it to multi-strategy format
+        3. Merge markets into the current config
+        4. Add strategy to arbitrage_m_strategies list
+        5. Save the updated config file
+        6. Start the new strategy in the running orchestrator
+
+        Args:
+            config_file: Name of the config file (e.g., 'arb_ace_kucoin_gate.yml')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        from hummingbot.client.settings import STRATEGIES_CONF_DIR_PATH
+
+        try:
+            # Normalize filename
+            if not config_file.endswith('.yml') and not config_file.endswith('.yaml'):
+                config_file = f"{config_file}.yml"
+
+            # Load the single-strategy config file
+            config_path = STRATEGIES_CONF_DIR_PATH / config_file
+            if not config_path.exists():
+                self.logger().error(f"Config file not found: {config_path}")
+                return False
+
+            with open(config_path, 'r') as f:
+                single_config = yaml.safe_load(f)
+
+            if not single_config:
+                self.logger().error(f"Config file is empty or invalid: {config_path}")
+                return False
+
+            # Validate it's an arbitrage_m strategy
+            if single_config.get('strategy') != 'arbitrage_m':
+                self.logger().error(f"Only arbitrage_m strategies are supported. Found: {single_config.get('strategy')}")
+                return False
+
+            # Convert single-strategy config to multi-strategy format
+            strategy_config = self._convert_single_to_multi_config(single_config, config_file)
+            if not strategy_config:
+                return False
+
+            # Extract markets needed by this strategy
+            new_markets = self._extract_markets_from_strategy(strategy_config)
+
+            # Update the multi-strategy config file
+            if not self.config.config_file_path:
+                self.logger().error("Config file path not set")
+                return False
+
+            self._merge_strategy_into_config(strategy_config, new_markets)
+
+            # Add the new strategy to the running orchestrator
+            self._add_arbitrage_m_strategy(ArbitrageMInstanceConfig(**strategy_config))
+
+            self.logger().info(f"Strategy '{strategy_config['name']}' added successfully")
+            return True
+
+        except Exception as e:
+            self.logger().error(f"Failed to add strategy from {config_file}: {e}", exc_info=True)
+            return False
+
+    def _convert_single_to_multi_config(self, single_config: Dict[str, Any], source_file: str) -> Optional[Dict[str, Any]]:
+        """Convert single-strategy config format to multi-strategy format."""
+        try:
+            # Generate strategy name from config if not provided
+            name = single_config.get('name')
+            if not name:
+                # Extract name from filename (e.g., 'conf_arb_ace_kucoin_gate_strategy.yml' -> 'arb_ace_kucoin_gate')
+                base_name = source_file.replace('.yml', '').replace('.yaml', '')
+                base_name = base_name.replace('conf_', '').replace('_strategy', '')
+                name = base_name
+
+            # Parse additional_markets field (can be string or list)
+            additional_markets = single_config.get('additional_markets', [])
+            if isinstance(additional_markets, str):
+                if additional_markets.strip():
+                    # Parse comma-separated string: "mexc:SLF-USDT, htx:SLF-USDT"
+                    additional_markets = [m.strip() for m in additional_markets.split(',') if m.strip()]
+                else:
+                    additional_markets = []
+
+            # Build multi-strategy config
+            multi_config = {
+                'name': name,
+                'primary_market': single_config['primary_market'],
+                'secondary_market': single_config['secondary_market'],
+                'primary_trading_pair': single_config['primary_market_trading_pair'],
+                'secondary_trading_pair': single_config['secondary_market_trading_pair'],
+                'min_profitability': single_config.get('min_profitability', 0.5),
+                'use_oracle_conversion_rate': single_config.get('use_oracle_conversion_rate', False),
+                'secondary_to_primary_base_conversion_rate': single_config.get('secondary_to_primary_base_conversion_rate', 1.0),
+                'secondary_to_primary_quote_conversion_rate': single_config.get('secondary_to_primary_quote_conversion_rate', 1.0),
+                'buy_in_enabled': single_config.get('buy_in_enabled', False),
+                'buy_in_target_usd': single_config.get('buy_in_target_usdt', single_config.get('buy_in_target_usd', 100.0)),
+                'buy_in_min_profitability': single_config.get('buy_in_min_profitability', 0.5),
+                'status_report_interval': single_config.get('status_report_interval', 60.0),
+                'next_trade_delay_interval': single_config.get('next_trade_delay_interval', 2.0),
+                'order_timeout': single_config.get('order_timeout', 300.0),
+                'additional_markets': additional_markets,
+            }
+
+            return multi_config
+
+        except Exception as e:
+            self.logger().error(f"Failed to convert config: {e}", exc_info=True)
+            return None
+
+    def _extract_markets_from_strategy(self, strategy_config: Dict[str, Any]) -> Dict[str, Set[str]]:
+        """Extract all markets needed by a strategy config."""
+        markets = {}
+
+        # Primary market
+        primary_exchange = strategy_config['primary_market']
+        primary_pair = strategy_config['primary_trading_pair']
+        if primary_exchange not in markets:
+            markets[primary_exchange] = set()
+        markets[primary_exchange].add(primary_pair)
+
+        # Secondary market
+        secondary_exchange = strategy_config['secondary_market']
+        secondary_pair = strategy_config['secondary_trading_pair']
+        if secondary_exchange not in markets:
+            markets[secondary_exchange] = set()
+        markets[secondary_exchange].add(secondary_pair)
+
+        # Additional markets
+        for additional in strategy_config.get('additional_markets', []):
+            if ':' in additional:
+                exchange, pair = additional.split(':', 1)
+                if exchange not in markets:
+                    markets[exchange] = set()
+                markets[exchange].add(pair)
+
+        return markets
+
+    def _merge_strategy_into_config(self, strategy_config: Dict[str, Any], new_markets: Dict[str, Set[str]]):
+        """Merge a new strategy and its markets into the config file."""
+        config_path = Path(self.config.config_file_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        # Read current config
+        with open(config_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
+
+        if not yaml_data:
+            raise ValueError("Config file is empty or invalid")
+
+        # Merge markets
+        if 'markets' not in yaml_data:
+            yaml_data['markets'] = {}
+
+        for exchange, pairs in new_markets.items():
+            if exchange not in yaml_data['markets']:
+                yaml_data['markets'][exchange] = []
+
+            # Add new pairs if not already present
+            existing_pairs = set(yaml_data['markets'][exchange])
+            for pair in pairs:
+                if pair not in existing_pairs:
+                    yaml_data['markets'][exchange].append(pair)
+                    self.logger().info(f"Added market pair: {exchange}:{pair}")
+
+        # Add strategy to arbitrage_m_strategies
+        if 'arbitrage_m_strategies' not in yaml_data:
+            yaml_data['arbitrage_m_strategies'] = []
+
+        # Check if strategy with same name already exists
+        existing_names = [s.get('name') for s in yaml_data['arbitrage_m_strategies']]
+        if strategy_config['name'] in existing_names:
+            self.logger().warning(f"Strategy '{strategy_config['name']}' already exists, replacing it")
+            yaml_data['arbitrage_m_strategies'] = [
+                s for s in yaml_data['arbitrage_m_strategies']
+                if s.get('name') != strategy_config['name']
+            ]
+
+        yaml_data['arbitrage_m_strategies'].append(strategy_config)
+        self.logger().info(f"Added strategy '{strategy_config['name']}' to config")
+
+        # Write updated config back to file
+        with open(config_path, 'w') as f:
+            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+        self.logger().info(f"Config file updated: {config_path}")
 
     def list_strategies(self) -> Dict[str, Dict[str, Any]]:
         """

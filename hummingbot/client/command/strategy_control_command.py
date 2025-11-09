@@ -25,6 +25,7 @@ class StrategyControlCommand:
             control pause_all         - Pause all strategies
             control resume_all        - Resume all strategies
             control remove <id>       - Remove a strategy (edits config file)
+            control add <file>        - Add a strategy from config file (conf/strategies/)
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -77,9 +78,19 @@ class StrategyControlCommand:
                 self.notify("The current strategy does not support removing strategies.")
                 return
             safe_ensure_future(self._control_remove(identifier), loop=self.ev_loop)
+        elif action == "add":
+            if identifier is None:
+                self.notify("Error: Please specify a config file to add.")
+                self.notify("Usage: control add <config_file.yml>")
+                return
+            # Check if add capability exists
+            if not hasattr(strategy, 'add_strategy_from_file'):
+                self.notify("The current strategy does not support adding strategies.")
+                return
+            safe_ensure_future(self._control_add(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
-            self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove")
+            self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -129,6 +140,7 @@ class StrategyControlCommand:
             self.notify("  control pause_all               - Pause all strategies")
             self.notify("  control resume_all              - Resume all strategies")
             self.notify("  control remove <name_or_token>  - Remove a strategy (edits config file)")
+            self.notify("  control add <config_file>       - Add strategy from conf/strategies/")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -206,15 +218,31 @@ class StrategyControlCommand:
         """Remove a strategy by name or token, updating the config file."""
         try:
             strategy = self.trading_core.strategy
-
-
             success = strategy.remove_strategy_by_identifier(identifier)
 
             if success:
-                self.notify(f"\n✓ Strategy {identifier} removed successfully")
+                self.notify(f"\n✓ Strategy removed successfully")
             else:
                 self.notify(f"\n✗ Failed to remove strategy: {identifier}")
+                self.notify("  Use 'control list' to see available strategies")
 
         except Exception as e:
             self.notify(f"Error removing strategy: {e}")
             self.logger().error(f"Error in control remove: {e}", exc_info=True)
+
+    async def _control_add(self,  # type: HummingbotApplication
+                          config_file: str):
+        """Add a strategy from a config file in conf/strategies/."""
+        try:
+            strategy = self.trading_core.strategy
+            success = await strategy.add_strategy_from_file(config_file)
+
+            if success:
+                self.notify(f"\n✓ Strategy added successfully from {config_file}")
+            else:
+                self.notify(f"\n✗ Failed to add strategy from {config_file}")
+                self.notify("  Check that the file exists in conf/strategies/")
+
+        except Exception as e:
+            self.notify(f"Error adding strategy: {e}")
+            self.logger().error(f"Error in control add: {e}", exc_info=True)
