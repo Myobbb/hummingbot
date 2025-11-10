@@ -369,10 +369,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.strategies: List[V1StrategyInstance] = []
         self._strategies_started: bool = False  # FIX #2: Track whether strategies have been started
         self._strategy_clock = None  # FIX #3: Store clock reference for strategies
-        # Streamlined readiness logging and deferred start helpers
-        self._last_not_ready_names: Set[str] = set()
-        self._last_ready_log_time: float = 0.0
-        self._ready_announce_done: bool = False
+        # Readiness is handled by ScriptStrategyBase.tick(); keep no extra state here
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -542,64 +539,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def start(self, clock, timestamp: float):
         """
-        FIX #2 & #4: Start the orchestrator and all V1 strategies with proper clock management.
-
-        This is called by the Clock system after the orchestrator is registered.
-        We use this opportunity to start all V1 strategies with the clock.
-
-        Args:
-            clock: The clock instance managing this orchestrator
-            timestamp: Current timestamp
+        Start the orchestrator and initialize all V1 strategies with the clock immediately.
+        Trading will still be gated by ScriptStrategyBase.tick() until connectors report ready.
         """
-        # Store clock reference for lifecycle management
         self._strategy_clock = clock
-        self._last_timestamp = timestamp
-
-        # If connectors are already ready, start immediately; otherwise defer until tick detects readiness
-        try:
-            all_ready = all(getattr(c, 'ready', False) for c in self.connectors.values())
-        except Exception:
-            all_ready = False
-
-        if all_ready:
-            self._start_all_strategies_if_needed()
-        else:
-            self.logger().info(
-                f"Deferring start of {len(self.strategies)} V1 strategies until connectors are ready..."
-            )
+        self._start_all_strategies_if_needed()
 
     def tick(self, timestamp: float):
-        """Override base tick to reduce startup log spam and start strategies only when ready.
-
-        - Aggregates and throttles readiness logs to once every 2s or on change.
-        - Starts V1 strategies only after all connectors are ready.
         """
-        try:
-            not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
-        except Exception:
-            not_ready = list(self.connectors.keys())
-
-        if not_ready:
-            # Throttle and aggregate logs
-            names_set = set(not_ready)
-            if names_set != self._last_not_ready_names or (timestamp - self._last_ready_log_time) >= 2.0:
-                self.logger().info(
-                    f"Waiting for connectors ({len(not_ready)}): {', '.join(not_ready)}"
-                )
-                self._last_not_ready_names = names_set
-                self._last_ready_log_time = timestamp
-            # Stay idle until connectors are ready
-            return
-
-        # All connectors ready
-        if not self.ready_to_trade:
-            self.ready_to_trade = True
-            if not self._ready_announce_done:
-                self.logger().info("All connectors ready. Starting strategies and entering trading loop.")
-                self._ready_announce_done = True
-            self._start_all_strategies_if_needed()
-
-        # Delegate to base tick to preserve normal runtime cadence/behavior
+        Delegate readiness gating to ScriptStrategyBase. It will call on_tick() only when all connectors are ready.
+        """
         return super().tick(timestamp)
 
     def _start_all_strategies_if_needed(self):
@@ -609,6 +558,25 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         for strategy_instance in self.strategies:
             try:
                 self.logger().info(f"Starting strategy: {strategy_instance.name}")
+                # Re-attach markets if previously stopped (c_remove_markets is called on stop)
+                try:
+                    active = list(getattr(strategy_instance.strategy, "active_markets", []))
+                except Exception:
+                    active = []
+                if not active:
+                    try:
+                        unique_connectors = []
+                        seen = set()
+                        for mt in strategy_instance.market_pairs:
+                            key = id(mt.market)
+                            if key not in seen:
+                                seen.add(key)
+                                unique_connectors.append(mt.market)
+                        if unique_connectors:
+                            strategy_instance.strategy.add_markets(unique_connectors)
+                            self.logger().info(f"Re-attached markets for '{strategy_instance.name}' ({len(unique_connectors)} connectors)")
+                    except Exception as e:
+                        self.logger().warning(f"Failed to re-attach markets for '{strategy_instance.name}': {e}")
                 if hasattr(strategy_instance.strategy, "start"):
                     strategy_instance.strategy.start(self._strategy_clock)
             except Exception as e:
@@ -650,7 +618,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     async def on_stop(self):
         """
-        FIX #3: Clean shutdown of all strategies using the correct clock reference.
+        Clean shutdown of all strategies using the correct clock reference.
 
         Each strategy's stop() is called to clean up its event listeners
         and cancel any pending orders.
@@ -675,41 +643,22 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         else:
             self.logger().warning("Strategies were never started or clock not available")
 
-        # Proactively teardown connectors so a subsequent start recreates fresh WS subscriptions and trading pairs
+        # Do NOT tear down connectors here; TradingCore manages connector lifecycle to preserve websocket state.
+        # Just cancel outstanding orders to be safe.
         try:
             from hummingbot.client.hummingbot_application import HummingbotApplication
             app = HummingbotApplication.main_application()
             trading_core = getattr(app, "trading_core", None)
             if trading_core:
-                connector_names = list(self.connectors.keys())
-                if connector_names:
-                    self.logger().info(f"Tearing down connectors: {connector_names}")
-                    # Ensure outstanding orders are cancelled before connectors are removed
-                    try:
-                        await trading_core.cancel_outstanding_orders()
-                    except Exception as e:
-                        self.logger().warning(f"Failed to cancel outstanding orders before teardown: {e}")
-                    # Remove each connector via TradingCore to ensure proper stop + clock/recorder cleanup
-                    for name in connector_names:
-                        try:
-                            trading_core.remove_connector(name)
-                        except Exception as e:
-                            self.logger().warning(f"Failed to remove connector {name}: {e}")
-                    # Clear our local pool so a new start receives a fresh set from TradingCore
-                    self.connectors.clear()
-            else:
-                self.logger().warning("TradingCore not available; connectors will remain alive after stop.")
+                try:
+                    await trading_core.cancel_outstanding_orders()
+                except Exception as e:
+                    self.logger().warning(f"Failed to cancel outstanding orders during stop: {e}")
         except Exception as e:
-            self.logger().error(f"Unexpected error during connector teardown: {e}", exc_info=True)
+            self.logger().debug(f"Skip order cancellation on stop due to error: {e}")
 
-        # Reset readiness flags for a clean next start
-        try:
-            self.ready_to_trade = False
-            self._ready_announce_done = False
-            self._last_not_ready_names = set()
-        except Exception:
-            pass
-
+        # Reset basic readiness flag; base class will re-evaluate on next start
+        self.ready_to_trade = False
         self.logger().info("MultiStrategyOrchestrator stopped")
 
     def _find_strategy_by_token(self, token_symbol: str) -> Optional[V1StrategyInstance]:
@@ -835,11 +784,24 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info(f"Pausing strategy: {strategy_name}")
         strategy_instance.paused = True
 
-        # Cancel any open orders for this strategy
+        # Cancel any open orders for this strategy (limit orders tracked by the strategy)
         try:
-            if hasattr(strategy_instance.strategy, "cancel_all_orders"):
-                strategy_instance.strategy.cancel_all_orders()
-                self.logger().info(f"Cancelled all open orders for '{strategy_name}'")
+            count = 0
+            try:
+                active_limits = list(getattr(strategy_instance.strategy.order_tracker, "active_limit_orders", []))
+            except Exception:
+                active_limits = []
+            for connector, order in list(active_limits):
+                try:
+                    mt = next((t for t in strategy_instance.market_pairs
+                               if t.market is connector and t.trading_pair == order.trading_pair), None)
+                    if mt is not None:
+                        strategy_instance.strategy.cancel_order(mt, order.client_order_id)
+                        count += 1
+                except Exception as ce:
+                    self.logger().debug(f"Cancel error on '{strategy_name}' {getattr(connector, 'name', '?')}:{getattr(order, 'trading_pair', '?')}: {ce}")
+            if count > 0:
+                self.logger().info(f"Cancelled {count} open orders for '{strategy_name}'")
         except Exception as e:
             self.logger().warning(f"Error cancelling orders for '{strategy_name}': {e}")
 
@@ -999,14 +961,25 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info(f"Removing strategy: {strategy_name}")
 
-        # Step 1: Stop the strategy if it's running
+        # Step 1: Cancel strategy-specific open orders and stop the strategy if it's running
         try:
+            # Best-effort cancel of this strategy's orders before detaching listeners
+            try:
+                active_limits = list(getattr(strategy_instance.strategy.order_tracker, "active_limit_orders", []))
+            except Exception:
+                active_limits = []
+            for connector, order in list(active_limits):
+                try:
+                    mt = next((t for t in strategy_instance.market_pairs
+                               if t.market is connector and t.trading_pair == order.trading_pair), None)
+                    if mt is not None:
+                        strategy_instance.strategy.cancel_order(mt, order.client_order_id)
+                except Exception:
+                    pass
             if self._strategies_started and self._strategy_clock is not None:
                 self.logger().info(f"Stopping strategy before removal: {strategy_name}")
                 if hasattr(strategy_instance.strategy, "stop"):
                     strategy_instance.strategy.stop(self._strategy_clock)
-                if hasattr(strategy_instance.strategy, "cancel_all_orders"):
-                    strategy_instance.strategy.cancel_all_orders()
         except Exception as e:
             self.logger().warning(f"Error stopping strategy '{strategy_name}': {e}")
 
