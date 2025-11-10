@@ -16,6 +16,8 @@ BROKER_ID = "hummingbotfound"
 
 PUBLIC_TRADE_CHANNEL_NAME = "spot/trade"
 PUBLIC_DEPTH_CHANNEL_NAME = "spot/depth50"
+PUBLIC_DEPTH_INCREASE_CHANNEL_NAME = "spot/depth/increase100"
+USE_DEPTH_INCREASE = False
 PRIVATE_ORDER_PROGRESS_CHANNEL_NAME = "spot/user/order"
 PRIVATE_BALANCE_CHANNEL_NAME = "spot/user/balance"
 

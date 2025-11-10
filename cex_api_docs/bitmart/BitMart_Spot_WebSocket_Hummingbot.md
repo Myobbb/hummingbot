@@ -77,8 +77,11 @@ Reference: Subscribe/Unsubscribe (WebSocket). [`https://developer-pro.bitmart.co
   - Topic: `spot/trade:<symbol>` (e.g., `spot/trade:BTC_USDT`)
   - Used for real-time trade ticks
 - **Order Book (full snapshots)**:
-  - Topic: `spot/depth50:<symbol>` (full depth snapshots, top 50)
-  - Hummingbot consumes full snapshots only; no incremental diffs
+  - Default topic: `spot/depth50:<symbol>` (full depth snapshots, top 50)
+  - Optional: Depth-Increase diffs `spot/depth/increase100:<symbol>` can be enabled via a connector flag. When enabled:
+    - We send `subscribe` and an initial `request` to get a versioned snapshot.
+    - We apply `type="update"` messages strictly by `version` (drop <= current, apply == current+1, re-request on gaps).
+    - Empty heartbeats (asks=[], bids=[]) are ignored.
 
 Other public channels (e.g., Ticker, KLine, Depth-Increase) are available per docs but not currently consumed by the connector.
 
@@ -128,9 +131,14 @@ These align to the “Stay Connected and Limit” guidance.
 Reference: Rate Limit & Stay Connected and Limit. [`https://developer-pro.bitmart.com/en/spot/#api-basic-information`]
 
 ### Notes specific to Hummingbot implementation
-- Public order book uses full-snapshot channel `spot/depth50` only.
+- Public order book uses full-snapshot channel `spot/depth50` only (Depth-Increase is not used yet).
 - All WS frames are decompressed if gzip/deflate/zlib.
-- Current connector relies on library-level ping/pong timeouts; BitMart recommends text `"ping"` for keepalive, and will deprecate protocol ping frames in the future. See Compliance section below.
+- The connector proactively sends WS text `"ping"` on idle (~15s) and expects `"pong"`, with reconnect on prolonged idle, per BitMart guidance.
+- Subscriptions are chunked to ≤ 20 topics per subscribe message, respecting BitMart limits.
+- Order book heartbeats with empty `asks`/`bids` are ignored (do not clear the local book).
+- A per-symbol liveness watchdog resubscribes and refreshes a REST snapshot if no depth updates are received for a symbol within ~45s (helps when trades keep the connection active but a specific depth topic stalls).
+- Depth-Increase optional flag:
+  - Connector constant: `hummingbot/connector/exchange/bitmart/bitmart_constants.py` → `USE_DEPTH_INCREASE = False` (set `True` to enable).
 
 ### Compliance check (current connector vs. BitMart guidance)
 - Endpoints and topics:
@@ -143,10 +151,11 @@ Reference: Rate Limit & Stay Connected and Limit. [`https://developer-pro.bitmar
 - Limits & throttling:
   - Connector enforces ~30 connect/min and 100 subs/10s — compliant.
 - Topic-per-message:
-  - GAP: Connector batches all symbols into a single `subscribe` message per channel. If tracking > 20 symbols, this exceeds BitMart’s “max 20 topics per subscribe message”. Recommendation: chunk `args` into batches of ≤ 20 topics per subscribe call.
+  - Connector chunks `subscribe` calls into batches of ≤ 20 topics — compliant.
 - Keepalive:
-  - GAP: Connector does not proactively send WS text `"ping"` on idle; it relies on protocol ping/pong/timeout from the underlying WS layer. Per BitMart’s update, text ping should be used and ping frames will be unsupported in the future.
-  - Recommendation: Add an inactivity watchdog per connection (idle threshold < 20s) to send text `"ping"` and expect `"pong"`, with reconnect on missing `"pong"`.
+  - Connector uses WS text `"ping"` on idle and forces reconnect on prolonged idle — compliant with BitMart’s update (ping frames deprecated).
+- Liveness robustness:
+  - Per-symbol depth watchdog plus REST snapshot refresh mitigates depth-channel stalls without relying on full-connection idleness.
 
 Reference: API Basic Information, WebSocket sections, Change Log (KeepAlive ping text). [`https://developer-pro.bitmart.com/en/spot/#api-basic-information`]
 

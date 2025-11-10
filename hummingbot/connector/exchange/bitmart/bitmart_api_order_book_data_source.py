@@ -25,17 +25,26 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
     _FORCE_RECONNECT_IDLE_SECONDS: float = 20.0
+    _DEPTH_STALENESS_SECONDS: float = 45.0  # per-symbol watchdog
 
     def __init__(self,
                  trading_pairs: List[str],
                  connector: 'BitmartExchange',
-                 api_factory: WebAssistantsFactory):
+                 api_factory: WebAssistantsFactory,
+                 use_depth_increase: bool = CONSTANTS.USE_DEPTH_INCREASE):
         super().__init__(trading_pairs)
         self._connector: BitmartExchange = connector
         self._api_factory = api_factory
+        self._use_depth_increase: bool = use_depth_increase
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._depth_watchdog_task: Optional[asyncio.Task] = None
         self._reconnect_attempts: int = 0
         self._last_ping_sent_time: float = 0.0
+        # Per-trading_pair last depth update time (unix seconds)
+        self._last_depth_update_ts: Dict[str, float] = {}
+        # Per-trading_pair last applied version (Depth-Increase only)
+        self._last_depth_version: Dict[str, int] = {}
+        self._active_ws: Optional[WSAssistant] = None
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -44,22 +53,27 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
-        Bitmart only sends full snapshots, they never send diff messages. That is why this method is overwritten to
-        do nothing.
-
-        :param ev_loop: the event loop the method will run in
-        :param output: a queue to add the created diff messages
+        For Depth-Increase: process incremental updates with version sequencing.
+        For depth50 (default), no diffs are produced (method will idle with empty queue).
         """
-        pass
+        message_queue = self._message_queue[self._diff_messages_queue_key]
+        while True:
+            try:
+                diff_event = await message_queue.get()
+                await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error when processing public order book updates from exchange")
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
-        Bitmart sends always full snapshots through the depth channel. That is why they are processed here.
+        Processes full snapshots (depth50 or Depth-Increase 'snapshot' messages).
 
         :param ev_loop: the event loop the method will run in
         :param output: a queue to add the created diff messages
         """
-        message_queue = self._message_queue[self._diff_messages_queue_key]
+        message_queue = self._message_queue[self._snapshot_messages_queue_key]
         while True:
             try:
                 snapshot_event = await message_queue.get()
@@ -133,8 +147,62 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # Bitmart never sends diff messages. This method will never be called
-        pass
+        # Depth-Increase incremental updates
+        if not isinstance(raw_message, dict):
+            return
+        event_table = raw_message.get("table")
+        if event_table != CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
+            # No diffs expected for depth50
+            return
+        diff_updates: Dict[str, Any] = raw_message.get("data") or []
+        for diff_data in diff_updates:
+            # Ignore empty heartbeats (asks=[], bids=[]) and invalid entries
+            bids_list = diff_data.get("bids", [])
+            asks_list = diff_data.get("asks", [])
+            ms_t = diff_data.get("ms_t")
+            version = diff_data.get("version")
+            symbol = diff_data.get("symbol")
+            if symbol is None or ms_t is None or version is None:
+                continue
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            # Update liveness timestamp
+            try:
+                self._last_depth_update_ts[trading_pair] = time.time()
+            except Exception:
+                pass
+            # Heartbeat (empty) — do not emit, but keep local version unchanged per BitMart doc (version equals previous)
+            if (not bids_list) and (not asks_list):
+                continue
+            # Version sequencing
+            last_ver = self._last_depth_version.get(trading_pair)
+            new_ver = int(version)
+            if last_ver is None:
+                # We don't have a baseline; fetch snapshot to seed and skip this diff
+                await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                continue
+            if new_ver <= last_ver:
+                # Old or duplicate
+                continue
+            if new_ver != last_ver + 1:
+                # Gap detected, refresh snapshot and skip
+                await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                continue
+            # Build and emit DIFF
+            timestamp: float = int(ms_t) * 1e-3
+            update_id: int = int(ms_t)
+            order_book_message_content = {
+                "trading_pair": trading_pair,
+                "update_id": update_id,
+                "bids": [(bid[0], bid[1]) for bid in bids_list],
+                "asks": [(ask[0], ask[1]) for ask in asks_list],
+            }
+            diff_message: OrderBookMessage = OrderBookMessage(
+                OrderBookMessageType.DIFF,
+                order_book_message_content,
+                timestamp)
+            # Advance version
+            self._last_depth_version[trading_pair] = new_ver
+            message_queue.put_nowait(diff_message)
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         diff_updates: Dict[str, Any] = raw_message["data"]
@@ -145,11 +213,27 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=diff_data["symbol"])
 
+            # Discard heartbeats with empty asks/bids; update liveness timestamp regardless
+            bids_list = diff_data.get("bids", [])
+            asks_list = diff_data.get("asks", [])
+            try:
+                self._last_depth_update_ts[trading_pair] = time.time()
+            except Exception:
+                pass
+            if (not bids_list) and (not asks_list):
+                continue
+            # For Depth-Increase 'snapshot' set base version
+            if raw_message.get("table") == CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
+                try:
+                    self._last_depth_version[trading_pair] = int(diff_data.get("version"))
+                except Exception:
+                    self._last_depth_version.pop(trading_pair, None)
+
             order_book_message_content = {
                 "trading_pair": trading_pair,
                 "update_id": update_id,
-                "bids": [(bid[0], bid[1]) for bid in diff_data["bids"]],
-                "asks": [(ask[0], ask[1]) for ask in diff_data["asks"]],
+                "bids": [(bid[0], bid[1]) for bid in bids_list],
+                "asks": [(ask[0], ask[1]) for ask in asks_list],
             }
             diff_message: OrderBookMessage = OrderBookMessage(
                 OrderBookMessageType.SNAPSHOT,
@@ -157,6 +241,40 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 timestamp)
 
             message_queue.put_nowait(diff_message)
+    
+    async def _refresh_snapshot_for_pair(self, trading_pair: str, symbol: str):
+        """
+        Refresh a single pair snapshot. Prefer WS 'request' for Depth-Increase to obtain a versioned snapshot.
+        """
+        try:
+            if self._use_depth_increase and self._active_ws is not None:
+                payload = {"op": "request", "args": [f"{CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME}:{symbol}"]}
+                req = WSJSONRequest(payload=payload)
+                async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                    await self._active_ws.send(req)
+                return
+        except Exception:
+            # Fall back to REST below
+            pass
+        try:
+            snapshot = await self._request_order_book_snapshot(trading_pair)
+            snap_data = snapshot.get("data") or {}
+            ts = int(snap_data.get("ts", int(time.time() * 1000)))
+            synthetic = {
+                "table": (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
+                          if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME),
+                "data": [{
+                    "asks": snap_data.get("asks", []),
+                    "bids": snap_data.get("bids", []),
+                    "ms_t": ts,
+                    "symbol": symbol,
+                    "type": "snapshot",
+                }]
+            }
+            self._message_queue[self._snapshot_messages_queue_key].put_nowait(synthetic)
+        except Exception:
+            # If REST fails, let watchdog handle later
+            pass
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
@@ -165,7 +283,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             # BitMart allows up to 20 topics per subscription message
             trade_topics = [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols]
-            depth_topics = [f"{CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME}:{symbol}" for symbol in symbols]
+            depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
+                             if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
+            depth_topics = [f"{depth_channel}:{symbol}" for symbol in symbols]
 
             async def send_chunked(topics: List[str]):
                 CHUNK_SIZE = 20
@@ -180,6 +300,23 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await send_chunked(depth_topics)
 
             self.logger().info("Subscribed to public order book and trade channels...")
+            # Initialize per-pair liveness timestamps
+            now = time.time()
+            for tp in self._trading_pairs:
+                self._last_depth_update_ts[tp] = now
+                self._last_depth_version.pop(tp, None)
+
+            # Depth-Increase: proactively request full snapshot per symbol to seed version state
+            if self._use_depth_increase:
+                async def send_requests(topics: List[str]):
+                    CHUNK_SIZE = 20
+                    for i in range(0, len(topics), CHUNK_SIZE):
+                        chunk = topics[i:i + CHUNK_SIZE]
+                        payload = {"op": "request", "args": chunk}
+                        req = WSJSONRequest(payload=payload)
+                        async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                            await ws.send(req)
+                await send_requests(depth_topics)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -189,7 +326,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         # Start keepalive task
         self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
+        # Start per-symbol depth watchdog
+        self._depth_watchdog_task = asyncio.create_task(self._depth_watchdog_loop(websocket_assistant))
         try:
+            self._active_ws = websocket_assistant
             async for ws_response in websocket_assistant.iter_messages():
                 data: Dict[str, Any] = ws_response.data
                 decompressed_data = utils.decompress_ws_message(data)
@@ -211,7 +351,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     raise ConnectionError(f"BitMart WS error: {json_data}")
 
                 channel: str = self._channel_originating_message(event_message=json_data)
-                if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key]:
+                if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key, self._snapshot_messages_queue_key]:
                     self._message_queue[channel].put_nowait(json_data)
         finally:
             if self._keepalive_task is not None and not self._keepalive_task.done():
@@ -221,15 +361,37 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 except Exception:
                     pass
             self._keepalive_task = None
+            if self._depth_watchdog_task is not None and not self._depth_watchdog_task.done():
+                self._depth_watchdog_task.cancel()
+                try:
+                    await self._depth_watchdog_task
+                except Exception:
+                    pass
+            self._depth_watchdog_task = None
+            self._active_ws = None
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""
         if "data" in event_message:
-            event_channel = event_message["table"]
+            event_channel = event_message.get("table")
             if event_channel == CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME:
                 channel = self._trade_messages_queue_key
-            if event_channel == CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME:
-                channel = self._diff_messages_queue_key
+            elif event_channel == CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME:
+                # depth50 sends full snapshots only
+                channel = self._snapshot_messages_queue_key
+            elif event_channel == CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
+                # Route by message type
+                try:
+                    data = event_message.get("data") or []
+                    msg_type = str(data[0].get("type", "")).lower() if data else ""
+                    if msg_type == "snapshot":
+                        channel = self._snapshot_messages_queue_key
+                    elif msg_type == "update":
+                        channel = self._diff_messages_queue_key
+                    else:
+                        channel = self._diff_messages_queue_key
+                except Exception:
+                    channel = self._diff_messages_queue_key
 
         return channel
 
@@ -243,6 +405,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_timeout=60,
                 ws_headers={"Accept-Encoding": "gzip"},
             )
+        self._active_ws = ws
         return ws
 
     async def _keepalive_ping_loop(self, ws: WSAssistant):
@@ -268,6 +431,51 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
         except Exception:
             # Bubble up to reconnect loop
+            raise
+
+    async def _depth_watchdog_loop(self, ws: WSAssistant):
+        """
+        Detect symbols whose depth stream has stalled (while trades or other traffic may still flow)
+        and attempt a targeted resubscribe plus REST snapshot refresh.
+        """
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                now = time.time()
+                for trading_pair in list(self._trading_pairs):
+                    last_ts = float(self._last_depth_update_ts.get(trading_pair, 0.0) or 0.0)
+                    if last_ts <= 0:
+                        continue
+                    if (now - last_ts) >= self._DEPTH_STALENESS_SECONDS:
+                        try:
+                            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                            depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
+                                             if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
+                            topic = f"{depth_channel}:{symbol}"
+                            # Unsubscribe (best-effort) then subscribe
+                            try:
+                                unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
+                                async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                                    await ws.send(unsub)
+                            except Exception:
+                                pass
+                            sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
+                            async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                                await ws.send(sub)
+                            # Refresh snapshot using WS request (Depth-Increase) or REST fallback
+                            try:
+                                await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                                self.logger().warning(f"BitMart depth watchdog refreshed snapshot for {trading_pair}")
+                            except Exception:
+                                pass
+                            # Reset timer to avoid repeated attempts
+                            self._last_depth_update_ts[trading_pair] = now
+                        except Exception:
+                            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Escalate to reconnect; the outer caller will handle
             raise
 
     async def listen_for_subscriptions(self):

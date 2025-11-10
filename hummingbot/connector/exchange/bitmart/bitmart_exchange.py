@@ -152,7 +152,8 @@ class BitmartExchange(ExchangePyBase):
         return BitmartAPIOrderBookDataSource(
             trading_pairs=self._trading_pairs,
             connector=self,
-            api_factory=self._web_assistants_factory)
+            api_factory=self._web_assistants_factory,
+            use_depth_increase=CONSTANTS.USE_DEPTH_INCREASE)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return BitmartAPIUserStreamDataSource(
