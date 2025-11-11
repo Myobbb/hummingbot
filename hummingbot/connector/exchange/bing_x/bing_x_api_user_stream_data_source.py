@@ -11,7 +11,7 @@ from hummingbot.connector.exchange.bing_x.bing_x_auth import BingXAuth
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -19,7 +19,7 @@ from hummingbot.logger import HummingbotLogger
 
 class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
-    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1500
+    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800  # 30 minutes per BingX docs (key valid 60 min, docs recommend ping every 30 min)
 
     _bausds_logger: Optional[HummingbotLogger] = None
 
@@ -306,37 +306,68 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         :return: True if renewal was successful, False otherwise
         """
         try:
+            # IMPORTANT: BingX docs show contradictory information:
+            # - API spec table says listenKey is REQUIRED parameter
+            # - Sample code shows paramsMap={} (empty, only timestamp in signature)
+            # 
+            # Following standard pattern (like Binance): listenKey is included in params,
+            # which means it WILL be part of the signature (via rest_authenticate).
+            #
             # BingX returns 200 (with body) or 204 (no content) on success
-            # Use return_err=False to let api_request handle 204 properly
-            await web_utils.api_request(
-                path=CONSTANTS.USER_STREAM_PATH_URL,
-                api_factory=self._api_factory,
-                throttler=self._throttler,
-                time_synchronizer=None,
-                domain=self._domain,
-                params={"listenKey": self._current_listen_key},
+            # Using return_err=True to handle errors gracefully
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            
+            request = RESTRequest(
                 method=RESTMethod.PUT,
-                is_auth_required=True,
-                return_err=False,  # Let it raise on error
-                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
+                url=url,
+                params={"listenKey": self._current_listen_key},
                 headers=self._auth.header_for_authentication(),
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
-            self.logger().debug(f"Successfully renewed listen key {self._current_listen_key}")
-            return True
+
+            async with self._throttler.execute_task(limit_id=CONSTANTS.USER_STREAM_PATH_URL):
+                response = await rest_assistant.call(request=request, timeout=10)
+                
+                # BingX returns 204 No Content on successful PUT
+                if response.status == 204:
+                    self.logger().debug(f"Successfully renewed listen key {self._current_listen_key} (204 No Content)")
+                    return True
+                    
+                # BingX might also return 200 with empty body
+                if response.status == 200:
+                    self.logger().debug(f"Successfully renewed listen key {self._current_listen_key} (200 OK)")
+                    return True
+                
+                # Handle 404 - key not found, need new key
+                if response.status == 404:
+                    self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
+                    self._current_listen_key = None
+                    self._listen_key_initialized_event.clear()
+                    return False
+                
+                # Other error status
+                try:
+                    error_text = await response.text()
+                    self.logger().warning(
+                        f"Failed to refresh listen key {self._current_listen_key}: "
+                        f"HTTP {response.status} - {error_text}"
+                    )
+                except Exception:
+                    self.logger().warning(
+                        f"Failed to refresh listen key {self._current_listen_key}: HTTP {response.status}"
+                    )
+                return False
 
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            # 404 means key not found - need new key
-            # Clear the key here (safe because caller holds _listen_key_lock)
+            self.logger().warning(f"Exception refreshing listen key {self._current_listen_key}: {exception}")
+            # Check if it's a 404 error in the exception message
             if "404" in str(exception):
-                self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
-                # Clear current key to force new key creation
-                # This is safe because this method is called within _listen_key_lock
                 self._current_listen_key = None
                 self._listen_key_initialized_event.clear()
-            else:
-                self.logger().warning(f"Failed to refresh listen key: {exception}")
             return False
 
     async def _manage_listen_key_task_loop(self):
