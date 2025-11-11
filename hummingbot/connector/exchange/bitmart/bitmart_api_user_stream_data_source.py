@@ -75,7 +75,7 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             # Subscribe to private order progress for all tracked symbols and to balance updates
             order_topics = [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME}:{symbol}" for symbol in symbols]
-            balance_topic = [CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME + ":BALANCE_UPDATE"]
+            balance_topic = [CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME]
 
             async def send_chunked(topics: List[str]):
                 CHUNK_SIZE = 20
