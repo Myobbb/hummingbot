@@ -174,29 +174,51 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if symbol is None or ms_t is None or version is None:
                 continue
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
-            # Update liveness timestamp
-            try:
-                self._last_depth_update_ts[trading_pair] = time.time()
-            except Exception:
-                pass
-            # Heartbeat (empty) — do not emit, but keep local version unchanged per BitMart doc (version equals previous)
-            if (not bids_list) and (not asks_list):
+            
+            # Check if this is a heartbeat (both sides empty) BEFORE updating staleness timestamp
+            # Heartbeats should NOT reset the staleness timer as they don't contain actual orderbook data
+            is_heartbeat = (not bids_list) and (not asks_list)
+            
+            # Update liveness timestamp ONLY for non-heartbeat messages
+            if not is_heartbeat:
+                try:
+                    self._last_depth_update_ts[trading_pair] = time.time()
+                except Exception:
+                    pass
+            # Skip heartbeats early (no version check needed as they don't have actual data)
+            if is_heartbeat:
                 continue
-            # Version sequencing
+                
+            # Version sequencing for actual data updates
             last_ver = self._last_depth_version.get(trading_pair)
             new_ver = int(version)
+            
+            # Debug logging for version tracking and one-sided updates
+            update_type = "two-sided"
+            if not bids_list and asks_list:
+                update_type = "asks-only"
+            elif bids_list and not asks_list:
+                update_type = "bids-only"
+            
             if last_ver is None:
                 # We don't have a baseline; fetch snapshot to seed and skip this diff
+                self.logger().debug(f"BitMart {trading_pair}: No baseline version, requesting snapshot for {update_type} update (v{new_ver})")
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 continue
             if new_ver <= last_ver:
                 # Old or duplicate
+                self.logger().debug(f"BitMart {trading_pair}: Skipping old/duplicate {update_type} update v{new_ver} (current v{last_ver})")
                 continue
             if new_ver != last_ver + 1:
                 # Gap detected, refresh snapshot and skip
+                self.logger().warning(
+                    f"BitMart {trading_pair}: Version gap detected in {update_type} update! "
+                    f"Expected v{last_ver + 1}, got v{new_ver}. Requesting snapshot."
+                )
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 continue
-            # Build and emit DIFF
+            
+            # Build and emit DIFF for actual updates (includes one-sided updates)
             timestamp: float = int(ms_t) * 1e-3
             update_id: int = int(ms_t)
             order_book_message_content = {
@@ -209,6 +231,14 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 OrderBookMessageType.DIFF,
                 order_book_message_content,
                 timestamp)
+            
+            # Log one-sided updates for debugging
+            if update_type != "two-sided":
+                self.logger().debug(
+                    f"BitMart {trading_pair}: Applying {update_type} diff v{last_ver}→v{new_ver} "
+                    f"({len(bids_list)} bids, {len(asks_list)} asks)"
+                )
+            
             # Advance version
             self._last_depth_version[trading_pair] = new_ver
             message_queue.put_nowait(diff_message)
@@ -222,19 +252,31 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=diff_data["symbol"])
 
-            # Discard heartbeats with empty asks/bids; update liveness timestamp regardless
+            # Check for heartbeats with empty asks/bids
             bids_list = diff_data.get("bids", [])
             asks_list = diff_data.get("asks", [])
-            try:
-                self._last_depth_update_ts[trading_pair] = time.time()
-            except Exception:
-                pass
-            if (not bids_list) and (not asks_list):
+            is_heartbeat = (not bids_list) and (not asks_list)
+            
+            # Update liveness timestamp ONLY for non-heartbeat snapshots
+            if not is_heartbeat:
+                try:
+                    self._last_depth_update_ts[trading_pair] = time.time()
+                except Exception:
+                    pass
+            
+            # Skip heartbeats (no data to process)
+            if is_heartbeat:
                 continue
             # For Depth-Increase 'snapshot' set base version
             if raw_message.get("table") == CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
                 try:
-                    self._last_depth_version[trading_pair] = int(diff_data.get("version"))
+                    new_version = int(diff_data.get("version"))
+                    old_version = self._last_depth_version.get(trading_pair)
+                    self._last_depth_version[trading_pair] = new_version
+                    self.logger().info(
+                        f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
+                        f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks)"
+                    )
                 except Exception:
                     self._last_depth_version.pop(trading_pair, None)
 
@@ -255,15 +297,18 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Refresh a single pair snapshot. Prefer WS 'request' for Depth-Increase to obtain a versioned snapshot.
         """
+        self.logger().info(f"BitMart {trading_pair}: Requesting snapshot refresh")
         try:
             if self._use_depth_increase and self._active_ws is not None:
                 payload = {"op": "request", "args": [f"{CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME}:{symbol}"]}
                 req = WSJSONRequest(payload=payload)
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
                     await self._active_ws.send(req)
+                self.logger().debug(f"BitMart {trading_pair}: Sent WS snapshot request")
                 return
-        except Exception:
+        except Exception as e:
             # Fall back to REST below
+            self.logger().warning(f"BitMart {trading_pair}: WS snapshot request failed ({e}), falling back to REST")
             pass
         try:
             snapshot = await self._request_order_book_snapshot(trading_pair)
@@ -281,9 +326,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }]
             }
             self._message_queue[self._snapshot_messages_queue_key].put_nowait(synthetic)
-        except Exception:
+            self.logger().debug(f"BitMart {trading_pair}: Applied REST snapshot fallback")
+        except Exception as e:
             # If REST fails, let watchdog handle later
-            pass
+            self.logger().error(f"BitMart {trading_pair}: REST snapshot fallback also failed: {e}")
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
@@ -470,6 +516,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                  if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
                 topic = f"{depth_channel}:{symbol}"
                 
+                last_update = self._last_depth_update_ts.get(trading_pair, 0)
+                stale_duration = int(now - last_update) if last_update > 0 else 0
+                self.logger().warning(
+                    f"BitMart {trading_pair}: Orderbook stale for {stale_duration}s "
+                    f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), attempting recovery"
+                )
+                
                 # Unsubscribe (best-effort) then subscribe
                 try:
                     unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
@@ -483,17 +536,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(sub)
                 
                 # Refresh snapshot using WS request (Depth-Increase) or REST fallback
-                try:
-                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
-                    self.logger().warning(f"BitMart depth watchdog: resubscribed and refreshed {trading_pair}")
-                except Exception:
-                    pass
+                await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 
                 # Reset timer to avoid repeated attempts
                 self._last_depth_update_ts[trading_pair] = now
                 
             except Exception as e:
-                self.logger().warning(f"BitMart depth watchdog: failed to refresh {trading_pair}: {e}")
+                self.logger().warning(f"BitMart depth watchdog: failed to recover {trading_pair}: {e}")
                 # If we can't send resubscribe (e.g., WS disconnected), force full reconnect
                 raise ConnectionError(f"BitMart depth watchdog recovery failed; forcing reconnect")
 
