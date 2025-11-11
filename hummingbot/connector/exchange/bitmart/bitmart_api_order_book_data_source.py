@@ -131,8 +131,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         for trade_data in trade_updates:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=trade_data["symbol"])
+            ms_ts = int(trade_data["ms_t"]) if "ms_t" in trade_data else int(trade_data["s_t"]) * 1000
             message_content = {
-                "trade_id": int(trade_data["s_t"]),
+                "trade_id": ms_ts,
                 "trading_pair": trading_pair,
                 "trade_type": float(TradeType.BUY.value) if trade_data["side"] == "buy" else float(
                     TradeType.SELL.value),
@@ -142,7 +143,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trade_message: Optional[OrderBookMessage] = OrderBookMessage(
                 message_type=OrderBookMessageType.TRADE,
                 content=message_content,
-                timestamp=int(trade_data["s_t"]))
+                timestamp=ms_ts * 1e-3)
 
             message_queue.put_nowait(trade_message)
 

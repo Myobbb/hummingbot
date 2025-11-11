@@ -407,7 +407,8 @@ class BitmartExchange(ExchangePyBase):
                 execution_data = event_message.get("data", [])
 
                 # Refer to https://developer-pro.bitmart.com/en/spot/#private-order-progress
-                if event_type == CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME:
+                if event_type in (CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME,
+                                  CONSTANTS.PRIVATE_ORDER_PROGRESS_ALL_CHANNEL_NAME):
                     for each_event in execution_data:
                         try:
                             client_order_id: Optional[str] = each_event.get("client_order_id")

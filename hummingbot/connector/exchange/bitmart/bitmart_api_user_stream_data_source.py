@@ -70,12 +70,9 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
         try:
-            symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                       for trading_pair in self._trading_pairs]
-
-            # Subscribe to private order progress for all tracked symbols and to balance updates
-            order_topics = [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME}:{symbol}" for symbol in symbols]
-            balance_topic = [CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME]
+            # Subscribe to private order progress for ALL symbols (simplifies when tracking many pairs)
+            order_topics = [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_ALL_CHANNEL_NAME}:ALL_SYMBOLS"]
+            balance_topic = [CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME + ":BALANCE_UPDATE"]
 
             async def send_chunked(topics: List[str]):
                 CHUNK_SIZE = 20
@@ -89,7 +86,7 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await send_chunked(order_topics)
             # Send balance subscription separately
             await send_chunked(balance_topic)
-            self.logger().info("Subscribed to private balance and orders channels...")
+            self.logger().info("Subscribed to private orders (ALL_SYMBOLS) and balance channels...")
         except asyncio.CancelledError:
             raise
         except Exception:
