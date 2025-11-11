@@ -461,6 +461,11 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # If still no messages beyond max idle threshold, force reconnect (no messages at all, including pongs)
                 if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
                     self.logger().warning("BitMart public WS: no messages for 30s, forcing reconnect")
+                    # Force close the WS to ensure main loop exits
+                    try:
+                        await ws.disconnect()
+                    except Exception:
+                        pass
                     raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
 
         except asyncio.CancelledError:
@@ -498,9 +503,15 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         f"BitMart depth watchdog: {len(stale_pairs)}/{len(self._trading_pairs)} pairs stale "
                         f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), forcing full reconnect"
                     )
+                    # Force close the WS to ensure main loop exits
+                    try:
+                        await ws.disconnect()
+                    except Exception:
+                        pass
                     raise ConnectionError("BitMart orderbook data stale for multiple pairs; forcing reconnect")
                 
                 # Try targeted recovery for individual stale pairs
+                recovery_failed = False
                 for trading_pair in stale_pairs:
                     try:
                         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -532,8 +543,19 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         
                     except Exception as e:
                         self.logger().warning(f"BitMart depth watchdog: failed to refresh {trading_pair}: {e}")
-                        # If we can't even send resubscribe, force full reconnect
-                        raise ConnectionError(f"BitMart depth watchdog failed to resubscribe; forcing reconnect")
+                        # If we can't send resubscribe (e.g., WS disconnected), force full reconnect
+                        recovery_failed = True
+                        break
+                
+                # If any recovery failed, force full reconnect
+                if recovery_failed:
+                    self.logger().warning("BitMart depth watchdog: recovery failed, forcing full reconnect")
+                    # Force close the WS to ensure main loop exits
+                    try:
+                        await ws.disconnect()
+                    except Exception:
+                        pass
+                    raise ConnectionError("BitMart depth watchdog recovery failed; forcing reconnect")
                         
         except asyncio.CancelledError:
             raise

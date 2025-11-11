@@ -168,6 +168,11 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 # Force reconnect on prolonged idle (no messages at all, including pongs)
                 if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
                     self.logger().warning("BitMart private WS: no messages for 30s, forcing reconnect")
+                    # Force close the WS to ensure main loop exits
+                    try:
+                        await ws.disconnect()
+                    except Exception:
+                        pass
                     raise ConnectionError("BitMart private WS idle exceeded threshold; forcing reconnect")
         except asyncio.CancelledError:
             raise
