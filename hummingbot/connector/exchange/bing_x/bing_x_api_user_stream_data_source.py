@@ -355,10 +355,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     async with self._listen_key_lock:
                         # Double-check after acquiring lock - another task might have created it
                         if self._current_listen_key is None:
-                            self._current_listen_key = await self._get_listen_key()
-                            self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
-                            self._listen_key_initialized_event.set()
-                            self._last_listen_key_ping_ts = int(time.time())
+                            try:
+                                new_key = await self._get_listen_key()
+                            except Exception as e:
+                                # Keep the manager alive; retry shortly
+                                self.logger().warning(f"Failed to obtain listen key; will retry shortly. Error: {e}")
+                                await self._sleep(5)
+                                continue
+                            else:
+                                self._current_listen_key = new_key
+                                self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
+                                self._listen_key_initialized_event.set()
+                                self._last_listen_key_ping_ts = int(time.time())
 
                 # Renew listen key periodically
                 if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
@@ -409,7 +417,6 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._get_ws_assistant()
-        # Remove the stray line that does nothing
         url = f"{CONSTANTS.WSS_PRIVATE_URL[self._domain]}?listenKey={self._current_listen_key}"
         # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
         await ws.connect(
@@ -447,7 +454,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # Best-effort: delete the previous connected listen key if it differs from the current one
         try:
             old_connected = self._connected_listen_key
-            if old_connected and old_connected != self._current_listen_key:
+            if old_connected:
                 await self._delete_listen_key(old_connected)
         except Exception:
             # Non-fatal cleanup
