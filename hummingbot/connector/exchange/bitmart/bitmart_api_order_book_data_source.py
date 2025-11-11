@@ -337,9 +337,31 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
         # Start per-symbol depth watchdog
         self._depth_watchdog_task = asyncio.create_task(self._depth_watchdog_loop(websocket_assistant))
+        
         try:
             self._active_ws = websocket_assistant
             async for ws_response in websocket_assistant.iter_messages():
+                # Check if background tasks failed and need to trigger reconnect
+                if self._keepalive_task and self._keepalive_task.done():
+                    # Keepalive task exited - check for exception
+                    try:
+                        self._keepalive_task.result()  # Will raise if task failed
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        self.logger().warning(f"BitMart public WS keepalive failed: {e}")
+                        raise
+                
+                if self._depth_watchdog_task and self._depth_watchdog_task.done():
+                    # Depth watchdog task exited - check for exception
+                    try:
+                        self._depth_watchdog_task.result()  # Will raise if task failed
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        self.logger().warning(f"BitMart public WS depth watchdog failed: {e}")
+                        raise
+                
                 data: Dict[str, Any] = ws_response.data
                 decompressed_data = utils.decompress_ws_message(data)
                 try:
@@ -364,6 +386,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key, self._snapshot_messages_queue_key]:
                     self._message_queue[channel].put_nowait(json_data)
         finally:
+            # Clean up tasks
             if self._keepalive_task is not None and not self._keepalive_task.done():
                 self._keepalive_task.cancel()
                 try:
@@ -449,41 +472,68 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Detect symbols whose depth stream has stalled (while trades or other traffic may still flow)
         and attempt a targeted resubscribe plus REST snapshot refresh.
+        If multiple symbols are stale or resubscribe fails, force full reconnection.
         """
         try:
             while True:
                 await asyncio.sleep(5.0)
                 now = time.time()
+                stale_pairs = []
+                
+                # Check all trading pairs for staleness
                 for trading_pair in list(self._trading_pairs):
                     last_ts = float(self._last_depth_update_ts.get(trading_pair, 0.0) or 0.0)
                     if last_ts <= 0:
                         continue
                     if (now - last_ts) >= self._DEPTH_STALENESS_SECONDS:
+                        stale_pairs.append(trading_pair)
+                
+                if not stale_pairs:
+                    continue
+                
+                # If more than 50% of pairs are stale, it's a systematic issue - force full reconnect
+                if len(stale_pairs) > len(self._trading_pairs) // 2:
+                    self.logger().warning(
+                        f"BitMart depth watchdog: {len(stale_pairs)}/{len(self._trading_pairs)} pairs stale "
+                        f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), forcing full reconnect"
+                    )
+                    raise ConnectionError("BitMart orderbook data stale for multiple pairs; forcing reconnect")
+                
+                # Try targeted recovery for individual stale pairs
+                for trading_pair in stale_pairs:
+                    try:
+                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                        depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
+                                         if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
+                        topic = f"{depth_channel}:{symbol}"
+                        
+                        # Unsubscribe (best-effort) then subscribe
                         try:
-                            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                            depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
-                                             if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
-                            topic = f"{depth_channel}:{symbol}"
-                            # Unsubscribe (best-effort) then subscribe
-                            try:
-                                unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
-                                async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                                    await ws.send(unsub)
-                            except Exception:
-                                pass
-                            sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
+                            unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
                             async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                                await ws.send(sub)
-                            # Refresh snapshot using WS request (Depth-Increase) or REST fallback
-                            try:
-                                await self._refresh_snapshot_for_pair(trading_pair, symbol)
-                                self.logger().warning(f"BitMart depth watchdog refreshed snapshot for {trading_pair}")
-                            except Exception:
-                                pass
-                            # Reset timer to avoid repeated attempts
-                            self._last_depth_update_ts[trading_pair] = now
+                                await ws.send(unsub)
                         except Exception:
-                            continue
+                            pass
+                        
+                        sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
+                        async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                            await ws.send(sub)
+                        
+                        # Refresh snapshot using WS request (Depth-Increase) or REST fallback
+                        try:
+                            await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                            self.logger().warning(f"BitMart depth watchdog: resubscribed and refreshed {trading_pair}")
+                        except Exception:
+                            pass
+                        
+                        # Reset timer to avoid repeated attempts
+                        self._last_depth_update_ts[trading_pair] = now
+                        
+                    except Exception as e:
+                        self.logger().warning(f"BitMart depth watchdog: failed to refresh {trading_pair}: {e}")
+                        # If we can't even send resubscribe, force full reconnect
+                        raise ConnectionError(f"BitMart depth watchdog failed to resubscribe; forcing reconnect")
+                        
         except asyncio.CancelledError:
             raise
         except Exception:
