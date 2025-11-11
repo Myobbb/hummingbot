@@ -306,24 +306,31 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         :return: True if renewal was successful, False otherwise
         """
         try:
-            # IMPORTANT: BingX docs show contradictory information:
-            # - API spec table says listenKey is REQUIRED parameter
-            # - Sample code shows paramsMap={} (empty, only timestamp in signature)
-            # 
-            # Following standard pattern (like Binance): listenKey is included in params,
-            # which means it WILL be part of the signature (via rest_authenticate).
-            #
-            # BingX returns 200 (with body) or 204 (no content) on success
-            # Using return_err=True to handle errors gracefully
-            rest_assistant = await self._api_factory.get_rest_assistant()
-            url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            # CRITICAL: BingX docs show paramsMap={} (empty) for PUT request sample code,
+            # meaning listenKey should NOT be included in the HMAC signature calculation.
+            # We need to manually build the request:
+            # 1. Sign with only timestamp (empty params)
+            # 2. Add listenKey to the final URL AFTER the signature
             
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            base_url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            
+            # Generate signature with EMPTY params (only timestamp will be added)
+            signed_params = self._auth.add_auth_to_params(params={})
+            
+            # Manually build URL with signature first, then add listenKey
+            # Format: ?timestamp=XXX&signature=YYY&listenKey=ZZZ
+            from urllib.parse import urlencode
+            query_string = urlencode(signed_params) + f"&listenKey={self._current_listen_key}"
+            full_url = f"{base_url}?{query_string}"
+            
+            # Create request WITHOUT is_auth_required (we did auth manually above)
             request = RESTRequest(
                 method=RESTMethod.PUT,
-                url=url,
-                params={"listenKey": self._current_listen_key},
+                url=full_url,
+                params=None,  # Already in URL
                 headers=self._auth.header_for_authentication(),
-                is_auth_required=True,
+                is_auth_required=False,  # Already signed manually
                 throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
 
@@ -503,20 +510,33 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         if not listen_key:
             return
         try:
-            await web_utils.api_request(
-                path=CONSTANTS.USER_STREAM_PATH_URL,
-                api_factory=self._api_factory,
-                throttler=self._throttler,
-                time_synchronizer=None,
-                domain=self._domain,
-                params={"listenKey": listen_key},
+            # Same pattern as _ping_listen_key: listenKey should NOT be in signature
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            base_url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            
+            # Generate signature with EMPTY params (only timestamp)
+            signed_params = self._auth.add_auth_to_params(params={})
+            
+            # Build URL with signature first, then add listenKey
+            from urllib.parse import urlencode
+            query_string = urlencode(signed_params) + f"&listenKey={listen_key}"
+            full_url = f"{base_url}?{query_string}"
+            
+            request = RESTRequest(
                 method=RESTMethod.DELETE,
-                is_auth_required=True,
-                return_err=False,
-                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
+                url=full_url,
+                params=None,
                 headers=self._auth.header_for_authentication(),
+                is_auth_required=False,  # Already signed manually
+                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
-            self.logger().debug(f"Deleted stale listen key {listen_key}")
+
+            async with self._throttler.execute_task(limit_id=CONSTANTS.USER_STREAM_PATH_URL):
+                response = await rest_assistant.call(request=request, timeout=10)
+                if response.status in (200, 204):
+                    self.logger().debug(f"Deleted stale listen key {listen_key}")
+                else:
+                    self.logger().debug(f"Failed to delete listen key {listen_key}: HTTP {response.status}")
         except asyncio.CancelledError:
             raise
         except Exception:
