@@ -48,8 +48,12 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_ping_sent_time: float = 0.0
         # Per-trading_pair last depth update time (unix seconds)
         self._last_depth_update_ts: Dict[str, float] = {}
+        # Per-trading_pair last ANY message time (including heartbeats/snapshots)
+        self._last_any_message_ts: Dict[str, float] = {}
         # Per-trading_pair last applied version (Depth-Increase only)
         self._last_depth_version: Dict[str, int] = {}
+        # Flag to drop diffs when waiting for snapshot after version gap
+        self._waiting_for_snapshot: Dict[str, bool] = {}
         self._active_ws: Optional[WSAssistant] = None
         self._ws_consumer_task: Optional[asyncio.Task] = None
         self._watchdog_check_interval: float = 5.0  # Check watchdogs every 5s
@@ -175,14 +179,20 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
             
-            # Check if this is a heartbeat (both sides empty) BEFORE updating staleness timestamp
-            # Heartbeats should NOT reset the staleness timer as they don't contain actual orderbook data
+            # Track ANY message received for this pair (proves subscription is alive)
+            current_time = time.time()
+            try:
+                self._last_any_message_ts[trading_pair] = current_time
+            except Exception:
+                pass
+            
+            # Check if this is a heartbeat (both sides empty)
             is_heartbeat = (not bids_list) and (not asks_list)
             
-            # Update liveness timestamp ONLY for non-heartbeat messages
+            # Update data timestamp ONLY for non-heartbeat messages (actual orderbook changes)
             if not is_heartbeat:
                 try:
-                    self._last_depth_update_ts[trading_pair] = time.time()
+                    self._last_depth_update_ts[trading_pair] = current_time
                 except Exception:
                     pass
             # Skip heartbeats early (no version check needed as they don't have actual data)
@@ -200,9 +210,18 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             elif bids_list and not asks_list:
                 update_type = "bids-only"
             
+            # If waiting for snapshot, drop all diffs until snapshot arrives
+            if self._waiting_for_snapshot.get(trading_pair, False):
+                self.logger().debug(
+                    f"BitMart {trading_pair}: Dropping {update_type} diff v{new_ver} "
+                    f"(waiting for snapshot to resolve version gap)"
+                )
+                continue
+            
             if last_ver is None:
-                # We don't have a baseline; fetch snapshot to seed and skip this diff
+                # We don't have a baseline; fetch snapshot to seed and skip all diffs until snapshot arrives
                 self.logger().debug(f"BitMart {trading_pair}: No baseline version, requesting snapshot for {update_type} update (v{new_ver})")
+                self._waiting_for_snapshot[trading_pair] = True
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 continue
             if new_ver <= last_ver:
@@ -210,11 +229,12 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().debug(f"BitMart {trading_pair}: Skipping old/duplicate {update_type} update v{new_ver} (current v{last_ver})")
                 continue
             if new_ver != last_ver + 1:
-                # Gap detected, refresh snapshot and skip
+                # Gap detected, refresh snapshot and drop all subsequent diffs until snapshot arrives
                 self.logger().warning(
                     f"BitMart {trading_pair}: Version gap detected in {update_type} update! "
-                    f"Expected v{last_ver + 1}, got v{new_ver}. Requesting snapshot."
+                    f"Expected v{last_ver + 1}, got v{new_ver}. Requesting snapshot and dropping diffs."
                 )
+                self._waiting_for_snapshot[trading_pair] = True
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 continue
             
@@ -257,10 +277,17 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             asks_list = diff_data.get("asks", [])
             is_heartbeat = (not bids_list) and (not asks_list)
             
-            # Update liveness timestamp ONLY for non-heartbeat snapshots
+            # Track ANY message received for this pair (proves subscription is alive)
+            current_time = time.time()
+            try:
+                self._last_any_message_ts[trading_pair] = current_time
+            except Exception:
+                pass
+            
+            # Update data timestamp ONLY for non-heartbeat snapshots (actual orderbook data)
             if not is_heartbeat:
                 try:
-                    self._last_depth_update_ts[trading_pair] = time.time()
+                    self._last_depth_update_ts[trading_pair] = current_time
                 except Exception:
                     pass
             
@@ -272,13 +299,32 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 try:
                     new_version = int(diff_data.get("version"))
                     old_version = self._last_depth_version.get(trading_pair)
+                    was_waiting = self._waiting_for_snapshot.get(trading_pair, False)
+                    
+                    # Clear waiting flag - snapshot arrived, can resume processing diffs
+                    self._waiting_for_snapshot[trading_pair] = False
+                    
+                    # Log snapshot receipt
+                    if was_waiting:
+                        self.logger().info(
+                            f"BitMart {trading_pair}: Received requested SNAPSHOT v{new_version} "
+                            f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks) - resuming diffs"
+                        )
+                    elif old_version is not None and new_version == old_version:
+                        self.logger().debug(
+                            f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
+                            f"(unchanged, {len(bids_list)} bids, {len(asks_list)} asks)"
+                        )
+                    else:
+                        self.logger().info(
+                            f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
+                            f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks)"
+                        )
+                    
                     self._last_depth_version[trading_pair] = new_version
-                    self.logger().info(
-                        f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
-                        f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks)"
-                    )
                 except Exception:
                     self._last_depth_version.pop(trading_pair, None)
+                    self._waiting_for_snapshot.pop(trading_pair, None)
 
             order_book_message_content = {
                 "trading_pair": trading_pair,
@@ -360,8 +406,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Initialize per-pair liveness timestamps
             now = time.time()
             for tp in self._trading_pairs:
-                self._last_depth_update_ts[tp] = now
-                self._last_depth_version.pop(tp, None)
+                self._last_any_message_ts[tp] = now  # Track any message
+                self._last_depth_update_ts[tp] = now  # Track actual data
+                self._last_depth_version.pop(tp, None)  # Clear version to wait for first snapshot
+                self._waiting_for_snapshot.pop(tp, None)  # Clear waiting flag on reconnect
 
             # Depth-Increase optional: proactively request full snapshot per symbol to seed version state
             # Disabled by default to reduce subscribe-burst load; fallback refresh logic remains in place.
@@ -485,16 +533,21 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Detect symbols whose depth stream has stalled and take corrective action.
         Called periodically from main loop's watchdog check.
+        
+        Note: For illiquid pairs, orderbook may not change for extended periods.
+        Staleness is detected when we don't receive ANY messages (updates/heartbeats/snapshots),
+        not when the orderbook itself doesn't change.
         """
         now = time.time()
         stale_pairs = []
         
-        # Check all trading pairs for staleness
+        # Check all trading pairs for staleness based on ANY message receipt
         for trading_pair in list(self._trading_pairs):
-            last_ts = float(self._last_depth_update_ts.get(trading_pair, 0.0) or 0.0)
-            if last_ts <= 0:
+            # Use _last_any_message_ts which includes heartbeats and snapshots
+            last_any_ts = float(self._last_any_message_ts.get(trading_pair, 0.0) or 0.0)
+            if last_any_ts <= 0:
                 continue
-            if (now - last_ts) >= self._DEPTH_STALENESS_SECONDS:
+            if (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
                 stale_pairs.append(trading_pair)
         
         if not stale_pairs:
@@ -516,10 +569,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                  if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
                 topic = f"{depth_channel}:{symbol}"
                 
-                last_update = self._last_depth_update_ts.get(trading_pair, 0)
-                stale_duration = int(now - last_update) if last_update > 0 else 0
+                last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
+                stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
                 self.logger().warning(
-                    f"BitMart {trading_pair}: Orderbook stale for {stale_duration}s "
+                    f"BitMart {trading_pair}: No messages for {stale_duration}s "
                     f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), attempting recovery"
                 )
                 
@@ -535,11 +588,15 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
                     await ws.send(sub)
                 
+                # Mark that we're waiting for snapshot (diffs will be dropped until it arrives)
+                self._waiting_for_snapshot[trading_pair] = True
+                
                 # Refresh snapshot using WS request (Depth-Increase) or REST fallback
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
                 
-                # Reset timer to avoid repeated attempts
-                self._last_depth_update_ts[trading_pair] = now
+                # Reset staleness timer to avoid repeated attempts every check cycle
+                # The snapshot response will update _last_any_message_ts when received
+                self._last_any_message_ts[trading_pair] = now
                 
             except Exception as e:
                 self.logger().warning(f"BitMart depth watchdog: failed to recover {trading_pair}: {e}")
