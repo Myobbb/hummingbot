@@ -102,9 +102,9 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
                         reconnect_delay = self._backoff_seconds(transient=False)
             finally:
-                # Make sure no background task is leaked.
+                # Ensure proper cleanup (disconnect WS, stop key manager, best-effort delete old key)
+                await self._on_user_stream_interruption(websocket_assistant=ws)
                 self._connected_listen_key = None
-                ws and await ws.disconnect()
                 await self._sleep(reconnect_delay)
 
     async def _subscribe_channels(self, ws: WSAssistant):
@@ -199,6 +199,15 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 pass
 
             # Process actual data events
+            # Handle subscription acknowledgments per BingX spec: {"id": "...", "code": 0, "msg": ""}
+            if isinstance(data, dict) and "code" in data:
+                code = data.get("code")
+                if code != 0:
+                    self.logger().warning(
+                        f"Private WS subscription ack error: id={data.get('id')} code={code} msg={data.get('msg')}"
+                    )
+                # Skip ACK messages
+                continue
             if data.get("e") == "ACCOUNT_UPDATE":
                 # Ignore funding/non-spot reasons per requirement
                 reason = str(data.get("a", {}).get("m", "")).upper()

@@ -305,7 +305,20 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
                 
             # Skip success confirmations
+            # Prefer checking 'code' field per BingX ack format: {"id": "...", "code": 0, "msg": ""}
+            if "code" in data:
+                code = data.get("code")
+                if code != 0:
+                    try:
+                        self.logger().warning(
+                            f"Public WS subscription ack error: id={data.get('id')} code={code} msg={data.get('msg')}"
+                        )
+                    except Exception:
+                        pass
+                # Skip ACKs regardless
+                continue
             if data.get("msg") == "SUCCESS":
+                # Legacy success message handling
                 continue
             
             # Handle ping/pong
