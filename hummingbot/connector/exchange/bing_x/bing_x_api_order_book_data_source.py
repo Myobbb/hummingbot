@@ -304,21 +304,29 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if not isinstance(data, dict):
                 continue
                 
-            # Skip success confirmations
-            # Prefer checking 'code' field per BingX ack format: {"id": "...", "code": 0, "msg": ""}
-            if "code" in data:
+            # Handle subscription acknowledgments:
+            # BingX acks look like: {"id": "...", "code": 0, "msg": ""}. They do not include dataType.
+            if isinstance(data, dict) and "code" in data and "id" in data and "dataType" not in data:
                 code = data.get("code")
-                if code != 0:
+                sub_id = data.get("id")
+                if code == 0:
+                    try:
+                        self.logger().debug(f"Public WS subscribed: id={sub_id}")
+                    except Exception:
+                        pass
+                    # Skip ack frames
+                    continue
+                else:
+                    # Ack error: log and force reconnect to retry fresh
                     try:
                         self.logger().warning(
-                            f"Public WS subscription ack error: id={data.get('id')} code={code} msg={data.get('msg')}"
+                            f"Public WS subscription ack error: id={sub_id} code={code} msg={data.get('msg')}"
                         )
                     except Exception:
                         pass
-                # Skip ACKs regardless
-                continue
-            if data.get("msg") == "SUCCESS":
-                # Legacy success message handling
+                    raise ConnectionError(f"Subscription failed for id={sub_id} (code={code})")
+            # Legacy success message handling
+            if data.get("msg") == "SUCCESS" and "dataType" not in data:
                 continue
             
             # Handle ping/pong

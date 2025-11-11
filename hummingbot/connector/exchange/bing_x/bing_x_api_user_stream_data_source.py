@@ -200,14 +200,18 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             # Process actual data events
             # Handle subscription acknowledgments per BingX spec: {"id": "...", "code": 0, "msg": ""}
-            if isinstance(data, dict) and "code" in data:
+            # Acks do not contain dataType. Private subscription uses explicit sub payloads above.
+            if isinstance(data, dict) and "code" in data and "id" in data and "dataType" not in data:
                 code = data.get("code")
-                if code != 0:
+                if code == 0:
+                    self.logger().debug(f"Private WS subscribed: id={data.get('id')}")
+                    continue
+                else:
                     self.logger().warning(
                         f"Private WS subscription ack error: id={data.get('id')} code={code} msg={data.get('msg')}"
                     )
-                # Skip ACK messages
-                continue
+                    # Force reconnect on subscription failure
+                    raise ConnectionError(f"Private subscription failed for id={data.get('id')} (code={code})")
             if data.get("e") == "ACCOUNT_UPDATE":
                 # Ignore funding/non-spot reasons per requirement
                 reason = str(data.get("a", {}).get("m", "")).upper()
