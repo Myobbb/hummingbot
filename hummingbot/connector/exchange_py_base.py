@@ -37,11 +37,11 @@ from hummingbot.logger import HummingbotLogger
 class ExchangePyBase(ExchangeBase, ABC):
     _logger = None
 
-    SHORT_POLL_INTERVAL = 120.0
-    LONG_POLL_INTERVAL = 600.0
+    SHORT_POLL_INTERVAL = 10.0
+    LONG_POLL_INTERVAL = 120.0
     TRADING_RULES_INTERVAL = 30 * MINUTE
     TRADING_FEES_INTERVAL = TWELVE_HOURS
-    TICK_INTERVAL_LIMIT = 180.0
+    TICK_INTERVAL_LIMIT = 60.0
 
     def __init__(self,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
