@@ -51,6 +51,8 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Per-trading_pair last applied version (Depth-Increase only)
         self._last_depth_version: Dict[str, int] = {}
         self._active_ws: Optional[WSAssistant] = None
+        self._ws_consumer_task: Optional[asyncio.Task] = None
+        self._watchdog_check_interval: float = 5.0  # Check watchdogs every 5s
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -332,42 +334,18 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().exception("Unexpected error occurred subscribing to order book trading and delta streams...")
             raise
 
-    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
-        # Start keepalive task
-        self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
-        # Start per-symbol depth watchdog
-        self._depth_watchdog_task = asyncio.create_task(self._depth_watchdog_loop(websocket_assistant))
-        
+    async def _process_ws_messages_consumer(self, websocket_assistant: WSAssistant):
+        """
+        Consumer task that processes WebSocket messages.
+        Runs continuously until socket closes or error occurs.
+        """
         try:
-            self._active_ws = websocket_assistant
             async for ws_response in websocket_assistant.iter_messages():
-                # Check if background tasks failed and need to trigger reconnect
-                # IMPORTANT: Do this BEFORE any continue statements so watchdog failures are detected
-                if self._keepalive_task and self._keepalive_task.done():
-                    # Keepalive task exited - check for exception
-                    try:
-                        self._keepalive_task.result()  # Will raise if task failed
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        self.logger().warning(f"BitMart public WS keepalive failed: {e}")
-                        raise
-                
-                if self._depth_watchdog_task and self._depth_watchdog_task.done():
-                    # Depth watchdog task exited - check for exception
-                    try:
-                        self._depth_watchdog_task.result()  # Will raise if task failed
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        self.logger().warning(f"BitMart public WS depth watchdog failed: {e}")
-                        raise
-                
                 data: Dict[str, Any] = ws_response.data
                 decompressed_data = utils.decompress_ws_message(data)
                 try:
                     if isinstance(decompressed_data, str):
-                        # Gracefully ignore plain-text 'pong' - but still check watchdog above
+                        # Gracefully ignore plain-text 'pong'
                         if decompressed_data.strip().lower() == "pong":
                             continue
                         json_data = json.loads(decompressed_data)
@@ -386,23 +364,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 channel: str = self._channel_originating_message(event_message=json_data)
                 if channel in [self._diff_messages_queue_key, self._trade_messages_queue_key, self._snapshot_messages_queue_key]:
                     self._message_queue[channel].put_nowait(json_data)
-        finally:
-            # Clean up tasks
-            if self._keepalive_task is not None and not self._keepalive_task.done():
-                self._keepalive_task.cancel()
-                try:
-                    await self._keepalive_task
-                except Exception:
-                    pass
-            self._keepalive_task = None
-            if self._depth_watchdog_task is not None and not self._depth_watchdog_task.done():
-                self._depth_watchdog_task.cancel()
-                try:
-                    await self._depth_watchdog_task
-                except Exception:
-                    pass
-            self._depth_watchdog_task = None
-            self._active_ws = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""
@@ -442,130 +407,99 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._active_ws = ws
         return ws
 
-    async def _keepalive_ping_loop(self, ws: WSAssistant):
-        try:
-            while True:
-                await asyncio.sleep(1.0)
-                # If idle for >= interval, send text 'ping'
-                last_recv = getattr(ws, "last_recv_time", 0) or 0
-                now = time.time()
-                # Send at most one ping per interval and only when idle
-                if (now - last_recv) >= self._PING_INTERVAL_SECONDS and (now - self._last_ping_sent_time) >= self._PING_INTERVAL_SECONDS:
-                    try:
-                        await ws.send(WSPlainTextRequest(payload="ping"))
-                        self._last_ping_sent_time = now
-                        self.logger().debug("BitMart public WS: sent ping")
-                    except Exception:
-                        # Force reconnect by raising
-                        raise
-                # If still no messages beyond max idle threshold, force reconnect (no messages at all, including pongs)
-                if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
-                    self.logger().warning("BitMart public WS: no messages for 30s, forcing reconnect")
-                    # Force close the WS to ensure main loop exits
-                    try:
-                        await ws.disconnect()
-                    except Exception:
-                        pass
-                    raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
+    async def _check_and_send_ping_if_needed(self, ws: WSAssistant):
+        """Send ping if idle for >= interval"""
+        last_recv = getattr(ws, "last_recv_time", 0) or 0
+        now = time.time()
+        if (now - last_recv) >= self._PING_INTERVAL_SECONDS and (now - self._last_ping_sent_time) >= self._PING_INTERVAL_SECONDS:
+            try:
+                await ws.send(WSPlainTextRequest(payload="ping"))
+                self._last_ping_sent_time = now
+                self.logger().debug("BitMart public WS: sent ping")
+            except Exception as e:
+                raise ConnectionError(f"BitMart public WS: failed to send ping: {e}")
 
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Bubble up to reconnect loop
-            raise
+    async def _check_watchdogs(self, ws: WSAssistant):
+        """
+        Check for connection health and stale orderbook data.
+        Raises ConnectionError if reconnect is needed.
+        """
+        last_recv = getattr(ws, "last_recv_time", 0) or 0
+        now = time.time()
+        
+        # Check for complete silence (no messages at all, including pongs)
+        if last_recv > 0 and (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
+            self.logger().warning("BitMart public WS: no messages for 30s, forcing reconnect")
+            raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
+        
+        # Check for stale orderbook data per trading pair
+        await self._check_stale_pairs(ws)
 
-    async def _depth_watchdog_loop(self, ws: WSAssistant):
+    async def _check_stale_pairs(self, ws: WSAssistant):
         """
-        Detect symbols whose depth stream has stalled (while trades or other traffic may still flow)
-        and attempt a targeted resubscribe plus REST snapshot refresh.
-        If multiple symbols are stale or resubscribe fails, force full reconnection.
+        Detect symbols whose depth stream has stalled and take corrective action.
+        Called periodically from main loop's watchdog check.
         """
-        try:
-            while True:
-                await asyncio.sleep(5.0)
-                now = time.time()
-                stale_pairs = []
+        now = time.time()
+        stale_pairs = []
+        
+        # Check all trading pairs for staleness
+        for trading_pair in list(self._trading_pairs):
+            last_ts = float(self._last_depth_update_ts.get(trading_pair, 0.0) or 0.0)
+            if last_ts <= 0:
+                continue
+            if (now - last_ts) >= self._DEPTH_STALENESS_SECONDS:
+                stale_pairs.append(trading_pair)
+        
+        if not stale_pairs:
+            return
+        
+        # If more than 50% of pairs are stale, it's a systematic issue - force full reconnect
+        if len(stale_pairs) > len(self._trading_pairs) // 2:
+            self.logger().warning(
+                f"BitMart depth watchdog: {len(stale_pairs)}/{len(self._trading_pairs)} pairs stale "
+                f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), forcing full reconnect"
+            )
+            raise ConnectionError("BitMart orderbook data stale for multiple pairs; forcing reconnect")
+        
+        # Try targeted recovery for individual stale pairs
+        for trading_pair in stale_pairs:
+            try:
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
+                                 if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
+                topic = f"{depth_channel}:{symbol}"
                 
-                # Check all trading pairs for staleness
-                for trading_pair in list(self._trading_pairs):
-                    last_ts = float(self._last_depth_update_ts.get(trading_pair, 0.0) or 0.0)
-                    if last_ts <= 0:
-                        continue
-                    if (now - last_ts) >= self._DEPTH_STALENESS_SECONDS:
-                        stale_pairs.append(trading_pair)
+                # Unsubscribe (best-effort) then subscribe
+                try:
+                    unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
+                    async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                        await ws.send(unsub)
+                except Exception:
+                    pass
                 
-                if not stale_pairs:
-                    continue
+                sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
+                async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                    await ws.send(sub)
                 
-                # If more than 50% of pairs are stale, it's a systematic issue - force full reconnect
-                if len(stale_pairs) > len(self._trading_pairs) // 2:
-                    self.logger().warning(
-                        f"BitMart depth watchdog: {len(stale_pairs)}/{len(self._trading_pairs)} pairs stale "
-                        f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), forcing full reconnect"
-                    )
-                    # Force close the WS to ensure main loop exits
-                    try:
-                        await ws.disconnect()
-                    except Exception:
-                        pass
-                    raise ConnectionError("BitMart orderbook data stale for multiple pairs; forcing reconnect")
+                # Refresh snapshot using WS request (Depth-Increase) or REST fallback
+                try:
+                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                    self.logger().warning(f"BitMart depth watchdog: resubscribed and refreshed {trading_pair}")
+                except Exception:
+                    pass
                 
-                # Try targeted recovery for individual stale pairs
-                recovery_failed = False
-                for trading_pair in stale_pairs:
-                    try:
-                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                        depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
-                                         if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
-                        topic = f"{depth_channel}:{symbol}"
-                        
-                        # Unsubscribe (best-effort) then subscribe
-                        try:
-                            unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
-                            async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                                await ws.send(unsub)
-                        except Exception:
-                            pass
-                        
-                        sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
-                        async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                            await ws.send(sub)
-                        
-                        # Refresh snapshot using WS request (Depth-Increase) or REST fallback
-                        try:
-                            await self._refresh_snapshot_for_pair(trading_pair, symbol)
-                            self.logger().warning(f"BitMart depth watchdog: resubscribed and refreshed {trading_pair}")
-                        except Exception:
-                            pass
-                        
-                        # Reset timer to avoid repeated attempts
-                        self._last_depth_update_ts[trading_pair] = now
-                        
-                    except Exception as e:
-                        self.logger().warning(f"BitMart depth watchdog: failed to refresh {trading_pair}: {e}")
-                        # If we can't send resubscribe (e.g., WS disconnected), force full reconnect
-                        recovery_failed = True
-                        break
+                # Reset timer to avoid repeated attempts
+                self._last_depth_update_ts[trading_pair] = now
                 
-                # If any recovery failed, force full reconnect
-                if recovery_failed:
-                    self.logger().warning("BitMart depth watchdog: recovery failed, forcing full reconnect")
-                    # Force close the WS to ensure main loop exits
-                    try:
-                        await ws.disconnect()
-                    except Exception:
-                        pass
-                    raise ConnectionError("BitMart depth watchdog recovery failed; forcing reconnect")
-                        
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Escalate to reconnect; the outer caller will handle
-            raise
+            except Exception as e:
+                self.logger().warning(f"BitMart depth watchdog: failed to refresh {trading_pair}: {e}")
+                # If we can't send resubscribe (e.g., WS disconnected), force full reconnect
+                raise ConnectionError(f"BitMart depth watchdog recovery failed; forcing reconnect")
 
     async def listen_for_subscriptions(self):
         """
-        Override to add graceful transient reconnect/backoff and keepalive-driven reconnects.
+        Main WebSocket loop using Bybit-style architecture with asyncio.wait() and periodic watchdog checks.
         """
         ws: Optional[WSAssistant] = None
         while True:
@@ -573,7 +507,43 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 ws = await self._connected_websocket_assistant()
                 await self._subscribe_channels(ws)
-                await self._process_websocket_messages(websocket_assistant=ws)
+                self._last_ping_sent_time = time.time()
+                self._active_ws = ws
+                
+                # Create message consumer task
+                if self._ws_consumer_task is None or self._ws_consumer_task.done():
+                    self._ws_consumer_task = asyncio.create_task(self._process_ws_messages_consumer(ws))
+                
+                # Main event loop: multiplex between consumer and watchdog checks
+                while True:
+                    # Create a timer for next watchdog check
+                    watchdog_timer = asyncio.create_task(asyncio.sleep(self._watchdog_check_interval))
+                    
+                    done, pending = await asyncio.wait(
+                        {self._ws_consumer_task, watchdog_timer},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    
+                    # Consumer finished -> check for exception and reconnect
+                    if self._ws_consumer_task in done:
+                        exc = None
+                        try:
+                            exc = self._ws_consumer_task.exception()
+                        except asyncio.CancelledError:
+                            raise
+                        finally:
+                            watchdog_timer.cancel()
+                        if exc:
+                            raise exc
+                        raise ConnectionError("BitMart WS consumer ended unexpectedly")
+                    
+                    # Watchdog timer expired -> run checks
+                    if watchdog_timer in done:
+                        # Send ping if needed
+                        await self._check_and_send_ping_if_needed(ws)
+                        # Check for staleness and connection health
+                        await self._check_watchdogs(ws)
+                        
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, Exception) as e:
@@ -595,5 +565,15 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     exponent = min(self._reconnect_attempts, 5)
                     reconnect_delay = float(min(30, 2 ** max(1, exponent)))
             finally:
+                # Clean up
+                self._active_ws = None
+                if self._ws_consumer_task and not self._ws_consumer_task.done():
+                    self._ws_consumer_task.cancel()
+                    try:
+                        await self._ws_consumer_task
+                    except Exception:
+                        pass
+                self._ws_consumer_task = None
                 await self._sleep(reconnect_delay)
-                ws and await ws.disconnect()
+                if ws:
+                    await ws.disconnect()
