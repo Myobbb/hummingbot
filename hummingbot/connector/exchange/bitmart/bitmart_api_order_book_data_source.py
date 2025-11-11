@@ -31,11 +31,17 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  trading_pairs: List[str],
                  connector: 'BitmartExchange',
                  api_factory: WebAssistantsFactory,
-                 use_depth_increase: bool = CONSTANTS.USE_DEPTH_INCREASE):
+                 use_depth_increase: bool = CONSTANTS.USE_DEPTH_INCREASE,
+                 subscribe_trades: bool = False,
+                 seed_snapshot_via_request: bool = False):
         super().__init__(trading_pairs)
         self._connector: BitmartExchange = connector
         self._api_factory = api_factory
         self._use_depth_increase: bool = use_depth_increase
+        # Reduce message volume: trades are optional for order book maintenance
+        self._subscribe_trades: bool = subscribe_trades
+        # Depth-Increase supports explicit WS snapshot request; default to off to reduce bursts on reconnect
+        self._seed_snapshot_via_request: bool = seed_snapshot_via_request
         self._keepalive_task: Optional[asyncio.Task] = None
         self._depth_watchdog_task: Optional[asyncio.Task] = None
         self._reconnect_attempts: int = 0
@@ -283,7 +289,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                        for trading_pair in self._trading_pairs]
 
             # BitMart allows up to 20 topics per subscription message
-            trade_topics = [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols]
+            trade_topics = [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols] if self._subscribe_trades else []
             depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
                              if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
             depth_topics = [f"{depth_channel}:{symbol}" for symbol in symbols]
@@ -296,6 +302,8 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     req = WSJSONRequest(payload=payload)
                     async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
                         await ws.send(req)
+                    # Pace messages to stay comfortably under 100 msgs/10s (ping texts count too)
+                    await asyncio.sleep(0.12)
 
             await send_chunked(trade_topics)
             await send_chunked(depth_topics)
@@ -307,17 +315,17 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._last_depth_update_ts[tp] = now
                 self._last_depth_version.pop(tp, None)
 
-            # Depth-Increase: proactively request full snapshot per symbol to seed version state
-            if self._use_depth_increase:
-                async def send_requests(topics: List[str]):
-                    CHUNK_SIZE = 20
-                    for i in range(0, len(topics), CHUNK_SIZE):
-                        chunk = topics[i:i + CHUNK_SIZE]
-                        payload = {"op": "request", "args": chunk}
-                        req = WSJSONRequest(payload=payload)
-                        async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                            await ws.send(req)
-                await send_requests(depth_topics)
+            # Depth-Increase optional: proactively request full snapshot per symbol to seed version state
+            # Disabled by default to reduce subscribe-burst load; fallback refresh logic remains in place.
+            if self._use_depth_increase and self._seed_snapshot_via_request:
+                CHUNK_SIZE = 20
+                for i in range(0, len(depth_topics), CHUNK_SIZE):
+                    chunk = depth_topics[i:i + CHUNK_SIZE]
+                    payload = {"op": "request", "args": chunk}
+                    req = WSJSONRequest(payload=payload)
+                    async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                        await ws.send(req)
+                    await asyncio.sleep(0.12)
         except asyncio.CancelledError:
             raise
         except Exception:
