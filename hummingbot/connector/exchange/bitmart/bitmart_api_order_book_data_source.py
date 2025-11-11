@@ -24,7 +24,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
-    _FORCE_RECONNECT_IDLE_SECONDS: float = 20.0
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
     _DEPTH_STALENESS_SECONDS: float = 45.0  # per-symbol watchdog
 
     def __init__(self,
@@ -357,6 +357,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Handle exchange error messages gracefully
                 if isinstance(json_data, dict) and ("errorCode" in json_data or "errorMessage" in json_data):
                     # Convert to ConnectionError to trigger reconnect with backoff at higher level
+                    self.logger().error(f"BitMart public WS error: {json_data}")
                     raise ConnectionError(f"BitMart WS error: {json_data}")
 
                 channel: str = self._channel_originating_message(event_message=json_data)
@@ -429,11 +430,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     try:
                         await ws.send(WSPlainTextRequest(payload="ping"))
                         self._last_ping_sent_time = now
+                        self.logger().debug("BitMart public WS: sent ping")
                     except Exception:
                         # Force reconnect by raising
                         raise
-                # If still no messages beyond max idle threshold, force reconnect
+                # If still no messages beyond max idle threshold, force reconnect (no messages at all, including pongs)
                 if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
+                    self.logger().warning("BitMart public WS: no messages for 30s, forcing reconnect")
                     raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
 
         except asyncio.CancelledError:

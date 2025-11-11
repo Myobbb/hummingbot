@@ -19,7 +19,8 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
-    _FORCE_RECONNECT_IDLE_SECONDS: float = 20.0
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
+    _DATA_STALENESS_SECONDS: float = 60.0  # Watchdog for actual user data (not just pongs)
 
     def __init__(
         self,
@@ -34,8 +35,10 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._data_watchdog_task: Optional[asyncio.Task] = None
         self._reconnect_attempts: int = 0
         self._last_ping_sent_time: float = 0.0
+        self._last_data_received_time: float = 0.0  # Track actual user data, not just pongs
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -48,6 +51,7 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             ws_url=CONSTANTS.WSS_PRIVATE_URL,
             ping_timeout=None,
             message_timeout=60,
+            ws_headers={"Accept-Encoding": "gzip"},  #not really needed, but it's here for completeness
         )
 
         payload = {
@@ -96,6 +100,8 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
         # Start keepalive task
         self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
+        # Start data watchdog task
+        self._data_watchdog_task = asyncio.create_task(self._data_watchdog_loop(websocket_assistant))
         try:
             async for ws_response in websocket_assistant.iter_messages():
                 data: Dict[str, Any] = ws_response.data
@@ -116,6 +122,7 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
                 if isinstance(json_data, dict) and ("errorCode" in json_data or "errorMessage" in json_data):
                     # Escalate to reconnect
+                    self.logger().error(f"BitMart private WS error: {json_data}")
                     raise ConnectionError(f"BitMart private WS error: {json_data}")
 
                 await self._process_event_message(event_message=json_data, queue=queue)
@@ -127,9 +134,18 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 except Exception:
                     pass
             self._keepalive_task = None
+            if self._data_watchdog_task is not None and not self._data_watchdog_task.done():
+                self._data_watchdog_task.cancel()
+                try:
+                    await self._data_watchdog_task
+                except Exception:
+                    pass
+            self._data_watchdog_task = None
 
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
         if len(event_message) > 0 and "table" in event_message and "data" in event_message:
+            # Update timestamp when actual user data is received
+            self._last_data_received_time = time.time()
             queue.put_nowait(event_message)
 
     async def _get_ws_assistant(self) -> WSAssistant:
@@ -148,12 +164,41 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     try:
                         await ws.send(WSPlainTextRequest(payload="ping"))
                         self._last_ping_sent_time = now
+                        self.logger().debug("BitMart private WS: sent ping")
                     except Exception:
                         # Force reconnect
                         raise
-                # Force reconnect on prolonged idle
+                # Force reconnect on prolonged idle (no messages at all, including pongs)
                 if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
+                    self.logger().warning("BitMart private WS: no messages for 30s, forcing reconnect")
                     raise ConnectionError("BitMart private WS idle exceeded threshold; forcing reconnect")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise
+
+    async def _data_watchdog_loop(self, ws: WSAssistant):
+        """
+        Detect when actual user data (orders/balance) stops flowing even though connection appears alive.
+        This can happen if BitMart's server stops sending data without closing the connection.
+        """
+        try:
+            while True:
+                await asyncio.sleep(10.0)
+                now = time.time()
+                # Initialize on first check
+                if self._last_data_received_time == 0:
+                    self._last_data_received_time = now
+                    continue
+                
+                # Check if we've received actual user data recently
+                time_since_data = now - self._last_data_received_time
+                if time_since_data >= self._DATA_STALENESS_SECONDS:
+                    self.logger().warning(
+                        f"BitMart private WS: no user data for {time_since_data:.0f}s "
+                        f"(threshold: {self._DATA_STALENESS_SECONDS}s), forcing reconnect"
+                    )
+                    raise ConnectionError("BitMart private WS data stream stale; forcing reconnect")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -168,6 +213,8 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             try:
                 self._ws_assistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(websocket_assistant=self._ws_assistant)
+                # Initialize data timestamp on new connection
+                self._last_data_received_time = time.time()
                 # initial text ping to mark activity
                 try:
                     await self._ws_assistant.send(WSPlainTextRequest(payload="ping"))
