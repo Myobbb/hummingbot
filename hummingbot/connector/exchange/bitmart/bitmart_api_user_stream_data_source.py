@@ -99,11 +99,22 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
         try:
             async for ws_response in websocket_assistant.iter_messages():
+                # Check if keepalive task failed and needs to trigger reconnect
+                # IMPORTANT: Do this BEFORE any continue statements so failures are detected
+                if self._keepalive_task and self._keepalive_task.done():
+                    try:
+                        self._keepalive_task.result()  # Will raise if task failed
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        self.logger().warning(f"BitMart private WS keepalive failed: {e}")
+                        raise
+                
                 data: Dict[str, Any] = ws_response.data
                 decompressed_data = utils.decompress_ws_message(data)
                 try:
                     if type(decompressed_data) == str:
-                        # Ignore raw 'pong' frames
+                        # Ignore raw 'pong' frames - but still check keepalive above
                         if decompressed_data.strip().lower() == "pong":
                             continue
                         json_data = json.loads(decompressed_data)

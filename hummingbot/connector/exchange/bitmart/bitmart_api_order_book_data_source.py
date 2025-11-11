@@ -342,6 +342,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._active_ws = websocket_assistant
             async for ws_response in websocket_assistant.iter_messages():
                 # Check if background tasks failed and need to trigger reconnect
+                # IMPORTANT: Do this BEFORE any continue statements so watchdog failures are detected
                 if self._keepalive_task and self._keepalive_task.done():
                     # Keepalive task exited - check for exception
                     try:
@@ -366,7 +367,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 decompressed_data = utils.decompress_ws_message(data)
                 try:
                     if isinstance(decompressed_data, str):
-                        # Gracefully ignore plain-text 'pong'
+                        # Gracefully ignore plain-text 'pong' - but still check watchdog above
                         if decompressed_data.strip().lower() == "pong":
                             continue
                         json_data = json.loads(decompressed_data)
