@@ -305,7 +305,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Version gap detected - could be transient network issue, exchange rate limiting, etc.
                 # OPTIMISTIC STRATEGY: Apply the update anyway, request snapshot in background for correction
                 gap_size = new_ver - last_ver - 1
-                self.logger().warning(
+                self.logger().debug(
                     f"BitMart {trading_pair}: Version gap detected in {update_type} update! "
                     f"Expected v{last_ver + 1}, got v{new_ver} (gap of {gap_size}). "
                     f"Applying update anyway, requesting snapshot for correction."
@@ -404,7 +404,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         # Log snapshot receipt
                         if was_waiting:
                             wait_msg = f" after {wait_duration}s wait" if wait_duration > 0 else ""
-                            self.logger().info(
+                            self.logger().debug(
                                 f"BitMart {trading_pair}: Received requested SNAPSHOT v{new_version}{wait_msg} "
                                 f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks) - resuming diffs"
                             )
@@ -414,7 +414,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 f"(unchanged, {len(bids_list)} bids, {len(asks_list)} asks)"
                             )
                         else:
-                            self.logger().info(
+                            self.logger().debug(
                                 f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
                                 f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks)"
                             )
