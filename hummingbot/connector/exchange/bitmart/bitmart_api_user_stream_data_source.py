@@ -20,6 +20,9 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
     _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
+    # Public attribute used by ExchangePyBase._is_user_stream_initialized()
+    # Updated whenever we receive any frame on the private WS (including pongs)
+    last_recv_time: float = 0.0
 
     def __init__(
         self,
@@ -36,6 +39,8 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._keepalive_task: Optional[asyncio.Task] = None
         self._reconnect_attempts: int = 0
         self._last_ping_sent_time: float = 0.0
+        # Initialize last recv marker
+        self.last_recv_time = 0.0
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -68,6 +73,12 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             if "errorCode" in message or "error_code" in message or message.get("event") != "login":
                 self.logger().error(f"Error authenticating the private websocket connection: {message}")
                 raise IOError(f"Private websocket connection authentication failed ({message})")
+            # Successful login - mark last receive time
+            try:
+                # Prefer assistant's internal timestamp when available
+                self.last_recv_time = float(getattr(ws, "last_recv_time", time.time()) or time.time())
+            except Exception:
+                self.last_recv_time = time.time()
         except asyncio.TimeoutError:
             self.logger().error("Timeout waiting for login response from BitMart private WebSocket")
             raise IOError("BitMart private WebSocket login timeout (30s)")
@@ -104,6 +115,11 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._keepalive_task = asyncio.create_task(self._keepalive_ping_loop(websocket_assistant))
         try:
             async for ws_response in websocket_assistant.iter_messages():
+                # Update last receive marker regardless of message content
+                try:
+                    self.last_recv_time = float(getattr(websocket_assistant, "last_recv_time", time.time()) or time.time())
+                except Exception:
+                    self.last_recv_time = time.time()
                 # Check if keepalive task failed and needs to trigger reconnect
                 # IMPORTANT: Do this BEFORE any continue statements so failures are detected
                 if self._keepalive_task and self._keepalive_task.done():
