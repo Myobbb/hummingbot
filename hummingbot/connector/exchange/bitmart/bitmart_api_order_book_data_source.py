@@ -458,7 +458,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Refresh a single pair snapshot. Prefer WS 'request' for Depth-Increase to obtain a versioned snapshot.
         """
-        self.logger().info(f"BitMart {trading_pair}: Requesting snapshot refresh")
+        #self.logger().info(f"BitMart {trading_pair}: Requesting snapshot refresh")
         try:
             if self._use_depth_increase and self._active_ws is not None:
                 payload = {"op": "request", "args": [f"{CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME}:{symbol}"]}
