@@ -846,7 +846,44 @@ class ExchangePyBase(ExchangeBase, ABC):
                 await self._sleep(1.0)
 
     def _is_user_stream_initialized(self):
-        return self._user_stream_tracker.data_source.last_recv_time > 0 or not self.is_trading_required
+        """
+        Check if user stream is initialized with grace period for reconnections.
+        
+        Returns True if:
+        1. User stream is currently connected (last_recv_time > 0)
+        2. User stream has been initialized before and is within 60s grace period for reconnection
+        3. Trading is not required (orderbook-only connector)
+        
+        The grace period prevents false negatives during legitimate reconnections where
+        last_recv_time temporarily drops to 0 while _ws_assistant is None.
+        """
+        if not self.is_trading_required:
+            return True
+        
+        last_recv = self._user_stream_tracker.data_source.last_recv_time
+        
+        # Initialize grace period tracking on first call
+        if not hasattr(self, '_user_stream_ever_initialized'):
+            self._user_stream_ever_initialized = False
+            self._user_stream_last_good_time = 0.0
+        
+        # Update tracking when connected (last_recv > 0 means _ws_assistant exists and receiving)
+        if last_recv > 0:
+            self._user_stream_ever_initialized = True
+            self._user_stream_last_good_time = last_recv
+            return True  # Currently connected and working
+        
+        # Not currently connected (last_recv == 0), check grace period
+        # If we were ever initialized, give 60s grace period for reconnections
+        if self._user_stream_ever_initialized and self._user_stream_last_good_time > 0:
+            import time
+            time_since_disconnect = time.time() - self._user_stream_last_good_time
+            if time_since_disconnect < 60.0:
+                # Within grace period - consider still initialized (reconnection in progress)
+                return True
+        
+        # Never initialized or grace period expired
+        return False
 
     def _create_user_stream_tracker(self):
         return UserStreamTracker(data_source=self._create_user_stream_data_source())

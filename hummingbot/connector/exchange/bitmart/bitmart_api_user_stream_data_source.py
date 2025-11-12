@@ -61,11 +61,16 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
             await ws.send(login_request)
 
-        response: WSResponse = await ws.receive()
-        message = response.data
-        if "errorCode" in message or "error_code" in message or message.get("event") != "login":
-            self.logger().error("Error authenticating the private websocket connection")
-            raise IOError(f"Private websocket connection authentication failed ({message})")
+        # Wait for login response with timeout to prevent infinite hang
+        try:
+            response: WSResponse = await asyncio.wait_for(ws.receive(), timeout=30.0)
+            message = response.data
+            if "errorCode" in message or "error_code" in message or message.get("event") != "login":
+                self.logger().error(f"Error authenticating the private websocket connection: {message}")
+                raise IOError(f"Private websocket connection authentication failed ({message})")
+        except asyncio.TimeoutError:
+            self.logger().error("Timeout waiting for login response from BitMart private WebSocket")
+            raise IOError("BitMart private WebSocket login timeout (30s)")
 
         return ws
 

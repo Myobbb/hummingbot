@@ -236,10 +236,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # After 10s, accept ANY update to keep orderbook moving
                 if wait_duration >= 10.0:  # Reduced from 30s
                     # Timeout exceeded - force recovery by accepting this update as new baseline
-                    self.logger().warning(
-                        f"BitMart {trading_pair}: Snapshot wait timeout ({int(wait_duration)}s). "
-                        f"Forcing recovery: accepting {update_type} v{new_ver} as new baseline"
-                    )
+                    #self.logger().warning(
+                    #    f"BitMart {trading_pair}: Snapshot wait timeout ({int(wait_duration)}s). "
+                    #    f"Forcing recovery: accepting {update_type} v{new_ver} as new baseline"
+                    #)
                     self._waiting_for_snapshot[trading_pair] = False
                     self._waiting_for_snapshot_since.pop(trading_pair, None)
                     self._last_depth_version[trading_pair] = new_ver
@@ -775,10 +775,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     last_asks_ts = self._last_asks_update_ts.get(trading_pair, 0)
                     stale_duration = int(now - (last_asks_ts if stale_side == "asks" else last_bids_ts))
                     
-                    self.logger().warning(
-                        f"BitMart {trading_pair}: One-sided staleness detected - {stale_side} stale for {stale_duration}s "
-                        f"while {'bids' if stale_side == 'asks' else 'asks'} updating. Requesting snapshot (non-blocking)."
-                    )
+                    #self.logger().warning(
+                    #    f"BitMart {trading_pair}: One-sided staleness detected - {stale_side} stale for {stale_duration}s "
+                    #    f"while {'bids' if stale_side == 'asks' else 'asks'} updating. Requesting snapshot (non-blocking)."
+                    #)
                     
                     # Don't need to resubscribe, just refresh snapshot to get both sides fresh
                     # IMPORTANT: Don't block updates - request snapshot in background
