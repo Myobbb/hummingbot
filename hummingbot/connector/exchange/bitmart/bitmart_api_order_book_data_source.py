@@ -777,19 +777,19 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     
                     self.logger().warning(
                         f"BitMart {trading_pair}: One-sided staleness detected - {stale_side} stale for {stale_duration}s "
-                        f"while {'bids' if stale_side == 'asks' else 'asks'} updating. Refreshing snapshot."
+                        f"while {'bids' if stale_side == 'asks' else 'asks'} updating. Requesting snapshot (non-blocking)."
                     )
                     
                     # Don't need to resubscribe, just refresh snapshot to get both sides fresh
-                    # Mark waiting for snapshot to drop intermediate diffs
-                    self._waiting_for_snapshot[trading_pair] = True
-                    self._waiting_for_snapshot_since[trading_pair] = now
-                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                    # IMPORTANT: Don't block updates - request snapshot in background
+                    # The snapshot will fix any staleness when it arrives, but updates keep flowing
+                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
                     
                 except Exception as e:
                     self.logger().warning(f"BitMart {trading_pair}: Failed to refresh snapshot for one-sided staleness: {e}")
         
-        # Handle periodic refresh (preventive maintenance)
+        # Handle periodic refresh (preventive maintenance - defensive, not required by protocol)
+        # This is completely non-blocking: fire-and-forget background requests
         if periodic_refresh_pairs:
             # Limit number of refreshes per cycle to avoid bursts
             refresh_batch = periodic_refresh_pairs[:5]  # Max 5 per cycle
@@ -800,17 +800,19 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     last_snapshot_ts = self._last_snapshot_refresh_ts.get(trading_pair, 0)
                     elapsed = int(now - last_snapshot_ts) if last_snapshot_ts > 0 else 0
                     
-                    self.logger().info(
+                    # DEBUG only - no need to spam logs for routine maintenance
+                    self.logger().debug(
                         f"BitMart {trading_pair}: Periodic snapshot refresh ({elapsed}s since last refresh)"
                     )
                     
-                    # Mark waiting for snapshot to ensure clean state
-                    self._waiting_for_snapshot[trading_pair] = True
-                    self._waiting_for_snapshot_since[trading_pair] = now
-                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                    # CRITICAL: Don't set _waiting_for_snapshot - this would block updates!
+                    # Just fire-and-forget the snapshot request in background
+                    # The snapshot will arrive and update the orderbook without blocking live updates
+                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
                     
                 except Exception as e:
-                    self.logger().debug(f"BitMart {trading_pair}: Periodic refresh failed: {e}")
+                    # Silence errors - periodic refresh is optional defensive measure
+                    pass
 
     async def listen_for_subscriptions(self):
         """
