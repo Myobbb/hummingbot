@@ -55,6 +55,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Pending buy-in tracking
         dict _pending_buyin_by_asset
         dict _pending_buyin_orders
+
+        # Optimistic balance tracking (prevents stale balance reads with rapid orders)
+        dict _optimistic_balance_adjustments
+        dict _optimistic_balance_orders
         
         
         # Order tracking - single unified map

@@ -69,6 +69,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._last_failure_timestamps = {}
         self._pending_buyin_by_asset = {}
         self._pending_buyin_orders = {}
+        self._optimistic_balance_adjustments = {}
+        self._optimistic_balance_orders = {}
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
         # Keep recent order -> market pair mapping for late events
@@ -616,12 +618,23 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if cooldown_tuple is None:
                 return
 
+        # Clear optimistic balance adjustment BEFORE early return (critical for MARKET orders)
+        try:
+            pend_opt = self._optimistic_balance_orders.pop(order_id, None)
+            if pend_opt is not None:
+                asset_key, amt = pend_opt
+                self._optimistic_balance_adjustments[asset_key] = self._optimistic_balance_adjustments.get(asset_key, 0.0) + amt
+                if abs(self._optimistic_balance_adjustments.get(asset_key, 0.0)) < 1e-10:
+                    self._optimistic_balance_adjustments.pop(asset_key, None)
+        except Exception:
+            pass
+
         # Check if we've already processed this order's completion
         # This prevents duplicate logging for partial fills
         if self._completed_orders.find(order_id_str) != self._completed_orders.end():
             # Already processed - this is normal for market orders (late exchange confirmation)
             return
-            
+
         try:
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str)
@@ -732,7 +745,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
         except Exception:
             pass
         self._sb_order_tracker.c_stop_tracking_market_order(market_pair, order_id)
-        
+
+        # Clear optimistic balance adjustment for cancelled order
+        try:
+            pend_opt = self._optimistic_balance_orders.pop(order_id, None)
+            if pend_opt is not None:
+                asset_key, amt = pend_opt
+                self._optimistic_balance_adjustments[asset_key] = self._optimistic_balance_adjustments.get(asset_key, 0.0) + amt
+                if abs(self._optimistic_balance_adjustments.get(asset_key, 0.0)) < 1e-10:
+                    self._optimistic_balance_adjustments.pop(asset_key, None)
+        except Exception:
+            pass
+
         # Clean up pending buy-in tracking if applicable
         try:
             pend = self._pending_buyin_orders.pop(order_id, None)
@@ -794,6 +818,16 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     f"cooling down for {self._order_timeout:.0f}s")
             except Exception:
                 pass
+        except Exception:
+            pass
+        # Clear optimistic balance adjustment for failed order
+        try:
+            pend_opt = self._optimistic_balance_orders.pop(order_id, None)
+            if pend_opt is not None:
+                asset_key, amt = pend_opt
+                self._optimistic_balance_adjustments[asset_key] = self._optimistic_balance_adjustments.get(asset_key, 0.0) + amt
+                if abs(self._optimistic_balance_adjustments.get(asset_key, 0.0)) < 1e-10:
+                    self._optimistic_balance_adjustments.pop(asset_key, None)
         except Exception:
             pass
 
@@ -982,6 +1016,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
         
         # Safety cap: re-check sell venue's live available base and re-quantize to prevent oversold at submission time
         sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+        sell_available_now = max(0.0, sell_available_now + self._optimistic_balance_adjustments.get(sell_market_tuple.base_asset, 0.0))
         # Only do extra work if available shrank below our planned amount
         if sell_available_now + 1e-15 < float(quantized_amount):
             sell_cap_dec = Decimal(str(max(0.0, sell_available_now - QUANTIZATION_EPSILON)))
@@ -1014,6 +1049,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
 
         # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability
         buy_quote_available_now = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+        buy_quote_available_now = max(0.0, buy_quote_available_now + self._optimistic_balance_adjustments.get(buy_market_tuple.quote_asset, 0.0))
         buy_required_quote = float(quantized_amount) * buy_price
         if buy_quote_available_now + 1e-15 < buy_required_quote:
             # Reduce to affordable base amount and re-quantize both sides accordingly
@@ -1089,6 +1125,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     order_type=buy_order_type,
                     price=buy_price_decimal,
                     expiration_seconds=self._next_trade_delay)
+                # Track optimistic balance adjustment
+                try:
+                    quote_asset = buy_market_tuple.quote_asset
+                    spent_amount = float(quantized_amount) * float(buy_price_decimal)
+                    self._optimistic_balance_orders[buy_order_id] = (quote_asset, spent_amount)
+                    self._optimistic_balance_adjustments[quote_asset] = self._optimistic_balance_adjustments.get(quote_asset, 0.0) - spent_amount
+                except Exception:
+                    pass
             except Exception as e:
                 try:
                     self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
@@ -1107,6 +1151,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     order_type=sell_order_type,
                     price=sell_price_decimal,
                     expiration_seconds=self._next_trade_delay)
+                # Track optimistic balance adjustment
+                try:
+                    base_asset = sell_market_tuple.base_asset
+                    sold_amount = float(quantized_amount)
+                    self._optimistic_balance_orders[sell_order_id] = (base_asset, sold_amount)
+                    self._optimistic_balance_adjustments[base_asset] = self._optimistic_balance_adjustments.get(base_asset, 0.0) - sold_amount
+                except Exception:
+                    pass
             except Exception as e:
                 try:
                     self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
@@ -1194,6 +1246,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Fetch balances only after passing the gate
         buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+        # Apply optimistic adjustments to prevent stale balance reads
+        buy_quote_balance = max(0.0, buy_quote_balance + self._optimistic_balance_adjustments.get(buy_market_tuple.quote_asset, 0.0))
+        sell_base_balance = max(0.0, sell_base_balance + self._optimistic_balance_adjustments.get(sell_market_tuple.base_asset, 0.0))
         if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
 
@@ -1512,6 +1567,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 order_type=order_type,
                 price=Decimal(str(buy_price)),
                 expiration_seconds=self._next_trade_delay)
+            # Track optimistic balance adjustment
+            try:
+                quote_asset = buy_market_tuple.quote_asset
+                spent_amount = float(quantized_amount) * buy_price
+                self._optimistic_balance_orders[buy_order_id] = (quote_asset, spent_amount)
+                self._optimistic_balance_adjustments[quote_asset] = self._optimistic_balance_adjustments.get(quote_asset, 0.0) - spent_amount
+            except Exception:
+                pass
         except Exception as e:
             try:
                 self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
@@ -1672,12 +1735,23 @@ cdef class ArbitrageMStrategy(StrategyBase):
             # Also remove from completed orders set
             self._completed_orders.erase(order_id_str)
 
-            # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount 
+            # Best-effort cleanup: decode order_id for Python dict lookups
             try:
                 oid = order_id_str.decode('utf-8')
             except Exception:
                 oid = None
             if oid is not None:
+                # Clear optimistic balance adjustment
+                try:
+                    pend_opt = self._optimistic_balance_orders.pop(oid, None)
+                    if pend_opt is not None:
+                        asset_key, amt = pend_opt
+                        self._optimistic_balance_adjustments[asset_key] = self._optimistic_balance_adjustments.get(asset_key, 0.0) + amt
+                        if abs(self._optimistic_balance_adjustments.get(asset_key, 0.0)) < 1e-10:
+                            self._optimistic_balance_adjustments.pop(asset_key, None)
+                except Exception:
+                    pass
+                # Clear pending buy-in tracking
                 try:
                     pend = self._pending_buyin_orders.pop(oid, None)
                     if pend is not None:
