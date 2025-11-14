@@ -407,6 +407,21 @@ class BitmartExchange(ExchangePyBase):
                 execution_data = event_message.get("data", [])
 
                 # Refer to https://developer-pro.bitmart.com/en/spot/#private-order-progress
+                # Expected message format:
+                # {
+                #   "data": [{
+                #     "symbol": "BTC_USDT",
+                #     "side": "buy",
+                #     "type": "market",
+                #     "order_state": "partially_filled",
+                #     "filled_size": "1.0000000000",
+                #     "ms_t": "1609926028000",
+                #     "order_id": "2147857398",
+                #     "client_order_id": "order4872191",
+                #     ...
+                #   }],
+                #   "table": "spot/user/order" or "spot/user/orders"
+                # }
                 if event_type in (CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME,
                                   CONSTANTS.PRIVATE_ORDER_PROGRESS_ALL_CHANNEL_NAME):
                     for each_event in execution_data:
@@ -483,31 +498,48 @@ class BitmartExchange(ExchangePyBase):
                             self.logger().exception("Unexpected error in user stream listener loop.")
 
                 # Refer to https://developer-pro.bitmart.com/en/spot/#private-balance-change
+                # Expected message format:
+                # {
+                #   "data": [{
+                #     "event_type": "TRANSACTION_COMPLETED",
+                #     "event_time": "1693364237000",
+                #     "balance_details": [{
+                #       "ccy": "BTC",
+                #       "av_bal": "123.22",
+                #       "fz_bal": "12.56"
+                #     }]
+                #   }],
+                #   "table": "spot/user/balance"
+                # }
                 elif event_type == CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME:
                     for balance_event in execution_data:
                         try:
-                            details = balance_event.get("balance_details") or []
-                            if isinstance(details, list) and len(details) > 0:
-                                for detail in details:
-                                    asset_name = str(detail.get("ccy") or detail.get("currency") or "")
-                                    available_str = str(detail.get("av_bal") or detail.get("available") or "0")
-                                    frozen_str = str(detail.get("fz_bal") or detail.get("frozen") or "0")
-                                    available = Decimal(available_str)
-                                    frozen = Decimal(frozen_str)
-                                    if asset_name:
-                                        self._account_available_balances[asset_name] = available
-                                        self._account_balances[asset_name] = available + frozen
-                            else:
-                                asset_name = str(balance_event.get("ccy") or balance_event.get("currency") or "")
-                                available_str = str(balance_event.get("av_bal") or balance_event.get("available") or "0")
-                                frozen_str = str(balance_event.get("fz_bal") or balance_event.get("frozen") or "0")
+                            # Balance details is always an array per BitMart API specification
+                            details = balance_event.get("balance_details")
+                            if not isinstance(details, list):
+                                self.logger().warning(f"Invalid balance_details format in message: {balance_event}")
+                                continue
+
+                            for detail in details:
+                                # Support both current and legacy field names for robustness
+                                asset_name = str(detail.get("ccy") or detail.get("currency") or "")
+                                available_str = str(detail.get("av_bal") or detail.get("available") or "0")
+                                frozen_str = str(detail.get("fz_bal") or detail.get("frozen") or "0")
+
+                                if not asset_name:
+                                    self.logger().warning(f"Missing asset name in balance update: {detail}")
+                                    continue
+
                                 available = Decimal(available_str)
                                 frozen = Decimal(frozen_str)
-                                if asset_name:
-                                    self._account_available_balances[asset_name] = available
-                                    self._account_balances[asset_name] = available + frozen
+
+                                self._account_available_balances[asset_name] = available
+                                self._account_balances[asset_name] = available + frozen
+
+                        except asyncio.CancelledError:
+                            raise
                         except Exception:
-                            # Ignore malformed entries but keep processing
+                            self.logger().exception("Unexpected error processing balance update")
                             continue
             except asyncio.CancelledError:
                 raise

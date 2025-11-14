@@ -44,7 +44,14 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Creates an instance of WSAssistant connected to the exchange
+        Creates an instance of WSAssistant connected to the exchange and authenticates.
+
+        Login format per BitMart API specification:
+        {"op": "login", "args": ["<API_KEY>", "<timestamp>", "<sign>"]}
+
+        Where sign = HmacSHA256(timestamp + "#" + api_memo + "#" + "bitmart.WebSocket", secret)
+
+        Refer to: https://developer-pro.bitmart.com/en/spot/#private-login
         """
 
         ws: WSAssistant = await self._get_ws_assistant()
@@ -56,9 +63,10 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
             ws_headers={"Accept-Encoding": "gzip"},  #not really needed, but it's here for completeness
         )
 
+        # Build login request per API specification
         payload = {
             "op": "login",
-            "args": self._auth.websocket_login_parameters()
+            "args": self._auth.websocket_login_parameters()  # Returns [api_key, timestamp, signature]
         }
 
         login_request: WSJSONRequest = WSJSONRequest(payload=payload)
@@ -86,9 +94,26 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return ws
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
+        """
+        Subscribe to private WebSocket channels per BitMart API specification.
+
+        Order Progress Channel:
+        - Format: {"op": "subscribe", "args": ["spot/user/orders:ALL_SYMBOLS"]}
+        - Receives updates for all trading pairs
+
+        Balance Update Channel:
+        - Format: {"op": "subscribe", "args": ["spot/user/balance:BALANCE_UPDATE"]}
+        - Receives balance changes for all currencies
+
+        Refer to: https://developer-pro.bitmart.com/en/spot/#private-channels
+        """
         try:
             # Subscribe to private order progress for ALL symbols (simplifies when tracking many pairs)
+            # Format: "spot/user/orders:ALL_SYMBOLS"
             order_topics = [f"{CONSTANTS.PRIVATE_ORDER_PROGRESS_ALL_CHANNEL_NAME}:ALL_SYMBOLS"]
+
+            # Subscribe to balance updates for all currencies
+            # Format: "spot/user/balance:BALANCE_UPDATE"
             balance_topic = [CONSTANTS.PRIVATE_BALANCE_CHANNEL_NAME + ":BALANCE_UPDATE"]
 
             async def send_chunked(topics: List[str]):
@@ -107,7 +132,7 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.logger().exception("Unexpected error occurred subscribing to order book trading and delta streams...")
+            self.logger().exception("Unexpected error occurred subscribing to private channels...")
             raise
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
