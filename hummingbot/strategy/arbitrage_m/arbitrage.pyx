@@ -1069,17 +1069,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
-            
+
+            # CRITICAL: Set global cooldown timestamp BEFORE placing orders
+            # This prevents race conditions where orders fail async but next tick already started
+            self._last_global_trade_timestamp = order_start_time
+
             # CRITICAL: Place both orders with minimal latency
             # The price is passed even for market orders as some connectors use it
             # to calculate the correct amount (especially for quote currency market orders)
-            
+
             # Pre-calculate all parameters to minimize latency between orders
             # Use cached taker order type if available to avoid Python lookups
             buy_order_type = self._taker_order_type_by_market.get(buy_market, buy_market.get_taker_order_type())
             sell_order_type = self._taker_order_type_by_market.get(sell_market, sell_market.get_taker_order_type())
             # Prices already prepared above as Decimal for quantization
-            
+
             # Execute both orders in rapid succession
             # This is the best we can do in Cython without async support
             # The actual network calls happen inside the exchange connectors
@@ -1099,7 +1103,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 except Exception:
                     pass
                 return
-            
+
             # Immediately place the sell order - minimal delay
             try:
                 sell_order_id = self.c_sell_with_specific_market(
@@ -1117,15 +1121,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 except Exception:
                     pass
                 return
-            
+
             # Track orders
             buy_id_str = self._to_cpp_str(buy_order_id)
             sell_id_str = self._to_cpp_str(sell_order_id)
 
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
-
-            self._last_global_trade_timestamp = order_start_time
 
             if buy_order_type == OrderType.MARKET:
                 self._completed_orders.insert(buy_id_str)
@@ -1505,6 +1507,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return False
             return False
 
+        # CRITICAL: Set global cooldown timestamp BEFORE placing order
+        # This prevents race conditions where order fails async but next tick already started
+        self._last_global_trade_timestamp = self._current_timestamp
+
         try:
             buy_order_id = self.c_buy_with_specific_market(
                 buy_market_tuple,
@@ -1526,7 +1532,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
-        self._last_global_trade_timestamp = self._current_timestamp
 
         # Track pending base to avoid stale underestimation until fills settle
         try:
