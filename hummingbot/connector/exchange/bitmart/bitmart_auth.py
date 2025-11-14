@@ -73,6 +73,15 @@ class BitmartAuth(AuthBase):
         return header
 
     def websocket_login_parameters(self) -> List[str]:
+        """
+        Generate WebSocket login parameters per BitMart API specification.
+
+        Returns: [api_key, timestamp, signature]
+
+        Where signature = HmacSHA256(timestamp + "#" + api_memo + "#" + "bitmart.WebSocket", secret)
+
+        Refer to: https://developer-pro.bitmart.com/en/spot/#private-login
+        """
         timestamp = str(int(self.time_provider.time() * 1e3))
 
         return [
