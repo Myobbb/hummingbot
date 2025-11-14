@@ -68,7 +68,6 @@ class BitmartAuth(AuthBase):
             "X-BM-KEY": self.api_key,
             "X-BM-SIGN": sign,
             "X-BM-TIMESTAMP": timestamp,
-            "X-BM-BROKER-ID": CONSTANTS.BROKER_ID,
         }
 
         return header

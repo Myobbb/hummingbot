@@ -580,8 +580,8 @@ class ExecutorOrchestrator:
         report = PerformanceReport()
         cached_report = self.cached_performance.get(controller_id, PerformanceReport())
 
-        # Start with cached values (from DB)
-        report.realized_pnl_quote = cached_report.realized_pnl_quote
+        # Start with cached values (from DB) - skip P&L since it's disabled
+        # report.realized_pnl_quote = cached_report.realized_pnl_quote  # DISABLED
         report.volume_traded = cached_report.volume_traded
         report.close_type_counts = cached_report.close_type_counts.copy() if cached_report.close_type_counts else {}
 
@@ -591,10 +591,12 @@ class ExecutorOrchestrator:
 
         for executor in active_executors:
             executor_info = executor.executor_info
-            if not executor_info.is_done:
-                report.unrealized_pnl_quote += executor_info.net_pnl_quote
-            else:
-                report.realized_pnl_quote += executor_info.net_pnl_quote
+            # DISABLED: Skip P&L accumulation since it will be forced to zero anyway
+            # if not executor_info.is_done:
+            #     report.unrealized_pnl_quote += executor_info.net_pnl_quote
+            # else:
+            #     report.realized_pnl_quote += executor_info.net_pnl_quote
+            if executor_info.is_done:
                 if executor_info.close_type:
                     report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type, 0) + 1
 
@@ -613,21 +615,19 @@ class ExecutorOrchestrator:
                 position.connector_name, position.trading_pair, PriceType.MidPrice)
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
-            # Update report with position data
-            report.realized_pnl_quote += position_summary.realized_pnl_quote - position_summary.cum_fees_quote
+            # Update report with position data (exclude fees/PnL as they are disabled)
             report.volume_traded += position_summary.volume_traded_quote
-            report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
             positions_summary.append(position_summary)
 
         # Set the positions summary (don't use dynamic attribute)
         report.positions_summary = positions_summary
 
-        # Calculate global PNL values
-        report.global_pnl_quote = report.unrealized_pnl_quote + report.realized_pnl_quote
-        report.global_pnl_pct = (report.global_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
-
-        # Calculate individual PNL percentages
-        report.unrealized_pnl_pct = (report.unrealized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
-        report.realized_pnl_pct = (report.realized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
+        # Force all PnL metrics to zero
+        report.unrealized_pnl_quote = Decimal("0")
+        report.realized_pnl_quote = Decimal("0")
+        report.global_pnl_quote = Decimal("0")
+        report.unrealized_pnl_pct = Decimal("0")
+        report.realized_pnl_pct = Decimal("0")
+        report.global_pnl_pct = Decimal("0")
 
         return report
