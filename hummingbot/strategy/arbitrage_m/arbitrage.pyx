@@ -625,29 +625,24 @@ cdef class ArbitrageMStrategy(StrategyBase):
         try:
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str)
+
             # Clean fill marker since completion supersedes partials
             try:
                 self._orders_with_fills.discard(order_id)
             except Exception:
                 pass
+
             # If any cooldown was set earlier for this market tuple due to cancel/timeout, remove it now
-            try:
-                if cooldown_tuple is not None and cooldown_tuple in self._last_failure_timestamps:
-                    self._last_failure_timestamps.pop(cooldown_tuple, None)
-                    try:
-                        self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            
-            
+            if cooldown_tuple is not None and cooldown_tuple in self._last_failure_timestamps:
+                self._last_failure_timestamps.pop(cooldown_tuple, None)
+                self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
+
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
                 self.logger().info(f"{market_pair_tuple[0].name}: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
                 self._order_timestamps.erase(order_id_str)
-            
+
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(
                     logging.DEBUG,
@@ -664,7 +659,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self._pending_buyin_by_asset.pop(asset_key, None)
                 except Exception:
                     pass
-                
+
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
@@ -680,6 +675,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._orders_with_fills.add(order_id)
         except Exception:
             pass
+
         # If we previously enforced cooldown due to cancel/timeout, remove it upon seeing fills
         market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
         if market_pair_tuple is None:
@@ -687,16 +683,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 market_pair_tuple = self._recent_order_market_pair.get(order_id)
             except Exception:
                 market_pair_tuple = None
-        if market_pair_tuple is not None:
-            try:
-                if market_pair_tuple in self._last_failure_timestamps:
-                    self._last_failure_timestamps.pop(market_pair_tuple, None)
-                    try:
-                        self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+
+        if market_pair_tuple is not None and market_pair_tuple in self._last_failure_timestamps:
+            self._last_failure_timestamps.pop(market_pair_tuple, None)
+            self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
+
         if order_type == OrderType.MARKET:
             if self._completed_orders.find(order_id_str) == self._completed_orders.end():
                 self._completed_orders.insert(order_id_str)
@@ -755,11 +746,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     self._orders_with_fills.discard(order_id)
                 except Exception:
                     pass
-                try:
-                    self.logger().info(
-                        f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was cancelled after fills - treating as complete (no cooldown)")
-                except Exception:
-                    pass
+                self.logger().info(
+                    f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was cancelled after fills - treating as complete (no cooldown)")
             else:
                 # No fills at all -> enforce cooldown like a failure
                 self._last_failure_timestamps[market_pair] = self._current_timestamp
@@ -786,16 +774,12 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
         if market_pair_tuple is None:
             return
-        try:
-            self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp
-            try:
-                self.logger().warning(
-                    f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
-                    f"cooling down for {self._order_timeout:.0f}s")
-            except Exception:
-                pass
-        except Exception:
-            pass
+
+        # CRITICAL: Set failure timestamp to enforce cooldown
+        self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp
+        self.logger().warning(
+            f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
+            f"cooling down for {self._order_timeout:.0f}s")
 
     cdef void c_check_all_order_timeouts(self):
         """Check ALL pending orders for timeouts, regardless of which markets are being considered for trading"""
@@ -891,10 +875,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 if time_left > 0:
                     return False
                 else:
-                    try:
-                        self._last_failure_timestamps.pop(market_tuple, None)
-                    except Exception:
-                        pass
+                    # Cooldown expired - auto-clean
+                    self._last_failure_timestamps.pop(market_tuple, None)
 
         return True
 
@@ -1069,17 +1051,21 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
-            
+
+            # CRITICAL: Set global cooldown timestamp BEFORE placing orders
+            # This prevents race conditions where orders fail async but next tick already started
+            self._last_global_trade_timestamp = order_start_time
+
             # CRITICAL: Place both orders with minimal latency
             # The price is passed even for market orders as some connectors use it
             # to calculate the correct amount (especially for quote currency market orders)
-            
+
             # Pre-calculate all parameters to minimize latency between orders
             # Use cached taker order type if available to avoid Python lookups
             buy_order_type = self._taker_order_type_by_market.get(buy_market, buy_market.get_taker_order_type())
             sell_order_type = self._taker_order_type_by_market.get(sell_market, sell_market.get_taker_order_type())
             # Prices already prepared above as Decimal for quantization
-            
+
             # Execute both orders in rapid succession
             # This is the best we can do in Cython without async support
             # The actual network calls happen inside the exchange connectors
@@ -1090,16 +1076,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     price=buy_price_decimal,
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
-                try:
-                    self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
-                except Exception:
-                    pass
-                try:
-                    self.logger().warning(f"Error submitting buy order to {buy_market.name}: {e}")
-                except Exception:
-                    pass
+                # CRITICAL: Set failure timestamp to enforce cooldown
+                self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
+                self.logger().warning(f"Error submitting buy order to {buy_market.name}: {e}")
                 return
-            
+
             # Immediately place the sell order - minimal delay
             try:
                 sell_order_id = self.c_sell_with_specific_market(
@@ -1108,24 +1089,18 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     price=sell_price_decimal,
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
-                try:
-                    self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
-                except Exception:
-                    pass
-                try:
-                    self.logger().warning(f"Error submitting sell order to {sell_market.name}: {e}")
-                except Exception:
-                    pass
+                # CRITICAL: Set failure timestamp to enforce cooldown
+                # Note: Buy order may have been placed - will timeout/cancel naturally
+                self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
+                self.logger().warning(f"Error submitting sell order to {sell_market.name}: {e}")
                 return
-            
+
             # Track orders
             buy_id_str = self._to_cpp_str(buy_order_id)
             sell_id_str = self._to_cpp_str(sell_order_id)
 
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
-
-            self._last_global_trade_timestamp = order_start_time
 
             if buy_order_type == OrderType.MARKET:
                 self._completed_orders.insert(buy_id_str)
@@ -1505,6 +1480,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return False
             return False
 
+        # CRITICAL: Set global cooldown timestamp BEFORE placing order
+        # This prevents race conditions where order fails async but next tick already started
+        self._last_global_trade_timestamp = self._current_timestamp
+
         try:
             buy_order_id = self.c_buy_with_specific_market(
                 buy_market_tuple,
@@ -1513,20 +1492,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 price=Decimal(str(buy_price)),
                 expiration_seconds=self._next_trade_delay)
         except Exception as e:
-            try:
-                self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
-            except Exception:
-                pass
-            try:
-                self.logger().warning(f"Error submitting buy-in order to {market.name}: {e}")
-            except Exception:
-                pass
+            # CRITICAL: Set failure timestamp to enforce cooldown
+            self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
+            self.logger().warning(f"Error submitting buy-in order to {market.name}: {e}")
             return False
 
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
-        self._last_global_trade_timestamp = self._current_timestamp
 
         # Track pending base to avoid stale underestimation until fills settle
         try:
