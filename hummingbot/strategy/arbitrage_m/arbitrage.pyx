@@ -700,10 +700,15 @@ cdef class ArbitrageMStrategy(StrategyBase):
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
             object maybe_market_order
             bint has_any_fill = False
+            bint was_already_completed = False
 
         if market_pair is None:
             return
-        
+
+        # Check if order was already marked as completed (completion event arrived first)
+        # This prevents race condition where cancel arrives after completion
+        was_already_completed = (self._completed_orders.find(order_id_str) != self._completed_orders.end())
+
         # Determine whether the cancelled order was a MARKET or LIMIT order
         maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
         # Consider the order as having fills if we observed any fill events for it
@@ -737,8 +742,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     self._pending_buyin_by_asset.pop(asset_key, None)
         except Exception:
             pass
-        # Decide cooldown/logging based on order type and fill state
-        if maybe_market_order is not None:
+        # Decide cooldown/logging based on completion status, order type and fill state
+        if was_already_completed:
+            # Order was already marked as completed before cancel event arrived
+            # This is a race condition - treat as successful, no cooldown
+            try:
+                self._orders_with_fills.discard(order_id)
+            except Exception:
+                pass
+            self.logger().info(
+                f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} completed before cancel event - treating as complete (no cooldown)")
+        elif maybe_market_order is not None:
             # MARKET order cancellation
             # If the market order had any fill(s), treat as complete and DO NOT enforce cooldown
             if has_any_fill:
@@ -836,6 +850,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             except Exception:
                                 pass
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                            # Clean up pending buy-in tracking if applicable
+                            try:
+                                pend = self._pending_buyin_orders.pop(order_id, None)
+                                if pend is not None:
+                                    asset_key, amt = pend
+                                    self._pending_buyin_by_asset[asset_key] = max(
+                                        0.0,
+                                        float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
+                                    )
+                                    if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                                        self._pending_buyin_by_asset.pop(asset_key, None)
+                            except Exception:
+                                pass
                             if has_any_fill:
                                 try:
                                     self._orders_with_fills.discard(order_id)
@@ -852,6 +879,19 @@ cdef class ArbitrageMStrategy(StrategyBase):
                             self._order_timestamps.erase(order_id_str)
                             self._completed_orders.erase(order_id_str)  # Remove from completed if it was there
                             self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                            # Clean up pending buy-in tracking if applicable
+                            try:
+                                pend = self._pending_buyin_orders.pop(order_id, None)
+                                if pend is not None:
+                                    asset_key, amt = pend
+                                    self._pending_buyin_by_asset[asset_key] = max(
+                                        0.0,
+                                        float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
+                                    )
+                                    if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                                        self._pending_buyin_by_asset.pop(asset_key, None)
+                            except Exception:
+                                pass
                             # Enforce failure cooldown for this market
                             self._last_failure_timestamps[market_tuple] = self._current_timestamp
 
@@ -1023,7 +1063,13 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 q_sell2 = sell_market.quantize_order_amount(
                     sell_market_tuple.trading_pair,
                     sell_req2)
-            quantized_amount = min(quantized_amount, q_buy2, q_sell2)
+            # Handle potential None from quantization
+            if q_buy2 is not None and q_sell2 is not None:
+                quantized_amount = min(quantized_amount, q_buy2, q_sell2)
+            elif q_buy2 is not None:
+                quantized_amount = min(quantized_amount, q_buy2)
+            elif q_sell2 is not None:
+                quantized_amount = min(quantized_amount, q_sell2)
 
         # Apply max_order_size cap from trading rules
         try:
@@ -1039,6 +1085,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pass  # Fail gracefully if trading rules unavailable; balance caps already applied
 
         # Check minimum order size after any safety caps
+        # NOTE: volume_usd is notional value in sell market quote currency, not necessarily USD
+        # _min_order_usd should be configured in same units as the quote currency
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self._min_order_usd:
             return
@@ -1227,7 +1275,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
             avg_buy_price = total_cost / total_base
             profitability = ((avg_sell_price_orig * conv_rate) / avg_buy_price - 1.0) if avg_buy_price > 0 else 0.0
             
-            # Check minimum notional
+            # Check minimum notional (in sell market quote currency)
+            # NOTE: _min_order_usd should match quote currency units
             if avg_sell_price_orig * total_base >= self._min_order_usd:
                 return (total_base, profitability, avg_sell_price_orig, avg_buy_price)
         
@@ -1473,6 +1522,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             pass  # Fail gracefully if trading rules unavailable
 
         # Enforce minimum notional like normal arbitrage orders
+        # NOTE: volume_usd is notional value in buy market quote currency, not necessarily USD
         cdef double volume_usd = float(quantized_amount) * buy_price
         if volume_usd < self._min_order_usd:
             # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
@@ -1505,8 +1555,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         try:
             self._pending_buyin_orders[buy_order_id] = (asset_key, float(quantized_amount))
             self._pending_buyin_by_asset[asset_key] = float(self._pending_buyin_by_asset.get(asset_key, 0.0)) + float(quantized_amount)
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger().warning(f"Failed to track pending buy-in for order {buy_order_id}: {e}")
 
         # MARKET ORDERS: Assume instant fill - only track briefly to catch cancellations
         if order_type == OrderType.MARKET:
@@ -1673,6 +1723,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     keys_to_drop.append(mp_tuple)
             for k in keys_to_drop:
                 self._last_failure_timestamps.pop(k, None)
+        except Exception:
+            pass
+
+        # Cleanup stale recent order mappings for orders that were just cleaned
+        try:
+            for order_id_str in to_remove:
+                try:
+                    oid = order_id_str.decode('utf-8')
+                    self._recent_order_market_pair.pop(oid, None)
+                except Exception:
+                    pass
         except Exception:
             pass
 
