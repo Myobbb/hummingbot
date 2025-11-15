@@ -954,6 +954,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
         Execute arbitrage trade
 
         """
+        # CRITICAL SAFEGUARD: Prevent double execution at the same timestamp
+        # This protects against multiple strategy instances or rapid tick cycles
+        if self._last_global_trade_timestamp == self._current_timestamp:
+            self.logger().warning(
+                f"Skipping duplicate arbitrage execution at timestamp {self._current_timestamp:.3f} "
+                f"(already executed this tick)")
+            return
+
         cdef:
             tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
             double amount = <double>result[0]
@@ -1439,6 +1447,14 @@ cdef class ArbitrageMStrategy(StrategyBase):
         using the same amount-finding logic as arbitrage execution, gated by a separate buy-in profitability.
         Returns True if a buy-in was placed; False otherwise.
         """
+        # CRITICAL SAFEGUARD: Prevent double execution at the same timestamp
+        # This protects against multiple strategy instances or rapid tick cycles
+        if self._last_global_trade_timestamp == self._current_timestamp:
+            self.logger().debug(
+                f"Skipping duplicate buy-in execution at timestamp {self._current_timestamp:.3f} "
+                f"(already executed this tick)")
+            return False
+
         if not self._buy_in_enabled:
             return False
         cdef:
