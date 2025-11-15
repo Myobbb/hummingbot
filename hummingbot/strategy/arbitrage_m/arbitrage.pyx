@@ -962,6 +962,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 f"(already executed this tick)")
             return
 
+        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
+        # If we wait until line 1113, a second call could slip through the check above
+        self._last_global_trade_timestamp = self._current_timestamp
+
         cdef:
             tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
             double amount = <double>result[0]
@@ -1107,10 +1111,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
-
-            # CRITICAL: Set global cooldown timestamp BEFORE placing orders
-            # This prevents race conditions where orders fail async but next tick already started
-            self._last_global_trade_timestamp = order_start_time
 
             # CRITICAL: Place both orders with minimal latency
             # The price is passed even for market orders as some connectors use it
@@ -1455,6 +1455,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 f"(already executed this tick)")
             return False
 
+        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
+        # If we wait until later, a second call could slip through the check above
+        self._last_global_trade_timestamp = self._current_timestamp
+
         if not self._buy_in_enabled:
             return False
         cdef:
@@ -1545,10 +1549,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
                 return False
             return False
-
-        # CRITICAL: Set global cooldown timestamp BEFORE placing order
-        # This prevents race conditions where order fails async but next tick already started
-        self._last_global_trade_timestamp = self._current_timestamp
 
         try:
             buy_order_id = self.c_buy_with_specific_market(
