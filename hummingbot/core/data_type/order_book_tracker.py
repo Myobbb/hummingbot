@@ -146,13 +146,27 @@ class OrderBookTracker:
         '''
         Updates last trade price for all order books through REST API, it is to initiate last_trade_price and as
         fall-back mechanism for when the web socket update channel fails.
+
+        Monitors both trade events AND order book diff updates. If BOTH streams have not received updates
+        in 3 minutes, triggers REST fallback. This prevents false positives on low-volume trading pairs
+        where order book updates are streaming but no trades occur.
         '''
         await self._order_books_initialized.wait()
         while True:
             try:
-                outdateds = [t_pair for t_pair, o_book in self._order_books.items()
-                             if o_book.last_applied_trade < time.perf_counter() - (60. * 3)
-                             and o_book.last_trade_price_rest_updated < time.perf_counter() - 5]
+                # Check if BOTH trade stream AND orderbook diff stream are stale (no updates in 3 minutes)
+                # This avoids false positives on low-volume pairs where order books update but trades are rare
+                current_time = time.perf_counter()
+                three_minutes_ago = current_time - (60. * 3)
+                five_seconds_ago = current_time - 5
+
+                outdateds = [
+                    t_pair for t_pair, o_book in self._order_books.items()
+                    if (o_book.last_applied_trade < three_minutes_ago and
+                        o_book.last_applied_diff < three_minutes_ago and
+                        o_book.last_trade_price_rest_updated < five_seconds_ago)
+                ]
+
                 if outdateds:
                     args = {"trading_pairs": outdateds}
                     if self._domain is not None:
@@ -174,16 +188,60 @@ class OrderBookTracker:
 
     async def _init_order_books(self):
         """
-        Initialize order books
+        Initialize order books with timeout and error recovery.
+        
+        Note: Even if initial snapshot fetch fails/times out, we still set the ready flag
+        because WebSocket snapshots will arrive soon and populate the orderbooks.
         """
+        failed_pairs = []
         for index, trading_pair in enumerate(self._trading_pairs):
-            self._order_books[trading_pair] = await self._initial_order_book_for_trading_pair(trading_pair)
-            self._tracking_message_queues[trading_pair] = asyncio.Queue()
-            self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
-            self.logger().info(f"Initialized order book for {trading_pair}. "
-                               f"{index + 1}/{len(self._trading_pairs)} completed.")
+            try:
+                # Add timeout to prevent hanging on slow/failed snapshot requests
+                self._order_books[trading_pair] = await asyncio.wait_for(
+                    self._initial_order_book_for_trading_pair(trading_pair),
+                    timeout=30.0  # 30 second timeout per trading pair
+                )
+                self._tracking_message_queues[trading_pair] = asyncio.Queue()
+                self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
+                self.logger().info(f"Initialized order book for {trading_pair}. "
+                                   f"{index + 1}/{len(self._trading_pairs)} completed.")
+            except asyncio.TimeoutError:
+                # Snapshot fetch timed out - create empty orderbook, WebSocket will populate it
+                self.logger().warning(
+                    f"Timeout initializing order book for {trading_pair}. "
+                    f"Creating empty orderbook, will be populated by WebSocket."
+                )
+                self._order_books[trading_pair] = self.order_book_create_function()
+                self._tracking_message_queues[trading_pair] = asyncio.Queue()
+                self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
+                failed_pairs.append(trading_pair)
+            except Exception as e:
+                # Any other error - create empty orderbook
+                self.logger().error(
+                    f"Error initializing order book for {trading_pair}: {e}. "
+                    f"Creating empty orderbook, will be populated by WebSocket.",
+                    exc_info=True
+                )
+                self._order_books[trading_pair] = self.order_book_create_function()
+                self._tracking_message_queues[trading_pair] = asyncio.Queue()
+                self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
+                failed_pairs.append(trading_pair)
+            
             await self._sleep(delay=1)
+        
+        # CRITICAL: Always set the flag, even if some snapshots failed
+        # WebSocket will provide snapshots soon, so connector can still operate
         self._order_books_initialized.set()
+        
+        if failed_pairs:
+            self.logger().info(
+                f"Order book tracker ready. {len(failed_pairs)}/{len(self._trading_pairs)} pairs "
+                f"initialized with empty orderbooks (will be populated by WebSocket): {failed_pairs}"
+            )
+        else:
+            self.logger().info(
+                f"Order book tracker ready. All {len(self._trading_pairs)} pairs initialized successfully."
+            )
 
     async def _order_book_diff_router(self):
         """

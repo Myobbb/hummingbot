@@ -96,7 +96,8 @@ class BybitAuth(AuthBase):
         Generates the authentication message to start receiving messages from
         the 3 private ws channels
         """
-        expires = int((self._time() + 10000) * 1000)
+        # Per Bybit docs, expires should be greater than current time; use short-lived (+1s)
+        expires = int((self._time() + 1) * 1000)
         signature = self._generate_ws_signature(expires)
         auth_message = {
             "op": "auth",

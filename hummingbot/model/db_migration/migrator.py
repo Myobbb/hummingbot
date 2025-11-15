@@ -57,7 +57,7 @@ class Migrator:
                 new_db_handle.engine.dispose()
                 if migration_successful:
                     move(new_db_path, original_db_path)
-                db_handle.__init__(SQLConnectionType.TRADE_FILLS, original_db_path, original_db_name, True)
+                db_handle.__init__(client_config_map, SQLConnectionType.TRADE_FILLS, original_db_path, original_db_name, True)
             except Exception as e:
                 logging.getLogger().error(f"Fatal error migrating DB {original_db_path}")
                 raise e

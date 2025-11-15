@@ -22,10 +22,7 @@ class StopCommand:
         self.logger().info("stop command initiated.")
         self.notify("\nWinding down...")
 
-        # Restore App Nap on macOS.
-        if platform.system() == "Darwin":
-            import appnope
-            appnope.nap()
+
 
         # Handle script strategy specific cleanup first
         if self.trading_core.strategy and isinstance(self.trading_core.strategy, ScriptStrategyBase):
@@ -39,29 +36,11 @@ class StopCommand:
         if not skip_order_cancellation:
             await self.trading_core.cancel_outstanding_orders()
 
-        # Remove all connectors
-        connector_names = list(self.trading_core.connectors.keys())
-        for name in connector_names:
-            try:
-                self.trading_core.remove_connector(name)
-            except Exception as e:
-                self.logger().error(f"Error stopping connector {name}: {e}")
+        # Keep clock running to preserve connector state (order books, user streams, etc.)
+        # This allows the strategy to be restarted with 'start' without re-importing
 
-        # Stop clock if running
-        if self.trading_core._is_running:
-            await self.trading_core.stop_clock()
+        # Note: We do NOT stop the clock or connectors here to allow quick restart
+        # The connectors stay connected and ready, enabling seamless restart
 
-        # Stop markets recorder
-        if self.trading_core.markets_recorder:
-            self.trading_core.markets_recorder.stop()
-            self.trading_core.markets_recorder = None
-
-        # Clear strategy references
-        self.trading_core.strategy = None
-        self.trading_core.strategy_name = None
-        self.trading_core.strategy_config_map = None
-        self.trading_core._strategy_file_name = None
-        self.trading_core._config_source = None
-        self.trading_core._config_data = None
-
-        self.notify("Hummingbot stopped.")
+        # Preserve strategy metadata and connectors to avoid unloading on stop
+        self.notify("Strategy stopped.")
