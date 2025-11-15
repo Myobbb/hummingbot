@@ -379,49 +379,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info(f"MultiStrategyOrchestrator initialized with {len(self.strategies)} strategies")
         self.logger().info(f"Shared connectors: {list(self.connectors.keys())}")
-
-        # Validate no market overlap between strategies (could cause double orders)
-        self._validate_no_market_overlap()
-
         self.logger().info("")
         self._show_runtime_help()
-
-    def _validate_no_market_overlap(self):
-        """
-        Check if multiple strategies are trading the same market pairs.
-        This could cause double orders if not properly coordinated.
-        """
-        # Build map of (exchange, trading_pair) -> list of strategy names
-        market_to_strategies = {}
-
-        for strategy_instance in self.strategies:
-            strategy_name = strategy_instance.name
-            for market_tuple in strategy_instance.market_pairs:
-                key = (market_tuple.market.name, market_tuple.trading_pair)
-                if key not in market_to_strategies:
-                    market_to_strategies[key] = []
-                market_to_strategies[key].append(strategy_name)
-
-        # Check for overlaps
-        overlaps_found = False
-        for (exchange, pair), strategies in market_to_strategies.items():
-            if len(strategies) > 1:
-                overlaps_found = True
-                self.logger().warning(
-                    f"CRITICAL: Multiple strategies trading {exchange}:{pair}: {strategies}. "
-                    f"This violates the design assumption that each strategy has unique markets. "
-                    f"Double orders are possible!"
-                )
-
-        if overlaps_found:
-            self.logger().error(
-                "=" * 70 + "\n"
-                "CRITICAL CONFIGURATION ERROR DETECTED\n"
-                "Multiple strategies are configured to trade the same markets.\n"
-                "This violates the orchestrator's design and WILL cause double orders!\n"
-                "Please ensure each strategy has completely unique market pairs.\n"
-                + "=" * 70
-            )
 
     def _show_runtime_help(self):
         """Display runtime control help message."""
@@ -467,15 +426,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             config: Strategy configuration
             paused: Whether to start the strategy in paused state (useful for runtime additions)
         """
-        # CRITICAL: Check for duplicate strategy names to prevent double orders
-        existing_names = [s.name for s in self.strategies]
-        if config.name in existing_names:
-            self.logger().error(
-                f"CRITICAL: Strategy '{config.name}' already exists! "
-                f"This would cause double orders. Skipping duplicate."
-            )
-            return
-
         self.logger().info(f"Adding arbitrage_m strategy: {config.name}")
 
         # Validate connectors exist
