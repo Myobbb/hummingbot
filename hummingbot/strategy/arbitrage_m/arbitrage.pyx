@@ -479,17 +479,20 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double best_profitability = 0.0
 
         try:
-            # Check market readiness (skip in orchestrated mode - orchestrator handles this)
+            # Check market readiness 
             if not self._orchestrated_mode:
+                # Normal mode: full readiness check with logging
                 if not self.c_check_markets_ready(should_report):
                     return
-            elif not self._all_markets_ready:
-                # In orchestrated mode, mark as ready without redundant checks
-                # The orchestrator has already verified all connectors are ready
-                self._all_markets_ready = True
-                # Perform one-time buy-in check (orchestrator coordinates this)
-                if self._buy_in_enabled:
-                    self.c_scan_and_mark_buyin_completion()
+            else:
+                # Orchestrated mode: check connectivity but skip redundant logging/buy-in
+                if not self.c_check_markets_ready_orchestrated():
+                    return
+                # Mark ready and do one-time buy-in check if not done yet
+                if not self._all_markets_ready:
+                    self._all_markets_ready = True
+                    if self._buy_in_enabled:
+                        self.c_scan_and_mark_buyin_completion()
 
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
@@ -587,6 +590,25 @@ cdef class ArbitrageMStrategy(StrategyBase):
                 return False
         
         return True
+
+    cdef bint c_check_markets_ready_orchestrated(self):
+        """
+        Orchestrated mode readiness check: connectivity only, no logging/buy-in.
+        
+        This ensures individual strategies still detect disconnections in orchestrated mode
+        while avoiding redundant logging that the orchestrator handles.
+        """
+        # Check basic market readiness
+        if not all([market.ready for market in self._sb_markets]):
+            return False
+        
+        # Check network connectivity - this is crucial for disconnection detection
+        for market in self._sb_markets:
+            if market.network_status is not NetworkStatus.CONNECTED:
+                return False
+        
+        return True
+
     cdef double c_get_reference_bid_for_asset(self, str asset_key):
         """Return a non-zero bid for the given base asset from any active market tuple, or 0.0 if none."""
         cdef:

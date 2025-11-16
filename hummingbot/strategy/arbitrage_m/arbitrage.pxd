@@ -74,6 +74,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
     # Core methods
     cdef void _validate_configuration(self)
     cdef bint c_check_markets_ready(self, bint should_report)
+    cdef bint c_check_markets_ready_orchestrated(self)
     cdef bint c_ready_for_new_orders(self, list market_tuples)
     cdef string _to_cpp_str(self, object py_str)
     
