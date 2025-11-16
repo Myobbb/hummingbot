@@ -672,11 +672,23 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # CRITICAL FIX: Register all connectors with the clock for network monitoring
         # Without this, connector._check_network_loop() never starts!
         registered_count = 0
-        for connector in self.connectors.values():
-            if connector not in clock._child_iterators:
-                clock.add_iterator(connector)
-                registered_count += 1
-                self.logger().info(f"Registered connector {connector.name} with clock for network monitoring")
+        for connector_name, connector in self.connectors.items():
+            try:
+                # Check if connector is already registered with clock
+                if connector not in clock._child_iterators:
+                    self.logger().info(f"Registering connector {connector_name} with clock for network monitoring")
+                    clock.add_iterator(connector)
+                    registered_count += 1
+                    
+                    # Verify the network monitoring task was created
+                    if hasattr(connector, '_check_network_task') and connector._check_network_task:
+                        self.logger().debug(f"Network monitoring task created for {connector_name}")
+                    else:
+                        self.logger().warning(f"Network monitoring task not found for {connector_name}")
+                else:
+                    self.logger().debug(f"Connector {connector_name} already registered with clock")
+            except Exception as e:
+                self.logger().error(f"Failed to register connector {connector_name} with clock: {e}", exc_info=True)
         
         if registered_count > 0:
             self.logger().info(f"Registered {registered_count} connectors with clock - network monitoring started")
