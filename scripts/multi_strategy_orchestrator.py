@@ -273,6 +273,7 @@ class V1StrategyInstance:
     config: Dict
     market_pairs: List[MarketTradingPairTuple]
     paused: bool = False  # Runtime pause state
+    _last_ready_state: bool = False  # Track ready transitions for this strategy
 
 
 class ArbitrageMInstanceConfig(BaseModel):
@@ -578,39 +579,54 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def tick(self, timestamp: float):
         """
-        Leverage ScriptStrategyBase readiness checking pattern.
+        Coordinated initialization on startup, per-strategy readiness during operation.
 
-        ScriptStrategyBase.tick() already implements the correct pattern:
-        - Checks ready_to_trade = all(ex.ready for ex in self.connectors.values())
-        - Only calls on_tick() when ready
-        - This single check replaces 40-50 individual strategy checks
+        Flow:
+        1. Initial startup: Wait for ALL connectors to be ready, run coordinated init
+        2. Normal operation: Call on_tick() which handles per-strategy readiness
+        3. Full reconnection: If ALL connectors reconnect, run coordinated init again
+
+        This enables:
+        - Coordinated initialization when all markets first become ready
+        - Per-strategy operation during partial disconnections
+        - Coordinated re-initialization after full reconnection
         """
-        # Check both connector readiness AND network status
-        # connector.ready checks orderbooks/balances but NOT network_status
-        prev_ready = self.ready_to_trade
-        self.ready_to_trade = all(
+        # Check if ALL connectors are ready (for coordinated initialization only)
+        all_connectors_ready = all(
             ex.ready and ex.network_status == NetworkStatus.CONNECTED
             for ex in self.connectors.values()
         )
 
-        # Detect state transitions
-        if not self.ready_to_trade:
-            # Not ready - reset notification flags for next ready transition
-            if prev_ready:
-                # Transition from ready -> not ready (disconnection detected)
-                self.logger().warning("Connectors disconnected - pausing all strategies")
-                self._markets_ready_notified = False  # Reset for next reconnection
-                self._buy_in_initialized = False  # Reset buy-in check for reconnection
-            return  # Skip tick when not ready
-
-        # All connectors ready and connected
+        # Handle initial coordinated initialization
         if not self._markets_ready_notified:
-            # First transition to ready (startup or reconnection)
-            self._on_markets_ready(timestamp)
-            self._markets_ready_notified = True
-            return  # Skip this tick to let initialization settle
+            # Still waiting for first "all ready" event
+            if all_connectors_ready:
+                # First time ALL connectors are ready - run coordinated init
+                self._on_markets_ready(timestamp)
+                self._markets_ready_notified = True
+                self.ready_to_trade = True
+                return  # Skip this tick to let initialization settle
+            else:
+                # Not all ready yet - skip tick
+                return
 
-        # Normal operation - delegate to on_tick
+        # After initial startup, always call on_tick()
+        # Individual strategies will check their own connector readiness
+        # This allows unaffected strategies to continue during partial disconnections
+
+        # Track full disconnection/reconnection for coordinated re-init
+        prev_global_ready = self.ready_to_trade
+        self.ready_to_trade = all_connectors_ready
+
+        if self.ready_to_trade and not prev_global_ready:
+            # Full reconnection after full disconnection
+            self.logger().info("All connectors reconnected - running coordinated re-initialization")
+            # Reset buy-in flag so it runs again on reconnection
+            self._buy_in_initialized = False
+            self._on_markets_ready(timestamp)
+            return  # Skip this tick for re-initialization
+
+        # Normal operation - call on_tick which handles per-strategy readiness
         self.on_tick()
 
     def _on_markets_ready(self, timestamp: float):
@@ -695,24 +711,72 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._strategies_started = True
         self.logger().info("All strategies started successfully")
 
+    def _get_strategy_connectors(self, strategy_instance: V1StrategyInstance) -> Set[ConnectorBase]:
+        """Get the unique set of connectors used by a strategy."""
+        connectors = set()
+        for market_pair in strategy_instance.market_pairs:
+            connectors.add(market_pair.market)
+        return connectors
+
+    def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
+        """
+        Check if a strategy's specific connectors are ready.
+
+        This enables partial disconnection handling - a strategy only pauses
+        if ITS connectors are down, not if unrelated connectors disconnect.
+        """
+        strategy_connectors = self._get_strategy_connectors(strategy_instance)
+
+        # Strategy is ready if ALL of its connectors are ready and connected
+        return all(
+            connector.ready and connector.network_status == NetworkStatus.CONNECTED
+            for connector in strategy_connectors
+        )
+
     def on_tick(self):
         """
-        Main tick function - tick all strategies.
+        Main tick function - tick all strategies with per-strategy readiness.
 
-        Each strategy's c_tick() is called independently. The strategies share
-        the same connectors but maintain separate state and logic.
+        Each strategy is ticked independently and only pauses if ITS specific
+        connectors are not ready. This allows unaffected strategies to continue
+        trading during partial disconnections.
 
-        Note: ready_to_trade is already checked by the inherited tick() method
-        from ScriptStrategyBase, so we don't need to check it again here.
+        Example: Strategy A uses Binance+KuCoin, Strategy B uses Gate.io+Mexc
+        If Gate.io disconnects: Strategy A continues, Strategy B pauses
         """
         # Get current timestamp from TimeIterator property
-        # This was set by TimeIterator.c_tick() before tick() was called
         current_timestamp = self.current_timestamp
 
-        # Tick each strategy independently (skip paused strategies)
+        # Tick each strategy independently with per-strategy readiness check
         for strategy_instance in self.strategies:
-            # Skip ticking if strategy is paused
+            # Skip if manually paused
             if strategy_instance.paused:
+                continue
+
+            # Check if THIS strategy's connectors are ready
+            strategy_ready = self._is_strategy_ready(strategy_instance)
+
+            # Detect ready state transitions for this strategy
+            if strategy_ready != strategy_instance._last_ready_state:
+                if strategy_ready:
+                    # Transition: not ready -> ready (reconnection)
+                    self.logger().info(
+                        f"Strategy '{strategy_instance.name}' connectors ready - resuming"
+                    )
+                else:
+                    # Transition: ready -> not ready (disconnection)
+                    affected_connectors = [
+                        c.name for c in self._get_strategy_connectors(strategy_instance)
+                        if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
+                    ]
+                    self.logger().warning(
+                        f"Strategy '{strategy_instance.name}' paused - connectors not ready: "
+                        f"{', '.join(affected_connectors)}"
+                    )
+                strategy_instance._last_ready_state = strategy_ready
+
+            # Only tick if strategy's connectors are ready
+            if not strategy_ready:
                 continue
 
             try:
