@@ -726,8 +726,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         This queries wallet balances ONCE for all strategies instead of
         40-50 individual queries, significantly speeding up reconnection.
         """
-        # Check if any strategy has buy-in enabled
-        buy_in_strategies = [s for s in self.strategies if s.strategy._buy_in_enabled]
+        # Check if any strategy has buy-in enabled (with defensive check for recompilation)
+        buy_in_strategies = []
+        for s in self.strategies:
+            try:
+                if hasattr(s.strategy, '_buy_in_enabled') and s.strategy._buy_in_enabled:
+                    buy_in_strategies.append(s)
+            except AttributeError:
+                # Strategy not yet recompiled - skip buy-in check for now
+                continue
 
         if not buy_in_strategies:
             return
