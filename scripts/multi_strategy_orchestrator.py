@@ -1520,7 +1520,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             # Normal operation - use original simple counting
             running_count = sum(1 for s in self.strategies if not s.paused)
             paused_count = sum(1 for s in self.strategies if s.paused)
-            lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
+
+            # Diagnostic: check if strategies list is empty
+            if len(self.strategies) == 0:
+                lines.append(f"\nNo strategies loaded. Check your configuration file.")
+                lines.append(f"Config file: {self.config.config_file_path if hasattr(self.config, 'config_file_path') else 'Unknown'}")
+                lines.append(f"Expected format: 'arbitrage_m_strategies' list in YAML")
+            else:
+                lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
 
         # Balances
         balance_df = self.get_balance_df()
