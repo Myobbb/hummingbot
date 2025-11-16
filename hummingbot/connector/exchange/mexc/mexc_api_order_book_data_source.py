@@ -106,7 +106,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Process messages from all active connections concurrently
                 if self._active_connections:
                     tasks = [
-                        self._process_websocket_messages(websocket_assistant=conn.ws_assistant)
+                        asyncio.create_task(self._process_websocket_messages(websocket_assistant=conn.ws_assistant))
                         for conn in self._active_connections
                     ]
                     # Wait for any task to complete (usually means connection closed)
