@@ -390,6 +390,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.config: MultiStrategyOrchestratorConfig = config
         self.ready_to_trade: bool = False
 
+        # DEBUG: Log config details
+        self.logger().info(f"DEBUG: Config type: {type(config)}")
+        self.logger().info(f"DEBUG: Config markets: {config.markets if hasattr(config, 'markets') else 'NO MARKETS ATTR'}")
+        self.logger().info(f"DEBUG: Config arbitrage_m_strategies type: {type(config.arbitrage_m_strategies) if hasattr(config, 'arbitrage_m_strategies') else 'NO ATTR'}")
+        self.logger().info(f"DEBUG: Number of strategies in config: {len(config.arbitrage_m_strategies) if hasattr(config, 'arbitrage_m_strategies') else 'NO ATTR'}")
+
         # Storage for V1 strategy instances
         self.strategies: List[V1StrategyInstance] = []
         self._strategies_started: bool = False
@@ -435,9 +441,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def _initialize_arbitrage_m_strategies(self):
         """Initialize all arbitrage_m strategy instances"""
-        for strategy_config in self.config.arbitrage_m_strategies:
+        self.logger().info(f"DEBUG: _initialize_arbitrage_m_strategies called")
+        self.logger().info(f"DEBUG: Looping over {len(self.config.arbitrage_m_strategies)} strategy configs")
+
+        for i, strategy_config in enumerate(self.config.arbitrage_m_strategies):
+            self.logger().info(f"DEBUG: Processing strategy {i+1}: {strategy_config.name if hasattr(strategy_config, 'name') else 'NO NAME'}")
             try:
                 self._add_arbitrage_m_strategy(strategy_config)
+                self.logger().info(f"DEBUG: Successfully added strategy {i+1}")
             except Exception as e:
                 self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
 
