@@ -32,6 +32,11 @@ MEXC_USER_STREAM_PATH_URL = "/userDataStream"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
+# Websocket subscription limits
+# https://www.mexc.com/api-docs/spot-v3/websocket-market-streams
+# One ws connection supports a maximum of 30 subscriptions
+WS_MAX_SUBSCRIPTIONS_PER_CONNECTION = 30
+
 # Mexc params
 
 SIDE_BUY = "BUY"

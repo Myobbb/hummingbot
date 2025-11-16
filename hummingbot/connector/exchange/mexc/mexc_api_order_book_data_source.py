@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from . import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
 from .mexc_order_book import MexcOrderBook
+from .mexc_websocket_subscription_manager import MexcWebsocketSubscriptionManager, WSConnectionInfo
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
@@ -34,6 +35,11 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        
+        # Initialize websocket subscription manager for handling multiple connections
+        self._ws_manager = MexcWebsocketSubscriptionManager(api_factory, domain)
+        self._ws_manager.set_connector(connector)
+        self._active_connections: List[WSConnectionInfo] = []
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -66,35 +72,17 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
-        Subscribes to the trade events and diff orders events through the provided websocket connection.
-        :param ws: the websocket assistant used to connect to the exchange
+        This method is called by the base class but we override it to use our subscription manager.
+        The ws parameter is ignored since we manage our own connections.
         """
         try:
-            trade_params = []
-            depth_params = []
-            for trading_pair in self._trading_pairs:
-                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                # Prefer protobuf channels with interval hints
-                trade_params.append(f"spot@public.aggre.deals.v3.api.pb@10ms@{symbol}")
-                depth_params.append(f"spot@public.aggre.depth.v3.api.pb@100ms@{symbol}")
-            payload = {
-                "method": "SUBSCRIPTION",
-                "params": trade_params,
-                "id": 1
-            }
-            subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=payload)
-
-            payload = {
-                "method": "SUBSCRIPTION",
-                "params": depth_params,
-                "id": 2
-            }
-            subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=payload)
-
-            await ws.send(subscribe_trade_request)
-            await ws.send(subscribe_orderbook_request)
-
-            self.logger().info("Subscribed to public order book and trade channels...")
+            # Use the subscription manager to handle multiple connections
+            self._active_connections = await self._ws_manager.subscribe_to_pairs(self._trading_pairs)
+            
+            # Log subscription summary
+            summary = self._ws_manager.get_subscription_summary()
+            self.logger().info(f"MEXC subscription summary: {summary}")
+            
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -104,7 +92,71 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             raise
 
+    async def listen_for_subscriptions(self):
+        """
+        Override the base class method to handle multiple websocket connections.
+        """
+        while True:
+            try:
+                # Create a dummy websocket for the base class _subscribe_channels call
+                # This will trigger our custom subscription logic
+                dummy_ws = await self._api_factory.get_ws_assistant()
+                await self._subscribe_channels(dummy_ws)
+                
+                # Process messages from all active connections concurrently
+                if self._active_connections:
+                    tasks = [
+                        self._process_websocket_messages(websocket_assistant=conn.ws_assistant)
+                        for conn in self._active_connections
+                    ]
+                    # Wait for any task to complete (usually means connection closed)
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    
+                    # Cancel remaining tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Check if any task completed with an exception
+                    for task in done:
+                        try:
+                            await task
+                        except Exception as e:
+                            self.logger().warning(f"Websocket connection closed: {e}")
+                            break
+                else:
+                    self.logger().warning("No active websocket connections")
+                    await asyncio.sleep(5)
+                    
+            except asyncio.CancelledError:
+                raise
+            except ConnectionError as connection_exception:
+                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+            except Exception:
+                self.logger().exception(
+                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
+                )
+                await asyncio.sleep(5.0)
+            finally:
+                # Clean up connections
+                await self._cleanup_connections()
+
+    async def _cleanup_connections(self):
+        """Clean up websocket connections"""
+        try:
+            await self._ws_manager.close_all_connections()
+            self._active_connections.clear()
+        except Exception as e:
+            self.logger().warning(f"Error during connection cleanup: {e}")
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
+        """
+        This method is still needed by the base class but we don't use it directly.
+        Our subscription manager handles connection creation.
+        """
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         # Try new endpoint first, then fallback to legacy
         try:

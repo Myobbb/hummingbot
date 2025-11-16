@@ -9,7 +9,6 @@ while sharing websocket connections to the same exchanges. This provides:
 3. Memory Savings: Order books and market data cached once and shared
 4. Compatibility: Works with existing V1 Cython strategies without modification
 5. Runtime Control: Pause/resume individual strategies without stopping the bot
-6. Coordinated Initialization: Single readiness check for 40-50 strategies (vs. 40-50 individual checks)
 
 Architecture:
 -----------
@@ -30,19 +29,6 @@ How Websocket Sharing Works:
 4. Connector broadcasts events to all registered listeners
 5. Strategies operate independently, sharing the underlying connection
 
-Websocket Subscription Limits:
------------------------------
-Different exchanges have limits on subscriptions per websocket connection:
-- MEXC: 30 subscriptions per connection (2 per trading pair: trade + depth)
-- BingX: 200 subscriptions per connection
-- OKX: 240 subscriptions per hour
-
-The orchestrator automatically handles these limits:
-- MEXC: Uses MexcWebsocketSubscriptionManager for multiple connections when needed
-- Other exchanges: Enhanced connectors respect their specific limits
-- Automatic connection distribution when limits are exceeded
-- Graceful degradation with warnings when limits cannot be accommodated
-
 Critical Implementation Details:
 -------------------------------
 FIXED - Lifecycle Management:
@@ -59,37 +45,8 @@ Event Listener Pattern:
 Clock Management:
 - Orchestrator is registered with clock (only orchestrator, not individual strategies)
 - Orchestrator's start() is called by clock → starts all V1 strategies
-- Orchestrator's tick() delegates to ScriptStrategyBase.tick() → calls on_tick() when ready
+- Orchestrator's on_tick() is called by clock → manually ticks all V1 strategies
 - Orchestrator's on_stop() is called by clock → stops all V1 strategies
-
-FIXED - Websocket Reconnection Handling:
-----------------------------------------
-- Orchestrator now properly delegates to ScriptStrategyBase.tick() for connector lifecycle
-- This restores the critical websocket reconnection logic that individual strategies depend on
-- ScriptStrategyBase.tick() continuously monitors connector.ready status and updates ready_to_trade
-- Individual strategies receive proper readiness gating through orchestrated_mode parameter
-
-Optimizations for 40-50 Strategies (Reconnection Performance):
----------------------------------------------------------------
-1. Coordinated Initialization:
-   - Single coordinated initialization when ALL connectors first become ready
-   - Coordinated re-initialization after full reconnection events
-   - Prevents redundant startup logic across 40-50 strategies
-
-2. Coordinated Buy-in Initialization:
-   - Single wallet balance query when markets become ready
-   - Orchestrator coordinates buy-in checks for all strategies
-   - Prevents 40-50 simultaneous wallet queries on reconnection
-
-3. Optimized Readiness Checking:
-   - Individual strategies use orchestrated_mode for streamlined readiness checks
-   - Reduces redundant logging while preserving connectivity detection
-   - Maintains per-strategy readiness handling for partial disconnections
-
-4. Framework Pattern Compliance:
-   - Properly leverages ScriptStrategyBase.tick() readiness pattern
-   - Follows hummingbot framework best practices for connector lifecycle
-   - Minimal changes to existing arbitrage_m strategy
 
 Example Usage:
 -------------
@@ -148,7 +105,6 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict
-from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.strategy.arbitrage_m.arbitrage import ArbitrageMStrategy
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -403,7 +359,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Orchestrator doesn't need event listeners - only V1 strategies do
         from hummingbot.strategy.strategy_py_base import StrategyPyBase
         StrategyPyBase.__init__(self)
-
+        
         # Set attributes that ScriptStrategyBase.__init__() would set
         self.connectors: Dict[str, ConnectorBase] = connectors
         self.config: MultiStrategyOrchestratorConfig = config
@@ -413,14 +369,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.strategies: List[V1StrategyInstance] = []
         self._strategies_started: bool = False
         self._strategy_clock = None
-
-        # Track initialization errors for diagnostics
-        self._init_errors: List[Tuple[str, str]] = []  # (strategy_name, error_message)
-        self._available_connectors: Set[str] = set(connectors.keys()) if connectors else set()
-
-        # Orchestrator-level readiness coordination (optimization for 40-50 strategies)
-        self._markets_ready_notified: bool = False
-        self._buy_in_initialized: bool = False
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -456,54 +404,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """Show runtime control help (can be called from console)."""
         self._show_runtime_help()
 
-    def _validate_config_structure(self):
-        """Validate configuration structure and return diagnostic information"""
-        issues = []
-        
-        # Check if config has the required sections
-        if not hasattr(self.config, 'arbitrage_m_strategies'):
-            issues.append("Missing 'arbitrage_m_strategies' section in config")
-        elif not self.config.arbitrage_m_strategies:
-            issues.append("'arbitrage_m_strategies' section is empty")
-        
-        if not hasattr(self.config, 'markets'):
-            issues.append("Missing 'markets' section in config")
-        elif not self.config.markets:
-            issues.append("'markets' section is empty")
-        
-        # Validate individual strategies
-        if hasattr(self.config, 'arbitrage_m_strategies') and self.config.arbitrage_m_strategies:
-            for i, strategy_config in enumerate(self.config.arbitrage_m_strategies):
-                required_fields = ['name', 'primary_market', 'secondary_market', 
-                                 'primary_trading_pair', 'secondary_trading_pair']
-                
-                missing_fields = []
-                for field in required_fields:
-                    if not hasattr(strategy_config, field) or not getattr(strategy_config, field):
-                        missing_fields.append(field)
-                
-                if missing_fields:
-                    strategy_name = getattr(strategy_config, 'name', f'strategy_{i}')
-                    issues.append(f"Strategy '{strategy_name}' missing fields: {', '.join(missing_fields)}")
-        
-        return issues
-
     def _initialize_arbitrage_m_strategies(self):
         """Initialize all arbitrage_m strategy instances"""
-        # First validate config structure
-        config_issues = self._validate_config_structure()
-        if config_issues:
-            for issue in config_issues:
-                self._init_errors.append(("CONFIG_VALIDATION", issue))
-                self.logger().error(f"Configuration issue: {issue}")
-            return
-        
         for strategy_config in self.config.arbitrage_m_strategies:
             try:
                 self._add_arbitrage_m_strategy(strategy_config)
             except Exception as e:
-                error_msg = str(e)
-                self._init_errors.append((strategy_config.name, error_msg))
                 self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
@@ -522,26 +428,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """
         self.logger().info(f"Adding arbitrage_m strategy: {config.name}")
 
-        # Validate connectors exist with detailed error information
-        missing_connectors = []
+        # Validate connectors exist
         if config.primary_market not in self.connectors:
-            missing_connectors.append(config.primary_market)
+            raise ValueError(f"Primary market '{config.primary_market}' not in connector pool")
         if config.secondary_market not in self.connectors:
-            missing_connectors.append(config.secondary_market)
-        
-        # Check additional markets
-        for additional in config.additional_markets:
-            if ":" in additional:
-                exchange = additional.split(":", 1)[0].lower()
-                if exchange not in self.connectors:
-                    missing_connectors.append(exchange)
-        
-        if missing_connectors:
-            available = sorted(self.connectors.keys())
-            raise ValueError(
-                f"Missing connectors: {', '.join(set(missing_connectors))}. "
-                f"Available: {', '.join(available)}"
-            )
+            raise ValueError(f"Secondary market '{config.secondary_market}' not in connector pool")
 
         # Build market tuples from shared connectors
         market_tuples = []
@@ -607,7 +498,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Initialize strategy parameters
         # This will call c_add_markets() which registers event listeners on shared connectors
-        # CRITICAL: Set orchestrated_mode=True to skip redundant readiness checks
         strategy.init_params(
             market_pairs=market_pairs,
             min_profitability=config.min_profitability / Decimal("100"),  # Convert percentage to decimal
@@ -626,7 +516,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             buy_in_enabled=config.buy_in_enabled,
             buy_in_target_usd=config.buy_in_target_usd,
             buy_in_min_profitability=float(config.buy_in_min_profitability) / 100.0,
-            orchestrated_mode=True,  # Enable orchestrated mode for coordinated readiness checking
         )
 
         # Store strategy instance
@@ -659,115 +548,20 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def tick(self, timestamp: float):
         """
-        Delegate to ScriptStrategyBase.tick() for proper connector lifecycle management,
-        with coordinated initialization enhancements.
-
-        This restores the critical websocket reconnection handling that individual
-        strategies depend on, while preserving coordinated initialization benefits.
+        Delegate readiness gating to ScriptStrategyBase. It will call on_tick() only when all connectors are ready.
         """
-        # Check if ALL connectors are ready (for coordinated initialization only)
-        all_connectors_ready = all(
-            ex.ready and ex.network_status == NetworkStatus.CONNECTED
-            for ex in self.connectors.values()
-        )
-
-        # Handle initial coordinated initialization
-        if not self._markets_ready_notified and all_connectors_ready:
-            # First time ALL connectors are ready - run coordinated init
-            self._on_markets_ready(timestamp)
-            self._markets_ready_notified = True
-            # Don't return - let ScriptStrategyBase.tick() handle the rest
-
-        # Track full disconnection/reconnection for coordinated re-init
-        prev_global_ready = getattr(self, '_prev_all_ready', False)
-        self._prev_all_ready = all_connectors_ready
-
-        if all_connectors_ready and not prev_global_ready and self._markets_ready_notified:
-            # Full reconnection after full disconnection
-            self.logger().info("All connectors reconnected - running coordinated re-initialization")
-            # Reset buy-in flag so it runs again on reconnection
-            self._buy_in_initialized = False
-            self._on_markets_ready(timestamp)
-            # Don't return - let ScriptStrategyBase.tick() handle the rest
-
-        # CRITICAL: Delegate to ScriptStrategyBase.tick() for proper connector lifecycle management
-        # This ensures websocket reconnections are handled correctly for individual strategies
         return super().tick(timestamp)
-
-    def _on_markets_ready(self, timestamp: float):
-        """
-        Coordinated initialization when markets become ready.
-
-        This performs ONE-TIME initialization for all strategies:
-        1. Log market ready status (once for all strategies)
-        2. Perform coordinated buy-in initialization (single wallet query)
-        3. Notify strategies that markets are ready
-
-        This replaces 40-50 individual strategy readiness checks and buy-in scans.
-        """
-        self.logger().info("=" * 70)
-        self.logger().info("MARKETS READY - Coordinated Initialization")
-        self.logger().info("=" * 70)
-
-        # Show connector status
-        for name, connector in self.connectors.items():
-            status = connector.status_dict
-            self.logger().info(f"{name}: {status}")
-
-        # Coordinated buy-in initialization (if any strategy has it enabled)
-        if not self._buy_in_initialized:
-            self._perform_coordinated_buy_in_check()
-            self._buy_in_initialized = True
-
-        self.logger().info("=" * 70)
-        self.logger().info("Markets ready. Trading started.")
-        self.logger().info("=" * 70)
-
-    def _perform_coordinated_buy_in_check(self):
-        """
-        Perform buy-in completion check at orchestrator level.
-
-        This queries wallet balances ONCE for all strategies instead of
-        40-50 individual queries, significantly speeding up reconnection.
-        """
-        # Check if any strategy has buy-in enabled (with defensive check for recompilation)
-        buy_in_strategies = []
-        for s in self.strategies:
-            try:
-                if hasattr(s.strategy, '_buy_in_enabled') and s.strategy._buy_in_enabled:
-                    buy_in_strategies.append(s)
-            except AttributeError:
-                # Strategy not yet recompiled - skip buy-in check for now
-                continue
-
-        if not buy_in_strategies:
-            return
-
-        self.logger().info(f"Coordinated buy-in check for {len(buy_in_strategies)} strategies...")
-
-        # Perform coordinated buy-in completion scan for each enabled strategy
-        # This calls the strategy's existing buy-in logic but only ONCE when markets are ready
-        for strategy_instance in buy_in_strategies:
-            try:
-                strategy = strategy_instance.strategy
-                if hasattr(strategy, 'c_scan_and_mark_buyin_completion'):
-                    strategy.c_scan_and_mark_buyin_completion()
-            except Exception as e:
-                self.logger().warning(
-                    f"Error in buy-in check for '{strategy_instance.name}': {e}",
-                    exc_info=True
-                )
 
     def _start_all_strategies_if_needed(self):
         """
         Start all V1 strategies with the clock.
-
+        
         Note: Strategy init_params() already called c_add_markets(), so event listeners
         are registered. We just need to call start() to activate them.
         """
         if self._strategies_started:
             return
-
+            
         self.logger().info(f"Starting {len(self.strategies)} V1 strategies...")
         for strategy_instance in self.strategies:
             try:
@@ -783,17 +577,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._strategies_started = True
         self.logger().info("All strategies started successfully")
 
-
     def on_tick(self):
         """
         Main tick function - tick all strategies.
 
-        Now that ScriptStrategyBase.tick() handles connector readiness properly,
-        we can simplify this to just tick all non-paused strategies. The individual
-        strategies will handle their own connector readiness through the orchestrated_mode
-        parameter and the c_check_markets_ready_orchestrated() method.
+        Each strategy's c_tick() is called independently. The strategies share
+        the same connectors but maintain separate state and logic.
+
+        Note: ready_to_trade is already checked by the inherited tick() method
+        from ScriptStrategyBase, so we don't need to check it again here.
         """
         # Get current timestamp from TimeIterator property
+        # This was set by TimeIterator.c_tick() before tick() was called
         current_timestamp = self.current_timestamp
 
         # Tick each strategy independently (skip paused strategies)
@@ -804,7 +599,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             try:
                 # Call the Python-level tick() method
-                # The strategy will handle its own connector readiness via orchestrated_mode
                 strategy_instance.strategy.tick(current_timestamp)
             except Exception as e:
                 self.logger().error(
@@ -1497,83 +1291,20 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     def format_status(self) -> str:
         """
         Format status output for all strategies.
-
-        Shows per-strategy status even during partial disconnections, since
-        unaffected strategies may still be trading.
         """
-        # Check if we've completed initial startup
-        if not self._markets_ready_notified:
-            # Initial startup - still waiting for first coordinated initialization
-            not_ready = [name for name, c in self.connectors.items()
-                        if not (c.ready and c.network_status == NetworkStatus.CONNECTED)]
+        if not self.ready_to_trade:
+            # Show only non-ready connectors if available
+            not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
             if not_ready:
-                return "\n".join(["Waiting for connectors to initialize:"] + [f"  {n}" for n in not_ready])
-            return "Market connectors are initializing..."
+                return "\n".join(["Connectors not ready:"] + [f"  {n}" for n in not_ready])
+            return "Market connectors are not ready."
 
         lines = []
 
-        # Connector Status Summary (show which connectors are down during partial disconnection)
-        all_connectors_ready = all(
-            c.ready and c.network_status == NetworkStatus.CONNECTED
-            for c in self.connectors.values()
-        )
-
         # Strategy Status Summary
-        # During normal operation: simple count of non-paused strategies
-        # During partial disconnection: show which connectors are down
-        if not all_connectors_ready:
-            # Partial disconnection - show detailed breakdown
-            not_ready = [
-                name for name, c in self.connectors.items()
-                if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
-            ]
-            lines.append(f"\n⚠ Partial Disconnection - Connectors down: {', '.join(not_ready)}")
-            lines.append(f"  (Individual strategies handle their own readiness)")
-
-            # Simple counting during partial disconnection
-            running_count = sum(1 for s in self.strategies if not s.paused)
-            paused_count = sum(1 for s in self.strategies if s.paused)
-            lines.append(f"\nStrategies: {running_count} active, {paused_count} paused (manual)")
-        else:
-            # Normal operation - use original simple counting
-            running_count = sum(1 for s in self.strategies if not s.paused)
-            paused_count = sum(1 for s in self.strategies if s.paused)
-
-            # Diagnostic: check if strategies list is empty
-            if len(self.strategies) == 0:
-                lines.append(f"\n⚠ No strategies loaded!")
-                lines.append(f"Config file: {self.config.config_file_path if hasattr(self.config, 'config_file_path') else 'Unknown'}")
-                
-                # Show configuration diagnostics
-                config_strategies = getattr(self.config, 'arbitrage_m_strategies', [])
-                lines.append(f"Strategies in config: {len(config_strategies)}")
-                
-                if config_strategies and self._init_errors:
-                    lines.append("\nInitialization errors:")
-                    for strategy_name, error_msg in self._init_errors:
-                        # Truncate long error messages
-                        short_error = error_msg[:100] + "..." if len(error_msg) > 100 else error_msg
-                        lines.append(f"  • {strategy_name}: {short_error}")
-                
-                # Show connector diagnostics
-                if self._init_errors:
-                    required_connectors = set()
-                    for strategy_config in config_strategies:
-                        required_connectors.add(getattr(strategy_config, 'primary_market', None))
-                        required_connectors.add(getattr(strategy_config, 'secondary_market', None))
-                    required_connectors.discard(None)
-                    
-                    missing_connectors = required_connectors - self._available_connectors
-                    if missing_connectors:
-                        lines.append(f"\nMissing connectors: {', '.join(sorted(missing_connectors))}")
-                        lines.append(f"Available connectors: {', '.join(sorted(self._available_connectors))}")
-                
-                if not config_strategies:
-                    lines.append("\nExpected format: 'arbitrage_m_strategies' list in YAML")
-                elif not self._init_errors:
-                    lines.append("\nNo initialization errors detected. Check logs for details.")
-            else:
-                lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
+        running_count = sum(1 for s in self.strategies if not s.paused)
+        paused_count = sum(1 for s in self.strategies if s.paused)
+        lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
 
         # Balances
         balance_df = self.get_balance_df()
@@ -1597,12 +1328,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             status_blob = None
             best_prof_str = "n/a"
 
-            # Determine strategy state
+            # Show "PAUSED" instead of profitability if strategy is paused
             if strategy_instance.paused:
-                # Manually paused - always show this
                 best_prof_str = "PAUSED"
             else:
-                # Normal operation or strategy's connectors are ready - show profitability
                 try:
                     strategy = strategy_instance.strategy
                     if hasattr(strategy, 'format_status'):
