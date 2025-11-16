@@ -1,0 +1,55 @@
+# Example configuration for multi_strategy_orchestrator.py
+#
+# This demonstrates the correct YAML format for running multiple arbitrage_m strategies
+# Copy this file and modify with your own exchanges and trading pairs
+
+# STEP 1: Define all markets (exchanges and trading pairs) needed across ALL strategies
+# Format: Dict[exchange_name, List[trading_pairs]]
+markets:
+  binance:
+    - BTC-USDT
+    - ETH-USDT
+  kucoin:
+    - BTC-USDT
+    - ETH-USDT
+
+# STEP 2: Define arbitrage_m strategy instances
+# Each strategy monitors price differences between two markets
+arbitrage_m_strategies:
+  # Example 1: Simple BTC arbitrage between Binance and KuCoin
+  - name: arb_btc_binance_kucoin
+    primary_market: binance          # Must match a key in 'markets' section above
+    secondary_market: kucoin          # Must match a key in 'markets' section above
+    primary_trading_pair: BTC-USDT    # Must be in binance's list above
+    secondary_trading_pair: BTC-USDT  # Must be in kucoin's list above
+    min_profitability: 0.5            # Minimum profit percentage (0.5%)
+    use_oracle_conversion_rate: false
+    buy_in_enabled: false             # Disable automatic buy-in
+    buy_in_target_usd: 100.0
+    buy_in_min_profitability: 0.5
+    status_report_interval: 60.0
+    next_trade_delay_interval: 2.0
+    order_timeout: 300.0
+    additional_markets: []            # Optional: add more markets for multi-exchange arb
+
+  # Example 2: ETH arbitrage with additional market for triangular opportunities
+  - name: arb_eth_binance_kucoin
+    primary_market: binance
+    secondary_market: kucoin
+    primary_trading_pair: ETH-USDT
+    secondary_trading_pair: ETH-USDT
+    min_profitability: 0.5
+    use_oracle_conversion_rate: false
+    buy_in_enabled: false
+    buy_in_target_usd: 100.0
+    buy_in_min_profitability: 0.5
+    status_report_interval: 60.0
+    next_trade_delay_interval: 2.0
+    order_timeout: 300.0
+    additional_markets: []
+
+# IMPORTANT NOTES:
+# 1. All exchange names in strategies MUST exist in the 'markets' section
+# 2. All trading pairs in strategies MUST be listed under their respective exchanges
+# 3. Exchange names must match Hummingbot's connector names exactly (e.g., 'gate_io' not 'gate-io')
+# 4. Start the script with: start --script multi_strategy_orchestrator --conf multi_strategy_orchestrator_example
