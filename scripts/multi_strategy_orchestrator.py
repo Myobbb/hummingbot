@@ -1493,7 +1493,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             c.ready and c.network_status == NetworkStatus.CONNECTED
             for c in self.connectors.values()
         )
+
+        # Strategy Status Summary
+        # During normal operation: simple count of non-paused strategies
+        # During partial disconnection: detailed breakdown showing which are affected
         if not all_connectors_ready:
+            # Partial disconnection - show detailed breakdown
             not_ready = [
                 name for name, c in self.connectors.items()
                 if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
@@ -1501,16 +1506,21 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             lines.append(f"\n⚠ Partial Disconnection - Connectors down: {', '.join(not_ready)}")
             lines.append(f"  (Unaffected strategies continue trading)")
 
-        # Strategy Status Summary (counts both actively running and ready-but-paused)
-        running_count = sum(1 for s in self.strategies
-                           if not s.paused and self._is_strategy_ready(s))
-        paused_by_disconnect = sum(1 for s in self.strategies
-                                   if not s.paused and not self._is_strategy_ready(s))
-        manually_paused = sum(1 for s in self.strategies if s.paused)
+            # Count strategies by their actual state during partial disconnection
+            running_count = sum(1 for s in self.strategies
+                               if not s.paused and self._is_strategy_ready(s))
+            paused_by_disconnect = sum(1 for s in self.strategies
+                                       if not s.paused and not self._is_strategy_ready(s))
+            manually_paused = sum(1 for s in self.strategies if s.paused)
 
-        lines.append(f"\nStrategies: {running_count} trading, "
-                    f"{paused_by_disconnect} paused (connector down), "
-                    f"{manually_paused} paused (manual)")
+            lines.append(f"\nStrategies: {running_count} trading, "
+                        f"{paused_by_disconnect} paused (connector down), "
+                        f"{manually_paused} paused (manual)")
+        else:
+            # Normal operation - use original simple counting
+            running_count = sum(1 for s in self.strategies if not s.paused)
+            paused_count = sum(1 for s in self.strategies if s.paused)
+            lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
 
         # Balances
         balance_df = self.get_balance_df()
@@ -1534,18 +1544,19 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             status_blob = None
             best_prof_str = "n/a"
 
-            # Determine strategy state: manually paused, connector down, or trading
+            # Determine strategy state
             if strategy_instance.paused:
-                best_prof_str = "PAUSED (manual)"
-            elif not self._is_strategy_ready(strategy_instance):
-                # Strategy paused because its connectors are down
+                # Manually paused - always show this
+                best_prof_str = "PAUSED"
+            elif not all_connectors_ready and not self._is_strategy_ready(strategy_instance):
+                # Partial disconnection AND this strategy's connectors are down
                 affected_connectors = [
                     c.name for c in self._get_strategy_connectors(strategy_instance)
                     if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
                 ]
                 best_prof_str = f"PAUSED ({', '.join(affected_connectors)} down)"
             else:
-                # Strategy is ready and trading - show profitability
+                # Normal operation or strategy's connectors are ready - show profitability
                 try:
                     strategy = strategy_instance.strategy
                     if hasattr(strategy, 'format_status'):
