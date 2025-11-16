@@ -84,6 +84,11 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._last_rate_update = 0
         # Orchestrated mode flag (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = False
+        # Buy-in params/state - initialize defaults
+        self._buy_in_enabled = False
+        self._buy_in_target_usd = 100.0
+        self._buy_in_min_profitability = 0.005
+        self._buy_in_completed = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageMMarketPair],
