@@ -396,6 +396,20 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info(f"DEBUG: Config arbitrage_m_strategies type: {type(config.arbitrage_m_strategies) if hasattr(config, 'arbitrage_m_strategies') else 'NO ATTR'}")
         self.logger().info(f"DEBUG: Number of strategies in config: {len(config.arbitrage_m_strategies) if hasattr(config, 'arbitrage_m_strategies') else 'NO ATTR'}")
 
+        # DEBUG: Try to dump config for inspection
+        try:
+            config_dict = config.model_dump() if hasattr(config, 'model_dump') else config.dict() if hasattr(config, 'dict') else {}
+            self.logger().info(f"DEBUG: Config dict keys: {list(config_dict.keys())}")
+            self.logger().info(f"DEBUG: arbitrage_m_strategies in dict: {'arbitrage_m_strategies' in config_dict}")
+            if 'arbitrage_m_strategies' in config_dict:
+                strats = config_dict['arbitrage_m_strategies']
+                self.logger().info(f"DEBUG: arbitrage_m_strategies value type: {type(strats)}")
+                self.logger().info(f"DEBUG: arbitrage_m_strategies length: {len(strats) if isinstance(strats, (list, tuple)) else 'NOT A LIST'}")
+                if isinstance(strats, (list, tuple)) and len(strats) > 0:
+                    self.logger().info(f"DEBUG: First strategy: {strats[0] if len(strats) > 0 else 'EMPTY'}")
+        except Exception as e:
+            self.logger().error(f"DEBUG: Failed to dump config: {e}", exc_info=True)
+
         # Storage for V1 strategy instances
         self.strategies: List[V1StrategyInstance] = []
         self._strategies_started: bool = False
@@ -443,14 +457,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """Initialize all arbitrage_m strategy instances"""
         self.logger().info(f"DEBUG: _initialize_arbitrage_m_strategies called")
         self.logger().info(f"DEBUG: Looping over {len(self.config.arbitrage_m_strategies)} strategy configs")
+        self.logger().info(f"DEBUG: Available connectors: {list(self.connectors.keys())}")
 
         for i, strategy_config in enumerate(self.config.arbitrage_m_strategies):
-            self.logger().info(f"DEBUG: Processing strategy {i+1}: {strategy_config.name if hasattr(strategy_config, 'name') else 'NO NAME'}")
+            self.logger().info(f"DEBUG: Processing strategy {i+1}/{len(self.config.arbitrage_m_strategies)}: {strategy_config.name if hasattr(strategy_config, 'name') else 'NO NAME'}")
+            if hasattr(strategy_config, 'primary_market') and hasattr(strategy_config, 'secondary_market'):
+                self.logger().info(f"DEBUG:   Requires connectors: {strategy_config.primary_market}, {strategy_config.secondary_market}")
             try:
                 self._add_arbitrage_m_strategy(strategy_config)
-                self.logger().info(f"DEBUG: Successfully added strategy {i+1}")
+                self.logger().info(f"DEBUG: ✓ Successfully added strategy {i+1}: {strategy_config.name}")
             except Exception as e:
-                self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
+                self.logger().error(f"✗ Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
