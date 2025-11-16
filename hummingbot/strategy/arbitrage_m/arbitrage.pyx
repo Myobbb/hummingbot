@@ -82,6 +82,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
         self._cached_base_rate = 1.0
         self._cached_quote_rate = 1.0
         self._last_rate_update = 0
+        # Orchestrated mode flag (for multi-strategy orchestrator optimization)
+        self._orchestrated_mode = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageMMarketPair],
@@ -100,7 +102,8 @@ cdef class ArbitrageMStrategy(StrategyBase):
                     max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
                     buy_in_enabled: bool = True,
                     buy_in_target_usd: float = 100.0,
-                    buy_in_min_profitability: float = 0.005):
+                    buy_in_min_profitability: float = 0.005,
+                    orchestrated_mode: bool = False):
         """Initialize arbitrage strategy with configurable parameters"""
         
         if not market_pairs:
@@ -169,7 +172,10 @@ cdef class ArbitrageMStrategy(StrategyBase):
         # Used to de-stale holdings valuation until fills settle
         self._pending_buyin_by_asset = {}
         self._pending_buyin_orders = {}
-        
+
+        # Orchestration mode (for multi-strategy orchestrator optimization)
+        self._orchestrated_mode = orchestrated_mode
+
         # Validate and add markets
         self._validate_configuration()
         
@@ -468,9 +474,17 @@ cdef class ArbitrageMStrategy(StrategyBase):
             double best_profitability = 0.0
 
         try:
-            # Check market readiness
-            if not self.c_check_markets_ready(should_report):
-                return
+            # Check market readiness (skip in orchestrated mode - orchestrator handles this)
+            if not self._orchestrated_mode:
+                if not self.c_check_markets_ready(should_report):
+                    return
+            elif not self._all_markets_ready:
+                # In orchestrated mode, mark as ready without redundant checks
+                # The orchestrator has already verified all connectors are ready
+                self._all_markets_ready = True
+                # Perform one-time buy-in check (orchestrator coordinates this)
+                if self._buy_in_enabled:
+                    self.c_scan_and_mark_buyin_completion()
 
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
