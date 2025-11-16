@@ -395,6 +395,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._strategies_started: bool = False
         self._strategy_clock = None
 
+        # Track initialization errors for diagnostics
+        self._init_errors: List[Tuple[str, str]] = []  # (strategy_name, error_message)
+        self._available_connectors: Set[str] = set(connectors.keys()) if connectors else set()
+
         # Orchestrator-level readiness coordination (optimization for 40-50 strategies)
         self._markets_ready_notified: bool = False
         self._buy_in_initialized: bool = False
@@ -433,12 +437,54 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """Show runtime control help (can be called from console)."""
         self._show_runtime_help()
 
+    def _validate_config_structure(self):
+        """Validate configuration structure and return diagnostic information"""
+        issues = []
+        
+        # Check if config has the required sections
+        if not hasattr(self.config, 'arbitrage_m_strategies'):
+            issues.append("Missing 'arbitrage_m_strategies' section in config")
+        elif not self.config.arbitrage_m_strategies:
+            issues.append("'arbitrage_m_strategies' section is empty")
+        
+        if not hasattr(self.config, 'markets'):
+            issues.append("Missing 'markets' section in config")
+        elif not self.config.markets:
+            issues.append("'markets' section is empty")
+        
+        # Validate individual strategies
+        if hasattr(self.config, 'arbitrage_m_strategies') and self.config.arbitrage_m_strategies:
+            for i, strategy_config in enumerate(self.config.arbitrage_m_strategies):
+                required_fields = ['name', 'primary_market', 'secondary_market', 
+                                 'primary_trading_pair', 'secondary_trading_pair']
+                
+                missing_fields = []
+                for field in required_fields:
+                    if not hasattr(strategy_config, field) or not getattr(strategy_config, field):
+                        missing_fields.append(field)
+                
+                if missing_fields:
+                    strategy_name = getattr(strategy_config, 'name', f'strategy_{i}')
+                    issues.append(f"Strategy '{strategy_name}' missing fields: {', '.join(missing_fields)}")
+        
+        return issues
+
     def _initialize_arbitrage_m_strategies(self):
         """Initialize all arbitrage_m strategy instances"""
+        # First validate config structure
+        config_issues = self._validate_config_structure()
+        if config_issues:
+            for issue in config_issues:
+                self._init_errors.append(("CONFIG_VALIDATION", issue))
+                self.logger().error(f"Configuration issue: {issue}")
+            return
+        
         for strategy_config in self.config.arbitrage_m_strategies:
             try:
                 self._add_arbitrage_m_strategy(strategy_config)
             except Exception as e:
+                error_msg = str(e)
+                self._init_errors.append((strategy_config.name, error_msg))
                 self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
@@ -457,11 +503,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """
         self.logger().info(f"Adding arbitrage_m strategy: {config.name}")
 
-        # Validate connectors exist
+        # Validate connectors exist with detailed error information
+        missing_connectors = []
         if config.primary_market not in self.connectors:
-            raise ValueError(f"Primary market '{config.primary_market}' not in connector pool")
+            missing_connectors.append(config.primary_market)
         if config.secondary_market not in self.connectors:
-            raise ValueError(f"Secondary market '{config.secondary_market}' not in connector pool")
+            missing_connectors.append(config.secondary_market)
+        
+        # Check additional markets
+        for additional in config.additional_markets:
+            if ":" in additional:
+                exchange = additional.split(":", 1)[0].lower()
+                if exchange not in self.connectors:
+                    missing_connectors.append(exchange)
+        
+        if missing_connectors:
+            available = sorted(self.connectors.keys())
+            raise ValueError(
+                f"Missing connectors: {', '.join(set(missing_connectors))}. "
+                f"Available: {', '.join(available)}"
+            )
 
         # Build market tuples from shared connectors
         market_tuples = []
@@ -1523,9 +1584,37 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             # Diagnostic: check if strategies list is empty
             if len(self.strategies) == 0:
-                lines.append(f"\nNo strategies loaded. Check your configuration file.")
+                lines.append(f"\n⚠ No strategies loaded!")
                 lines.append(f"Config file: {self.config.config_file_path if hasattr(self.config, 'config_file_path') else 'Unknown'}")
-                lines.append(f"Expected format: 'arbitrage_m_strategies' list in YAML")
+                
+                # Show configuration diagnostics
+                config_strategies = getattr(self.config, 'arbitrage_m_strategies', [])
+                lines.append(f"Strategies in config: {len(config_strategies)}")
+                
+                if config_strategies and self._init_errors:
+                    lines.append("\nInitialization errors:")
+                    for strategy_name, error_msg in self._init_errors:
+                        # Truncate long error messages
+                        short_error = error_msg[:100] + "..." if len(error_msg) > 100 else error_msg
+                        lines.append(f"  • {strategy_name}: {short_error}")
+                
+                # Show connector diagnostics
+                if self._init_errors:
+                    required_connectors = set()
+                    for strategy_config in config_strategies:
+                        required_connectors.add(getattr(strategy_config, 'primary_market', None))
+                        required_connectors.add(getattr(strategy_config, 'secondary_market', None))
+                    required_connectors.discard(None)
+                    
+                    missing_connectors = required_connectors - self._available_connectors
+                    if missing_connectors:
+                        lines.append(f"\nMissing connectors: {', '.join(sorted(missing_connectors))}")
+                        lines.append(f"Available connectors: {', '.join(sorted(self._available_connectors))}")
+                
+                if not config_strategies:
+                    lines.append("\nExpected format: 'arbitrage_m_strategies' list in YAML")
+                elif not self._init_errors:
+                    lines.append("\nNo initialization errors detected. Check logs for details.")
             else:
                 lines.append(f"\nStrategies: {running_count} active, {paused_count} paused")
 
