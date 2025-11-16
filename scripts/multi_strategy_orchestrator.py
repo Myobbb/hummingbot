@@ -675,7 +675,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         for connector_name, connector in self.connectors.items():
             try:
                 # Check if connector is already registered with clock
-                if connector not in clock._child_iterators:
+                if connector not in clock.child_iterators:
                     self.logger().info(f"Registering connector {connector_name} with clock for network monitoring")
                     clock.add_iterator(connector)
                     registered_count += 1
