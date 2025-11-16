@@ -128,6 +128,7 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.strategy.arbitrage_m.arbitrage import ArbitrageMStrategy
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -584,23 +585,32 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         - Only calls on_tick() when ready
         - This single check replaces 40-50 individual strategy checks
         """
-        # Call parent tick() which handles readiness checking
-        # It will only call on_tick() when all connectors are ready
+        # Check both connector readiness AND network status
+        # connector.ready checks orderbooks/balances but NOT network_status
+        prev_ready = self.ready_to_trade
+        self.ready_to_trade = all(
+            ex.ready and ex.network_status == NetworkStatus.CONNECTED
+            for ex in self.connectors.values()
+        )
+
+        # Detect state transitions
         if not self.ready_to_trade:
-            # Before parent tick: check if we need to update ready_to_trade
-            # Parent's tick() will do this, but we intercept first ready transition
-            self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
+            # Not ready - reset notification flags for next ready transition
+            if prev_ready:
+                # Transition from ready -> not ready (disconnection detected)
+                self.logger().warning("Connectors disconnected - pausing all strategies")
+                self._markets_ready_notified = False  # Reset for next reconnection
+                self._buy_in_initialized = False  # Reset buy-in check for reconnection
+            return  # Skip tick when not ready
 
-            if self.ready_to_trade and not self._markets_ready_notified:
-                # First transition to ready - perform coordinated initialization
-                self._on_markets_ready(timestamp)
-                self._markets_ready_notified = True
-                return  # Skip this tick to let initialization settle
-            elif not self.ready_to_trade:
-                # Still not ready - log once per interval instead of per strategy
-                return
+        # All connectors ready and connected
+        if not self._markets_ready_notified:
+            # First transition to ready (startup or reconnection)
+            self._on_markets_ready(timestamp)
+            self._markets_ready_notified = True
+            return  # Skip this tick to let initialization settle
 
-        # All connectors ready - delegate to on_tick
+        # Normal operation - delegate to on_tick
         self.on_tick()
 
     def _on_markets_ready(self, timestamp: float):
