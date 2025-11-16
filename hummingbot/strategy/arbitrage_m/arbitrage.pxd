@@ -67,6 +67,9 @@ cdef class ArbitrageMStrategy(StrategyBase):
         dict _recent_order_market_pair
         # Cached taker order types per market to avoid repeated Python calls
         dict _taker_order_type_by_market
+        
+        # Orchestration mode flag (for multi-strategy orchestrator optimization)
+        bint _orchestrated_mode
 
     # Core methods
     cdef void _validate_configuration(self)
