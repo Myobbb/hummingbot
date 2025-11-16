@@ -46,28 +46,35 @@ The orchestrator automatically handles these limits:
 Critical Implementation Details:
 -------------------------------
 FIXED - Lifecycle Management:
-- The orchestrator bypasses ScriptStrategyBase.__init__() to avoid double event listener registration
+- The orchestrator now properly calls ScriptStrategyBase.__init__() to register connectors with clock
+- This is CRITICAL for network monitoring - without it, websocket disconnections are never detected
 - Strategies are initialized in __init__() but started later in start() when clock is available
 - Each strategy gets proper c_start(clock, timestamp) call with clock reference
 - Strategies are stopped with c_stop(clock) using the SAME clock from start()
 
 Event Listener Pattern:
-- Orchestrator itself does NOT register event listeners (no add_markets call)
-- Only V1 strategies register listeners via c_add_markets() during init_params()
-- Multiple strategies can safely share connectors via observer pattern
+- Orchestrator MUST call add_markets() to register connectors with clock for network monitoring
+- This enables websocket disconnection detection via connector.network_status updates
+- V1 strategies also register listeners via c_add_markets() during init_params()
+- Multiple listeners per connector are supported via observer pattern
 
 Clock Management:
 - Orchestrator is registered with clock (only orchestrator, not individual strategies)
 - Orchestrator's start() is called by clock → starts all V1 strategies
-- Orchestrator's tick() delegates to ScriptStrategyBase.tick() → calls on_tick() when ready
+- Orchestrator's tick() implements custom per-strategy readiness checking
 - Orchestrator's on_stop() is called by clock → stops all V1 strategies
 
 FIXED - Websocket Reconnection Handling:
 ----------------------------------------
-- Orchestrator now properly delegates to ScriptStrategyBase.tick() for connector lifecycle
-- This restores the critical websocket reconnection logic that individual strategies depend on
-- ScriptStrategyBase.tick() continuously monitors connector.ready status and updates ready_to_trade
-- Individual strategies receive proper readiness gating through orchestrated_mode parameter
+- CRITICAL FIX #1: Orchestrator must call add_markets() for event listeners (done in __init__)
+- CRITICAL FIX #2: Orchestrator must register connectors with clock for network monitoring (done in start())
+- Without clock registration, connector._check_network_loop() never starts and network_status never updates
+- CRITICAL FIX #3: ScriptStrategyBase.tick() only calls on_tick() when ALL connectors are ready
+- This breaks multi-exchange orchestrators where one exchange down stops all strategies
+- Orchestrator now implements per-strategy readiness checking in tick() and on_tick()
+- Each strategy only pauses when ITS specific connectors disconnect
+- Unaffected strategies continue trading during partial disconnections
+- Proper reconnection logging shows when individual strategies resume/pause
 
 Optimizations for 40-50 Strategies (Reconnection Performance):
 ---------------------------------------------------------------
@@ -293,6 +300,7 @@ class V1StrategyInstance:
     config: Dict
     market_pairs: List[MarketTradingPairTuple]
     paused: bool = False  # Runtime pause state
+    _last_ready_state: bool = True  # Track ready transitions for reconnection logging
 
 
 class ArbitrageMInstanceConfig(BaseModel):
@@ -399,15 +407,20 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                        These connectors are SHARED across all strategies
             config: Orchestrator configuration
         """
-        # Initialize base class manually without calling add_markets()
-        # Orchestrator doesn't need event listeners - only V1 strategies do
+        # Initialize base class manually to control event listener registration
         from hummingbot.strategy.strategy_py_base import StrategyPyBase
         StrategyPyBase.__init__(self)
-
+        
         # Set attributes that ScriptStrategyBase.__init__() would set
         self.connectors: Dict[str, ConnectorBase] = connectors
         self.config: MultiStrategyOrchestratorConfig = config
         self.ready_to_trade: bool = False
+        
+        # CRITICAL FIX: We must call add_markets() to register connectors with the clock
+        # This starts the network monitoring loops that update connector.network_status
+        # Without this, websocket disconnections are never detected!
+        # Note: This will add event listeners to the orchestrator, but that's necessary for network monitoring
+        self.add_markets(list(connectors.values()))
 
         # Storage for V1 strategy instances
         self.strategies: List[V1StrategyInstance] = []
@@ -651,19 +664,33 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """
         Start the orchestrator and all V1 strategies.
         
-        Note: Connectors manage their own reconnection logic. We just start strategies
-        and let them register event listeners. Connector lifecycle is independent.
+        CRITICAL: We must also register connectors with the clock to start their network monitoring.
+        The orchestrator's add_markets() call only adds event listeners, not clock registration.
         """
         self._strategy_clock = clock
+        
+        # CRITICAL FIX: Register all connectors with the clock for network monitoring
+        # Without this, connector._check_network_loop() never starts!
+        registered_count = 0
+        for connector in self.connectors.values():
+            if connector not in clock._child_iterators:
+                clock.add_iterator(connector)
+                registered_count += 1
+                self.logger().info(f"Registered connector {connector.name} with clock for network monitoring")
+        
+        if registered_count > 0:
+            self.logger().info(f"Registered {registered_count} connectors with clock - network monitoring started")
+        else:
+            self.logger().info("All connectors already registered with clock")
+        
         self._start_all_strategies_if_needed()
 
     def tick(self, timestamp: float):
         """
-        Delegate to ScriptStrategyBase.tick() for proper connector lifecycle management,
-        with coordinated initialization enhancements.
-
-        This restores the critical websocket reconnection handling that individual
-        strategies depend on, while preserving coordinated initialization benefits.
+        Custom tick implementation that handles per-strategy readiness instead of requiring ALL connectors to be ready.
+        
+        CRITICAL FIX: ScriptStrategyBase.tick() only calls on_tick() when ALL connectors are ready,
+        which breaks multi-exchange orchestrators. We need per-strategy readiness checking.
         """
         # Check if ALL connectors are ready (for coordinated initialization only)
         all_connectors_ready = all(
@@ -676,7 +703,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             # First time ALL connectors are ready - run coordinated init
             self._on_markets_ready(timestamp)
             self._markets_ready_notified = True
-            # Don't return - let ScriptStrategyBase.tick() handle the rest
 
         # Track full disconnection/reconnection for coordinated re-init
         prev_global_ready = getattr(self, '_prev_all_ready', False)
@@ -688,11 +714,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             # Reset buy-in flag so it runs again on reconnection
             self._buy_in_initialized = False
             self._on_markets_ready(timestamp)
-            # Don't return - let ScriptStrategyBase.tick() handle the rest
 
-        # CRITICAL: Delegate to ScriptStrategyBase.tick() for proper connector lifecycle management
-        # This ensures websocket reconnections are handled correctly for individual strategies
-        return super().tick(timestamp)
+        # CRITICAL: Don't use ScriptStrategyBase.tick() - it requires ALL connectors to be ready
+        # Instead, implement per-strategy readiness checking that allows partial operation
+        
+        # Update orchestrator-level ready_to_trade for status display
+        self.ready_to_trade = any(ex.ready for ex in self.connectors.values())
+        
+        # Always call on_tick() - individual strategies will check their own connector readiness
+        # This allows strategies with working connectors to continue during partial disconnections
+        self.on_tick()
 
     def _on_markets_ready(self, timestamp: float):
         """
@@ -784,27 +815,80 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("All strategies started successfully")
 
 
+    def _get_strategy_connectors(self, strategy_instance: V1StrategyInstance) -> Set[ConnectorBase]:
+        """Get the unique set of connectors used by a strategy."""
+        connectors = set()
+        for market_pair in strategy_instance.market_pairs:
+            connectors.add(market_pair.market)
+        return connectors
+
+    def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
+        """
+        Check if a strategy's specific connectors are ready.
+        
+        This enables partial disconnection handling - a strategy only pauses
+        if ITS connectors are down, not if unrelated connectors disconnect.
+        """
+        strategy_connectors = self._get_strategy_connectors(strategy_instance)
+        
+        # Strategy is ready if ALL of its connectors are ready and connected
+        return all(
+            connector.ready and connector.network_status == NetworkStatus.CONNECTED
+            for connector in strategy_connectors
+        )
+
     def on_tick(self):
         """
-        Main tick function - tick all strategies.
-
-        Now that ScriptStrategyBase.tick() handles connector readiness properly,
-        we can simplify this to just tick all non-paused strategies. The individual
-        strategies will handle their own connector readiness through the orchestrated_mode
-        parameter and the c_check_markets_ready_orchestrated() method.
+        Main tick function with per-strategy readiness checking.
+        
+        CRITICAL: This implements the proper websocket reconnection handling that
+        ScriptStrategyBase.tick() would do, but on a per-strategy basis instead of
+        requiring ALL connectors to be ready.
+        
+        Each strategy is ticked independently and only pauses if ITS specific
+        connectors are not ready. This allows unaffected strategies to continue
+        trading during partial disconnections.
         """
         # Get current timestamp from TimeIterator property
         current_timestamp = self.current_timestamp
 
-        # Tick each strategy independently (skip paused strategies)
+        # Tick each strategy independently with per-strategy readiness check
         for strategy_instance in self.strategies:
-            # Skip ticking if strategy is paused
+            # Skip if manually paused
             if strategy_instance.paused:
+                continue
+
+            # Check if THIS strategy's connectors are ready
+            strategy_ready = self._is_strategy_ready(strategy_instance)
+            
+            # Track ready state transitions for reconnection logging
+            prev_ready = getattr(strategy_instance, '_last_ready_state', True)
+            strategy_instance._last_ready_state = strategy_ready
+            
+            # Log reconnection events
+            if strategy_ready != prev_ready:
+                if strategy_ready:
+                    # Transition: not ready -> ready (reconnection)
+                    self.logger().info(
+                        f"Strategy '{strategy_instance.name}' connectors reconnected - resuming trading"
+                    )
+                else:
+                    # Transition: ready -> not ready (disconnection)
+                    affected_connectors = [
+                        c.name for c in self._get_strategy_connectors(strategy_instance)
+                        if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
+                    ]
+                    self.logger().warning(
+                        f"Strategy '{strategy_instance.name}' paused - connectors disconnected: "
+                        f"{', '.join(affected_connectors)}"
+                    )
+
+            # Only tick if strategy's connectors are ready
+            if not strategy_ready:
                 continue
 
             try:
                 # Call the Python-level tick() method
-                # The strategy will handle its own connector readiness via orchestrated_mode
                 strategy_instance.strategy.tick(current_timestamp)
             except Exception as e:
                 self.logger().error(
@@ -1528,12 +1612,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
             ]
             lines.append(f"\n⚠ Partial Disconnection - Connectors down: {', '.join(not_ready)}")
-            lines.append(f"  (Individual strategies handle their own readiness)")
+            lines.append(f"  (Unaffected strategies continue trading)")
 
-            # Simple counting during partial disconnection
-            running_count = sum(1 for s in self.strategies if not s.paused)
-            paused_count = sum(1 for s in self.strategies if s.paused)
-            lines.append(f"\nStrategies: {running_count} active, {paused_count} paused (manual)")
+            # Count strategies by their actual readiness state during partial disconnection
+            running_count = sum(1 for s in self.strategies
+                               if not s.paused and self._is_strategy_ready(s))
+            paused_by_disconnect = sum(1 for s in self.strategies
+                                       if not s.paused and not self._is_strategy_ready(s))
+            manually_paused = sum(1 for s in self.strategies if s.paused)
+
+            lines.append(f"\nStrategies: {running_count} trading, "
+                        f"{paused_by_disconnect} paused (connector down), "
+                        f"{manually_paused} paused (manual)")
         else:
             # Normal operation - use original simple counting
             running_count = sum(1 for s in self.strategies if not s.paused)
@@ -1601,6 +1691,13 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if strategy_instance.paused:
                 # Manually paused - always show this
                 best_prof_str = "PAUSED"
+            elif not all_connectors_ready and not self._is_strategy_ready(strategy_instance):
+                # Partial disconnection AND this strategy's connectors are down
+                affected_connectors = [
+                    c.name for c in self._get_strategy_connectors(strategy_instance)
+                    if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
+                ]
+                best_prof_str = f"PAUSED ({', '.join(affected_connectors)} down)"
             else:
                 # Normal operation or strategy's connectors are ready - show profitability
                 try:
