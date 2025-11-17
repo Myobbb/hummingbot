@@ -65,6 +65,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         set _orders_with_fills
         # Recent order -> market pair mapping to resolve late events after tracker cleanup
         dict _recent_order_market_pair
+        # Track pending limit orders per market tuple to allow parallel trading
+        dict _pending_limit_orders_by_market
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode

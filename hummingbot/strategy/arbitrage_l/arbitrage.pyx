@@ -74,6 +74,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._orders_with_fills = set()
         # Keep recent order -> market pair mapping for late events
         self._recent_order_market_pair = {}
+        # Track pending limit orders per market tuple for parallel trading
+        self._pending_limit_orders_by_market = {}
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -166,6 +168,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         try:
             self._recent_order_market_pair.clear()
+        except Exception:
+            pass
+        try:
+            self._pending_limit_orders_by_market.clear()
         except Exception:
             pass
 
@@ -668,6 +674,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._last_failure_timestamps.pop(cooldown_tuple, None)
                 self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
 
+            # Remove from pending limit orders tracking to allow new trades on this market
+            try:
+                if market_pair_tuple is not None:
+                    pending_set = self._pending_limit_orders_by_market.get(market_pair_tuple)
+                    if pending_set is not None:
+                        pending_set.discard(order_id)
+                        # Clean up empty sets
+                        if len(pending_set) == 0:
+                            self._pending_limit_orders_by_market.pop(market_pair_tuple, None)
+            except Exception as e:
+                self.logger().warning(f"Failed to remove completed order from pending tracking: {e}")
+
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
@@ -762,13 +780,26 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if pend is not None:
                 asset_key, amt = pend
                 self._pending_buyin_by_asset[asset_key] = max(
-                    0.0, 
+                    0.0,
                     float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
                 )
                 if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
                     self._pending_buyin_by_asset.pop(asset_key, None)
         except Exception:
             pass
+
+        # Remove from pending limit orders tracking to allow new trades on this market
+        try:
+            if market_pair is not None:
+                pending_set = self._pending_limit_orders_by_market.get(market_pair)
+                if pending_set is not None:
+                    pending_set.discard(order_id)
+                    # Clean up empty sets
+                    if len(pending_set) == 0:
+                        self._pending_limit_orders_by_market.pop(market_pair, None)
+        except Exception as e:
+            self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
+
         # Decide cooldown/logging based on completion status, order type and fill state
         if was_already_completed:
             # Order was already marked as completed before cancel event arrived
@@ -890,6 +921,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                         self._pending_buyin_by_asset.pop(asset_key, None)
                             except Exception:
                                 pass
+                            # Remove from pending limit orders tracking
+                            try:
+                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
+                                if pending_set is not None:
+                                    pending_set.discard(order_id)
+                                    if len(pending_set) == 0:
+                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
+                            except Exception:
+                                pass
                             if has_any_fill:
                                 try:
                                     self._orders_with_fills.discard(order_id)
@@ -919,18 +959,35 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                         self._pending_buyin_by_asset.pop(asset_key, None)
                             except Exception:
                                 pass
+                            # Remove from pending limit orders tracking
+                            try:
+                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
+                                if pending_set is not None:
+                                    pending_set.discard(order_id)
+                                    if len(pending_set) == 0:
+                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
+                            except Exception:
+                                pass
                             # Enforce failure cooldown for this market
                             self._last_failure_timestamps[market_tuple] = self._current_timestamp
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
-        """Check if ready for new orders - global delay across all markets"""
+        """Check if ready for new orders - per-market pending check for parallel trading"""
         cdef:
             double time_left
+            object market_tuple
+            set pending_orders
 
-        # For limit orders: check if there are any pending orders
-        # If yes, don't place new orders until they complete
-        if len(self.tracked_limit_orders) > 0:
-            return False
+        # For limit orders: check if THESE SPECIFIC markets have pending orders
+        # This allows parallel trading across different market pairs
+        for market_tuple in market_tuples:
+            try:
+                pending_orders = self._pending_limit_orders_by_market.get(market_tuple)
+                if pending_orders and len(pending_orders) > 0:
+                    # This specific market has pending orders - block trading on it
+                    return False
+            except Exception:
+                pass  # If check fails, continue (fail-safe approach)
 
         # Global cooldown check - applies to ALL market pairs
         if self._last_global_trade_timestamp > 0:
@@ -1188,6 +1245,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
+
+            # Track pending limit orders per market for parallel trading support
+            try:
+                if buy_market_tuple not in self._pending_limit_orders_by_market:
+                    self._pending_limit_orders_by_market[buy_market_tuple] = set()
+                self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+
+                if sell_market_tuple not in self._pending_limit_orders_by_market:
+                    self._pending_limit_orders_by_market[sell_market_tuple] = set()
+                self._pending_limit_orders_by_market[sell_market_tuple].add(sell_order_id)
+            except Exception as e:
+                self.logger().warning(f"Failed to track pending orders by market: {e}")
 
 
             
@@ -1602,6 +1671,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
+
+        # Track pending limit orders per market for parallel trading support
+        try:
+            if buy_market_tuple not in self._pending_limit_orders_by_market:
+                self._pending_limit_orders_by_market[buy_market_tuple] = set()
+            self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+        except Exception as e:
+            self.logger().warning(f"Failed to track pending buy-in order by market: {e}")
 
         # Track pending base to avoid stale underestimation until fills settle
         try:
