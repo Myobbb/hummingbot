@@ -53,6 +53,7 @@ cdef class OrderBook(PubSub):
         self._best_bid = self._best_ask = float("NaN")
         self._last_trade_price = float("NaN")
         self._last_applied_trade = -1000.0
+        self._last_applied_diff = -1000.0
         self._last_trade_price_rest_updated = -1000
         self._dex = dex
 
@@ -93,8 +94,9 @@ cdef class OrderBook(PubSub):
             top_ask = deref(ask_iterator)
             self._best_ask = top_ask.getPrice()
 
-        # Remember the last diff update ID.
+        # Remember the last diff update ID and timestamp.
         self._last_diff_uid = update_id
+        self._last_applied_diff = time.perf_counter()
 
     cdef c_apply_snapshot(self, vector[OrderBookEntry] bids, vector[OrderBookEntry] asks, int64_t update_id):
         cdef:
@@ -133,8 +135,9 @@ cdef class OrderBook(PubSub):
         self._best_bid = best_bid_price
         self._best_ask = best_ask_price
 
-        # Remember the last snapshot update ID.
+        # Remember the last snapshot update ID and timestamp.
         self._snapshot_uid = update_id
+        self._last_applied_diff = time.perf_counter()
 
     cdef c_apply_trade(self, object trade_event):
         self._last_trade_price = trade_event.price
@@ -152,6 +155,10 @@ cdef class OrderBook(PubSub):
     @property
     def last_applied_trade(self) -> float:
         return self._last_applied_trade
+
+    @property
+    def last_applied_diff(self) -> float:
+        return self._last_applied_diff
 
     @property
     def last_trade_price_rest_updated(self) -> float:

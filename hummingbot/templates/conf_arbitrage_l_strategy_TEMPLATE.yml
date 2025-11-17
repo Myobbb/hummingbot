@@ -1,0 +1,40 @@
+########################################
+###   Arbitrage_l strategy config     ###
+########################################
+
+template_version: 1
+strategy: null
+
+# Required parameters (backward-compatible with 2-market mode)
+primary_market: null
+secondary_market: null
+primary_market_trading_pair: null
+secondary_market_trading_pair: null
+
+# Optional: future multi-market extension
+# You may provide either a comma-separated string or a YAML list. Examples:
+# additional_markets: "mexc:SLF-USDT, htx:SLF-USDT"
+# additional_markets:
+#   - "mexc:SLF-USDT"
+#   - "htx:SLF-USDT"
+# If left empty, only the two primary markets are used.
+additional_markets: ""
+
+# Profitability target (%) required to trade
+min_profitability: null
+
+# Whether to use rate oracle on unmatched trading pairs
+use_oracle_conversion_rate: null
+
+# Fixed conversion rates when oracle is disabled
+secondary_to_primary_base_conversion_rate: null
+secondary_to_primary_quote_conversion_rate: null
+
+# Optional buy-in module
+buy_in_enabled: null
+buy_in_target_usdt: null
+buy_in_min_profitability: null
+
+# Note: This strategy uses limit orders (maker orders) instead of market orders
+# Limit orders provide better price execution but may take longer to fill
+# Only one arbitrage position will be open at a time to prevent order accumulation

@@ -40,7 +40,7 @@ class HyperliquidExchange(ExchangePyBase):
     web_utils = web_utils
 
     SHORT_POLL_INTERVAL = 5.0
-    LONG_POLL_INTERVAL = 12.0
+    LONG_POLL_INTERVAL = 120.0
 
     def __init__(
             self,
@@ -115,10 +115,6 @@ class HyperliquidExchange(ExchangePyBase):
     @property
     def is_trading_required(self) -> bool:
         return self._trading_required
-
-    @property
-    def funding_fee_poll_interval(self) -> int:
-        return 120
 
     async def _make_network_check_request(self):
         await self._api_post(path_url=self.check_network_request_path, data={"type": CONSTANTS.META_INFO})
@@ -256,8 +252,8 @@ class HyperliquidExchange(ExchangePyBase):
             self.logger().debug(f"The order {order_id} does not exist on Hyperliquid s. "
                                 f"No cancelation needed.")
             await self._order_tracker.process_order_not_found(order_id)
-            raise IOError(f'{cancel_result["response"]["data"]["statuses"][0]["error"]}')
-        if "success" in cancel_result["response"]["data"]["statuses"][0]:
+            raise IOError(f'{cancel_result["response"]}')
+        if cancel_result["status"] == "ok" and "success" in cancel_result["response"]["data"]["statuses"][0]:
             return True
         return False
 
@@ -479,7 +475,8 @@ class HyperliquidExchange(ExchangePyBase):
                 elif channel == CONSTANTS.USEREVENT_ENDPOINT_NAME:
                     if "fills" in results:
                         for trade_msg in results["fills"]:
-                            await self._process_trade_message(trade_msg)
+                            client_order_id = str(trade_msg.get("cloid", ""))
+                            await self._process_trade_message(trade_msg, client_order_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -489,43 +486,35 @@ class HyperliquidExchange(ExchangePyBase):
 
     async def _process_trade_message(self, trade: Dict[str, Any], client_order_id: Optional[str] = None):
         """
-        Updates in-flight order and trigger order filled event for trade message received. Triggers order completed
+        Updates in-flight order and trigger order filled event for a trade message received. Triggers order completedim
         event if the total executed amount equals to the specified order amount.
         Example Trade:
         """
-        exchange_order_id = str(trade.get("oid", ""))
-        tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_order_id)
+        tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
 
-        if tracked_order is None:
-            all_orders = self._order_tracker.all_fillable_orders
-            for k, v in all_orders.items():
-                await v.get_exchange_order_id()
-            _cli_tracked_orders = [o for o in all_orders.values() if exchange_order_id == o.exchange_order_id]
-            if not _cli_tracked_orders:
-                self.logger().debug(f"Ignoring trade message with id {client_order_id}: not in in_flight_orders.")
-                return
-            tracked_order = _cli_tracked_orders[0]
-        trading_pair_base_coin = tracked_order.base_asset
-        if trade["coin"] == trading_pair_base_coin:
-            fee_asset = trade["feeToken"]
-            fee = TradeFeeBase.new_spot_fee(
-                fee_schema=self.trade_fee_schema(),
-                trade_type=tracked_order.trade_type,
-                percent_token=fee_asset,
-                flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=fee_asset)]
-            )
-            trade_update: TradeUpdate = TradeUpdate(
-                trade_id=str(trade["tid"]),
-                client_order_id=tracked_order.client_order_id,
-                exchange_order_id=str(trade["oid"]),
-                trading_pair=tracked_order.trading_pair,
-                fill_timestamp=trade["time"] * 1e-3,
-                fill_price=Decimal(trade["px"]),
-                fill_base_amount=Decimal(trade["sz"]),
-                fill_quote_amount=Decimal(trade["px"]) * Decimal(trade["sz"]),
-                fee=fee,
-            )
-            self._order_tracker.process_trade_update(trade_update)
+        if tracked_order is not None:
+            trading_pair_base_coin = tracked_order.trading_pair
+            exchange_symbol = await self.trading_pair_associated_to_exchange_symbol(symbol=trade["coin"])
+            if exchange_symbol == trading_pair_base_coin:
+                fee_asset = trade["feeToken"]
+                fee = TradeFeeBase.new_spot_fee(
+                    fee_schema=self.trade_fee_schema(),
+                    trade_type=tracked_order.trade_type,
+                    percent_token=fee_asset,
+                    flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=fee_asset)]
+                )
+                trade_update: TradeUpdate = TradeUpdate(
+                    trade_id=str(trade["tid"]),
+                    client_order_id=tracked_order.client_order_id,
+                    exchange_order_id=str(trade["oid"]),
+                    trading_pair=tracked_order.trading_pair,
+                    fill_timestamp=trade["time"] * 1e-3,
+                    fill_price=Decimal(trade["px"]),
+                    fill_base_amount=Decimal(trade["sz"]),
+                    fill_quote_amount=Decimal(trade["px"]) * Decimal(trade["sz"]),
+                    fee=fee,
+                )
+                self._order_tracker.process_trade_update(trade_update)
 
     def _process_order_message(self, order_msg: Dict[str, Any]):
         """
@@ -586,6 +575,7 @@ class HyperliquidExchange(ExchangePyBase):
                 return_val.append(
                     TradingRule(
                         trading_pair,
+                        min_order_size=step_size,  # asset_price,
                         min_base_amount_increment=step_size,
                         min_price_increment=price_size
                     )

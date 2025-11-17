@@ -1,0 +1,63 @@
+# Test configuration for MEXC websocket subscription limits
+# This config tests 20 trading pairs on MEXC (40 subscriptions total)
+# Should trigger multiple websocket connections since MEXC limit is 30/connection
+
+script_file_name: multi_strategy_orchestrator.py
+
+markets:
+  mexc:
+    - BTC-USDT
+    - ETH-USDT
+    - BNB-USDT
+    - ADA-USDT
+    - DOT-USDT
+    - LINK-USDT
+    - UNI-USDT
+    - LTC-USDT
+    - BCH-USDT
+    - XRP-USDT
+    - DOGE-USDT
+    - MATIC-USDT
+    - AVAX-USDT
+    - ATOM-USDT
+    - FTM-USDT
+    - NEAR-USDT
+    - ALGO-USDT
+    - VET-USDT
+    - THETA-USDT
+    - ICP-USDT
+
+arbitrage_m_strategies:
+  - name: mexc_ws_test_1
+    primary_market: mexc
+    secondary_market: mexc  # Same exchange for testing (will be filtered out by validation)
+    primary_trading_pair: BTC-USDT
+    secondary_trading_pair: ETH-USDT
+    min_profitability: 0.5
+    additional_markets:
+      - mexc:BNB-USDT
+      - mexc:ADA-USDT
+      - mexc:DOT-USDT
+      - mexc:LINK-USDT
+      - mexc:UNI-USDT
+      - mexc:LTC-USDT
+      - mexc:BCH-USDT
+      - mexc:XRP-USDT
+      - mexc:DOGE-USDT
+      - mexc:MATIC-USDT
+      - mexc:AVAX-USDT
+      - mexc:ATOM-USDT
+      - mexc:FTM-USDT
+      - mexc:NEAR-USDT
+      - mexc:ALGO-USDT
+      - mexc:VET-USDT
+      - mexc:THETA-USDT
+      - mexc:ICP-USDT
+
+# Expected behavior:
+# - 20 trading pairs × 2 subscriptions each = 40 total subscriptions
+# - MEXC limit: 30 subscriptions per connection
+# - Should create 2 websocket connections:
+#   - Connection 1: 15 pairs (30 subscriptions) - at limit
+#   - Connection 2: 5 pairs (10 subscriptions) - under limit
+# - Logs should show: "MEXC subscription summary" with connection details

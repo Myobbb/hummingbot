@@ -160,8 +160,9 @@ class ClientOrderTracker:
             if order.is_open:
                 self.start_tracking_order(order)
             elif order.is_failure:
-                # If the order is marked as failed but is still in the tracking states, it was a lost order
-                self._lost_orders[order.client_order_id] = order
+                # Previously, failed orders were re-added as "lost" to continue polling.
+                # Lost order recovery is disabled; do not repopulate the lost orders list.
+                pass
 
     def fetch_tracked_order(self, client_order_id: str) -> Optional[InFlightOrder]:
         return self._in_flight_orders.get(client_order_id, None)
@@ -237,8 +238,7 @@ class ClientOrderTracker:
                 # Only mark the order as failed if it has not been marked as done already asynchronously
                 if tracked_order.current_state not in [OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED]:
                     self.logger().warning(
-                        f"The order {client_order_id}({tracked_order.exchange_order_id}) will be "
-                        f"considered lost. Please check its status in the exchange."
+                        f"The order {client_order_id}({tracked_order.exchange_order_id}) was not found repeatedly and will be failed."
                     )
                     order_update: OrderUpdate = OrderUpdate(
                         client_order_id=client_order_id,
@@ -247,8 +247,9 @@ class ClientOrderTracker:
                         new_state=OrderState.FAILED,
                     )
                     await self._process_order_update(order_update)
-                    del self._cached_orders[client_order_id]
-                    self._lost_orders[tracked_order.client_order_id] = tracked_order
+                    # Do not add to lost orders; lost-order recovery is disabled.
+                    if client_order_id in self._cached_orders:
+                        del self._cached_orders[client_order_id]
         else:
             lost_order = self._lost_orders.get(client_order_id)
             if lost_order is not None:
@@ -282,7 +283,7 @@ class ClientOrderTracker:
                         tracked_order.wait_until_completely_filled(), timeout=self.TRADE_FILLS_WAIT_TIMEOUT
                     )
                 except asyncio.TimeoutError:
-                    self.logger().warning(
+                    self.logger().debug(
                         f"The order fill updates did not arrive on time for {tracked_order.client_order_id}. "
                         f"The complete update will be processed with incomplete information."
                     )
@@ -408,7 +409,7 @@ class ClientOrderTracker:
                              trade_id: str,
                              exchange_order_id: str):
         if prev_executed_amount_base < tracked_order.executed_amount_base:
-            self.logger().info(
+            self.logger().debug(
                 f"The {tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} "
                 f"amounting to {tracked_order.executed_amount_base}/{tracked_order.amount} {tracked_order.base_asset} "
                 f"has been filled at {fill_price} {tracked_order.quote_asset}."
@@ -432,7 +433,7 @@ class ClientOrderTracker:
 
         elif tracked_order.is_filled:
             self._trigger_completed_event(tracked_order)
-            self.logger().info(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
+            self.logger().debug(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
 
         elif tracked_order.is_failure:
             self._trigger_failure_event(tracked_order, order_update)
