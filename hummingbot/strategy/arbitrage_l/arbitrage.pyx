@@ -78,6 +78,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track pending limit orders per market tuple - SEPARATE for buy/sell to allow parallel buy+sell
         self._pending_buy_orders_by_market = {}   # market_tuple -> set of buy order_ids
         self._pending_sell_orders_by_market = {}  # market_tuple -> set of sell order_ids
+        # Track orders cancelled due to timeout (to avoid cooldown on timeout cancellations)
+        self._timeout_cancelled_orders = set()
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -174,6 +176,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         try:
             self._pending_limit_orders_by_market.clear()
+        except Exception:
+            pass
+        try:
+            self._timeout_cancelled_orders.clear()
         except Exception:
             pass
 
@@ -824,17 +830,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception as e:
             self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
 
-        # Decide cooldown/logging based on completion status
+        # Decide cooldown/logging based on completion status and cancellation reason
         if was_already_completed:
             # Order was already marked as completed before cancel event arrived
             # This is a race condition - treat as successful, no cooldown
             self.logger().info(
                 f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} completed before cancel event - treating as complete (no cooldown)")
+        elif order_id in self._timeout_cancelled_orders:
+            # Order was cancelled due to timeout - no cooldown needed
+            self._timeout_cancelled_orders.discard(order_id)  # Clean up
+            self.logger().info(
+                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was TIMEOUT-CANCELLED - no cooldown enforced")
         else:
-            # Limit order cancelled without completion - enforce cooldown
+            # Limit order cancelled naturally (by exchange or market conditions) - enforce cooldown
             self._last_failure_timestamps[market_pair] = self._current_timestamp
             self.logger().warning(
-                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
+                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was NATURALLY CANCELLED - cooldown enforced")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -896,12 +907,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         if self._sb_order_tracker.c_has_in_flight_cancel(order_id):
                             continue  # Skip if already being cancelled
                         
+                        # Mark this order as timeout-cancelled to prevent cooldown enforcement
+                        self._timeout_cancelled_orders.add(order_id)
+                        
                         # CRITICAL: Actually CANCEL the limit order on the exchange
                         try:
                             self.c_cancel_order(market_tuple, order_id)
                             self.logger().warning(f"Limit order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - CANCELLING order")
                         except Exception as e:
                             self.logger().error(f"Failed to cancel timed out order {order_id}: {e}")
+                            # Remove from timeout set if cancel failed
+                            self._timeout_cancelled_orders.discard(order_id)
 
                         # Clean up tracking
                         self._order_timestamps.erase(order_id_str)
@@ -1884,6 +1900,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 try:
                     oid = order_id_str.decode('utf-8')
                     self._recent_order_market_pair.pop(oid, None)
+                    # Also clean up timeout cancelled orders set
+                    self._timeout_cancelled_orders.discard(oid)
                 except Exception:
                     pass
         except Exception:
