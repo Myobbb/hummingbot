@@ -705,7 +705,7 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
     cdef c_did_fill_order(self, object order_filled_event):
-        """Track that an order has received at least one fill and pre-mark completion for MARKET orders."""
+        """Track that an order has received at least one fill."""
         cdef:
             str order_id = order_filled_event.order_id
             object order_type = order_filled_event.order_type
@@ -728,10 +728,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
         if market_pair_tuple is not None and market_pair_tuple in self._last_failure_timestamps:
             self._last_failure_timestamps.pop(market_pair_tuple, None)
             self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
-
-        if order_type == OrderType.MARKET:
-            if self._completed_orders.find(order_id_str) == self._completed_orders.end():
-                self._completed_orders.insert(order_id_str)
 
     cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
         """Handle cancelled orders - critical for catching failed market orders."""
@@ -1199,14 +1195,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
 
-            if buy_order_type == OrderType.MARKET:
-                self._completed_orders.insert(buy_id_str)
-                self.logger().debug(f"{buy_market.name}: Buy order {buy_order_id} treated as filled (market order)")
-                
-            if sell_order_type == OrderType.MARKET:
-                self._completed_orders.insert(sell_id_str)
-                self.logger().debug(f"{sell_market.name}: Sell order {sell_order_id} treated as filled (market order)")
-
 
             
           
@@ -1614,11 +1602,6 @@ cdef class ArbitrageMStrategy(StrategyBase):
             self._pending_buyin_by_asset[asset_key] = float(self._pending_buyin_by_asset.get(asset_key, 0.0)) + float(quantized_amount)
         except Exception as e:
             self.logger().warning(f"Failed to track pending buy-in for order {buy_order_id}: {e}")
-
-        # MARKET ORDERS: Assume instant fill - only track briefly to catch cancellations
-        if order_type == OrderType.MARKET:
-            self._completed_orders.insert(buy_id_str)
-            self.logger().debug(f"{market.name}: Buy-in order {buy_order_id} treated as filled (market order)")
 
         # Check if target reached after placing (aggregate across all markets)
         # Use the same reliable bid lookup as above
