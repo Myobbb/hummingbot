@@ -1149,8 +1149,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Pre-calculate all parameters to minimize latency between orders
             # Use maker order type (LIMIT or LIMIT_MAKER) for limit orders
-            buy_order_type = buy_market.get_maker_order_type()
-            sell_order_type = sell_market.get_maker_order_type()
+            #buy_order_type = buy_market.get_maker_order_type()
+            #sell_order_type = sell_market.get_maker_order_type()
+
+            # Use LIMIT order type for both buy and sell orders
+            buy_order_type = OrderType.LIMIT
+            sell_order_type = OrderType.LIMIT
             # Prices already prepared above as Decimal for quantization
 
             # Execute both orders in rapid succession
