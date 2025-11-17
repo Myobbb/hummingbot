@@ -75,8 +75,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._orders_with_fills = set()
         # Keep recent order -> market pair mapping for late events
         self._recent_order_market_pair = {}
-        # Track pending limit orders per market tuple for parallel trading
-        self._pending_limit_orders_by_market = {}
+        # Track pending limit orders per market tuple - SEPARATE for buy/sell to allow parallel buy+sell
+        self._pending_buy_orders_by_market = {}   # market_tuple -> set of buy order_ids
+        self._pending_sell_orders_by_market = {}  # market_tuple -> set of sell order_ids
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -491,6 +492,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if self._buy_in_enabled:
                         self.c_scan_and_mark_buyin_completion()
 
+            # Early check: skip orderbook scanning if global cooldown is active
+            # This optimization avoids expensive orderbook iterations when we can't trade anyway
+            if self._last_global_trade_timestamp > 0:
+                time_left = (self._last_global_trade_timestamp +
+                            self._next_trade_delay - self._current_timestamp)
+                if time_left > 0:
+                    # Still in global cooldown - skip orderbook scanning entirely
+                    return
+
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
                 if not self.c_ready_for_new_orders([market_pair.first, market_pair.second]):
@@ -675,15 +685,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._last_failure_timestamps.pop(cooldown_tuple, None)
                 self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
 
-            # Remove from pending limit orders tracking to allow new trades on this market
+            # Remove from pending orders - check both buy and sell dicts
             try:
                 if market_pair_tuple is not None:
-                    pending_set = self._pending_limit_orders_by_market.get(market_pair_tuple)
-                    if pending_set is not None:
-                        pending_set.discard(order_id)
-                        # Clean up empty sets
-                        if len(pending_set) == 0:
-                            self._pending_limit_orders_by_market.pop(market_pair_tuple, None)
+                    # Try removing from pending buy orders
+                    pending_buys = self._pending_buy_orders_by_market.get(market_pair_tuple)
+                    if pending_buys is not None and order_id in pending_buys:
+                        pending_buys.discard(order_id)
+                        if len(pending_buys) == 0:
+                            self._pending_buy_orders_by_market.pop(market_pair_tuple, None)
+
+                    # Try removing from pending sell orders
+                    pending_sells = self._pending_sell_orders_by_market.get(market_pair_tuple)
+                    if pending_sells is not None and order_id in pending_sells:
+                        pending_sells.discard(order_id)
+                        if len(pending_sells) == 0:
+                            self._pending_sell_orders_by_market.pop(market_pair_tuple, None)
             except Exception as e:
                 self.logger().warning(f"Failed to remove completed order from pending tracking: {e}")
 
@@ -779,15 +796,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Remove from pending limit orders tracking to allow new trades on this market
+        # Remove from pending orders tracking - check both buy and sell dicts
         try:
             if market_pair is not None:
-                pending_set = self._pending_limit_orders_by_market.get(market_pair)
-                if pending_set is not None:
-                    pending_set.discard(order_id)
-                    # Clean up empty sets
-                    if len(pending_set) == 0:
-                        self._pending_limit_orders_by_market.pop(market_pair, None)
+                # Try removing from pending buy orders
+                pending_buys = self._pending_buy_orders_by_market.get(market_pair)
+                if pending_buys is not None and order_id in pending_buys:
+                    pending_buys.discard(order_id)
+                    if len(pending_buys) == 0:
+                        self._pending_buy_orders_by_market.pop(market_pair, None)
+
+                # Try removing from pending sell orders
+                pending_sells = self._pending_sell_orders_by_market.get(market_pair)
+                if pending_sells is not None and order_id in pending_sells:
+                    pending_sells.discard(order_id)
+                    if len(pending_sells) == 0:
+                        self._pending_sell_orders_by_market.pop(market_pair, None)
         except Exception as e:
             self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
 
@@ -884,13 +908,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         except Exception:
                             pass
 
-                        # Remove from pending limit orders tracking
+                        # Remove from pending orders tracking - check both buy and sell dicts
                         try:
-                            pending_set = self._pending_limit_orders_by_market.get(market_tuple)
-                            if pending_set is not None:
-                                pending_set.discard(order_id)
-                                if len(pending_set) == 0:
-                                    self._pending_limit_orders_by_market.pop(market_tuple, None)
+                            # Try removing from pending buy orders
+                            pending_buys = self._pending_buy_orders_by_market.get(market_tuple)
+                            if pending_buys is not None and order_id in pending_buys:
+                                pending_buys.discard(order_id)
+                                if len(pending_buys) == 0:
+                                    self._pending_buy_orders_by_market.pop(market_tuple, None)
+
+                            # Try removing from pending sell orders
+                            pending_sells = self._pending_sell_orders_by_market.get(market_tuple)
+                            if pending_sells is not None and order_id in pending_sells:
+                                pending_sells.discard(order_id)
+                                if len(pending_sells) == 0:
+                                    self._pending_sell_orders_by_market.pop(market_tuple, None)
                         except Exception:
                             pass
 
@@ -899,37 +931,60 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
-        """Check if ready for new orders - per-market pending check for parallel trading"""
+        """
+        Check if ready for new arbitrage orders.
+        For arbitrage: market_tuples[0] = buy_market, market_tuples[1] = sell_market
+
+        Smart logic:
+        - Allow if buy_market has no pending BUY (pending SELL is OK)
+        - Allow if sell_market has no pending SELL (pending BUY is OK)
+        - This enables parallel trading: can do A->B and B->A simultaneously
+        """
         cdef:
             double time_left
-            object market_tuple
-            set pending_orders
+            object buy_market_tuple
+            object sell_market_tuple
+            set pending_buys
+            set pending_sells
+            bint has_unfilled_buy
+            bint has_unfilled_sell
 
-        # For limit orders: check if THESE SPECIFIC markets have pending orders
-        # Allow new orders if pending orders are already filling (shows good liquidity)
-        for market_tuple in market_tuples:
-            try:
-                pending_orders = self._pending_limit_orders_by_market.get(market_tuple)
-                if pending_orders and len(pending_orders) > 0:
-                    # Check if ALL pending orders have received fills
-                    # If any order has fills, it's a good sign - allow new orders
-                    has_unfilled_order = False
-                    for order_id in pending_orders:
-                        try:
-                            # If order_id is NOT in _orders_with_fills, it's unfilled
-                            if order_id not in self._orders_with_fills:
-                                has_unfilled_order = True
-                                break
-                        except Exception:
-                            # If we can't check, assume unfilled (conservative)
-                            has_unfilled_order = True
-                            break
+        # Early validation: need exactly 2 market tuples for arbitrage
+        if len(market_tuples) != 2:
+            return False
 
-                    # Only block if there's at least one completely unfilled order
-                    if has_unfilled_order:
-                        return False
-            except Exception:
-                pass  # If check fails, continue (fail-safe approach)
+        buy_market_tuple = market_tuples[0]
+        sell_market_tuple = market_tuples[1]
+
+        # Check buy market: block only if it has pending BUY orders without fills
+        try:
+            pending_buys = self._pending_buy_orders_by_market.get(buy_market_tuple)
+            if pending_buys and len(pending_buys) > 0:
+                # Check if ALL pending buys have received fills (smart allowance)
+                has_unfilled_buy = False
+                for order_id in pending_buys:
+                    if order_id not in self._orders_with_fills:
+                        has_unfilled_buy = True
+                        break
+                if has_unfilled_buy:
+                    return False  # Block: buy market has unfilled buy order
+        except Exception:
+            pass
+
+        # Check sell market: block only if it has pending SELL orders without fills
+        try:
+            pending_sells = self._pending_sell_orders_by_market.get(sell_market_tuple)
+            if pending_sells and len(pending_sells) > 0:
+                # Check if ALL pending sells have received fills (smart allowance)
+                has_unfilled_sell = False
+                for order_id in pending_sells:
+                    if order_id not in self._orders_with_fills:
+                        has_unfilled_sell = True
+                        break
+                if has_unfilled_sell:
+                    return False  # Block: sell market has unfilled sell order
+        except Exception:
+            pass
 
         # Global cooldown check - applies to ALL market pairs
         if self._last_global_trade_timestamp > 0:
@@ -1188,15 +1243,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
 
-            # Track pending limit orders per market for parallel trading support
+            # Track pending orders per market - SEPARATE by side (buy/sell) for smart parallel trading
             try:
-                if buy_market_tuple not in self._pending_limit_orders_by_market:
-                    self._pending_limit_orders_by_market[buy_market_tuple] = set()
-                self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+                # Track BUY order on buy market
+                if buy_market_tuple not in self._pending_buy_orders_by_market:
+                    self._pending_buy_orders_by_market[buy_market_tuple] = set()
+                self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
 
-                if sell_market_tuple not in self._pending_limit_orders_by_market:
-                    self._pending_limit_orders_by_market[sell_market_tuple] = set()
-                self._pending_limit_orders_by_market[sell_market_tuple].add(sell_order_id)
+                # Track SELL order on sell market
+                if sell_market_tuple not in self._pending_sell_orders_by_market:
+                    self._pending_sell_orders_by_market[sell_market_tuple] = set()
+                self._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
             except Exception as e:
                 self.logger().warning(f"Failed to track pending orders by market: {e}")
 
@@ -1614,11 +1671,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
 
-        # Track pending limit orders per market for parallel trading support
+        # Track pending BUY order for buy-in (buy-in is always a buy order)
         try:
-            if buy_market_tuple not in self._pending_limit_orders_by_market:
-                self._pending_limit_orders_by_market[buy_market_tuple] = set()
-            self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+            if buy_market_tuple not in self._pending_buy_orders_by_market:
+                self._pending_buy_orders_by_market[buy_market_tuple] = set()
+            self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
         except Exception as e:
             self.logger().warning(f"Failed to track pending buy-in order by market: {e}")
 
