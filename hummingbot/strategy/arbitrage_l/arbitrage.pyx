@@ -1148,9 +1148,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # The price is used as the limit price for the orders
 
             # Pre-calculate all parameters to minimize latency between orders
-            # Use maker order type (LIMIT or LIMIT_MAKER) for limit orders
-            buy_order_type = buy_market.get_maker_order_type()
-            sell_order_type = sell_market.get_maker_order_type()
+            # Use LIMIT order type for both buy and sell orders
+            buy_order_type = OrderType.LIMIT
+            sell_order_type = OrderType.LIMIT
             # Prices already prepared above as Decimal for quantization
 
             # Execute both orders in rapid succession
@@ -1528,7 +1528,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return False
 
         # Place only the buy leg on buy market
-        cdef object order_type = market.get_maker_order_type()
+        cdef object order_type = OrderType.LIMIT
         cdef object quantized_amount
         cdef object dec_safe_amount2 = Decimal(str(max(0.0, best_amount - QUANTIZATION_EPSILON)))
         try:

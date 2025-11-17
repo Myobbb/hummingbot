@@ -35,6 +35,6 @@ buy_in_enabled: null
 buy_in_target_usdt: null
 buy_in_min_profitability: null
 
-# Note: This strategy uses limit orders (maker orders) instead of market orders
+# Note: This strategy uses limit orders instead of market orders
 # Limit orders provide better price execution but may take longer to fill
 # Only one arbitrage position will be open at a time to prevent order accumulation
