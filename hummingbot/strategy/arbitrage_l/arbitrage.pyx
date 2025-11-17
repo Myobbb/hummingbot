@@ -906,13 +906,28 @@ cdef class ArbitrageLStrategy(StrategyBase):
             set pending_orders
 
         # For limit orders: check if THESE SPECIFIC markets have pending orders
-        # This allows parallel trading across different market pairs
+        # Allow new orders if pending orders are already filling (shows good liquidity)
         for market_tuple in market_tuples:
             try:
                 pending_orders = self._pending_limit_orders_by_market.get(market_tuple)
                 if pending_orders and len(pending_orders) > 0:
-                    # This specific market has pending orders - block trading on it
-                    return False
+                    # Check if ALL pending orders have received fills
+                    # If any order has fills, it's a good sign - allow new orders
+                    has_unfilled_order = False
+                    for order_id in pending_orders:
+                        try:
+                            # If order_id is NOT in _orders_with_fills, it's unfilled
+                            if order_id not in self._orders_with_fills:
+                                has_unfilled_order = True
+                                break
+                        except Exception:
+                            # If we can't check, assume unfilled (conservative)
+                            has_unfilled_order = True
+                            break
+
+                    # Only block if there's at least one completely unfilled order
+                    if has_unfilled_order:
+                        return False
             except Exception:
                 pass  # If check fails, continue (fail-safe approach)
 
