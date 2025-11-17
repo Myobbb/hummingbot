@@ -50,9 +50,10 @@ cdef:
 
 cdef class ArbitrageLStrategy(StrategyBase):
     """
-    Limit order arbitrage strategy with clean, uniform implementation.
+    Limit order arbitrage strategy (LIMIT ORDERS ONLY).
     Uses doubles internally for performance, converts to Decimal only for external APIs.
-    Places limit orders at best bid/ask prices instead of market orders.
+    Places limit orders at worst (furthest) scanned prices for instant fills.
+    Cancels unfilled orders after 300s timeout.
     """
     
     OPTION_LOG_STATUS_REPORT = 1 << 0
@@ -738,13 +739,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
 
     cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
-        """Handle cancelled orders - critical for catching failed market orders."""
+        """Handle cancelled limit orders"""
         cdef:
             str order_id = order_cancelled_event.order_id
             string order_id_str = self._to_cpp_str(order_id)
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
-            object maybe_market_order
-            bint has_any_fill = False
             bint was_already_completed = False
 
         if market_pair is None:
@@ -754,18 +753,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # This prevents race condition where cancel arrives after completion
         was_already_completed = (self._completed_orders.find(order_id_str) != self._completed_orders.end())
 
-        # Determine whether the cancelled order was a MARKET or LIMIT order
-        maybe_market_order = self._sb_order_tracker.c_get_market_order(market_pair, order_id)
-        # Consider the order as having fills if we observed any fill events for it
-        try:
-            has_any_fill = (order_id in self._orders_with_fills)
-        except Exception:
-            has_any_fill = False
-
-        # Full cleanup for cancelled orders (same as timeout handler)
+        # Full cleanup for cancelled orders
         self._order_timestamps.erase(order_id_str)
         self._completed_orders.erase(order_id_str)
-        
+
         # Stop tracking the order
         # Remember mapping for possible late events
         try:
@@ -773,7 +764,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
         self._sb_order_tracker.c_stop_tracking_market_order(market_pair, order_id)
-        
+
         # Clean up pending buy-in tracking if applicable
         try:
             pend = self._pending_buyin_orders.pop(order_id, None)
@@ -800,36 +791,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception as e:
             self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
 
-        # Decide cooldown/logging based on completion status, order type and fill state
+        # Decide cooldown/logging based on completion status
         if was_already_completed:
             # Order was already marked as completed before cancel event arrived
             # This is a race condition - treat as successful, no cooldown
-            try:
-                self._orders_with_fills.discard(order_id)
-            except Exception:
-                pass
             self.logger().info(
-                f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} completed before cancel event - treating as complete (no cooldown)")
-        elif maybe_market_order is not None:
-            # MARKET order cancellation
-            # If the market order had any fill(s), treat as complete and DO NOT enforce cooldown
-            if has_any_fill:
-                try:
-                    self._orders_with_fills.discard(order_id)
-                except Exception:
-                    pass
-                self.logger().info(
-                    f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was cancelled after fills - treating as complete (no cooldown)")
-            else:
-                # No fills at all -> enforce cooldown like a failure
-                self._last_failure_timestamps[market_pair] = self._current_timestamp
-                self.logger().warning(
-                    f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
+                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} completed before cancel event - treating as complete (no cooldown)")
         else:
-            # LIMIT order or unknown type -> keep previous behavior (enforce cooldown)
+            # Limit order cancelled without completion - enforce cooldown
             self._last_failure_timestamps[market_pair] = self._current_timestamp
             self.logger().warning(
-                f"Order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
+                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was CANCELLED - cooldown enforced")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -854,24 +826,23 @@ cdef class ArbitrageLStrategy(StrategyBase):
             f"cooling down for {self._order_timeout:.0f}s")
 
     cdef void c_check_all_order_timeouts(self):
-        """Check ALL pending orders for timeouts, regardless of which markets are being considered for trading"""
+        """Check and cancel timed out limit orders (300s timeout)"""
         cdef:
             double time_elapsed
-            double timeout_threshold  
+            double timeout_threshold
             string order_id_str
             object order_id
             object market_tuple
             dict all_market_orders
             dict market_orders
-            bint has_any_fill
 
-        # Get ALL market orders across ALL market tuples
+        # Get ALL orders (limit orders in our case) across ALL market tuples
         try:
             all_market_orders = self._sb_order_tracker.c_get_market_orders()
         except Exception:
             return
 
-        # Check each market tuple's orders
+        # Check each market tuple's orders for timeout
         for market_tuple, market_orders in list(all_market_orders.items()):
             if market_orders:
                 for order_id in list(market_orders):
@@ -883,93 +854,49 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
                     time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
 
-                    # Determine timeout based on order type (query from tracker)
-                    maybe_market_order = self._sb_order_tracker.c_get_market_order(market_tuple, order_id)
-                    if maybe_market_order is not None:
-                        # Market order: short timeout (180s) just to catch cancellations
-                        timeout_threshold = 180.0
-                    else:
-                        # Limit order or unconfirmed: full timeout
-                        timeout_threshold = self._order_timeout
+                    # Limit order timeout: 300 seconds (self._order_timeout)
+                    timeout_threshold = self._order_timeout
 
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
-                        if maybe_market_order is not None:
-                            # Market order cleanup after short window
-                            try:
-                                has_any_fill = (order_id in self._orders_with_fills)
-                            except Exception:
-                                has_any_fill = False
-                            # Stop tracking regardless
-                            self._order_timestamps.erase(order_id_str)
-                            # Remember mapping for late events before removing
-                            try:
-                                self._recent_order_market_pair[order_id] = market_tuple
-                            except Exception:
-                                pass
-                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            # Clean up pending buy-in tracking if applicable
-                            try:
-                                pend = self._pending_buyin_orders.pop(order_id, None)
-                                if pend is not None:
-                                    asset_key, amt = pend
-                                    self._pending_buyin_by_asset[asset_key] = max(
-                                        0.0,
-                                        float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
-                                    )
-                                    if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                                        self._pending_buyin_by_asset.pop(asset_key, None)
-                            except Exception:
-                                pass
-                            # Remove from pending limit orders tracking
-                            try:
-                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
-                                if pending_set is not None:
-                                    pending_set.discard(order_id)
-                                    if len(pending_set) == 0:
-                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
-                            except Exception:
-                                pass
-                            if has_any_fill:
-                                try:
-                                    self._orders_with_fills.discard(order_id)
-                                except Exception:
-                                    pass
-                                self.logger().info(f"Market order {order_id} on {market_tuple[0].name} tracked for {time_elapsed:.2f}s - treating as complete (fills detected)")
-                            else:
-                                # No fills detected within window → treat as failure and enforce cooldown
-                                self._last_failure_timestamps[market_tuple] = self._current_timestamp
-                                self.logger().warning(f"Market order {order_id} on {market_tuple[0].name} timed out unfilled after {time_elapsed:.2f}s - cooldown enforced")
-                        else:
-                            # Actual timeout - log warning and enforce cooldown
-                            self.logger().warning(f"Order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
-                            self._order_timestamps.erase(order_id_str)
-                            self._completed_orders.erase(order_id_str)  # Remove from completed if it was there
-                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
-                            # Clean up pending buy-in tracking if applicable
-                            try:
-                                pend = self._pending_buyin_orders.pop(order_id, None)
-                                if pend is not None:
-                                    asset_key, amt = pend
-                                    self._pending_buyin_by_asset[asset_key] = max(
-                                        0.0,
-                                        float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
-                                    )
-                                    if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                                        self._pending_buyin_by_asset.pop(asset_key, None)
-                            except Exception:
-                                pass
-                            # Remove from pending limit orders tracking
-                            try:
-                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
-                                if pending_set is not None:
-                                    pending_set.discard(order_id)
-                                    if len(pending_set) == 0:
-                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
-                            except Exception:
-                                pass
-                            # Enforce failure cooldown for this market
-                            self._last_failure_timestamps[market_tuple] = self._current_timestamp
+                        # CRITICAL: Actually CANCEL the limit order on the exchange
+                        try:
+                            self.c_cancel_order(market_tuple, order_id)
+                            self.logger().warning(f"Limit order {order_id} on {market_tuple[0].name} timed out after {time_elapsed:.2f}s - CANCELLING order")
+                        except Exception as e:
+                            self.logger().error(f"Failed to cancel timed out order {order_id}: {e}")
+
+                        # Clean up tracking
+                        self._order_timestamps.erase(order_id_str)
+                        self._completed_orders.erase(order_id_str)
+
+                        # Clean up pending buy-in tracking if applicable
+                        try:
+                            pend = self._pending_buyin_orders.pop(order_id, None)
+                            if pend is not None:
+                                asset_key, amt = pend
+                                self._pending_buyin_by_asset[asset_key] = max(
+                                    0.0,
+                                    float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
+                                )
+                                if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
+                                    self._pending_buyin_by_asset.pop(asset_key, None)
+                        except Exception:
+                            pass
+
+                        # Remove from pending limit orders tracking
+                        try:
+                            pending_set = self._pending_limit_orders_by_market.get(market_tuple)
+                            if pending_set is not None:
+                                pending_set.discard(order_id)
+                                if len(pending_set) == 0:
+                                    self._pending_limit_orders_by_market.pop(market_tuple, None)
+                        except Exception:
+                            pass
+
+                        # Enforce cooldown for this market
+                        self._last_failure_timestamps[market_tuple] = self._current_timestamp
+
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """Check if ready for new orders - per-market pending check for parallel trading"""
