@@ -862,7 +862,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Get ALL orders (limit orders in our case) across ALL market tuples
         try:
-            all_market_orders = self._sb_order_tracker.c_get_market_orders()
+            all_market_orders = self._sb_order_tracker.c_get_limit_orders()
         except Exception:
             return
 
