@@ -103,7 +103,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging_options: int = OPTION_LOG_STATUS_REPORT,
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 4.0,
-                    order_timeout: float = 60.0,
+                    order_timeout: float = 180.0,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
                     secondary_to_primary_quote_conversion_rate: Decimal = Decimal("1"),
