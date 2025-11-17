@@ -68,6 +68,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track pending limit orders per market tuple - SEPARATE for buy and sell to allow parallel buy+sell
         dict _pending_buy_orders_by_market   # market_tuple -> set of buy order_ids
         dict _pending_sell_orders_by_market  # market_tuple -> set of sell order_ids
+        # Track orders cancelled due to timeout (to avoid cooldown on timeout cancellations)
+        set _timeout_cancelled_orders
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode
