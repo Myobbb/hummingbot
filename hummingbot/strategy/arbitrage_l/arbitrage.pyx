@@ -1275,42 +1275,55 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
         
-        # Aggregate profitable volume
+        # Aggregate profitable volume and track worst prices for limit orders
         cdef:
             double total_base = 0.0
             double total_cost = 0.0
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
+            double worst_buy_price = 0.0    # Highest (worst) ask price for buy limit order
+            double worst_sell_price = 0.0   # Lowest (worst) bid price for sell limit order
             double avg_sell_price_orig, avg_buy_price, profitability
-        
+
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             # Apply constraints
-            amount = min(amount, 
+            amount = min(amount,
                         max_base_amount - total_base,
                         (buy_quote_balance - total_cost) / ask_adj if ask_adj > 0 else 0)
-            
+
             if amount <= EPSILON:
                 continue
-            
+
+            # Track worst (furthest) prices for limit orders to ensure full fill
+            # Buy side: use highest (worst) ask price we scanned
+            if orig_ask > worst_buy_price:
+                worst_buy_price = orig_ask
+            # Sell side: use lowest (worst) bid price we scanned
+            if worst_sell_price == 0.0 or orig_bid < worst_sell_price:
+                worst_sell_price = orig_bid
+
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds_orig += orig_bid * amount
-            
+
             # Stop if we've used all capacity
             if total_base >= max_base_amount - EPSILON:
                 break
-        
-        # Calculate results
+
+        # Calculate results using worst prices for limit orders
         if total_base > EPSILON:
+            # Use worst prices instead of averages for limit order placement
+            # Profitability check still uses average prices for accuracy
             avg_sell_price_orig = total_proceeds_orig / total_base
             avg_buy_price = total_cost / total_base
             profitability = ((avg_sell_price_orig * conv_rate) / avg_buy_price - 1.0) if avg_buy_price > 0 else 0.0
-            
+
             # Check minimum notional (in sell market quote currency)
             # NOTE: _min_order_usd should match quote currency units
             if avg_sell_price_orig * total_base >= self._min_order_usd:
-                return (total_base, profitability, avg_sell_price_orig, avg_buy_price)
-        
+                # Return worst prices for limit order placement (not averages)
+                return (total_base, profitability, worst_sell_price, worst_buy_price)
+
         return (0.0, 0.0, 0.0, 0.0)
 
 
@@ -1681,6 +1694,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
             double remaining_quote
             double avg_bid_adj, avg_bid_orig, avg_ask, profitability
+            double worst_buy_price = 0.0  # Highest (worst) ask price for buy limit order
 
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             remaining_quote = spend_cap - total_cost
@@ -1690,6 +1704,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 amount = min(amount, remaining_quote / ask_adj)
             if amount <= EPSILON:
                 continue
+
+            # Track worst (furthest) buy price for limit order to ensure full fill
+            if orig_ask > worst_buy_price:
+                worst_buy_price = orig_ask
+
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
@@ -1700,7 +1719,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             avg_bid_orig = total_proceeds_orig / total_base
             avg_ask = total_cost / total_base
             profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
-            return (total_base, profitability, avg_bid_orig, avg_ask)
+            # Return worst buy price for limit order placement (not average)
+            return (total_base, profitability, avg_bid_orig, worst_buy_price)
 
         return (0.0, 0.0, 0.0, 0.0)
 
