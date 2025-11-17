@@ -74,6 +74,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._orders_with_fills = set()
         # Keep recent order -> market pair mapping for late events
         self._recent_order_market_pair = {}
+        # Track pending limit orders per market tuple for parallel trading
+        self._pending_limit_orders_by_market = {}
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -166,6 +168,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         try:
             self._recent_order_market_pair.clear()
+        except Exception:
+            pass
+        try:
+            self._pending_limit_orders_by_market.clear()
         except Exception:
             pass
 
@@ -668,6 +674,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._last_failure_timestamps.pop(cooldown_tuple, None)
                 self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
 
+            # Remove from pending limit orders tracking to allow new trades on this market
+            try:
+                if market_pair_tuple is not None:
+                    pending_set = self._pending_limit_orders_by_market.get(market_pair_tuple)
+                    if pending_set is not None:
+                        pending_set.discard(order_id)
+                        # Clean up empty sets
+                        if len(pending_set) == 0:
+                            self._pending_limit_orders_by_market.pop(market_pair_tuple, None)
+            except Exception as e:
+                self.logger().warning(f"Failed to remove completed order from pending tracking: {e}")
+
             # Check completion time
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
@@ -762,13 +780,26 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if pend is not None:
                 asset_key, amt = pend
                 self._pending_buyin_by_asset[asset_key] = max(
-                    0.0, 
+                    0.0,
                     float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
                 )
                 if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
                     self._pending_buyin_by_asset.pop(asset_key, None)
         except Exception:
             pass
+
+        # Remove from pending limit orders tracking to allow new trades on this market
+        try:
+            if market_pair is not None:
+                pending_set = self._pending_limit_orders_by_market.get(market_pair)
+                if pending_set is not None:
+                    pending_set.discard(order_id)
+                    # Clean up empty sets
+                    if len(pending_set) == 0:
+                        self._pending_limit_orders_by_market.pop(market_pair, None)
+        except Exception as e:
+            self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
+
         # Decide cooldown/logging based on completion status, order type and fill state
         if was_already_completed:
             # Order was already marked as completed before cancel event arrived
@@ -890,6 +921,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                         self._pending_buyin_by_asset.pop(asset_key, None)
                             except Exception:
                                 pass
+                            # Remove from pending limit orders tracking
+                            try:
+                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
+                                if pending_set is not None:
+                                    pending_set.discard(order_id)
+                                    if len(pending_set) == 0:
+                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
+                            except Exception:
+                                pass
                             if has_any_fill:
                                 try:
                                     self._orders_with_fills.discard(order_id)
@@ -919,18 +959,35 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                         self._pending_buyin_by_asset.pop(asset_key, None)
                             except Exception:
                                 pass
+                            # Remove from pending limit orders tracking
+                            try:
+                                pending_set = self._pending_limit_orders_by_market.get(market_tuple)
+                                if pending_set is not None:
+                                    pending_set.discard(order_id)
+                                    if len(pending_set) == 0:
+                                        self._pending_limit_orders_by_market.pop(market_tuple, None)
+                            except Exception:
+                                pass
                             # Enforce failure cooldown for this market
                             self._last_failure_timestamps[market_tuple] = self._current_timestamp
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
-        """Check if ready for new orders - global delay across all markets"""
+        """Check if ready for new orders - per-market pending check for parallel trading"""
         cdef:
             double time_left
+            object market_tuple
+            set pending_orders
 
-        # For limit orders: check if there are any pending orders
-        # If yes, don't place new orders until they complete
-        if len(self.tracked_limit_orders) > 0:
-            return False
+        # For limit orders: check if THESE SPECIFIC markets have pending orders
+        # This allows parallel trading across different market pairs
+        for market_tuple in market_tuples:
+            try:
+                pending_orders = self._pending_limit_orders_by_market.get(market_tuple)
+                if pending_orders and len(pending_orders) > 0:
+                    # This specific market has pending orders - block trading on it
+                    return False
+            except Exception:
+                pass  # If check fails, continue (fail-safe approach)
 
         # Global cooldown check - applies to ALL market pairs
         if self._last_global_trade_timestamp > 0:
@@ -1148,10 +1205,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # The price is used as the limit price for the orders
 
             # Pre-calculate all parameters to minimize latency between orders
-            # Use maker order type (LIMIT or LIMIT_MAKER) for limit orders
-            #buy_order_type = buy_market.get_maker_order_type()
-            #sell_order_type = sell_market.get_maker_order_type()
-
             # Use LIMIT order type for both buy and sell orders
             buy_order_type = OrderType.LIMIT
             sell_order_type = OrderType.LIMIT
@@ -1192,6 +1245,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             self._order_timestamps[buy_id_str] = order_start_time
             self._order_timestamps[sell_id_str] = order_start_time
+
+            # Track pending limit orders per market for parallel trading support
+            try:
+                if buy_market_tuple not in self._pending_limit_orders_by_market:
+                    self._pending_limit_orders_by_market[buy_market_tuple] = set()
+                self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+
+                if sell_market_tuple not in self._pending_limit_orders_by_market:
+                    self._pending_limit_orders_by_market[sell_market_tuple] = set()
+                self._pending_limit_orders_by_market[sell_market_tuple].add(sell_order_id)
+            except Exception as e:
+                self.logger().warning(f"Failed to track pending orders by market: {e}")
 
 
             
@@ -1279,42 +1344,55 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if not profitable_orders:
             return (0.0, 0.0, 0.0, 0.0)
         
-        # Aggregate profitable volume
+        # Aggregate profitable volume and track worst prices for limit orders
         cdef:
             double total_base = 0.0
             double total_cost = 0.0
             double total_proceeds_orig = 0.0
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
+            double worst_buy_price = 0.0    # Highest (worst) ask price for buy limit order
+            double worst_sell_price = 0.0   # Lowest (worst) bid price for sell limit order
             double avg_sell_price_orig, avg_buy_price, profitability
-        
+
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             # Apply constraints
-            amount = min(amount, 
+            amount = min(amount,
                         max_base_amount - total_base,
                         (buy_quote_balance - total_cost) / ask_adj if ask_adj > 0 else 0)
-            
+
             if amount <= EPSILON:
                 continue
-            
+
+            # Track worst (furthest) prices for limit orders to ensure full fill
+            # Buy side: use highest (worst) ask price we scanned
+            if orig_ask > worst_buy_price:
+                worst_buy_price = orig_ask
+            # Sell side: use lowest (worst) bid price we scanned
+            if worst_sell_price == 0.0 or orig_bid < worst_sell_price:
+                worst_sell_price = orig_bid
+
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds_orig += orig_bid * amount
-            
+
             # Stop if we've used all capacity
             if total_base >= max_base_amount - EPSILON:
                 break
-        
-        # Calculate results
+
+        # Calculate results using worst prices for limit orders
         if total_base > EPSILON:
+            # Use worst prices instead of averages for limit order placement
+            # Profitability check still uses average prices for accuracy
             avg_sell_price_orig = total_proceeds_orig / total_base
             avg_buy_price = total_cost / total_base
             profitability = ((avg_sell_price_orig * conv_rate) / avg_buy_price - 1.0) if avg_buy_price > 0 else 0.0
-            
+
             # Check minimum notional (in sell market quote currency)
             # NOTE: _min_order_usd should match quote currency units
             if avg_sell_price_orig * total_base >= self._min_order_usd:
-                return (total_base, profitability, avg_sell_price_orig, avg_buy_price)
-        
+                # Return worst prices for limit order placement (not averages)
+                return (total_base, profitability, worst_sell_price, worst_buy_price)
+
         return (0.0, 0.0, 0.0, 0.0)
 
 
@@ -1532,7 +1610,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return False
 
         # Place only the buy leg on buy market
-        cdef object order_type = market.get_maker_order_type()
+        cdef object order_type = OrderType.LIMIT
         cdef object quantized_amount
         cdef object dec_safe_amount2 = Decimal(str(max(0.0, best_amount - QUANTIZATION_EPSILON)))
         try:
@@ -1593,6 +1671,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track order timestamp for housekeeping
         cdef string buy_id_str = self._to_cpp_str(buy_order_id)
         self._order_timestamps[buy_id_str] = self._current_timestamp
+
+        # Track pending limit orders per market for parallel trading support
+        try:
+            if buy_market_tuple not in self._pending_limit_orders_by_market:
+                self._pending_limit_orders_by_market[buy_market_tuple] = set()
+            self._pending_limit_orders_by_market[buy_market_tuple].add(buy_order_id)
+        except Exception as e:
+            self.logger().warning(f"Failed to track pending buy-in order by market: {e}")
 
         # Track pending base to avoid stale underestimation until fills settle
         try:
@@ -1685,6 +1771,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double bid_adj, ask_adj, orig_bid, orig_ask, amount
             double remaining_quote
             double avg_bid_adj, avg_bid_orig, avg_ask, profitability
+            double worst_buy_price = 0.0  # Highest (worst) ask price for buy limit order
 
         for bid_adj, ask_adj, orig_bid, orig_ask, amount in profitable_orders:
             remaining_quote = spend_cap - total_cost
@@ -1694,6 +1781,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 amount = min(amount, remaining_quote / ask_adj)
             if amount <= EPSILON:
                 continue
+
+            # Track worst (furthest) buy price for limit order to ensure full fill
+            if orig_ask > worst_buy_price:
+                worst_buy_price = orig_ask
+
             total_base += amount
             total_cost += ask_adj * amount
             total_proceeds += bid_adj * amount
@@ -1704,7 +1796,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             avg_bid_orig = total_proceeds_orig / total_base
             avg_ask = total_cost / total_base
             profitability = (avg_bid_adj / avg_ask - 1.0) if avg_ask > EPSILON else 0.0
-            return (total_base, profitability, avg_bid_orig, avg_ask)
+            # Return worst buy price for limit order placement (not average)
+            return (total_base, profitability, avg_bid_orig, worst_buy_price)
 
         return (0.0, 0.0, 0.0, 0.0)
 
