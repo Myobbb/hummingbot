@@ -667,7 +667,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Check if we've already processed this order's completion
         # This prevents duplicate logging for partial fills
         if self._completed_orders.find(order_id_str) != self._completed_orders.end():
-            # Already processed - this is normal for market orders (late exchange confirmation)
+            # Already processed - this is normal for limit orders (late exchange confirmation)
             return
             
         try:
@@ -704,10 +704,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             except Exception as e:
                 self.logger().warning(f"Failed to remove completed order from pending tracking: {e}")
 
-            # Check completion time
+            # Check completion time - safely handle None market_pair_tuple
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
-                self.logger().info(f"{market_pair_tuple[0].name}: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
+                if market_pair_tuple is not None:
+                    self.logger().info(f"{market_pair_tuple[0].name}: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
+                else:
+                    self.logger().info(f"Unknown market: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
                 self._order_timestamps.erase(order_id_str)
 
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
@@ -764,7 +767,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             bint was_already_completed = False
 
         if market_pair is None:
-            return
+            # Try to get from recent mapping for late events
+            try:
+                market_pair = self._recent_order_market_pair.get(order_id)
+            except Exception:
+                pass
+            if market_pair is None:
+                return
 
         # Check if order was already marked as completed (completion event arrived first)
         # This prevents race condition where cancel arrives after completion
@@ -774,13 +783,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._order_timestamps.erase(order_id_str)
         self._completed_orders.erase(order_id_str)
 
-        # Stop tracking the order
+        # Stop tracking the order - use LIMIT order tracking since this strategy uses limit orders only
         # Remember mapping for possible late events
         try:
             self._recent_order_market_pair[order_id] = market_pair
         except Exception:
             pass
-        self._sb_order_tracker.c_stop_tracking_market_order(market_pair, order_id)
+        self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, order_id)
 
         # Clean up pending buy-in tracking if applicable
         try:
@@ -883,6 +892,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
+                        # Check if this order is already being cancelled to prevent duplicates
+                        if self._sb_order_tracker.c_has_in_flight_cancel(order_id):
+                            continue  # Skip if already being cancelled
+                        
                         # CRITICAL: Actually CANCEL the limit order on the exchange
                         try:
                             self.c_cancel_order(market_tuple, order_id)
@@ -896,11 +909,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
                         # CRITICAL: Stop tracking the order immediately to prevent re-processing
                         # before the cancel event arrives (prevents repeated cancel attempts)
+                        # Use LIMIT order tracking since this strategy uses limit orders only
                         try:
                             self._recent_order_market_pair[order_id] = market_tuple
                         except Exception:
                             pass
-                        self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                        self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
                         # Clean up pending buy-in tracking if applicable
                         try:
