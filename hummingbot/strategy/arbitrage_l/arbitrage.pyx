@@ -894,6 +894,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self._order_timestamps.erase(order_id_str)
                         self._completed_orders.erase(order_id_str)
 
+                        # CRITICAL: Stop tracking the order immediately to prevent re-processing
+                        # before the cancel event arrives (prevents repeated cancel attempts)
+                        try:
+                            self._recent_order_market_pair[order_id] = market_tuple
+                        except Exception:
+                            pass
+                        self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+
                         # Clean up pending buy-in tracking if applicable
                         try:
                             pend = self._pending_buyin_orders.pop(order_id, None)
