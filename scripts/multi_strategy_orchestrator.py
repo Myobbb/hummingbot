@@ -1976,7 +1976,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         return out
 
     def _parse_best_profitability(self, status_blob: str) -> Optional[str]:
-        """Parse the 'best:' line and return only the trailing profitability piece after '->'."""
+        """Parse the 'best:' line and return direction + profitability (e.g., 'bybit->htx +2.1036%')."""
         if not status_blob:
             return None
         try:
@@ -1984,9 +1984,25 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 stripped = ln.strip()
                 if stripped.startswith("best:") and "->" in stripped:
                     try:
-                        return stripped.split("->", 1)[1].strip()
+                        # Format: "best: buy-exchange1 sell-exchange2 -> +X.XXXX%"
+                        # Extract: "exchange1->exchange2 +X.XXXX%"
+                        parts = stripped.split("->", 1)
+                        left = parts[0]  # "best: buy-exchange1 sell-exchange2 "
+                        right = parts[1].strip()  # "+X.XXXX%"
+
+                        # Extract exchanges from "buy-exchange1 sell-exchange2"
+                        buy_match = re.search(r'buy-(\S+)', left)
+                        sell_match = re.search(r'sell-(\S+)', left)
+
+                        if buy_match and sell_match:
+                            buy_ex = buy_match.group(1)
+                            sell_ex = sell_match.group(1)
+                            return f"{buy_ex}->{sell_ex} {right}"
+                        else:
+                            # Fallback: just return the percentage
+                            return right
                     except Exception:
-                        return stripped
+                        return stripped.split("->", 1)[1].strip()
         except Exception:
             return None
         return None
