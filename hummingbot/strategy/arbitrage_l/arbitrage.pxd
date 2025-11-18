@@ -22,6 +22,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _status_report_interval
         double _next_trade_delay
         double _order_timeout
+        double _filled_order_timeout
         double _order_warning_delay
         
         # Thresholds
@@ -58,6 +59,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cpp_set[string] _completed_orders
         # Track orders that have received at least one fill (Python set of order_ids)
         set _orders_with_fills
+        # Track when orders first received fills (for filled order timeout cleanup)
+        dict _order_fill_timestamps
         # Recent order -> market pair mapping to resolve late events after tracker cleanup
         dict _recent_order_market_pair
         # Track pending limit orders per market tuple - SEPARATE for buy and sell to allow parallel buy+sell
@@ -119,6 +122,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Maintenance
     cdef void c_check_all_order_timeouts(self)
+    cdef void c_check_filled_order_timeouts(self)
     cdef void c_cleanup_old_orders(self)
 
 # Single optimized function for finding profitable orders

@@ -42,6 +42,7 @@ cdef:
     double DEFAULT_RATE_CACHE_DURATION = 10.0
     double DEFAULT_ORDER_WARNING_DELAY = 10.0
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
+    double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
@@ -73,6 +74,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._buy_in_handler = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
+        # Track when orders first received fills (for filled order timeout cleanup)
+        self._order_fill_timestamps = {}  # order_id -> timestamp when first fill received
         # Keep recent order -> market pair mapping for late events
         self._recent_order_market_pair = {}
         # Track pending limit orders per market tuple - SEPARATE for buy/sell to allow parallel buy+sell
@@ -99,6 +102,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 4.0,
                     order_timeout: float = 180.0,
+                    filled_order_timeout: float = DEFAULT_FILLED_ORDER_TIMEOUT,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
                     secondary_to_primary_quote_conversion_rate: Decimal = Decimal("1"),
@@ -125,6 +129,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._status_report_interval = status_report_interval
         self._next_trade_delay = next_trade_delay_interval
         self._order_timeout = order_timeout
+        self._filled_order_timeout = filled_order_timeout
         self._order_warning_delay = order_warning_delay
         
         # Thresholds
@@ -163,6 +168,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._completed_orders.clear()
         try:
             self._orders_with_fills.clear()
+        except Exception:
+            pass
+        try:
+            self._order_fill_timestamps.clear()
         except Exception:
             pass
         try:
@@ -565,6 +574,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # This ensures canceled orders are detected even if their market is no longer being considered
             self.c_check_all_order_timeouts()
 
+            # Check filled orders for extended timeout
+            self.c_check_filled_order_timeouts()
+
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
                 self.c_cleanup_old_orders()
@@ -686,6 +698,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Clean fill marker since completion supersedes partials
             try:
                 self._orders_with_fills.discard(order_id)
+                self._order_fill_timestamps.pop(order_id, None)
             except Exception:
                 pass
 
@@ -728,6 +741,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track fills for any order type (we only change cooldown logic for MARKET)
         try:
             self._orders_with_fills.add(order_id)
+            # Track the timestamp when this order first received a fill (for filled order timeout)
+            if order_id not in self._order_fill_timestamps:
+                self._order_fill_timestamps[order_id] = self._current_timestamp
         except Exception:
             pass
 
@@ -767,6 +783,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Full cleanup for cancelled orders
         self._order_timestamps.erase(order_id_str)
         self._completed_orders.erase(order_id_str)
+        # Clean up fill timestamp tracking
+        try:
+            self._order_fill_timestamps.pop(order_id, None)
+        except Exception:
+            pass
 
         # Stop tracking the order - use LIMIT order tracking since this strategy uses limit orders only
         # Remember mapping for possible late events
@@ -895,6 +916,89 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         # Enforce cooldown for this market
                         self._last_failure_timestamps[market_tuple] = self._current_timestamp
 
+    cdef void c_check_filled_order_timeouts(self):
+        """
+        Check and cancel filled orders that exceed filled_order_timeout.
+        This allows orders with partial fills to remain open longer than unfilled orders.
+        """
+        cdef:
+            str order_id
+            double fill_time
+            double time_since_fill
+            object market_tuple
+            dict all_market_orders
+            dict market_orders
+
+        # Skip if no orders with fills to check
+        if not self._order_fill_timestamps:
+            return
+
+        # Get ALL tracked limit orders
+        try:
+            all_market_orders = self._sb_order_tracker.c_get_limit_orders()
+        except Exception:
+            return
+
+        # Check each order with fills for timeout
+        for order_id, fill_time in list(self._order_fill_timestamps.items()):
+            time_since_fill = self._current_timestamp - fill_time
+
+            # Check if filled order has exceeded its timeout
+            if time_since_fill > self._filled_order_timeout:
+                # Find the market tuple for this order
+                market_tuple = None
+                for mt, orders in all_market_orders.items():
+                    if order_id in orders:
+                        market_tuple = mt
+                        break
+
+                # If order is still tracked, cancel it
+                if market_tuple is not None:
+                    # Check if already being cancelled
+                    if self._sb_order_tracker.c_has_in_flight_cancel(order_id):
+                        continue
+
+                    # Mark as timeout-cancelled to avoid cooldown
+                    self._timeout_cancelled_orders.add(order_id)
+
+                    # Cancel the order
+                    try:
+                        self.c_cancel_order(market_tuple, order_id)
+                        self.logger().info(
+                            f"Filled limit order {order_id} on {market_tuple[0].name} exceeded "
+                            f"filled order timeout ({self._filled_order_timeout:.0f}s) after "
+                            f"{time_since_fill:.2f}s - CANCELLING order")
+                    except Exception as e:
+                        self.logger().error(f"Failed to cancel filled order {order_id}: {e}")
+                        self._timeout_cancelled_orders.discard(order_id)
+                        continue
+
+                    # Clean up tracking (similar to regular timeout handling)
+                    try:
+                        order_id_str = self._to_cpp_str(order_id)
+                        self._order_timestamps.erase(order_id_str)
+                        self._completed_orders.erase(order_id_str)
+                        self._recent_order_market_pair[order_id] = market_tuple
+                    except Exception:
+                        pass
+
+                    # Stop tracking the order
+                    self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
+
+                    # Cleanup buy-in tracking
+                    if self._buy_in_handler is not None:
+                        self._buy_in_handler.handle_order_timeout(order_id)
+
+                    # Remove from pending orders tracking
+                    self.c_remove_pending_order(market_tuple, order_id, "filled_timeout")
+
+                    # Clean up fill timestamp
+                    self._order_fill_timestamps.pop(order_id, None)
+
+                    # Do NOT enforce cooldown for filled order timeouts (they got fills, just didn't complete)
+                else:
+                    # Order no longer tracked, clean up fill timestamp
+                    self._order_fill_timestamps.pop(order_id, None)
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """
@@ -1517,6 +1621,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self._recent_order_market_pair.pop(oid, None)
                     # Also clean up timeout cancelled orders set
                     self._timeout_cancelled_orders.discard(oid)
+                    # Also clean up fill timestamps
+                    self._order_fill_timestamps.pop(oid, None)
                 except Exception:
                     pass
         except Exception:

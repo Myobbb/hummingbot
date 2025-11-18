@@ -56,6 +56,12 @@ async def start(self):
         if buy_in_min_profitability_val is None:
             buy_in_min_profitability_val = Decimal("0.5")
         buy_in_min_profitability = buy_in_min_profitability_val / Decimal("100")
+        # Filled order timeout (defaults to 3600 seconds = 1 hour)
+        filled_order_timeout_val = arbitrage_l_config_map.get("filled_order_timeout").value
+        if filled_order_timeout_val is None:
+            filled_order_timeout = 3600.0
+        else:
+            filled_order_timeout = float(filled_order_timeout_val)
         raw_additional = arbitrage_l_config_map.get("additional_markets").value or ""
         additional = _parse_additional_markets(raw_additional)
         
@@ -124,6 +130,7 @@ async def start(self):
             logging_options=(ArbitrageLStrategy.OPTION_LOG_STATUS_REPORT |
                            ArbitrageLStrategy.OPTION_LOG_ORDER_COMPLETED |
                            ArbitrageLStrategy.OPTION_LOG_CREATE_ORDER),
+            filled_order_timeout=filled_order_timeout,
             use_oracle_conversion_rate=use_oracle_conversion_rate,
             secondary_to_primary_base_conversion_rate=secondary_to_primary_base_conversion_rate,
             secondary_to_primary_quote_conversion_rate=secondary_to_primary_quote_conversion_rate,
