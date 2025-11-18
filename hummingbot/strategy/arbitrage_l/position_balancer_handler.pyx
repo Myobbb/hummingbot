@@ -581,7 +581,7 @@ cdef class PositionBalancerHandler:
 
         # Calculate amount based on shortfall, available quote, and order size limit
         max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
-        max_order_base = self._order_size_usd / last_bid if last_bid > 0 else 0.0
+        max_order_base = self._order_size_usd / buy_price if buy_price > 0 else 0.0
         amount_to_buy = min(
             shortfall / last_bid if last_bid > 0 else 0.0,
             max_affordable_base,
@@ -717,7 +717,7 @@ cdef class PositionBalancerHandler:
         sell_price = top_ask * (1.0 + self._sell_spread_pct)
 
         # Calculate amount based on excess, available base, and order size limit
-        max_order_base = self._order_size_usd / last_bid if last_bid > 0 else 0.0
+        max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
         amount_to_sell = min(
             excess / last_bid if last_bid > 0 else 0.0,
             base_bal_raw,
