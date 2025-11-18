@@ -169,38 +169,83 @@ def _is_buy_in_enabled() -> bool:
     except Exception:
         return False
 
+
+def _is_sell_off_enabled() -> bool:
+    """Helper to decide whether sell-off specific fields should be prompted."""
+    try:
+        enabled = arbitrage_l_config_map.get("sell_off_enabled").value
+        return bool(enabled)
+    except Exception:
+        return False
+
 arbitrage_l_config_map = {
     "strategy": ConfigVar(
         key="strategy",
         prompt="",
         default="arbitrage_l"
     ),
-    # Optional buy-in module
+    # Position Balancer - Buy-in Configuration
     "buy_in_enabled": ConfigVar(
         key="buy_in_enabled",
         type_str="bool",
-        prompt="Enable initial buy-in if base asset holdings are below target? (Yes/No)",
+        prompt="Enable buy-in to acquire assets when below target? (Yes/No)",
         prompt_on_new=True,
         default=True,
         validator=lambda v: validate_bool(v),
     ),
     "buy_in_target_usdt": ConfigVar(
         key="buy_in_target_usdt",
-        prompt="Target base asset value to accumulate (in quote units, e.g., USDT) >>> ",
+        prompt="Target minimum base asset value (in quote units, e.g., USDT) >>> ",
         prompt_on_new=False,
         default=Decimal("100"),
         validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
         type_str="decimal",
         required_if=_is_buy_in_enabled,
     ),
-    "buy_in_min_profitability": ConfigVar(
-        key="buy_in_min_profitability",
-        prompt="Minimum cross-market edge (%) required to trigger buy-in (e.g., 0.5) >>> ",
+    "buy_in_spread_pct": ConfigVar(
+        key="buy_in_spread_pct",
+        prompt="Spread percentage below top bid for buy limit orders (e.g., 0.1 for 0.1%) >>> ",
         prompt_on_new=False,
-        default=Decimal("0.5"),
-        validator=lambda v: validate_decimal(v, Decimal(-100), Decimal("100"), inclusive=True),
+        default=Decimal("0.1"),
+        validator=lambda v: validate_decimal(v, Decimal(0), Decimal("100"), inclusive=True),
         type_str="decimal",
         required_if=_is_buy_in_enabled,
+    ),
+    # Position Balancer - Sell-off Configuration
+    "sell_off_enabled": ConfigVar(
+        key="sell_off_enabled",
+        type_str="bool",
+        prompt="Enable sell-off to reduce assets when above target? (Yes/No)",
+        prompt_on_new=False,
+        default=False,
+        validator=lambda v: validate_bool(v),
+    ),
+    "sell_off_target_usd": ConfigVar(
+        key="sell_off_target_usd",
+        prompt="Target maximum base asset value (in quote units, e.g., USDT) >>> ",
+        prompt_on_new=False,
+        default=Decimal("1000"),
+        validator=lambda v: validate_decimal(v, Decimal(0), inclusive=False),
+        type_str="decimal",
+        required_if=_is_sell_off_enabled,
+    ),
+    "sell_off_spread_pct": ConfigVar(
+        key="sell_off_spread_pct",
+        prompt="Spread percentage above top ask for sell limit orders (e.g., 0.1 for 0.1%) >>> ",
+        prompt_on_new=False,
+        default=Decimal("0.1"),
+        validator=lambda v: validate_decimal(v, Decimal(0), Decimal("100"), inclusive=True),
+        type_str="decimal",
+        required_if=_is_sell_off_enabled,
+    ),
+    # Position Balancer - Order Management
+    "position_balancer_refresh_interval": ConfigVar(
+        key="position_balancer_refresh_interval",
+        prompt="How often to cancel and replace limit orders (seconds) >>> ",
+        prompt_on_new=False,
+        default=Decimal("10"),
+        validator=lambda v: validate_decimal(v, Decimal(1), inclusive=True),
+        type_str="decimal",
     ),
     "primary_market": ConfigVar(
         key="primary_market",
