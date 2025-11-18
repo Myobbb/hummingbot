@@ -83,10 +83,10 @@ Optimizations for 40-50 Strategies (Reconnection Performance):
    - Coordinated re-initialization after full reconnection events
    - Prevents redundant startup logic across 40-50 strategies
 
-2. Coordinated Buy-in Initialization:
-   - Single wallet balance query when markets become ready
-   - Orchestrator coordinates buy-in checks for all strategies
-   - Prevents 40-50 simultaneous wallet queries on reconnection
+2. Individual Strategy Buy-in:
+   - Each strategy handles its own buy-in logic in orchestrated mode
+   - Buy-in check runs when strategy first detects markets are ready
+   - No orchestrator-level coordination needed (strategies are self-contained)
 
 3. Optimized Readiness Checking:
    - Individual strategies use orchestrated_mode for streamlined readiness checks
@@ -448,7 +448,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Orchestrator-level readiness coordination (optimization for 40-50 strategies)
         self._markets_ready_notified: bool = False
-        self._buy_in_initialized: bool = False
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -756,8 +755,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if all_connectors_ready and not prev_global_ready and self._markets_ready_notified:
             # Full reconnection after full disconnection
             self.logger().info("All connectors reconnected - running coordinated re-initialization")
-            # Reset buy-in flag so it runs again on reconnection
-            self._buy_in_initialized = False
             self._on_markets_ready(timestamp)
 
         # CRITICAL: Don't use ScriptStrategyBase.tick() - it requires ALL connectors to be ready
@@ -790,55 +787,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             status = connector.status_dict
             self.logger().info(f"{name}: {status}")
 
-        # Coordinated buy-in initialization (if any strategy has it enabled)
-        if not self._buy_in_initialized:
-            self._perform_coordinated_buy_in_check()
-            self._buy_in_initialized = True
+        # Buy-in coordination is handled by individual strategies in orchestrated mode
+        # Each strategy calls its own buy-in check when it first detects markets are ready
+        # arbitrage_m: calls self.c_scan_and_mark_buyin_completion()
+        # arbitrage_l: calls self._buy_in_handler.c_scan_and_mark_completion()
+        # No orchestrator-level coordination needed - strategies handle it internally
 
         self.logger().info("=" * 70)
         self.logger().info("Markets ready. Trading started.")
         self.logger().info("=" * 70)
-
-    def _perform_coordinated_buy_in_check(self):
-        """
-        Perform buy-in completion check at orchestrator level.
-
-        This queries wallet balances ONCE for all strategies instead of
-        40-50 individual queries, significantly speeding up reconnection.
-        """
-        # Check if any strategy has buy-in enabled (with defensive check for recompilation)
-        buy_in_strategies = []
-        for s in self.strategies:
-            try:
-                if hasattr(s.strategy, '_buy_in_enabled') and s.strategy._buy_in_enabled:
-                    buy_in_strategies.append(s)
-            except AttributeError:
-                # Strategy not yet recompiled - skip buy-in check for now
-                continue
-
-        if not buy_in_strategies:
-            return
-
-        self.logger().info(f"Coordinated buy-in check for {len(buy_in_strategies)} strategies...")
-
-        # Perform coordinated buy-in completion scan for each enabled strategy
-        # This calls the strategy's existing buy-in logic but only ONCE when markets are ready
-        # Supports both arbitrage_m (inline) and arbitrage_l (handler-based) buy-in patterns
-        for strategy_instance in buy_in_strategies:
-            try:
-                strategy = strategy_instance.strategy
-                # arbitrage_m pattern: inline buy-in with c_scan_and_mark_buyin_completion()
-                if hasattr(strategy, 'c_scan_and_mark_buyin_completion'):
-                    strategy.c_scan_and_mark_buyin_completion()
-                # arbitrage_l pattern: handler-based buy-in with _buy_in_handler.c_scan_and_mark_completion()
-                elif hasattr(strategy, '_buy_in_handler') and strategy._buy_in_handler is not None:
-                    if hasattr(strategy._buy_in_handler, 'c_scan_and_mark_completion'):
-                        strategy._buy_in_handler.c_scan_and_mark_completion()
-            except Exception as e:
-                self.logger().warning(
-                    f"Error in buy-in check for '{strategy_instance.name}': {e}",
-                    exc_info=True
-                )
 
     def _start_all_strategies_if_needed(self):
         """
@@ -1807,6 +1764,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 lines.append(f"  {name}:")
                 lines.extend([f"    {ln}" for ln in blines])
 
+        # Pending Orders (aggregated across all strategies)
+        pending_orders_info = self._get_pending_orders_summary()
+        if pending_orders_info:
+            lines.append("\nPending Orders:")
+            lines.extend([f"  {line}" for line in pending_orders_info])
+
         # Only show connectors not ready; omit when all ready
         not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
         if not_ready:
@@ -1815,6 +1778,106 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 lines.append(f"  {n}")
 
         return "\n".join(lines)
+
+    def _get_pending_orders_summary(self) -> List[str]:
+        """
+        Collect and format pending orders from all strategies.
+        Returns a list of formatted lines showing pending orders by market.
+        """
+        from collections import defaultdict
+
+        # Collect all pending orders from all strategies
+        # Format: {(exchange, trading_pair, strategy_name): [(order_type, price, amount, order_id), ...]}
+        orders_by_market = defaultdict(list)
+
+        for strategy_instance in self.strategies:
+            try:
+                strategy = strategy_instance.strategy
+                strategy_name = strategy_instance.name
+
+                # Get limit orders (arbitrage_l primarily uses these)
+                if hasattr(strategy, 'tracked_limit_orders'):
+                    for market, limit_order in strategy.tracked_limit_orders:
+                        try:
+                            trading_pair = limit_order.trading_pair
+                            exchange = market.name
+                            order_type = "BUY" if limit_order.is_buy else "SELL"
+                            price = float(limit_order.price)
+                            amount = float(limit_order.quantity)
+                            order_id = limit_order.client_order_id
+
+                            orders_by_market[(exchange, trading_pair, strategy_name)].append(
+                                (order_type, price, amount, order_id)
+                            )
+                        except Exception as e:
+                            self.logger().debug(f"Error processing limit order: {e}")
+
+                # Get market orders (arbitrage_m may use these)
+                if hasattr(strategy, 'tracked_market_orders'):
+                    for market, market_order in strategy.tracked_market_orders:
+                        try:
+                            trading_pair = market_order.trading_pair
+                            exchange = market.name
+                            order_type = "BUY" if market_order.is_buy else "SELL"
+                            amount = float(market_order.amount)
+                            order_id = market_order.order_id
+
+                            orders_by_market[(exchange, trading_pair, strategy_name)].append(
+                                (order_type, "MARKET", amount, order_id)
+                            )
+                        except Exception as e:
+                            self.logger().debug(f"Error processing market order: {e}")
+
+            except Exception as e:
+                self.logger().debug(f"Error collecting orders from strategy {strategy_instance.name}: {e}")
+
+        if not orders_by_market:
+            return []
+
+        # Format the output - show total count and breakdown by strategy
+        total_orders = sum(len(orders) for orders in orders_by_market.values())
+        lines = [f"Total: {total_orders} order(s)"]
+
+        # Group by strategy for cleaner display
+        by_strategy = defaultdict(list)
+        for (exchange, trading_pair, strategy_name), orders in orders_by_market.items():
+            by_strategy[strategy_name].append((exchange, trading_pair, orders))
+
+        for strategy_name in sorted(by_strategy.keys()):
+            markets = by_strategy[strategy_name]
+            strategy_total = sum(len(orders) for _, _, orders in markets)
+            lines.append(f"  {strategy_name}: {strategy_total} order(s)")
+
+            for exchange, trading_pair, orders in sorted(markets):
+                # Group buys and sells for compact display
+                buys = [(p, a, oid) for ot, p, a, oid in orders if ot == "BUY"]
+                sells = [(p, a, oid) for ot, p, a, oid in orders if ot == "SELL"]
+
+                market_str = f"{trading_pair} ({exchange})"
+
+                if buys and sells:
+                    lines.append(f"    {market_str}: {len(buys)} BUY, {len(sells)} SELL")
+                elif buys:
+                    lines.append(f"    {market_str}: {len(buys)} BUY")
+                elif sells:
+                    lines.append(f"    {market_str}: {len(sells)} SELL")
+
+                # Show individual order details
+                for price, amount, order_id in buys:
+                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
+                    if price == "MARKET":
+                        lines.append(f"      BUY  {amount:>10.6f} @ MARKET     (#{short_id})")
+                    else:
+                        lines.append(f"      BUY  {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
+
+                for price, amount, order_id in sells:
+                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
+                    if price == "MARKET":
+                        lines.append(f"      SELL {amount:>10.6f} @ MARKET     (#{short_id})")
+                    else:
+                        lines.append(f"      SELL {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
+
+        return lines
 
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
