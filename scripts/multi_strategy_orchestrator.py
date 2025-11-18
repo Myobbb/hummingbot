@@ -1,7 +1,7 @@
 """
 Multi-Strategy Orchestrator for V1 Strategies with Shared Websocket Connections
 
-This script allows running multiple V1 strategies (like arbitrage_m) simultaneously
+This script allows running multiple V1 strategies (like arbitrage_l and arbitrage_m) simultaneously
 while sharing websocket connections to the same exchanges. This provides:
 
 1. Resource Efficiency: One websocket connection per exchange instead of one per strategy
@@ -17,8 +17,8 @@ MultiStrategyOrchestrator (ScriptStrategyBase)
 ├── connectors: Dict[str, ConnectorBase]     ← Shared connector pool
 │   └── Each connector manages ONE websocket connection
 ├── strategies: List[V1StrategyInstance]     ← Multiple V1 strategy instances
-│   ├── arbitrage_m instance 1
-│   ├── arbitrage_m instance 2
+│   ├── arbitrage_l/arbitrage_m instance 1
+│   ├── arbitrage_l/arbitrage_m instance 2
 │   └── ... (each adds event listeners to shared connectors)
 └── on_tick() → tick all strategies independently
 
@@ -98,9 +98,18 @@ Optimizations for 40-50 Strategies (Reconnection Performance):
    - Follows hummingbot framework best practices for connector lifecycle
    - Minimal changes to existing arbitrage_m strategy
 
+Strategy Types:
+--------------
+arbitrage_l (default): Uses limit orders for precision and better execution
+arbitrage_m: Uses market orders for immediate execution
+
 Example Usage:
 -------------
 See scripts/examples/conf_multi_arbitrage_m_*.yml for configurations
+
+The orchestrator automatically selects the strategy type based on the 'strategy_type' field:
+- If not specified: defaults to 'arbitrage_l' (limit order strategy)
+- If set to 'arbitrage_m': uses market order strategy
 
 Runtime Control:
 ---------------
@@ -158,6 +167,8 @@ from hummingbot.core.data_type.common import MarketDict
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.strategy.arbitrage_m.arbitrage import ArbitrageMStrategy
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
+from hummingbot.strategy.arbitrage_l.arbitrage import ArbitrageLStrategy
+from hummingbot.strategy.arbitrage_l.arbitrage_market_pair import ArbitrageLMarketPair
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.script_strategy_base import ScriptConfigBase, ScriptStrategyBase
 from hummingbot.strategy.strategy_base import StrategyBase
@@ -304,13 +315,16 @@ class V1StrategyInstance:
 
 
 class ArbitrageMInstanceConfig(BaseModel):
-    """Configuration for a single arbitrage_m strategy instance"""
+    """Configuration for a single arbitrage strategy instance (supports both arbitrage_m and arbitrage_l)"""
     name: str = Field(..., description="Unique name for this strategy instance")
     primary_market: str = Field(..., description="Primary exchange name (e.g., 'binance')")
     secondary_market: str = Field(..., description="Secondary exchange name (e.g., 'kucoin')")
     primary_trading_pair: str = Field(..., description="Primary trading pair (e.g., 'BTC-USDT')")
     secondary_trading_pair: str = Field(..., description="Secondary trading pair (e.g., 'BTC-USDT')")
     min_profitability: Decimal = Field(default=Decimal("0.5"), description="Minimum profitability percentage")
+
+    # Strategy type selection
+    strategy_type: str = Field(default="arbitrage_l", description="Strategy type: 'arbitrage_l' (default, limit orders) or 'arbitrage_m' (market orders)")
 
     # Advanced options
     use_oracle_conversion_rate: bool = Field(default=False)
@@ -326,6 +340,7 @@ class ArbitrageMInstanceConfig(BaseModel):
     status_report_interval: float = Field(default=60.0)
     next_trade_delay_interval: float = Field(default=2.0)
     order_timeout: float = Field(default=300.0)
+    filled_order_timeout: float = Field(default=3600.0, description="Timeout for orders with fills (arbitrage_l only, default 1 hour)")
 
     # Additional markets for cross-exchange opportunities
     additional_markets: List[str] = Field(default_factory=list, description="Additional markets as 'exchange:PAIR' (e.g., ['mexc:BTC-USDT'])")
@@ -521,11 +536,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
-        Add an arbitrage_m strategy instance.
+        Add an arbitrage strategy instance (supports both arbitrage_m and arbitrage_l).
 
         This method:
         1. Builds market pairs from the shared connector pool
-        2. Creates an ArbitrageMStrategy instance
+        2. Creates an ArbitrageMStrategy or ArbitrageLStrategy instance based on config.strategy_type
         3. Initializes it with the config
         4. The strategy's c_add_markets() call registers event listeners
 
@@ -533,7 +548,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             config: Strategy configuration
             paused: Whether to start the strategy in paused state (useful for runtime additions)
         """
-        self.logger().info(f"Adding arbitrage_m strategy: {config.name}")
+        strategy_type = config.strategy_type.lower()
+        self.logger().info(f"Adding {strategy_type} strategy: {config.name}")
 
         # Validate connectors exist with detailed error information
         missing_connectors = []
@@ -606,41 +622,58 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             market_tuples.append(additional_tuple)
 
         # Build all arbitrage pairs (all permutations where i != j)
+        # Use the appropriate market pair class based on strategy type
+        if strategy_type == "arbitrage_l":
+            MarketPairClass = ArbitrageLMarketPair
+            StrategyClass = ArbitrageLStrategy
+        elif strategy_type == "arbitrage_m":
+            MarketPairClass = ArbitrageMMarketPair
+            StrategyClass = ArbitrageMStrategy
+        else:
+            raise ValueError(f"Invalid strategy_type '{config.strategy_type}'. Must be 'arbitrage_l' or 'arbitrage_m'")
+
         market_pairs = []
         for i in range(len(market_tuples)):
             for j in range(len(market_tuples)):
                 if i != j:
-                    market_pairs.append(ArbitrageMMarketPair(
+                    market_pairs.append(MarketPairClass(
                         first=market_tuples[i],
                         second=market_tuples[j]
                     ))
 
         # Create strategy instance
-        strategy = ArbitrageMStrategy()
+        strategy = StrategyClass()
+
+        # Build init_params based on strategy type
+        init_params = {
+            "market_pairs": market_pairs,
+            "min_profitability": config.min_profitability / Decimal("100"),  # Convert percentage to decimal
+            "logging_options": (
+                StrategyClass.OPTION_LOG_STATUS_REPORT |
+                StrategyClass.OPTION_LOG_ORDER_COMPLETED |
+                StrategyClass.OPTION_LOG_CREATE_ORDER
+            ),
+            "status_report_interval": config.status_report_interval,
+            "next_trade_delay_interval": config.next_trade_delay_interval,
+            "order_timeout": config.order_timeout,
+            "use_oracle_conversion_rate": config.use_oracle_conversion_rate,
+            "secondary_to_primary_base_conversion_rate": config.secondary_to_primary_base_conversion_rate,
+            "secondary_to_primary_quote_conversion_rate": config.secondary_to_primary_quote_conversion_rate,
+            "hb_app_notification": True,
+            "buy_in_enabled": config.buy_in_enabled,
+            "buy_in_target_usd": config.buy_in_target_usd,
+            "buy_in_min_profitability": float(config.buy_in_min_profitability) / 100.0,
+            "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
+        }
+
+        # Add filled_order_timeout for arbitrage_l only
+        if strategy_type == "arbitrage_l":
+            init_params["filled_order_timeout"] = config.filled_order_timeout
 
         # Initialize strategy parameters
         # This will call c_add_markets() which registers event listeners on shared connectors
         # CRITICAL: Set orchestrated_mode=True to skip redundant readiness checks
-        strategy.init_params(
-            market_pairs=market_pairs,
-            min_profitability=config.min_profitability / Decimal("100"),  # Convert percentage to decimal
-            logging_options=(
-                ArbitrageMStrategy.OPTION_LOG_STATUS_REPORT |
-                ArbitrageMStrategy.OPTION_LOG_ORDER_COMPLETED |
-                ArbitrageMStrategy.OPTION_LOG_CREATE_ORDER
-            ),
-            status_report_interval=config.status_report_interval,
-            next_trade_delay_interval=config.next_trade_delay_interval,
-            order_timeout=config.order_timeout,
-            use_oracle_conversion_rate=config.use_oracle_conversion_rate,
-            secondary_to_primary_base_conversion_rate=config.secondary_to_primary_base_conversion_rate,
-            secondary_to_primary_quote_conversion_rate=config.secondary_to_primary_quote_conversion_rate,
-            hb_app_notification=True,
-            buy_in_enabled=config.buy_in_enabled,
-            buy_in_target_usd=config.buy_in_target_usd,
-            buy_in_min_profitability=float(config.buy_in_min_profitability) / 100.0,
-            orchestrated_mode=True,  # Enable orchestrated mode for coordinated readiness checking
-        )
+        strategy.init_params(**init_params)
 
         # Store strategy instance
         strategy_instance = V1StrategyInstance(
@@ -790,11 +823,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Perform coordinated buy-in completion scan for each enabled strategy
         # This calls the strategy's existing buy-in logic but only ONCE when markets are ready
+        # Supports both arbitrage_m (inline) and arbitrage_l (handler-based) buy-in patterns
         for strategy_instance in buy_in_strategies:
             try:
                 strategy = strategy_instance.strategy
+                # arbitrage_m pattern: inline buy-in with c_scan_and_mark_buyin_completion()
                 if hasattr(strategy, 'c_scan_and_mark_buyin_completion'):
                     strategy.c_scan_and_mark_buyin_completion()
+                # arbitrage_l pattern: handler-based buy-in with _buy_in_handler.c_scan_and_mark_completion()
+                elif hasattr(strategy, '_buy_in_handler') and strategy._buy_in_handler is not None:
+                    if hasattr(strategy._buy_in_handler, 'c_scan_and_mark_completion'):
+                        strategy._buy_in_handler.c_scan_and_mark_completion()
             except Exception as e:
                 self.logger().warning(
                     f"Error in buy-in check for '{strategy_instance.name}': {e}",
