@@ -47,16 +47,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _cached_quote_rate
         double _last_rate_update
         
-        # Buy-in params/state
-        bint _buy_in_enabled
-        double _buy_in_target_usd
-        double _buy_in_min_profitability
-        bint _buy_in_completed
-        # Pending buy-in tracking
-        dict _pending_buyin_by_asset
-        dict _pending_buyin_orders
-        
-        
+        # Buy-in handler (None when disabled)
+        object _buy_in_handler
+
+
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
         # Track completed orders to avoid duplicate completion logging
@@ -80,6 +74,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef bint c_check_markets_ready_orchestrated(self)
     cdef bint c_ready_for_new_orders(self, list market_tuples)
     cdef string _to_cpp_str(self, object py_str)
+
+    # Helper methods
+    cdef object c_safe_quantize_order_amount(self, object market, str trading_pair, object amount, object price)
+    cdef void c_remove_pending_order(self, object market_tuple, str order_id, str context)
     
     # Conversion rate methods
     cdef double _conv_rate(self, object buy_market_tuple, object sell_market_tuple)
@@ -92,28 +90,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Trading logic
     cdef double c_get_reference_bid_for_asset(self, str asset_key)
-    cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_buyin_amount(self,
                                         object buy_market_tuple,
                                         object sell_market_tuple,
                                         double buy_quote_balance,
-                                        double max_spend_quote)
-    cdef void c_maybe_disable_buy_in(self)
-    cdef void c_scan_and_mark_buyin_completion(self)
+                                        double max_spend_quote,
+                                        double min_profitability)
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                              object buy_market_tuple,
                                                              object sell_market_tuple,
                                                              double min_profitability)
-    cdef pair[double, double] c_compute_value_and_shortfall(self,
-                                                            double base_balance,
-                                                            double last_bid)
-    cdef double c_get_aggregated_base_balance(self, str asset)
-    cdef double c_get_pending_buyin_base(self, str asset)
-    cdef double c_get_adjusted_base_balance(self, str asset)
-    cdef bint c_try_mark_complete_buy_in(self,
-                                         str pair,
-                                         double current_value_quote,
-                                         double shortfall)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
     cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
