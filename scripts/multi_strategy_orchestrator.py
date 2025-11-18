@@ -324,7 +324,7 @@ class ArbitrageMInstanceConfig(BaseModel):
     min_profitability: Decimal = Field(default=Decimal("0.5"), description="Minimum profitability percentage")
 
     # Strategy type selection
-    strategy_type: str = Field(default="arbitrage_l", description="Strategy type: 'arbitrage_l' (default, limit orders) or 'arbitrage_m' (market orders)")
+    strategy_type: str = Field(default="arbitrage_m", description="Strategy type: 'arbitrage_m' (default, market orders) or 'arbitrage_l' (limit orders)")
 
     # Advanced options
     use_oracle_conversion_rate: bool = Field(default=False)
