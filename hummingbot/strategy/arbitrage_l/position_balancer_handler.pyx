@@ -47,7 +47,8 @@ cdef class PositionBalancerHandler:
                  bint sell_enabled,
                  double sell_target_usd,
                  double sell_spread_pct,
-                 double limit_refresh_interval):
+                 double limit_refresh_interval,
+                 double order_size_usd=100.0):
         """
         Initialize position balancer handler.
 
@@ -60,6 +61,7 @@ cdef class PositionBalancerHandler:
             sell_target_usd: Target maximum asset value in quote currency
             sell_spread_pct: Spread percentage above top ask for sell orders (e.g., 0.1 = 0.1%)
             limit_refresh_interval: How often to cancel and replace limit orders (seconds)
+            order_size_usd: Maximum order size in USD per order (default: 100.0)
         """
         self.strategy = strategy
 
@@ -72,6 +74,9 @@ cdef class PositionBalancerHandler:
         self._sell_enabled = sell_enabled
         self._sell_target_usd = sell_target_usd
         self._sell_spread_pct = sell_spread_pct / 100.0  # Convert to decimal
+
+        # Order size configuration
+        self._order_size_usd = order_size_usd
 
         # Completion tracking
         self._buy_completed = False
@@ -574,9 +579,14 @@ cdef class PositionBalancerHandler:
         # Calculate limit price: top_bid * (1 - spread_pct)
         buy_price = top_bid * (1.0 - self._buy_spread_pct)
 
-        # Calculate amount based on shortfall and available quote
+        # Calculate amount based on shortfall, available quote, and order size limit
         max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
-        amount_to_buy = min(shortfall / last_bid if last_bid > 0 else 0.0, max_affordable_base)
+        max_order_base = self._order_size_usd / last_bid if last_bid > 0 else 0.0
+        amount_to_buy = min(
+            shortfall / last_bid if last_bid > 0 else 0.0,
+            max_affordable_base,
+            max_order_base
+        )
 
         if amount_to_buy <= EPSILON:
             return False
@@ -706,8 +716,13 @@ cdef class PositionBalancerHandler:
         # Calculate limit price: top_ask * (1 + spread_pct)
         sell_price = top_ask * (1.0 + self._sell_spread_pct)
 
-        # Calculate amount based on excess and available base
-        amount_to_sell = min(excess / last_bid if last_bid > 0 else 0.0, base_bal_raw)
+        # Calculate amount based on excess, available base, and order size limit
+        max_order_base = self._order_size_usd / last_bid if last_bid > 0 else 0.0
+        amount_to_sell = min(
+            excess / last_bid if last_bid > 0 else 0.0,
+            base_bal_raw,
+            max_order_base
+        )
 
         if amount_to_sell <= EPSILON:
             return False
