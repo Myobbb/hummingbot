@@ -13,6 +13,7 @@ import logging
 from decimal import Decimal
 from libc.stdint cimport int64_t
 from libcpp.pair cimport pair
+from libcpp.string cimport string
 from libcpp.set cimport set as cpp_set
 from cython.operator cimport dereference as deref
 
