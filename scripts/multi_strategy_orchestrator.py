@@ -315,35 +315,107 @@ class V1StrategyInstance:
 
 
 class ArbitrageMInstanceConfig(BaseModel):
-    """Configuration for a single arbitrage strategy instance (supports both arbitrage_m and arbitrage_l)"""
+    """
+    Configuration for a single arbitrage strategy instance (supports both arbitrage_m and arbitrage_l).
+
+    DEFAULT VALUES (automatically applied if not specified in config):
+    ================================================================
+    Strategy Type:
+      - strategy_type: "arbitrage_l" (limit orders, default)
+
+    Profitability:
+      - min_profitability: 0.5 (%)
+
+    Buy-in Module (arbitrage_l uses this to acquire initial inventory):
+      - buy_in_enabled: True
+      - buy_in_target_usd: 100.0 (USD)
+      - buy_in_min_profitability: 0.5 (%)
+
+    Timing (arbitrage_l defaults):
+      - status_report_interval: 60.0 (seconds)
+      - next_trade_delay_interval: 4.0 (seconds)
+      - order_timeout: 180.0 (seconds)
+      - filled_order_timeout: 3600.0 (seconds, arbitrage_l only)
+
+    Conversion Rates:
+      - use_oracle_conversion_rate: False
+      - secondary_to_primary_base_conversion_rate: 1.0
+      - secondary_to_primary_quote_conversion_rate: 1.0
+
+    Additional Markets:
+      - additional_markets: [] (empty list)
+    """
+
+    # Required fields
     name: str = Field(..., description="Unique name for this strategy instance")
     primary_market: str = Field(..., description="Primary exchange name (e.g., 'binance')")
     secondary_market: str = Field(..., description="Secondary exchange name (e.g., 'kucoin')")
     primary_trading_pair: str = Field(..., description="Primary trading pair (e.g., 'BTC-USDT')")
     secondary_trading_pair: str = Field(..., description="Secondary trading pair (e.g., 'BTC-USDT')")
-    min_profitability: Decimal = Field(default=Decimal("0.5"), description="Minimum profitability percentage")
 
     # Strategy type selection
-    strategy_type: str = Field(default="arbitrage_l", description="Strategy type: 'arbitrage_l' (default, limit orders) or 'arbitrage_m' (market orders)")
+    strategy_type: str = Field(
+        default="arbitrage_l",
+        description="Strategy type: 'arbitrage_l' (limit orders, default) or 'arbitrage_m' (market orders)"
+    )
 
-    # Advanced options
-    use_oracle_conversion_rate: bool = Field(default=False)
-    secondary_to_primary_base_conversion_rate: Decimal = Field(default=Decimal("1.0"))
-    secondary_to_primary_quote_conversion_rate: Decimal = Field(default=Decimal("1.0"))
+    # Profitability
+    min_profitability: Decimal = Field(
+        default=Decimal("0.5"),
+        description="Minimum profitability percentage (e.g., 0.5 for 0.5%)"
+    )
+
+    # Advanced conversion options
+    use_oracle_conversion_rate: bool = Field(
+        default=False,
+        description="Use oracle for conversion rates between trading pairs"
+    )
+    secondary_to_primary_base_conversion_rate: Decimal = Field(
+        default=Decimal("1.0"),
+        description="Conversion rate for base asset from secondary to primary"
+    )
+    secondary_to_primary_quote_conversion_rate: Decimal = Field(
+        default=Decimal("1.0"),
+        description="Conversion rate for quote asset from secondary to primary"
+    )
 
     # Buy-in configuration
-    buy_in_enabled: bool = Field(default=False, description="Enable buy-in module")
-    buy_in_target_usd: float = Field(default=100.0, description="Target USD value for buy-in")
-    buy_in_min_profitability: float = Field(default=0.005, description="Min profitability for buy-in (0.5%)")
+    buy_in_enabled: bool = Field(
+        default=False,
+        description="Enable buy-in module to acquire initial inventory"
+    )
+    buy_in_target_usd: float = Field(
+        default=1000.0,
+        description="Target USD value for buy-in operations"
+    )
+    buy_in_min_profitability: float = Field(
+        default=1.5,
+        description="Min profitability percentage for buy-in (e.g., 0.5 for 0.5%)"
+    )
 
-    # Timing
-    status_report_interval: float = Field(default=60.0)
-    next_trade_delay_interval: float = Field(default=2.0)
-    order_timeout: float = Field(default=300.0)
-    filled_order_timeout: float = Field(default=3600.0, description="Timeout for orders with fills (arbitrage_l only, default 1 hour)")
+    # Timing parameters
+    status_report_interval: float = Field(
+        default=60.0,
+        description="Interval in seconds between status reports"
+    )
+    next_trade_delay_interval: float = Field(
+        default=2.0,
+        description="Delay in seconds between trade executions"
+    )
+    order_timeout: float = Field(
+        default=180.0,
+        description="Timeout in seconds for unfilled orders"
+    )
+    filled_order_timeout: float = Field(
+        default=3600.0,
+        description="Timeout in seconds for orders with partial fills (arbitrage_l only)"
+    )
 
     # Additional markets for cross-exchange opportunities
-    additional_markets: List[str] = Field(default_factory=list, description="Additional markets as 'exchange:PAIR' (e.g., ['mexc:BTC-USDT'])")
+    additional_markets: List[str] = Field(
+        default_factory=list,
+        description="Additional markets as 'exchange:PAIR' (e.g., ['mexc:BTC-USDT'])"
+    )
 
 
 class MultiStrategyOrchestratorConfig(BaseClientModel):
