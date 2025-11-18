@@ -923,14 +923,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self._order_timestamps.erase(order_id_str)
                         self._completed_orders.erase(order_id_str)
 
-                        # CRITICAL: Stop tracking the order immediately to prevent re-processing
-                        # before the cancel event arrives (prevents repeated cancel attempts)
-                        # Use LIMIT order tracking since this strategy uses limit orders only
+                        # Save market_pair for cancel event handler (in case order is removed from main tracking)
                         try:
                             self._recent_order_market_pair[order_id] = market_tuple
                         except Exception:
                             pass
-                        self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
+
+                        # NOTE: Do NOT call c_stop_tracking_limit_order() here!
+                        # It would remove the order from _in_flight_cancels, breaking duplicate cancel prevention.
+                        # Let the cancel event handler (c_did_cancel_order_tracker) stop tracking when the event arrives.
 
                         # Clean up pending buy-in tracking if applicable
                         try:
@@ -964,8 +965,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         except Exception:
                             pass
 
-                        # Enforce cooldown for this market
-                        self._last_failure_timestamps[market_tuple] = self._current_timestamp
+                        # NOTE: Do NOT enforce cooldown for timeouts - they are expected behavior, not failures
+                        # The cancel event handler will check _timeout_cancelled_orders to avoid cooldown
 
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
