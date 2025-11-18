@@ -823,11 +823,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Perform coordinated buy-in completion scan for each enabled strategy
         # This calls the strategy's existing buy-in logic but only ONCE when markets are ready
+        # Supports both arbitrage_m (inline) and arbitrage_l (handler-based) buy-in patterns
         for strategy_instance in buy_in_strategies:
             try:
                 strategy = strategy_instance.strategy
+                # arbitrage_m pattern: inline buy-in with c_scan_and_mark_buyin_completion()
                 if hasattr(strategy, 'c_scan_and_mark_buyin_completion'):
                     strategy.c_scan_and_mark_buyin_completion()
+                # arbitrage_l pattern: handler-based buy-in with _buy_in_handler.c_scan_and_mark_completion()
+                elif hasattr(strategy, '_buy_in_handler') and strategy._buy_in_handler is not None:
+                    if hasattr(strategy._buy_in_handler, 'c_scan_and_mark_completion'):
+                        strategy._buy_in_handler.c_scan_and_mark_completion()
             except Exception as e:
                 self.logger().warning(
                     f"Error in buy-in check for '{strategy_instance.name}': {e}",
