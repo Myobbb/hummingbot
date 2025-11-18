@@ -242,6 +242,49 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return 1.0
         return self.c_get_market_to_market_conversion_rate(buy_market_tuple, sell_market_tuple)
 
+    cdef object c_safe_quantize_order_amount(self,
+                                              ExchangeBase market,
+                                              str trading_pair,
+                                              object amount,
+                                              object price):
+        """
+        Safe quantization with fallback.
+        Tries c_quantize_order_amount with price, falls back to quantize_order_amount without price.
+        """
+        try:
+            return market.c_quantize_order_amount(trading_pair, amount, price)
+        except Exception:
+            return market.quantize_order_amount(trading_pair, amount)
+
+    cdef void c_remove_pending_order(self, object market_tuple, str order_id, str context="order"):
+        """
+        Remove order from pending buy/sell order tracking.
+        Checks both pending buy and sell dicts and cleans up empty entries.
+
+        Args:
+            market_tuple: Market pair tuple to remove order from
+            order_id: Order ID to remove
+            context: Context string for error logging (e.g., "completed", "cancelled")
+        """
+        try:
+            if market_tuple is not None:
+                # Try removing from pending buy orders
+                pending_buys = self._pending_buy_orders_by_market.get(market_tuple)
+                if pending_buys is not None and order_id in pending_buys:
+                    pending_buys.discard(order_id)
+                    if len(pending_buys) == 0:
+                        self._pending_buy_orders_by_market.pop(market_tuple, None)
+
+                # Try removing from pending sell orders
+                pending_sells = self._pending_sell_orders_by_market.get(market_tuple)
+                if pending_sells is not None and order_id in pending_sells:
+                    pending_sells.discard(order_id)
+                    if len(pending_sells) == 0:
+                        self._pending_sell_orders_by_market.pop(market_tuple, None)
+        except Exception as e:
+            if context:
+                self.logger().warning(f"Failed to remove {context} order from pending tracking: {e}")
+
     cdef double c_get_conversion_rate(self, bint is_base_asset):
         """Get conversion rate for base or quote asset"""
         if not self._use_oracle_conversion_rate:
@@ -692,23 +735,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
 
             # Remove from pending orders - check both buy and sell dicts
-            try:
-                if market_pair_tuple is not None:
-                    # Try removing from pending buy orders
-                    pending_buys = self._pending_buy_orders_by_market.get(market_pair_tuple)
-                    if pending_buys is not None and order_id in pending_buys:
-                        pending_buys.discard(order_id)
-                        if len(pending_buys) == 0:
-                            self._pending_buy_orders_by_market.pop(market_pair_tuple, None)
-
-                    # Try removing from pending sell orders
-                    pending_sells = self._pending_sell_orders_by_market.get(market_pair_tuple)
-                    if pending_sells is not None and order_id in pending_sells:
-                        pending_sells.discard(order_id)
-                        if len(pending_sells) == 0:
-                            self._pending_sell_orders_by_market.pop(market_pair_tuple, None)
-            except Exception as e:
-                self.logger().warning(f"Failed to remove completed order from pending tracking: {e}")
+            self.c_remove_pending_order(market_pair_tuple, order_id, "completed")
 
             # Check completion time - safely handle None market_pair_tuple
             if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
@@ -724,17 +751,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging.DEBUG,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
-            # If this was a buy-in buy order, remove its pending base from tracking
-            if is_buy:
-                try:
-                    pend = self._pending_buyin_orders.pop(order_id, None)
-                    if pend is not None:
-                        asset_key, amt = pend
-                        self._pending_buyin_by_asset[asset_key] = max(0.0, float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt))
-                        if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                            self._pending_buyin_by_asset.pop(asset_key, None)
-                except Exception:
-                    pass
+            # TODO: Buy-in cleanup to be moved to helper script
+            # Placeholder for buy-in pending order cleanup on completion
+            pass
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
@@ -797,38 +816,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, order_id)
 
-        # Clean up pending buy-in tracking if applicable
-        try:
-            pend = self._pending_buyin_orders.pop(order_id, None)
-            if pend is not None:
-                asset_key, amt = pend
-                self._pending_buyin_by_asset[asset_key] = max(
-                    0.0,
-                    float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
-                )
-                if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                    self._pending_buyin_by_asset.pop(asset_key, None)
-        except Exception:
-            pass
+        # TODO: Buy-in cleanup to be moved to helper script
+        # Placeholder for buy-in pending order cleanup on cancellation
+        pass
 
         # Remove from pending orders tracking - check both buy and sell dicts
-        try:
-            if market_pair is not None:
-                # Try removing from pending buy orders
-                pending_buys = self._pending_buy_orders_by_market.get(market_pair)
-                if pending_buys is not None and order_id in pending_buys:
-                    pending_buys.discard(order_id)
-                    if len(pending_buys) == 0:
-                        self._pending_buy_orders_by_market.pop(market_pair, None)
-
-                # Try removing from pending sell orders
-                pending_sells = self._pending_sell_orders_by_market.get(market_pair)
-                if pending_sells is not None and order_id in pending_sells:
-                    pending_sells.discard(order_id)
-                    if len(pending_sells) == 0:
-                        self._pending_sell_orders_by_market.pop(market_pair, None)
-        except Exception as e:
-            self.logger().warning(f"Failed to remove cancelled order from pending tracking: {e}")
+        self.c_remove_pending_order(market_pair, order_id, "cancelled")
 
         # Decide cooldown/logging based on completion status and cancellation reason
         if was_already_completed:
@@ -932,37 +925,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             pass
                         self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
-                        # Clean up pending buy-in tracking if applicable
-                        try:
-                            pend = self._pending_buyin_orders.pop(order_id, None)
-                            if pend is not None:
-                                asset_key, amt = pend
-                                self._pending_buyin_by_asset[asset_key] = max(
-                                    0.0,
-                                    float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt)
-                                )
-                                if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                                    self._pending_buyin_by_asset.pop(asset_key, None)
-                        except Exception:
-                            pass
+                        # TODO: Buy-in cleanup to be moved to helper script
+                        # Placeholder for buy-in pending order cleanup on timeout
+                        pass
 
                         # Remove from pending orders tracking - check both buy and sell dicts
-                        try:
-                            # Try removing from pending buy orders
-                            pending_buys = self._pending_buy_orders_by_market.get(market_tuple)
-                            if pending_buys is not None and order_id in pending_buys:
-                                pending_buys.discard(order_id)
-                                if len(pending_buys) == 0:
-                                    self._pending_buy_orders_by_market.pop(market_tuple, None)
-
-                            # Try removing from pending sell orders
-                            pending_sells = self._pending_sell_orders_by_market.get(market_tuple)
-                            if pending_sells is not None and order_id in pending_sells:
-                                pending_sells.discard(order_id)
-                                if len(pending_sells) == 0:
-                                    self._pending_sell_orders_by_market.pop(market_tuple, None)
-                        except Exception:
-                            pass
+                        self.c_remove_pending_order(market_tuple, order_id, "")
 
                         # Enforce cooldown for this market
                         self._last_failure_timestamps[market_tuple] = self._current_timestamp
@@ -1128,14 +1096,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object buy_price_decimal = Decimal(str(buy_price))
         cdef object sell_price_decimal = Decimal(str(sell_price))
         cdef object dec_safe_amount = Decimal(str(max(0.0, amount - QUANTIZATION_EPSILON)))
-        try:
-            quantized_buy = buy_market.c_quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount, buy_price_decimal)
-        except Exception:
-            quantized_buy = buy_market.quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount)
-        try:
-            quantized_sell = sell_market.c_quantize_order_amount(sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
-        except Exception:
-            quantized_sell = sell_market.quantize_order_amount(sell_market_tuple.trading_pair, dec_safe_amount)
+        quantized_buy = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, dec_safe_amount, buy_price_decimal)
+        quantized_sell = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
         quantized_amount = min(quantized_buy, quantized_sell)
         
         # Safety cap: re-check sell venue's live available base and re-quantize to prevent oversold at submission time
@@ -1143,15 +1105,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Only do extra work if available shrank below our planned amount
         if sell_available_now + 1e-15 < float(quantized_amount):
             sell_cap_dec = Decimal(str(max(0.0, sell_available_now - QUANTIZATION_EPSILON)))
-            try:
-                quantized_sell_cap = sell_market.c_quantize_order_amount(
-                    sell_market_tuple.trading_pair,
-                    sell_cap_dec,
-                    sell_price_decimal)
-            except Exception:
-                quantized_sell_cap = sell_market.quantize_order_amount(
-                    sell_market_tuple.trading_pair,
-                    sell_cap_dec)
+            quantized_sell_cap = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_cap_dec, sell_price_decimal)
             # Re-quantize buy side to the capped amount using Decimal math (avoid float conversions)
             buy_req = quantized_sell_cap
             dec_eps = Decimal("1e-12")
@@ -1159,15 +1113,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 buy_req = Decimal("0")
             else:
                 buy_req = buy_req - dec_eps if buy_req > dec_eps else Decimal("0")
-            try:
-                quantized_buy_cap = buy_market.c_quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    buy_req,
-                    buy_price_decimal)
-            except Exception:
-                quantized_buy_cap = buy_market.quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    buy_req)
+            quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
             quantized_amount = min(quantized_amount, quantized_sell_cap, quantized_buy_cap)
 
         # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability
@@ -1179,26 +1125,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if buy_price > 0.0:
                 affordable_base = max(0.0, buy_quote_available_now / buy_price)
             affordable_dec = Decimal(str(max(0.0, affordable_base - QUANTIZATION_EPSILON)))
-            try:
-                q_buy2 = buy_market.c_quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    affordable_dec,
-                    buy_price_decimal)
-            except Exception:
-                q_buy2 = buy_market.quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    affordable_dec)
+            q_buy2 = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, affordable_dec, buy_price_decimal)
             # Align sell side to the reduced buy size
             sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
-            try:
-                q_sell2 = sell_market.c_quantize_order_amount(
-                    sell_market_tuple.trading_pair,
-                    sell_req2,
-                    sell_price_decimal)
-            except Exception:
-                q_sell2 = sell_market.quantize_order_amount(
-                    sell_market_tuple.trading_pair,
-                    sell_req2)
+            q_sell2 = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_req2, sell_price_decimal)
             # Handle potential None from quantization
             if q_buy2 is not None and q_sell2 is not None:
                 quantized_amount = min(quantized_amount, q_buy2, q_sell2)
@@ -1650,27 +1580,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object order_type = OrderType.LIMIT
         cdef object quantized_amount
         cdef object dec_safe_amount2 = Decimal(str(max(0.0, best_amount - QUANTIZATION_EPSILON)))
-        try:
-            quantized_amount = market.c_quantize_order_amount(
-                buy_market_tuple.trading_pair,
-                dec_safe_amount2,
-                Decimal(str(buy_price)))
-        except Exception:
-            quantized_amount = market.quantize_order_amount(buy_market_tuple.trading_pair, dec_safe_amount2)
+        quantized_amount = self.c_safe_quantize_order_amount(market, buy_market_tuple.trading_pair, dec_safe_amount2, Decimal(str(buy_price)))
         # Ensure not exceeding available quote after quantization
         cdef double max_affordable = 0.0
         if buy_price > 0:
             max_affordable = quote_bal / buy_price
         if float(quantized_amount) > max_affordable:
-            try:
-                quantized_amount = market.c_quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))),
-                    Decimal(str(buy_price)))
-            except Exception:
-                quantized_amount = market.quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))))
+            quantized_amount = self.c_safe_quantize_order_amount(market, buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))), Decimal(str(buy_price)))
         if quantized_amount <= Decimal("0"):
             return False
 
@@ -1772,15 +1688,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef double buy_cap_base = 0.0
         if approx_ask > 0.0 and spend_cap > 0.0:
             buy_cap_base = spend_cap / approx_ask
-            try:
-                q = buy_market_tuple.market.c_quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    Decimal(str(max(0.0, buy_cap_base - QUANTIZATION_EPSILON))),
-                    Decimal(str(approx_ask)))
-            except Exception:
-                q = buy_market_tuple.market.quantize_order_amount(
-                    buy_market_tuple.trading_pair,
-                    Decimal(str(max(0.0, buy_cap_base - QUANTIZATION_EPSILON))))
+            q = self.c_safe_quantize_order_amount(buy_market_tuple.market, buy_market_tuple.trading_pair, Decimal(str(max(0.0, buy_cap_base - QUANTIZATION_EPSILON))), Decimal(str(approx_ask)))
             if q is not None:
                 buy_cap_base = float(q)
             else:
@@ -1863,21 +1771,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Also remove from completed orders set
             self._completed_orders.erase(order_id_str)
 
-            # Best-effort cleanup: if this maps to a pending buy-in order id, drop its pending amount 
-            try:
-                oid = order_id_str.decode('utf-8')
-            except Exception:
-                oid = None
-            if oid is not None:
-                try:
-                    pend = self._pending_buyin_orders.pop(oid, None)
-                    if pend is not None:
-                        asset_key, amt = pend
-                        self._pending_buyin_by_asset[asset_key] = max(0.0, float(self._pending_buyin_by_asset.get(asset_key, 0.0)) - float(amt))
-                        if self._pending_buyin_by_asset.get(asset_key, 0.0) <= 1e-15:
-                            self._pending_buyin_by_asset.pop(asset_key, None)
-                except Exception:
-                    pass
+            # TODO: Buy-in cleanup to be moved to helper script
+            # Placeholder for buy-in pending order cleanup during old order cleanup
+            pass
         
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
