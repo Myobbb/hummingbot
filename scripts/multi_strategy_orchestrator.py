@@ -379,18 +379,38 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Conversion rate for quote asset from secondary to primary"
     )
 
-    # Buy-in configuration
+    # Position balancer configuration - Buy-in
     buy_in_enabled: bool = Field(
         default=False,
-        description="Enable buy-in module to acquire initial inventory"
+        description="Enable buy-in to acquire assets when below target"
     )
     buy_in_target_usd: float = Field(
         default=1000.0,
-        description="Target USD value for buy-in operations"
+        description="Target minimum USD value (buy when below this)"
     )
-    buy_in_min_profitability: float = Field(
-        default=1.5,
-        description="Min profitability percentage for buy-in (e.g., 0.5 for 0.5%)"
+    buy_in_spread_pct: float = Field(
+        default=0.1,
+        description="Spread percentage below top bid for buy limit orders (e.g., 0.1 = 0.1%)"
+    )
+
+    # Position balancer configuration - Sell-off
+    sell_off_enabled: bool = Field(
+        default=False,
+        description="Enable sell-off to reduce assets when above target"
+    )
+    sell_off_target_usd: float = Field(
+        default=2000.0,
+        description="Target maximum USD value (sell when above this)"
+    )
+    sell_off_spread_pct: float = Field(
+        default=0.1,
+        description="Spread percentage above top ask for sell limit orders (e.g., 0.1 = 0.1%)"
+    )
+
+    # Position balancer - Order management
+    position_balancer_refresh_interval: float = Field(
+        default=10.0,
+        description="How often to cancel and replace limit orders (seconds)"
     )
 
     # Timing parameters
@@ -731,9 +751,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             "secondary_to_primary_base_conversion_rate": config.secondary_to_primary_base_conversion_rate,
             "secondary_to_primary_quote_conversion_rate": config.secondary_to_primary_quote_conversion_rate,
             "hb_app_notification": True,
+            # Position balancer - buy-in configuration
             "buy_in_enabled": config.buy_in_enabled,
             "buy_in_target_usd": config.buy_in_target_usd,
-            "buy_in_min_profitability": float(config.buy_in_min_profitability) / 100.0,
+            "buy_in_spread_pct": config.buy_in_spread_pct,
+            # Position balancer - sell-off configuration
+            "sell_off_enabled": config.sell_off_enabled,
+            "sell_off_target_usd": config.sell_off_target_usd,
+            "sell_off_spread_pct": config.sell_off_spread_pct,
+            # Position balancer - order management
+            "position_balancer_refresh_interval": config.position_balancer_refresh_interval,
             "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
         }
 
