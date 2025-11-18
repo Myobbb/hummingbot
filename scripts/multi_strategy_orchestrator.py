@@ -1764,6 +1764,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 lines.append(f"  {name}:")
                 lines.extend([f"    {ln}" for ln in blines])
 
+        # Pending Orders (aggregated across all strategies)
+        pending_orders_info = self._get_pending_orders_summary()
+        if pending_orders_info:
+            lines.append("\nPending Orders:")
+            lines.extend([f"  {line}" for line in pending_orders_info])
+
         # Only show connectors not ready; omit when all ready
         not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
         if not_ready:
@@ -1772,6 +1778,106 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 lines.append(f"  {n}")
 
         return "\n".join(lines)
+
+    def _get_pending_orders_summary(self) -> List[str]:
+        """
+        Collect and format pending orders from all strategies.
+        Returns a list of formatted lines showing pending orders by market.
+        """
+        from collections import defaultdict
+
+        # Collect all pending orders from all strategies
+        # Format: {(exchange, trading_pair, strategy_name): [(order_type, price, amount, order_id), ...]}
+        orders_by_market = defaultdict(list)
+
+        for strategy_instance in self.strategies:
+            try:
+                strategy = strategy_instance.strategy
+                strategy_name = strategy_instance.name
+
+                # Get limit orders (arbitrage_l primarily uses these)
+                if hasattr(strategy, 'tracked_limit_orders'):
+                    for market, limit_order in strategy.tracked_limit_orders:
+                        try:
+                            trading_pair = limit_order.trading_pair
+                            exchange = market.name
+                            order_type = "BUY" if limit_order.is_buy else "SELL"
+                            price = float(limit_order.price)
+                            amount = float(limit_order.quantity)
+                            order_id = limit_order.client_order_id
+
+                            orders_by_market[(exchange, trading_pair, strategy_name)].append(
+                                (order_type, price, amount, order_id)
+                            )
+                        except Exception as e:
+                            self.logger().debug(f"Error processing limit order: {e}")
+
+                # Get market orders (arbitrage_m may use these)
+                if hasattr(strategy, 'tracked_market_orders'):
+                    for market, market_order in strategy.tracked_market_orders:
+                        try:
+                            trading_pair = market_order.trading_pair
+                            exchange = market.name
+                            order_type = "BUY" if market_order.is_buy else "SELL"
+                            amount = float(market_order.amount)
+                            order_id = market_order.order_id
+
+                            orders_by_market[(exchange, trading_pair, strategy_name)].append(
+                                (order_type, "MARKET", amount, order_id)
+                            )
+                        except Exception as e:
+                            self.logger().debug(f"Error processing market order: {e}")
+
+            except Exception as e:
+                self.logger().debug(f"Error collecting orders from strategy {strategy_instance.name}: {e}")
+
+        if not orders_by_market:
+            return []
+
+        # Format the output - show total count and breakdown by strategy
+        total_orders = sum(len(orders) for orders in orders_by_market.values())
+        lines = [f"Total: {total_orders} order(s)"]
+
+        # Group by strategy for cleaner display
+        by_strategy = defaultdict(list)
+        for (exchange, trading_pair, strategy_name), orders in orders_by_market.items():
+            by_strategy[strategy_name].append((exchange, trading_pair, orders))
+
+        for strategy_name in sorted(by_strategy.keys()):
+            markets = by_strategy[strategy_name]
+            strategy_total = sum(len(orders) for _, _, orders in markets)
+            lines.append(f"  {strategy_name}: {strategy_total} order(s)")
+
+            for exchange, trading_pair, orders in sorted(markets):
+                # Group buys and sells for compact display
+                buys = [(p, a, oid) for ot, p, a, oid in orders if ot == "BUY"]
+                sells = [(p, a, oid) for ot, p, a, oid in orders if ot == "SELL"]
+
+                market_str = f"{trading_pair} ({exchange})"
+
+                if buys and sells:
+                    lines.append(f"    {market_str}: {len(buys)} BUY, {len(sells)} SELL")
+                elif buys:
+                    lines.append(f"    {market_str}: {len(buys)} BUY")
+                elif sells:
+                    lines.append(f"    {market_str}: {len(sells)} SELL")
+
+                # Show individual order details
+                for price, amount, order_id in buys:
+                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
+                    if price == "MARKET":
+                        lines.append(f"      BUY  {amount:>10.6f} @ MARKET     (#{short_id})")
+                    else:
+                        lines.append(f"      BUY  {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
+
+                for price, amount, order_id in sells:
+                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
+                    if price == "MARKET":
+                        lines.append(f"      SELL {amount:>10.6f} @ MARKET     (#{short_id})")
+                    else:
+                        lines.append(f"      SELL {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
+
+        return lines
 
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
