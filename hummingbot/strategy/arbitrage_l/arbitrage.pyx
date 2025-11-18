@@ -34,7 +34,7 @@ from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.arbitrage_l.arbitrage_config_map import arbitrage_l_config_map
 from hummingbot.core.data_type.order_book cimport OrderBook
 from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
-from hummingbot.strategy.arbitrage_l.buy_in_handler cimport ArbitrageBuyInHandler
+from hummingbot.strategy.arbitrage_l.position_balancer_handler cimport PositionBalancerHandler
 
 # Constants - Now configurable via init_params
 cdef:
@@ -71,7 +71,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Initialize defaults so attributes exist even if init_params isn't called yet
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
-        self._buy_in_handler = None  # Will be initialized in init_params if enabled
+        self._position_balancer = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
         # Track when orders first received fills (for filled order timeout cleanup)
@@ -111,9 +111,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     rate_cache_duration: float = DEFAULT_RATE_CACHE_DURATION,
                     order_warning_delay: float = DEFAULT_ORDER_WARNING_DELAY,
                     max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
+                    # Position balancer - buy-in configuration
                     buy_in_enabled: bool = True,
                     buy_in_target_usd: float = 100.0,
-                    buy_in_min_profitability: float = 0.005,
+                    buy_in_spread_pct: float = 0.1,
+                    # Position balancer - sell-off configuration
+                    sell_off_enabled: bool = False,
+                    sell_off_target_usd: float = 1000.0,
+                    sell_off_spread_pct: float = 0.1,
+                    # Position balancer - order management
+                    position_balancer_refresh_interval: float = 10.0,
                     orchestrated_mode: bool = False):
         """Initialize arbitrage strategy with configurable parameters"""
         
@@ -187,12 +194,19 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Buy-in handler (only create if enabled to avoid overhead)
-        if buy_in_enabled:
-            self._buy_in_handler = ArbitrageBuyInHandler(
-                self, buy_in_enabled, buy_in_target_usd, buy_in_min_profitability)
+        # Position balancer handler (create if either buy or sell enabled)
+        if buy_in_enabled or sell_off_enabled:
+            self._position_balancer = PositionBalancerHandler(
+                self,
+                buy_in_enabled,
+                buy_in_target_usd,
+                buy_in_spread_pct,
+                sell_off_enabled,
+                sell_off_target_usd,
+                sell_off_spread_pct,
+                position_balancer_refresh_interval)
         else:
-            self._buy_in_handler = None
+            self._position_balancer = None
 
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
@@ -462,9 +476,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in status (delegate to handler)
-            if self._buy_in_handler is not None:
-                lines.extend(self._buy_in_handler.get_status_lines(unique_tuples, balance_map))
+            # Position balancer status (delegate to handler)
+            if self._position_balancer is not None:
+                lines.extend(self._position_balancer.get_status_lines(unique_tuples, balance_map))
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
@@ -509,11 +523,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # Orchestrated mode: check connectivity but skip redundant logging/buy-in
                 if not self.c_check_markets_ready_orchestrated():
                     return
-                # Mark ready and do one-time buy-in check if not done yet
+                # Mark ready and do one-time position balancer check if not done yet
                 if not self._all_markets_ready:
                     self._all_markets_ready = True
-                    if self._buy_in_handler is not None:
-                        self._buy_in_handler.c_scan_and_mark_completion()
+                    if self._position_balancer is not None:
+                        self._position_balancer.c_scan_and_mark_completion()
 
             # Early check: skip orderbook scanning if global cooldown is active
             # This optimization avoids expensive orderbook iterations when we can't trade anyway
@@ -542,32 +556,30 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
-                if self._buy_in_handler is not None and self._buy_in_handler.is_active:
-                    # Try buy-in first if not completed
-                    if self._buy_in_handler.c_handle_buy_in(best_buy, best_sell):
-                        # buy-in executed; skip regular arbitrage this tick
+                if self._position_balancer is not None and self._position_balancer.is_active:
+                    # Try position balancing first (buy-in or sell-off)
+                    if self._position_balancer.c_handle_position_balancing(best_buy, best_sell):
+                        # Position balancing executed; skip regular arbitrage this tick
                         pass
                     else:
                         self.c_execute_arbitrage(best_buy, best_sell)
                 else:
                     self.c_execute_arbitrage(best_buy, best_sell)
-            elif self._buy_in_handler is not None and self._buy_in_handler.is_active and best_buy is not None and best_sell is not None:
-                # Not enough edge for normal arbitrage. Still try buy-in using its own threshold,
-                # and also try the reversed pairing in case that direction offers cheaper buys.
+            elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is not None and best_sell is not None:
+                # Not enough edge for normal arbitrage. Still try position balancing.
                 # Attempt with current best direction (respect pending/cool-off)
-                placed_buyin = False
+                placed = False
                 if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
-                    placed_buyin = self._buy_in_handler.c_handle_buy_in(best_buy, best_sell) or False
+                    placed = self._position_balancer.c_handle_position_balancing(best_buy, best_sell) or False
                 # Also attempt reversed only if nothing was placed in current direction
-                if (not placed_buyin) and self._buy_in_handler.is_active:
+                if (not placed) and self._position_balancer.is_active:
                     if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
-                        self._buy_in_handler.c_handle_buy_in(best_sell, best_buy)
-            elif self._buy_in_handler is not None and self._buy_in_handler.is_active and best_buy is None:
-                # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
-                # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
+                        self._position_balancer.c_handle_position_balancing(best_sell, best_buy)
+            elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is None:
+                # No arbitrageable pair found. Proactively scan all pairs for position balancing.
                 for market_pair in self._market_pairs:
                     if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
-                        if self._buy_in_handler.c_handle_buy_in(market_pair.first, market_pair.second):
+                        if self._position_balancer.c_handle_position_balancing(market_pair.first, market_pair.second):
                             break
 
             # Check ALL pending orders for timeouts every tick
@@ -603,12 +615,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self.logger().info("Markets ready. Trading started.")
                     # Debounce status logs for a short window to let connectors settle
                     self._status_debounce_until = self._current_timestamp + 2.0
-                # Run one-time global buy-in completion check now that markets are ready (always log once)
-                if self._buy_in_handler is not None:
-                    self.log_with_clock(logging.INFO, "Buy-in config enabled at startup; performing completion check.")
-                    self._buy_in_handler.c_scan_and_mark_completion()
+                # Run one-time position balancer completion check now that markets are ready
+                if self._position_balancer is not None:
+                    self.log_with_clock(logging.INFO, "Position balancer enabled at startup; performing completion check.")
+                    self._position_balancer.c_scan_and_mark_completion()
                 else:
-                    self.log_with_clock(logging.INFO, "Buy-in config disabled at startup.")
+                    self.log_with_clock(logging.INFO, "Position balancer disabled at startup.")
         
         # Check network status
         for market in self._sb_markets:
@@ -724,9 +736,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging.DEBUG,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
-            # Cleanup buy-in tracking (delegated to handler)
-            if self._buy_in_handler is not None:
-                self._buy_in_handler.handle_order_completion(order_id, is_buy)
+            # Cleanup position balancer tracking (delegated to handler)
+            if self._position_balancer is not None:
+                self._position_balancer.handle_order_completion(order_id, is_buy)
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
@@ -797,9 +809,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, order_id)
 
-        # Cleanup buy-in tracking (delegated to handler)
-        if self._buy_in_handler is not None:
-            self._buy_in_handler.handle_order_cancellation(order_id)
+        # Cleanup position balancer tracking (delegated to handler)
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_cancellation(order_id)
 
         # Remove from pending orders tracking - check both buy and sell dicts
         self.c_remove_pending_order(market_pair, order_id, "cancelled")
@@ -906,9 +918,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             pass
                         self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
-                        # Cleanup buy-in tracking (delegated to handler)
-                        if self._buy_in_handler is not None:
-                            self._buy_in_handler.handle_order_timeout(order_id)
+                        # Cleanup position balancer tracking (delegated to handler)
+                        if self._position_balancer is not None:
+                            self._position_balancer.handle_order_timeout(order_id)
 
                         # Remove from pending orders tracking - check both buy and sell dicts
                         self.c_remove_pending_order(market_tuple, order_id, "")
@@ -985,9 +997,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # Stop tracking the order
                     self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
-                    # Cleanup buy-in tracking
-                    if self._buy_in_handler is not None:
-                        self._buy_in_handler.handle_order_timeout(order_id)
+                    # Cleanup position balancer tracking
+                    if self._position_balancer is not None:
+                        self._position_balancer.handle_order_timeout(order_id)
 
                     # Remove from pending orders tracking
                     self.c_remove_pending_order(market_tuple, order_id, "filled_timeout")
@@ -1590,11 +1602,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Also remove from completed orders set
             self._completed_orders.erase(order_id_str)
 
-            # Cleanup buy-in tracking (delegated to handler)
+            # Cleanup position balancer tracking (delegated to handler)
             try:
                 oid = order_id_str.decode('utf-8')
-                if self._buy_in_handler is not None and oid is not None:
-                    self._buy_in_handler.handle_old_order_cleanup(oid)
+                if self._position_balancer is not None and oid is not None:
+                    self._position_balancer.handle_old_order_cleanup(oid)
             except Exception:
                 pass
         

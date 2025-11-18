@@ -49,8 +49,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _cached_quote_rate
         double _last_rate_update
         
-        # Buy-in handler (None when disabled)
-        object _buy_in_handler
+        # Position balancer handler (None when disabled)
+        object _position_balancer
 
 
         # Order tracking - single unified map
