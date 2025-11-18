@@ -83,10 +83,10 @@ Optimizations for 40-50 Strategies (Reconnection Performance):
    - Coordinated re-initialization after full reconnection events
    - Prevents redundant startup logic across 40-50 strategies
 
-2. Coordinated Buy-in Initialization:
-   - Single wallet balance query when markets become ready
-   - Orchestrator coordinates buy-in checks for all strategies
-   - Prevents 40-50 simultaneous wallet queries on reconnection
+2. Individual Strategy Buy-in:
+   - Each strategy handles its own buy-in logic in orchestrated mode
+   - Buy-in check runs when strategy first detects markets are ready
+   - No orchestrator-level coordination needed (strategies are self-contained)
 
 3. Optimized Readiness Checking:
    - Individual strategies use orchestrated_mode for streamlined readiness checks
@@ -448,7 +448,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Orchestrator-level readiness coordination (optimization for 40-50 strategies)
         self._markets_ready_notified: bool = False
-        self._buy_in_initialized: bool = False
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -756,8 +755,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if all_connectors_ready and not prev_global_ready and self._markets_ready_notified:
             # Full reconnection after full disconnection
             self.logger().info("All connectors reconnected - running coordinated re-initialization")
-            # Reset buy-in flag so it runs again on reconnection
-            self._buy_in_initialized = False
             self._on_markets_ready(timestamp)
 
         # CRITICAL: Don't use ScriptStrategyBase.tick() - it requires ALL connectors to be ready
@@ -790,55 +787,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             status = connector.status_dict
             self.logger().info(f"{name}: {status}")
 
-        # Coordinated buy-in initialization (if any strategy has it enabled)
-        if not self._buy_in_initialized:
-            self._perform_coordinated_buy_in_check()
-            self._buy_in_initialized = True
+        # Buy-in coordination is handled by individual strategies in orchestrated mode
+        # Each strategy calls its own buy-in check when it first detects markets are ready
+        # arbitrage_m: calls self.c_scan_and_mark_buyin_completion()
+        # arbitrage_l: calls self._buy_in_handler.c_scan_and_mark_completion()
+        # No orchestrator-level coordination needed - strategies handle it internally
 
         self.logger().info("=" * 70)
         self.logger().info("Markets ready. Trading started.")
         self.logger().info("=" * 70)
-
-    def _perform_coordinated_buy_in_check(self):
-        """
-        Perform buy-in completion check at orchestrator level.
-
-        This queries wallet balances ONCE for all strategies instead of
-        40-50 individual queries, significantly speeding up reconnection.
-        """
-        # Check if any strategy has buy-in enabled (with defensive check for recompilation)
-        buy_in_strategies = []
-        for s in self.strategies:
-            try:
-                if hasattr(s.strategy, '_buy_in_enabled') and s.strategy._buy_in_enabled:
-                    buy_in_strategies.append(s)
-            except AttributeError:
-                # Strategy not yet recompiled - skip buy-in check for now
-                continue
-
-        if not buy_in_strategies:
-            return
-
-        self.logger().info(f"Coordinated buy-in check for {len(buy_in_strategies)} strategies...")
-
-        # Perform coordinated buy-in completion scan for each enabled strategy
-        # This calls the strategy's existing buy-in logic but only ONCE when markets are ready
-        # Supports both arbitrage_m (inline) and arbitrage_l (handler-based) buy-in patterns
-        for strategy_instance in buy_in_strategies:
-            try:
-                strategy = strategy_instance.strategy
-                # arbitrage_m pattern: inline buy-in with c_scan_and_mark_buyin_completion()
-                if hasattr(strategy, 'c_scan_and_mark_buyin_completion'):
-                    strategy.c_scan_and_mark_buyin_completion()
-                # arbitrage_l pattern: handler-based buy-in with _buy_in_handler.c_scan_and_mark_completion()
-                elif hasattr(strategy, '_buy_in_handler') and strategy._buy_in_handler is not None:
-                    if hasattr(strategy._buy_in_handler, 'c_scan_and_mark_completion'):
-                        strategy._buy_in_handler.c_scan_and_mark_completion()
-            except Exception as e:
-                self.logger().warning(
-                    f"Error in buy-in check for '{strategy_instance.name}': {e}",
-                    exc_info=True
-                )
 
     def _start_all_strategies_if_needed(self):
         """
