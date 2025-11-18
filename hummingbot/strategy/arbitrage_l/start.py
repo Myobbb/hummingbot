@@ -45,17 +45,32 @@ async def start(self):
         use_oracle_conversion_rate = arbitrage_l_config_map.get("use_oracle_conversion_rate").value
         secondary_to_primary_base_conversion_rate = arbitrage_l_config_map["secondary_to_primary_base_conversion_rate"].value
         secondary_to_primary_quote_conversion_rate = arbitrage_l_config_map["secondary_to_primary_quote_conversion_rate"].value
+        # Position balancer - buy-in configuration
         buy_in_enabled = arbitrage_l_config_map.get("buy_in_enabled").value
         buy_in_target_usdt = arbitrage_l_config_map.get("buy_in_target_usdt").value
-        buy_in_min_profitability_val = arbitrage_l_config_map.get("buy_in_min_profitability").value
-        # Fallbacks when importing older/partial configs
+        buy_in_spread_pct = arbitrage_l_config_map.get("buy_in_spread_pct").value
+        # Position balancer - sell-off configuration
+        sell_off_enabled = arbitrage_l_config_map.get("sell_off_enabled").value
+        sell_off_target_usd = arbitrage_l_config_map.get("sell_off_target_usd").value
+        sell_off_spread_pct = arbitrage_l_config_map.get("sell_off_spread_pct").value
+        # Position balancer - order management
+        position_balancer_refresh_interval = arbitrage_l_config_map.get("position_balancer_refresh_interval").value
+
+        # Fallbacks when importing older/partial configs (use arbitrage.pyx defaults)
         if buy_in_enabled is None:
             buy_in_enabled = True
         if buy_in_target_usdt is None:
             buy_in_target_usdt = Decimal("100")
-        if buy_in_min_profitability_val is None:
-            buy_in_min_profitability_val = Decimal("0.5")
-        buy_in_min_profitability = buy_in_min_profitability_val / Decimal("100")
+        if buy_in_spread_pct is None:
+            buy_in_spread_pct = 0.1
+        if sell_off_enabled is None:
+            sell_off_enabled = False
+        if sell_off_target_usd is None:
+            sell_off_target_usd = 1000.0
+        if sell_off_spread_pct is None:
+            sell_off_spread_pct = 0.1
+        if position_balancer_refresh_interval is None:
+            position_balancer_refresh_interval = 10.0
         # Filled order timeout (defaults to 3600 seconds = 1 hour)
         filled_order_timeout_val = arbitrage_l_config_map.get("filled_order_timeout").value
         if filled_order_timeout_val is None:
@@ -135,10 +150,16 @@ async def start(self):
             secondary_to_primary_base_conversion_rate=secondary_to_primary_base_conversion_rate,
             secondary_to_primary_quote_conversion_rate=secondary_to_primary_quote_conversion_rate,
             hb_app_notification=True,
-            # buy-in params
+            # Position balancer - buy-in configuration
             buy_in_enabled=bool(buy_in_enabled),
             buy_in_target_usd=float(buy_in_target_usdt),
-            buy_in_min_profitability=float(buy_in_min_profitability)
+            buy_in_spread_pct=float(buy_in_spread_pct),
+            # Position balancer - sell-off configuration
+            sell_off_enabled=bool(sell_off_enabled),
+            sell_off_target_usd=float(sell_off_target_usd),
+            sell_off_spread_pct=float(sell_off_spread_pct),
+            # Position balancer - order management
+            position_balancer_refresh_interval=float(position_balancer_refresh_interval)
         )
         
         self.logger().info(f"arbitrage_l started with {len(tuples)} markets and {len(market_pairs)} ordered pairs")
