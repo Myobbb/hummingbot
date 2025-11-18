@@ -34,6 +34,7 @@ from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.arbitrage_l.arbitrage_config_map import arbitrage_l_config_map
 from hummingbot.core.data_type.order_book cimport OrderBook
 from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
+from hummingbot.strategy.arbitrage_l.buy_in_handler cimport ArbitrageBuyInHandler
 
 # Constants - Now configurable via init_params
 cdef:
@@ -69,8 +70,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Initialize defaults so attributes exist even if init_params isn't called yet
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
-        self._pending_buyin_by_asset = {}
-        self._pending_buyin_orders = {}
+        self._buy_in_handler = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
         # Keep recent order -> market pair mapping for late events
@@ -91,11 +91,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._last_rate_update = 0
         # Orchestrated mode flag (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = False
-        # Buy-in params/state - initialize defaults
-        self._buy_in_enabled = False
-        self._buy_in_target_usd = 100.0
-        self._buy_in_min_profitability = 0.005
-        self._buy_in_completed = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -183,15 +178,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Buy-in params/state
-        self._buy_in_enabled = buy_in_enabled
-        self._buy_in_target_usd = buy_in_target_usd
-        self._buy_in_min_profitability = buy_in_min_profitability
-        self._buy_in_completed = False
-        # Pending buy-in tracking (asset -> base amount) and per-order map (order_id -> (asset, amount))
-        # Used to de-stale holdings valuation until fills settle
-        self._pending_buyin_by_asset = {}
-        self._pending_buyin_orders = {}
+        # Buy-in handler (only create if enabled to avoid overhead)
+        if buy_in_enabled:
+            self._buy_in_handler = ArbitrageBuyInHandler(
+                self, buy_in_enabled, buy_in_target_usd, buy_in_min_profitability)
+        else:
+            self._buy_in_handler = None
 
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
@@ -461,36 +453,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 lines.append(
                     f"    best: buy-{best_pair.first.market.name} sell-{best_pair.second.market.name} -> {best_prof * 100:+.4f}%")
 
-            # Buy-in status (aggregate per base asset across active markets)
-            if self._buy_in_enabled:
-                # Collect base assets from active market pairs (no unique tuple logic)
-                try:
-                    aset = set()
-                    for mp in self._market_pairs:
-                        aset.add(mp.first.base_asset)
-                        aset.add(mp.second.base_asset)
-                    base_assets = sorted(aset)
-                except Exception:
-                    base_assets = []
-                agg_lines = []
-                any_pending = False
-                for a in base_assets:
-                    # Get a reference bid from any active tuple with this base asset
-                    bid = self.c_get_reference_bid_for_asset(a)
-                    # Aggregate available base balance using the same source as the Assets table (no fallback)
-                    total_base = 0.0
-                    for t in unique_tuples:
-                        if t.base_asset == a:
-                            total_base += float(balance_map.get((t.market.name, a), 0.0))
-                    total_value = total_base * bid
-                    # Status should reflect the permanent global flag, not current valuation
-                    is_pending = (not self._buy_in_completed)
-                    if is_pending:
-                        any_pending = True
-                    agg_lines.append(f"    {a}: base={total_base:.6f} value={total_value:.6f} ({'pending' if is_pending else 'completed'})")
-                if any_pending and self._buy_in_enabled:
-                    lines.extend(["", f"  Buy-in: target={self._buy_in_target_usd:.6f} min_prof={self._buy_in_min_profitability * 100:.2f}%"]) 
-                    lines.extend(agg_lines)
+            # Buy-in status (delegate to handler)
+            if self._buy_in_handler is not None:
+                lines.extend(self._buy_in_handler.get_status_lines(unique_tuples, balance_map))
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
@@ -538,8 +503,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # Mark ready and do one-time buy-in check if not done yet
                 if not self._all_markets_ready:
                     self._all_markets_ready = True
-                    if self._buy_in_enabled:
-                        self.c_scan_and_mark_buyin_completion()
+                    if self._buy_in_handler is not None:
+                        self._buy_in_handler.c_scan_and_mark_completion()
 
             # Early check: skip orderbook scanning if global cooldown is active
             # This optimization avoids expensive orderbook iterations when we can't trade anyway
@@ -568,38 +533,33 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Execute only the globally best profitable opportunity
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
-                if self._buy_in_enabled:
-                    # Quick skip if buy-in already completed
-                    if not self._buy_in_completed:
-                        if self.c_handle_buy_in(best_buy, best_sell):
-                            # buy-in executed; skip regular arbitrage this tick
-                            pass
-                        else:
-                            self.c_execute_arbitrage(best_buy, best_sell)
+                if self._buy_in_handler is not None and self._buy_in_handler.is_active:
+                    # Try buy-in first if not completed
+                    if self._buy_in_handler.c_handle_buy_in(best_buy, best_sell):
+                        # buy-in executed; skip regular arbitrage this tick
+                        pass
                     else:
                         self.c_execute_arbitrage(best_buy, best_sell)
                 else:
                     self.c_execute_arbitrage(best_buy, best_sell)
-            elif self._buy_in_enabled and best_buy is not None and best_sell is not None:
+            elif self._buy_in_handler is not None and self._buy_in_handler.is_active and best_buy is not None and best_sell is not None:
                 # Not enough edge for normal arbitrage. Still try buy-in using its own threshold,
                 # and also try the reversed pairing in case that direction offers cheaper buys.
-                if not self._buy_in_completed:
-                    # Attempt with current best direction (respect pending/cool-off)
-                    placed_buyin = False
-                    if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
-                        placed_buyin = self.c_handle_buy_in(best_buy, best_sell) or False
-                    # Also attempt reversed only if nothing was placed in current direction
-                    if (not placed_buyin) and (not self._buy_in_completed):
-                        if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
-                            self.c_handle_buy_in(best_sell, best_buy)
-            elif self._buy_in_enabled and best_buy is None:
+                # Attempt with current best direction (respect pending/cool-off)
+                placed_buyin = False
+                if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
+                    placed_buyin = self._buy_in_handler.c_handle_buy_in(best_buy, best_sell) or False
+                # Also attempt reversed only if nothing was placed in current direction
+                if (not placed_buyin) and self._buy_in_handler.is_active:
+                    if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
+                        self._buy_in_handler.c_handle_buy_in(best_sell, best_buy)
+            elif self._buy_in_handler is not None and self._buy_in_handler.is_active and best_buy is None:
                 # No arbitrageable pair found (likely due to zero sell-side base). Proactively scan all ordered
                 # pairs to try buy-in on any asset/venue where shortfall and edge allow it.
-                if not self._buy_in_completed:
-                    for market_pair in self._market_pairs:
-                        if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
-                            if self.c_handle_buy_in(market_pair.first, market_pair.second):
-                                break
+                for market_pair in self._market_pairs:
+                    if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
+                        if self._buy_in_handler.c_handle_buy_in(market_pair.first, market_pair.second):
+                            break
 
             # Check ALL pending orders for timeouts every tick
             # This ensures canceled orders are detected even if their market is no longer being considered
@@ -632,9 +592,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # Debounce status logs for a short window to let connectors settle
                     self._status_debounce_until = self._current_timestamp + 2.0
                 # Run one-time global buy-in completion check now that markets are ready (always log once)
-                if self._buy_in_enabled:
+                if self._buy_in_handler is not None:
                     self.log_with_clock(logging.INFO, "Buy-in config enabled at startup; performing completion check.")
-                    self.c_scan_and_mark_buyin_completion()
+                    self._buy_in_handler.c_scan_and_mark_completion()
                 else:
                     self.log_with_clock(logging.INFO, "Buy-in config disabled at startup.")
         
@@ -751,9 +711,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging.DEBUG,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
-            # TODO: Buy-in cleanup to be moved to helper script
-            # Placeholder for buy-in pending order cleanup on completion
-            pass
+            # Cleanup buy-in tracking (delegated to handler)
+            if self._buy_in_handler is not None:
+                self._buy_in_handler.handle_order_completion(order_id, is_buy)
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
@@ -816,9 +776,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, order_id)
 
-        # TODO: Buy-in cleanup to be moved to helper script
-        # Placeholder for buy-in pending order cleanup on cancellation
-        pass
+        # Cleanup buy-in tracking (delegated to handler)
+        if self._buy_in_handler is not None:
+            self._buy_in_handler.handle_order_cancellation(order_id)
 
         # Remove from pending orders tracking - check both buy and sell dicts
         self.c_remove_pending_order(market_pair, order_id, "cancelled")
@@ -925,9 +885,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             pass
                         self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
-                        # TODO: Buy-in cleanup to be moved to helper script
-                        # Placeholder for buy-in pending order cleanup on timeout
-                        pass
+                        # Cleanup buy-in tracking (delegated to handler)
+                        if self._buy_in_handler is not None:
+                            self._buy_in_handler.handle_order_timeout(order_id)
 
                         # Remove from pending orders tracking - check both buy and sell dicts
                         self.c_remove_pending_order(market_tuple, order_id, "")
@@ -1405,258 +1365,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
  
  
  
-    cdef void c_maybe_disable_buy_in(self):
-        """Disable buy-in globally for this run once target is reached (do not mutate config)."""
-        if self._buy_in_completed and self._buy_in_enabled:
-            self._buy_in_enabled = False
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, "Buy-in completed. Disabling buy-in for this session.")
-
-    cdef void c_scan_and_mark_buyin_completion(self):
-        """Re-evaluate the base asset against target and disable buy-in when done."""
-        if not self._buy_in_enabled or self._buy_in_completed:
-            return
-        cdef:
-            str asset_key
-            double last_bid = 0.0
-            double base_bal
-            pair[double, double] val_short
-            double current_value_quote
-            double shortfall
-            list unique_tuples
-            object assets_df
-            dict balance_map
-        # Determine the single base asset from the first market pair
-        asset_key = self._market_pairs[0].first.base_asset
-        # Get a non-zero bid from any active tuple with this base asset
-        last_bid = self.c_get_reference_bid_for_asset(asset_key)
-        # Build balances from the same source as status for consistency (shared helper)
-        unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
-        # Sum base using the same map
-        base_bal = 0.0
-        for t in unique_tuples:
-            if t.base_asset == asset_key:
-                base_bal += float(balance_map.get((t.market.name, asset_key), 0.0))
-        # Include any in-flight buy-in base to avoid stale underestimation
-        base_bal += self.c_get_pending_buyin_base(asset_key)
-        val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
-        current_value_quote = val_short.first
-        shortfall = val_short.second
-        # Concise info log about startup buy-in state and decision
-        try:
-            decision = "disable" if (current_value_quote >= self._buy_in_target_usd or (shortfall > 0 and shortfall < self._min_order_usd)) else "keep"
-            self.log_with_clock(
-                logging.INFO,
-                f"Buy-in check: asset={asset_key} base={base_bal:.6f} bid={last_bid:.6f} value={current_value_quote:.6f} target={self._buy_in_target_usd:.6f} -> {decision}")
-        except Exception:
-            pass
-        if self.c_try_mark_complete_buy_in(asset_key, current_value_quote, shortfall):
-            pass
-        self.c_maybe_disable_buy_in()
-
-    cdef pair[double, double] c_compute_value_and_shortfall(self,
-                                                           double base_balance,
-                                                           double last_bid):
-        """Return (current_value_quote, shortfall)."""
-        cdef double current_value_quote = base_balance * last_bid
-        cdef double shortfall = 0.0
-        if current_value_quote < self._buy_in_target_usd:
-            shortfall = self._buy_in_target_usd - current_value_quote
-        else:
-            shortfall = 0.0
-        return pair[double, double](current_value_quote, shortfall)
-
-    cdef double c_get_aggregated_base_balance(self, str asset):
-        """Aggregate base balance consistently using the same source as startup status (assets_df/balance_map)."""
-        cdef:
-            double total = 0.0
-            list unique_tuples
-            object assets_df
-            dict balance_map
-            object t
-        try:
-            unique_tuples, assets_df, balance_map = self.c_build_unique_tuples_assets_and_balance_map()
-            for t in unique_tuples:
-                if t.base_asset == asset:
-                    total += float(balance_map.get((t.market.name, asset), 0.0))
-        except Exception:
-            return 0.0
-        return total
-
-    cdef double c_get_pending_buyin_base(self, str asset):
-        """Return in-flight buy-in base amount for asset (orders placed but not yet reflected in balances)."""
-        try:
-            return <double> self._pending_buyin_by_asset.get(asset, 0.0)
-        except Exception:
-            return 0.0
-
-    cdef double c_get_adjusted_base_balance(self, str asset):
-        """Aggregated base balance plus pending buy-in base (to avoid stale underestimation)."""
-        cdef double agg = self.c_get_aggregated_base_balance(asset)
-        cdef double pend = self.c_get_pending_buyin_base(asset)
-        return agg + pend
-
-    cdef bint c_try_mark_complete_buy_in(self,
-                                         str pair,
-                                         double current_value_quote,
-                                         double shortfall):
-        """Mark buy-in as completed if at target or remaining < min notional (single asset)."""
-        if current_value_quote >= self._buy_in_target_usd:
-            self._buy_in_completed = True
-            self.c_maybe_disable_buy_in()
-            return True
-        if shortfall > 0 and shortfall < self._min_order_usd:
-            self._buy_in_completed = True
-            if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
-                self.log_with_clock(logging.INFO, f"Buy-in considered complete on {pair}: shortfall {shortfall:.6f} < min notional {self._min_order_usd:.6f}")
-            self.c_maybe_disable_buy_in()
-            return True
-        return False
-
-    cdef bint c_handle_buy_in(self, object buy_market_tuple, object sell_market_tuple):
-        """
-        If base asset holdings on buy_market_tuple are below target (in that market's quote units), place a taker buy
-        using the same amount-finding logic as arbitrage execution, gated by a separate buy-in profitability.
-        Returns True if a buy-in was placed; False otherwise.
-        """
-        # CRITICAL SAFEGUARD: Prevent double execution at the same timestamp
-        # This protects against multiple strategy instances or rapid tick cycles
-        if self._last_global_trade_timestamp == self._current_timestamp:
-            self.logger().debug(
-                f"Skipping duplicate buy-in execution at timestamp {self._current_timestamp:.3f} "
-                f"(already executed this tick)")
-            return False
-
-        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
-        # If we wait until later, a second call could slip through the check above
-        self._last_global_trade_timestamp = self._current_timestamp
-
-        if not self._buy_in_enabled:
-            return False
-        cdef:
-            str pair_str = buy_market_tuple.trading_pair
-            ExchangeBase market = buy_market_tuple.market #object market = buy_market_tuple.market
-            double base_bal = 0.0
-            double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
-            double best_amount
-            double best_prof
-            double sell_price
-            double buy_price
-            tuple res
-            str asset_key = buy_market_tuple.base_asset
-
-        if self._buy_in_completed:
-            return False
-
-        # Evaluate progress vs target and early complete (aggregate base across all markets)
-        # Get a reliable bid for the asset from any active tuple to avoid zero-bid stalls
-        cdef double last_bid = self.c_get_reference_bid_for_asset(asset_key)
-        base_bal = self.c_get_adjusted_base_balance(asset_key)
-        cdef pair[double, double] val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
-        cdef double current_value_quote = val_short.first
-        cdef double shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
-            return False
-
-        # Require quote balance to spend and a minimal edge
-        if quote_bal <= 0:
-            return False
-
-        res = self.c_find_best_buyin_amount(
-            buy_market_tuple,
-            sell_market_tuple,
-            quote_bal,
-            shortfall
-        )
-        best_amount = <double>res[0]
-        best_prof = <double>res[1]
-        sell_price = <double>res[2]
-        buy_price = <double>res[3]
-
-        if best_amount <= 0 or best_prof < self._buy_in_min_profitability:
-            return False
-
-        # Place only the buy leg on buy market
-        cdef object order_type = OrderType.LIMIT
-        cdef object quantized_amount
-        cdef object dec_safe_amount2 = Decimal(str(max(0.0, best_amount - QUANTIZATION_EPSILON)))
-        quantized_amount = self.c_safe_quantize_order_amount(market, buy_market_tuple.trading_pair, dec_safe_amount2, Decimal(str(buy_price)))
-        # Ensure not exceeding available quote after quantization
-        cdef double max_affordable = 0.0
-        if buy_price > 0:
-            max_affordable = quote_bal / buy_price
-        if float(quantized_amount) > max_affordable:
-            quantized_amount = self.c_safe_quantize_order_amount(market, buy_market_tuple.trading_pair, Decimal(str(max(0.0, max_affordable - QUANTIZATION_EPSILON))), Decimal(str(buy_price)))
-        if quantized_amount <= Decimal("0"):
-            return False
-
-        # Apply max_order_size cap from trading rules 
-        try:
-            buy_trading_rule = market._trading_rules.get(buy_market_tuple.trading_pair)
-            if buy_trading_rule is not None and buy_trading_rule.max_order_size > Decimal("0"):
-                if quantized_amount > buy_trading_rule.max_order_size:
-                    quantized_amount = min(quantized_amount, buy_trading_rule.max_order_size)
-        except Exception:
-            pass  # Fail gracefully if trading rules unavailable
-
-        # Enforce minimum notional like normal arbitrage orders
-        # NOTE: volume_usd is notional value in buy market quote currency, not necessarily USD
-        cdef double volume_usd = float(quantized_amount) * buy_price
-        if volume_usd < self._min_order_usd:
-            # If we cannot place a valid minimum-size order, mark complete only if remaining shortfall is under min
-            if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
-                return False
-            return False
-
-        try:
-            buy_order_id = self.c_buy_with_specific_market(
-                buy_market_tuple,
-                quantized_amount,
-                order_type=order_type,
-                price=Decimal(str(buy_price)),
-                expiration_seconds=self._next_trade_delay)
-        except Exception as e:
-            # CRITICAL: Set failure timestamp to enforce cooldown
-            self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
-            self.logger().warning(f"Error submitting buy-in order to {market.name}: {e}")
-            return False
-
-        # Track order timestamp for housekeeping
-        cdef string buy_id_str = self._to_cpp_str(buy_order_id)
-        self._order_timestamps[buy_id_str] = self._current_timestamp
-
-        # Track pending BUY order for buy-in (buy-in is always a buy order)
-        try:
-            if buy_market_tuple not in self._pending_buy_orders_by_market:
-                self._pending_buy_orders_by_market[buy_market_tuple] = set()
-            self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
-        except Exception as e:
-            self.logger().warning(f"Failed to track pending buy-in order by market: {e}")
-
-        # Track pending base to avoid stale underestimation until fills settle
-        try:
-            self._pending_buyin_orders[buy_order_id] = (asset_key, float(quantized_amount))
-            self._pending_buyin_by_asset[asset_key] = float(self._pending_buyin_by_asset.get(asset_key, 0.0)) + float(quantized_amount)
-        except Exception as e:
-            self.logger().warning(f"Failed to track pending buy-in for order {buy_order_id}: {e}")
-
-        # Check if target reached after placing (aggregate across all markets)
-        # Use the same reliable bid lookup as above
-        last_bid = self.c_get_reference_bid_for_asset(asset_key)
-        base_bal = self.c_get_adjusted_base_balance(asset_key)
-        val_short = self.c_compute_value_and_shortfall(base_bal, last_bid)
-        current_value_quote = val_short.first
-        shortfall = val_short.second
-        if self.c_try_mark_complete_buy_in(pair_str, current_value_quote, shortfall):
-            self.c_maybe_disable_buy_in()
-
-        return True
 
     cdef tuple c_find_best_buyin_amount(self,
                                         object buy_market_tuple,
                                         object sell_market_tuple,
                                         double buy_quote_balance,
-                                        double max_spend_quote):
+                                        double max_spend_quote,
+                                        double min_profitability):
         """
         Compute best buy-only amount using cross-market price edge, ignoring sell-side base balance limits.
         Caps spend by both available quote balance and provided max_spend_quote.
@@ -1670,7 +1385,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return (0.0, 0.0, 0.0, 0.0)
 
         # Early uniform gate for buy-in; reuse conv_rate
-        gate_res2 = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, self._buy_in_min_profitability)
+        gate_res2 = self.c_top_of_book_profitable_get_conv(buy_market_tuple, sell_market_tuple, min_profitability)
         if not gate_res2.first:
             return (0.0, 0.0, 0.0, 0.0)
         conv_rate = gate_res2.second
@@ -1696,7 +1411,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Use buy-in profitability threshold here (not the main arbitrage threshold), with capacity-aware early-stop
         profitable_orders = c_find_profitable_arbitrage_orders(
-            self._buy_in_min_profitability,
+            min_profitability,
             buy_market_tuple,
             sell_market_tuple,
             1.0,
@@ -1771,9 +1486,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Also remove from completed orders set
             self._completed_orders.erase(order_id_str)
 
-            # TODO: Buy-in cleanup to be moved to helper script
-            # Placeholder for buy-in pending order cleanup during old order cleanup
-            pass
+            # Cleanup buy-in tracking (delegated to handler)
+            try:
+                oid = order_id_str.decode('utf-8')
+                if self._buy_in_handler is not None and oid is not None:
+                    self._buy_in_handler.handle_old_order_cleanup(oid)
+            except Exception:
+                pass
         
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
