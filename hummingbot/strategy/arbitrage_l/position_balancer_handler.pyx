@@ -17,11 +17,8 @@ from decimal import Decimal
 from libc.stdint cimport int64_t
 from libcpp.pair cimport pair
 from libcpp.string cimport string
-from libcpp.set cimport set as cpp_set
-from cython.operator cimport dereference as deref
 
 from hummingbot.core.data_type.common import OrderType
-from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
 from hummingbot.core.data_type.order_book cimport OrderBook
 
 cdef double QUANTIZATION_EPSILON = 1e-12
@@ -553,10 +550,9 @@ cdef class PositionBalancerHandler:
         if quote_bal <= 0:
             return False
 
-        # Get top bid price via C-level orderbook
+        # Get top bid price from cached order book value
         cdef:
             OrderBook ob = market.c_get_order_book(buy_market_tuple.trading_pair)
-            cpp_set[OrderBookEntry].reverse_iterator bid_it
             double top_bid
             double buy_price
             double max_affordable_base
@@ -567,11 +563,10 @@ cdef class PositionBalancerHandler:
             str buy_order_id
             string buy_id_str
 
-        if ob._bid_book.size() == 0:
+        try:
+            top_bid = ob._best_bid
+        except Exception:
             return False
-
-        bid_it = ob._bid_book.rbegin()
-        top_bid = deref(bid_it).getPrice()
 
         if top_bid <= 0:
             return False
@@ -691,10 +686,9 @@ cdef class PositionBalancerHandler:
         if base_bal_raw <= 0:
             return False
 
-        # Get top ask price via C-level orderbook
+        # Get top ask price from cached order book value
         cdef:
             OrderBook ob = market.c_get_order_book(sell_market_tuple.trading_pair)
-            cpp_set[OrderBookEntry].iterator ask_it
             double top_ask
             double sell_price
             double amount_to_sell
@@ -704,11 +698,10 @@ cdef class PositionBalancerHandler:
             str sell_order_id
             string sell_id_str
 
-        if ob._ask_book.size() == 0:
+        try:
+            top_ask = ob._best_ask
+        except Exception:
             return False
-
-        ask_it = ob._ask_book.begin()
-        top_ask = deref(ask_it).getPrice()
 
         if top_ask <= 0:
             return False
