@@ -249,6 +249,14 @@ arbitrage_l_config_map = {
         validator=lambda v: validate_decimal(v, Decimal(-100), Decimal("100"), inclusive=True),
         type_str="decimal",
     ),
+    "filled_order_timeout": ConfigVar(
+        key="filled_order_timeout",
+        prompt="Timeout in seconds for limit orders that have received fills (default: 3600 = 1 hour) >>> ",
+        prompt_on_new=False,
+        default=Decimal("3600"),
+        validator=lambda v: validate_decimal(v, Decimal(1), inclusive=True),
+        type_str="decimal",
+    ),
     "use_oracle_conversion_rate": ConfigVar(
         key="use_oracle_conversion_rate",
         type_str="bool",
