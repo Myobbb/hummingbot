@@ -8,6 +8,8 @@ MAX_ORDER_ID_LEN = 32
 
 # Base URL
 REST_URL = "https://api.mexc.{}/api/"
+# Preferred WS endpoint per latest MEXC docs; keep legacy as fallback
+WSS_API_URL = "wss://wbs-api.mexc.{}/ws"
 WSS_URL = "wss://wbs.mexc.{}/ws"
 
 PUBLIC_API_VERSION = "v3"
@@ -30,6 +32,11 @@ MEXC_USER_STREAM_PATH_URL = "/userDataStream"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
+# Websocket subscription limits
+# https://www.mexc.com/api-docs/spot-v3/websocket-market-streams
+# One ws connection supports a maximum of 30 subscriptions
+WS_MAX_SUBSCRIPTIONS_PER_CONNECTION = 30
+
 # Mexc params
 
 SIDE_BUY = "BUY"
@@ -50,7 +57,7 @@ ONE_DAY = 86400
 
 MAX_REQUEST = 5000
 
-# Order States
+# Order States (REST)
 ORDER_STATE = {
     "PENDING": OrderState.PENDING_CREATE,
     "NEW": OrderState.OPEN,
@@ -67,7 +74,7 @@ ORDER_STATE = {
 WS_ORDER_STATE = {
     1: OrderState.OPEN,
     2: OrderState.FILLED,
-    3: OrderState.PARTIALLY_FILLED,
+    3: OrderState.FILLED, #part_filled
     4: OrderState.CANCELED,
     5: OrderState.OPEN,
 }
@@ -76,9 +83,9 @@ WS_ORDER_STATE = {
 DIFF_EVENT_TYPE = "increase.depth"
 TRADE_EVENT_TYPE = "public.deals"
 
-USER_TRADES_ENDPOINT_NAME = "spot@private.deals.v3.api"
-USER_ORDERS_ENDPOINT_NAME = "spot@private.orders.v3.api"
-USER_BALANCE_ENDPOINT_NAME = "spot@private.account.v3.api"
+USER_TRADES_ENDPOINT_NAME = "spot@private.deals.v3.api.pb"
+USER_ORDERS_ENDPOINT_NAME = "spot@private.orders.v3.api.pb"
+USER_BALANCE_ENDPOINT_NAME = "spot@private.account.v3.api.pb"
 WS_CONNECTION_TIME_INTERVAL = 20
 RATE_LIMITS = [
     RateLimit(limit_id=IP_REQUEST_WEIGHT, limit=20000, time_interval=ONE_MINUTE),
@@ -114,3 +121,4 @@ UNKNOWN_ORDER_ERROR_CODE = -2011
 UNKNOWN_ORDER_MESSAGE = "Unknown order sent"
 TIMESTAMP_RELATED_ERROR_CODE = 700003
 TIMESTAMP_RELATED_ERROR_MESSAGE = "Timestamp for this request is outside of the recvWindow"
+ORDER_CANCELLED_MESSAGE = "Order cancelled"

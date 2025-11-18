@@ -1,5 +1,7 @@
 import asyncio
 import uuid
+import time
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import hummingbot.connector.exchange.htx.htx_constants as CONSTANTS
@@ -30,33 +32,216 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.ORDERBOOK_CHANNEL_SUFFIX
         self._trade_messages_queue_key = CONSTANTS.TRADE_CHANNEL_SUFFIX
         self._api_factory = api_factory
+        
+        # Keep-alive tracking for stable connections
+        self._last_ping_timestamp = 0
+        self._last_pong_timestamp = 0
+        self._ping_interval = 30  # Rely on server pings; only monitor liveness
+        self._pong_timeout = 10
+
+        # Reconnect backoff tracking
+        self._reconnect_attempts = 0
+
+        # No per-channel silence tracking (keep minimal state)
+        self._suppress_reconnect_logs = False
+
+        # Track transient disconnects to emit a single concise INFO after successful resubscribe
+        self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        return match.group(1) if match else None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        """
+        Returns True for close codes typically associated with transient network/CDN resets
+        that should be auto-recovered without noisy error logs.
+        """
+        code = self._extract_close_code(exc)
+        # Treat these as transient: 1000 normal closure, 1001 going away, 1003 policy,
+        # 1005 no status, 1006 abnormal closure (often network), 1012 service restart,
+        # 1013 try again later
+        return code in {"1000", "1001", "1003", "1005", "1006", "1012", "1013"}
+
+    def _is_ws_close_code_1003_exception(self, exc: Exception) -> bool:
+        """
+        Returns True if the exception indicates WS close code 1003 (unsupported data / policy violation).
+        We treat it specially to avoid noisy logs and allow the outer loop to reconnect quietly.
+        """
+        try:
+            text = str(exc)
+        except Exception:
+            return False
+        # Matches formats raised by WSConnection._check_msg_closed_type and aiohttp errors.
+        return ("Close code = 1003" in text) or ("code=1003" in text)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
 
+        throttler = getattr(self._api_factory, "throttler", None)
+        
+        # IMPORTANT: Disable protocol-level ping; HTX uses JSON ping/pong
+        ws_url = CONSTANTS.WS_PUBLIC_URL
+        connection_params = {
+            "ws_url": ws_url,
+            "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
+            # Do not enforce a client-side receive timeout; HTX sends server pings every ~5s.
+            # Rely on _keep_alive_loop inactivity checks to recycle stale connections.
+            "message_timeout": None,
+            "ws_headers": {"Accept-Encoding": "gzip"},
+            "max_msg_size": 32 * 1024 * 1024,
+        }
+        
+        if throttler is not None:
+            async with throttler.execute_task(CONSTANTS.WS_CONNECTION_LIMIT_ID):
+                await ws.connect(**connection_params)
+        else:
+            await ws.connect(**connection_params)
+            
+        # Reset ping/pong tracking
+        self._last_ping_timestamp = 0
+        self._last_pong_timestamp = time.time()
+        
         return ws
+
+    async def listen_for_subscriptions(self):
+        """
+        Main entry point that maintains the WebSocket connection and processes messages.
+        This is the missing method that connects everything together.
+        """
+        ws = None
+        while True:
+            try:
+                ws = await self._connected_websocket_assistant()
+                await self._subscribe_channels(ws)
+                
+                # Create tasks for message processing and keep-alive
+                message_processor_task = asyncio.create_task(
+                    self._process_websocket_messages(websocket_assistant=ws)
+                )
+                keep_alive_task = asyncio.create_task(
+                    self._keep_alive_loop(ws)
+                )
+                
+                # Wait for either task to complete (likely due to disconnection)
+                done, pending = await asyncio.wait(
+                    [message_processor_task, keep_alive_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel the other task
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # Check if any task raised an exception
+                for task in done:
+                    exception = task.exception()
+                    if exception:
+                        raise exception
+                        
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._reconnect_attempts += 1
+                # For transient close codes, defer noisy logs and emit a concise INFO after resubscribe
+                if self._is_transient_ws_close_exception(e):
+                    code = self._extract_close_code(e)
+                    self._pending_reconnect_notice = {
+                        "code": code or "unknown",
+                        "t0": time.time(),
+                    }
+                    # Avoid extra subscription DEBUG spam on the next cycle
+                    self._suppress_reconnect_logs = True
+                    # Keep only a terse debug here to aid deep troubleshooting if needed
+                    self.logger().debug(
+                        f"Transient WS close detected (code={code}); attempting fast reconnect..."
+                    )
+                else:
+                    self.logger().error(
+                        f"Unexpected error with WebSocket connection. Retrying... Error: {e}",
+                        exc_info=True
+                    )
+                # No backoff; reconnect immediately
+            finally:
+                if ws is not None:
+                    await ws.disconnect()
+
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
+        """
+        Process incoming WebSocket messages and route them to the appropriate queue.
+        """
+        async for ws_response in websocket_assistant.iter_messages():
+            try:
+                # Any message from server proves connection is alive
+                self._last_pong_timestamp = time.time()
+                
+                # Data should already be decompressed/parsed by WS post-processor (gzip) and assistant
+                data = ws_response.data
+                if not isinstance(data, dict):
+                    # Ignore non-JSON frames to avoid extra branching here
+                    continue
+                
+                # First check if this is a channel message we care about
+                channel = self._channel_originating_message(data)
+                
+                if channel:
+                    # This is a data message, put it in the appropriate queue
+                    self._message_queue[channel].put_nowait(data)
+                else:
+                    # Not a recognized channel, handle control messages
+                    await self._process_message_for_unknown_channel(data, websocket_assistant)
+                        
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Silence logs for WS close code 1003 and re-raise to allow outer loop to handle reconnection
+                if self._is_ws_close_code_1003_exception(e):
+                    raise
+                self.logger().error("Unexpected error in message processing", exc_info=True)
+                # Keep minimal behavior on errors
+
+    async def _keep_alive_loop(self, ws: WSAssistant):
+        while True:
+            try:
+                await asyncio.sleep(self._ping_interval)
+
+                # Do not proactively ping; rely on server ping/pong for v1 market WS.
+                # Only monitor inactivity and recycle the connection if needed.
+                now = time.time()
+                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 180:
+                    self.logger().warning("Inactivity threshold exceeded, disconnecting")
+                    await ws.disconnect()
+                    break
+
+                # Per-channel silence detection disabled for minimal behavior
+
+            except Exception as e:
+                self.logger().error(f"Error in keep-alive loop: {e}")
+                break
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """
-        Suppressing call to this function as the orderbook snapshots are handled by
-        listen_for_order_book_diffs() for Htx
+        HTX provides snapshots through the depth channel, not separate REST calls.
+        The base class expects this method but we don't need to implement it.
         """
         pass
 
     def snapshot_message_from_exchange(self,
                                        msg: Dict[str, Any],
                                        metadata: Optional[Dict] = None) -> OrderBookMessage:
-
         """
         Creates a snapshot message with the order book snapshot message
-        :param msg: the response from the exchange when requesting the order book snapshot
-        :param timestamp: the snapshot timestamp
-        :param metadata: a dictionary with extra information to add to the snapshot data
-        :return: a snapshot message with the snapshot information received from the exchange
         """
         if metadata:
             msg.update(metadata)
@@ -67,22 +252,18 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "bids": msg["tick"].get("bids", []),
             "asks": msg["tick"].get("asks", [])
         }
-
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
 
     def trade_message_from_exchange(self,
                                     msg: Dict[str, Any],
                                     metadata: Dict[str, Any] = None) -> OrderBookMessage:
         """
-        Creates a trade message with the information from the trade event sent by the exchange
-        :param msg: the trade event details sent by the exchange
-        :param metadata: a dictionary with extra information to add to trade message
-        :return: a trade message with the details of the trade as provided by the exchange
+        Creates a trade message with the information from the trade event
         """
         if metadata:
             msg.update(metadata)
 
-        msg_ts = int(round(msg["ts"] / 1e3))
+        msg_ts = msg["ts"] * 1e-3
         content = {
             "trading_pair": msg["trading_pair"],
             "trade_type": float(TradeType.BUY.value) if msg["direction"] == "buy" else float(TradeType.SELL.value),
@@ -93,11 +274,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         }
         return OrderBookMessage(OrderBookMessageType.TRADE, content, timestamp=msg_ts)
 
-    async def _request_new_orderbook_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         rest_assistant = await self._api_factory.get_rest_assistant()
         url = public_rest_url(CONSTANTS.DEPTH_URL)
         exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        # when type is set to "step0", the default value of "depth" is 150
         params: Dict = {"symbol": exchange_symbol, "type": "step0"}
         snapshot_data = await rest_assistant.execute_request(
             url=url,
@@ -108,51 +288,101 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_data
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        snapshot: Dict[str, Any] = await self._request_new_orderbook_snapshot(trading_pair)
+        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
             msg=snapshot,
             metadata={"trading_pair": trading_pair},
         )
-
         return snapshot_msg
 
     async def _subscribe_channels(self, ws: WSAssistant):
+        """
+        Subscribe to orderbook and trade channels with proper rate limiting.
+        """
         try:
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                # HTX WS expects lowercase symbols in channel names
+                exchange_symbol = exchange_symbol.lower()
+                
+                # Subscribe to orderbook
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.depth.step0",
                     "id": str(uuid.uuid4())
                 })
+                
+                if not self._suppress_reconnect_logs:
+                    self.logger().debug(f"Subscribing to orderbook: market.{exchange_symbol}.depth.step0")
+                
+                throttler = getattr(self._api_factory, "throttler", None)
+                if throttler is not None:
+                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                        await ws.send(subscribe_orderbook_request)
+                else:
+                    await ws.send(subscribe_orderbook_request)
+
+                # Subscribe to trades
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.trade.detail",
                     "id": str(uuid.uuid4())
                 })
-                await ws.send(subscribe_orderbook_request)
-                await ws.send(subscribe_trade_request)
-            self.logger().info("Subscribed to public orderbook and trade channels...")
+                
+                if not self._suppress_reconnect_logs:
+                    self.logger().debug(f"Subscribing to trades: market.{exchange_symbol}.trade.detail")
+                
+                if throttler is not None:
+                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                        await ws.send(subscribe_trade_request)
+                else:
+                    await ws.send(subscribe_trade_request)
+                
+
+            if self._pending_reconnect_notice is not None:
+                try:
+                    elapsed = max(0.0, time.time() - self._pending_reconnect_notice.get("t0", time.time()))
+                    code = self._pending_reconnect_notice.get("code", "unknown")
+                    self.logger().info(
+                        f"WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
+                        f"subscribed to public orderbook and trade channels"
+                    )
+                finally:
+                    self._pending_reconnect_notice = None
+                    # Clear suppression after successful resubscribe
+                    self._suppress_reconnect_logs = False
+            elif not self._suppress_reconnect_logs:
+                self.logger().info("Subscribed to public orderbook and trade channels...")
+            
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...", exc_info=True
+                "Unexpected error occurred subscribing to order book trading and delta streams...", 
+                exc_info=True
             )
             raise
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        """
+        Identify which channel a message belongs to based on the channel name.
+        """
         channel = event_message.get("ch", "")
-        retval = ""
-        if channel.endswith(self._trade_messages_queue_key):
-            retval = self._trade_messages_queue_key
-        if channel.endswith(self._diff_messages_queue_key):
-            retval = self._diff_messages_queue_key
-
-        return retval
+        
+        # HTX uses "depth.step0" for orderbook and "trade.detail" for trades
+        if "depth.step0" in channel:
+            return self._diff_messages_queue_key
+        elif "trade.detail" in channel:
+            return self._trade_messages_queue_key
+        
+        return ""
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-
+        """
+        Parse trade messages from the raw dictionary.
+        Called by the base class with messages from the queue.
+        """
         ex_symbol = raw_message["ch"].split(".")[1]
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+        
         for data in raw_message["tick"]["data"]:
             trade_message: OrderBookMessage = self.trade_message_from_exchange(
                 msg=data,
@@ -161,6 +391,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parse orderbook snapshot messages.
+        HTX sends snapshots through the depth channel, not diffs.
+        """
         msg_channel = raw_message["ch"]
         order_book_symbol = msg_channel.split(".")[1]
         snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
@@ -171,9 +405,49 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         message_queue.put_nowait(snapshot_msg)
 
-    async def _process_message_for_unknown_channel(
-        self, event_message: Dict[str, Any], websocket_assistant: WSAssistant
-    ):
+    async def _process_message_for_unknown_channel(self, event_message: Dict[str, Any], websocket_assistant: WSAssistant):
+        # Server may send ping - respond immediately
         if "ping" in event_message:
-            pong_request = WSJSONRequest(payload={"pong": event_message["ping"]})
+            # Echo back the timestamp
+            ts = event_message.get("ping")
+            pong_payload = {"pong": ts} if ts else {"pong": int(time.time() * 1000)}
+            pong_request = WSJSONRequest(payload=pong_payload)
             await websocket_assistant.send(request=pong_request)
+            # Record server ping receipt
+            self._last_pong_timestamp = time.time()
+            return
+        
+        # HTX v2 format
+        action = event_message.get("action")
+        if action == "ping":
+            # Respond with pong echoing the timestamp
+            ts = (event_message.get("data") or {}).get("ts")
+            pong = {"action": "pong", "data": {"ts": ts} if ts else {}}
+            await websocket_assistant.send(WSJSONRequest(payload=pong))
+            # Record server ping receipt
+            self._last_pong_timestamp = time.time()
+            return
+        
+        # Handle subscription confirmations and errors
+        try:
+            status = event_message.get("status")
+            if status == "ok" and ("subbed" in event_message or "rep" in event_message):
+                ch = event_message.get("subbed") or event_message.get("rep")
+                if ch:
+                    # Clear suppression once we have a successful subscription ack
+                    if self._suppress_reconnect_logs:
+                        self._suppress_reconnect_logs = False
+                    self.logger().debug(f"Successfully subscribed to: {ch}")
+                return
+                
+            if status == "error" or ("err-code" in event_message or "err-msg" in event_message):
+                self.logger().warning(
+                    f"WebSocket error: {event_message.get('err-msg', 'Unknown error')}",
+                    extra={"event": event_message}
+                )
+                # Disconnect to trigger clean resubscribe when server rejects channels
+                if "invalid" in str(event_message.get("err-msg", "")).lower():
+                    await websocket_assistant.disconnect()
+                return
+        except Exception:
+            pass

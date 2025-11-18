@@ -34,9 +34,10 @@ class BingXExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
                  bingx_api_key: str,
                  bingx_api_secret: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
@@ -46,8 +47,7 @@ class BingXExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._last_trades_poll_bingx_timestamp = 1.0
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
     def bingx_order_type(order_type: OrderType) -> str:
@@ -290,6 +290,20 @@ class BingXExchange(ExchangePyBase):
                 min_order_size = Decimal(min_notional_size / last_traded_price)  # rule.get("minQty") is deprecated for now
                 max_order_size = Decimal(max_notional_size / last_traded_price)  # rule.get("maxQty") is deprecated for now
 
+                # Debug logging for ASSET-USDT pair
+                if trading_pair == "XXXXXXX-USDT": #debug
+                    self.logger().info(
+                        f"[DEBUG] Trading rules for {trading_pair}:\n"
+                        f"  Raw exchange data: {rule}\n"
+                        f"  Last traded price: {last_traded_price}\n"
+                        f"  Min notional: {min_notional_size}\n"
+                        f"  Max notional: {max_notional_size}\n"
+                        f"  Calculated min_order_size: {min_order_size}\n"
+                        f"  Calculated max_order_size: {max_order_size}\n"
+                        f"  Min price increment: {min_price_increment}\n"
+                        f"  Min base amount increment: {min_base_amount_increment}"
+                    )
+
                 retval.append(
                     TradingRule(
                         trading_pair,
@@ -474,7 +488,30 @@ class BingXExchange(ExchangePyBase):
             method=RESTMethod.GET,
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
             is_auth_required=True)
-        balances = account_info["data"]["balances"]
+        # Be tolerant to unexpected payloads from the API
+        balances = None
+        if isinstance(account_info, dict):
+            data_obj = account_info.get("data")
+            if isinstance(data_obj, dict) and "balances" in data_obj:
+                balances = data_obj.get("balances")
+            elif "balances" in account_info:
+                balances = account_info.get("balances")
+        if not isinstance(balances, list):
+            # Gracefully skip update when payload is not as expected, but log useful diagnostics for debugging
+            payload_type = type(account_info).__name__
+            top_keys = list(account_info.keys()) if isinstance(account_info, dict) else None
+            reason = "missing 'balances' key"
+            if isinstance(account_info, dict):
+                if isinstance(account_info.get("data"), dict) and "balances" not in account_info["data"]:
+                    reason = "missing 'data.balances' key"
+                elif "data" not in account_info and "balances" not in account_info:
+                    reason = "missing both 'data' and 'balances'"
+            payload_preview = str(account_info)
+            if len(payload_preview) > 800:
+                payload_preview = payload_preview[:800] + "... [truncated]"
+            self.logger().error(
+                f"Unexpected balances payload ({reason}); type={payload_type}, keys={top_keys}, preview={payload_preview}")
+            return
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
             free_balance = Decimal(str(balance_entry["free"]))
@@ -525,17 +562,6 @@ class BingXExchange(ExchangePyBase):
             "Accept": "application/json"
         }
 
-        # request_result = await rest_assistant.execute_request(
-        #     url=url,
-        #     params=params,
-        #     data=data,
-        #     method=method,
-        #     is_auth_required=is_auth_required,
-        #     return_err=return_err,
-        #     headers=local_headers,
-        #     throttler_limit_id=limit_id if limit_id else path_url,
-        # )
-        # return request_result
         for _ in range(2):
             try:
                 # Replacing the execute_request method in the rest_assistant object to work with text/plain content type.
