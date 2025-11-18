@@ -1,5 +1,6 @@
 # distutils: language=c++
 from hummingbot.strategy.strategy_base cimport StrategyBase
+from hummingbot.connector.exchange_base cimport ExchangeBase
 from libc.stdint cimport int64_t
 from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
@@ -76,8 +77,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef string _to_cpp_str(self, object py_str)
 
     # Helper methods
-    cdef object c_safe_quantize_order_amount(self, object market, str trading_pair, object amount, object price)
-    cdef void c_remove_pending_order(self, object market_tuple, str order_id, str context)
+    cdef object c_safe_quantize_order_amount(self, ExchangeBase market, str trading_pair, object amount, object price)
+    cdef void c_remove_pending_order(self, object market_tuple, str order_id, str context=*)
     
     # Conversion rate methods
     cdef double _conv_rate(self, object buy_market_tuple, object sell_market_tuple)
