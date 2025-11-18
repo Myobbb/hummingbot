@@ -324,7 +324,7 @@ class ArbitrageMInstanceConfig(BaseModel):
     min_profitability: Decimal = Field(default=Decimal("0.5"), description="Minimum profitability percentage")
 
     # Strategy type selection
-    strategy_type: str = Field(default="arbitrage_m", description="Strategy type: 'arbitrage_m' (default, market orders) or 'arbitrage_l' (limit orders)")
+    strategy_type: str = Field(default="arbitrage_l", description="Strategy type: 'arbitrage_l' (default, limit orders) or 'arbitrage_m' (market orders)")
 
     # Advanced options
     use_oracle_conversion_rate: bool = Field(default=False)
@@ -332,14 +332,14 @@ class ArbitrageMInstanceConfig(BaseModel):
     secondary_to_primary_quote_conversion_rate: Decimal = Field(default=Decimal("1.0"))
 
     # Buy-in configuration
-    buy_in_enabled: bool = Field(default=False, description="Enable buy-in module")
+    buy_in_enabled: bool = Field(default=True, description="Enable buy-in module")
     buy_in_target_usd: float = Field(default=100.0, description="Target USD value for buy-in")
     buy_in_min_profitability: float = Field(default=0.005, description="Min profitability for buy-in (0.5%)")
 
     # Timing
     status_report_interval: float = Field(default=60.0)
-    next_trade_delay_interval: float = Field(default=2.0)
-    order_timeout: float = Field(default=300.0)
+    next_trade_delay_interval: float = Field(default=4.0)
+    order_timeout: float = Field(default=180.0)
     filled_order_timeout: float = Field(default=3600.0, description="Timeout for orders with fills (arbitrage_l only, default 1 hour)")
 
     # Additional markets for cross-exchange opportunities
