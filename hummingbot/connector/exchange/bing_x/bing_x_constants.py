@@ -19,9 +19,10 @@ WSS_PUBLIC_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 WSS_PRIVATE_URL = {"main": "wss://open-api-ws.bingx.com/market"}
 
 # Websocket event types
-DIFF_EVENT_TYPE = ""
-TRADE_EVENT_TYPE = ""
-SNAPSHOT_EVENT_TYPE = "depth"
+# Use explicit queue keys aligned with tracker defaults
+DIFF_EVENT_TYPE = "order_book_diff"
+TRADE_EVENT_TYPE = "trade"
+SNAPSHOT_EVENT_TYPE = "order_book_snapshot"
 
 # Public API endpoints
 LAST_TRADED_PRICE_PATH = "/openApi/spot/v1/ticker/24hr"
@@ -35,8 +36,20 @@ ACCOUNTS_PATH_URL = "/openApi/spot/v1/account/balance"
 MY_TRADES_PATH_URL = "/openApi/spot/v1/trade/query"
 ORDER_PATH_URL = "/openApi/spot/v1/trade/order"
 CANCEL_ORDER_PATH_URL = "/openApi/spot/v1/trade/cancel"
+# Order details (per-order status) endpoint
+ORDER_INFO_PATH_URL = "/openApi/spot/v1/trade/orderInfo"
 
-WS_HEARTBEAT_TIME_INTERVAL = 30
+WS_HEARTBEAT_TIME_INTERVAL = 5
+
+# Orderbook management
+ONE_HOUR = 60 * 60  # Periodic snapshot interval (seconds)
+SNAPSHOT_DEPTH_LIMIT = 1000  # Maximum depth levels per REST snapshot
+DIFF_BATCH_SIZE = 100  # Max diffs to process per iteration (legacy for REST fallback)
+
+# BingX-specific WebSocket stream identifiers
+BINGX_DEPTH_LEVEL = "100"          # Depth level for market depth subscription
+BINGX_DEPTH_STREAM_SUFFIX = "@depth100"  # Market depth stream (300ms updates, full snapshots)
+BINGX_TRADE_STREAM_SUFFIX = "@trade"
 
 # Order States
 ORDER_STATE = {
@@ -84,9 +97,10 @@ RATE_LIMITS = {
     RateLimit(limit_id=LAST_TRADED_PRICE_PATH, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
               linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
-    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
-                             LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
+    # Per docs: user data stream endpoints limited to ~2/s by UID/IP
+    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=2, time_interval=ONE_SECOND,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_POST, 1), LinkedLimitWeightPair(REQUEST_POST_BURST, 1),
+                             LinkedLimitWeightPair(REQUEST_POST_MIXED, 1)]),
     RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
               linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
@@ -102,9 +116,14 @@ RATE_LIMITS = {
     RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
               linked_limits=[LinkedLimitWeightPair(REQUEST_POST, 1), LinkedLimitWeightPair(REQUEST_POST_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_POST_MIXED, 1)]),
-    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_POST, 1), LinkedLimitWeightPair(REQUEST_POST_BURST, 1),
-                             LinkedLimitWeightPair(REQUEST_POST_MIXED, 1)]),
+    RateLimit(limit_id=ORDER_INFO_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
+                             LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
+
+    # Balance endpoint: 2/s per UID (per BingX API docs)
+    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=1, time_interval=ONE_SECOND,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_GET, 1), LinkedLimitWeightPair(REQUEST_GET_BURST, 1),
+                             LinkedLimitWeightPair(REQUEST_GET_MIXED, 1)]),
     RateLimit(limit_id=MY_TRADES_PATH_URL, limit=MAX_REQUEST_GET, time_interval=TWO_MINUTES,
               linked_limits=[LinkedLimitWeightPair(REQUEST_POST, 1), LinkedLimitWeightPair(REQUEST_POST_BURST, 1),
                              LinkedLimitWeightPair(REQUEST_POST_MIXED, 1)]),
@@ -116,13 +135,8 @@ EXCHANGE_NAME = "bing_x"
 HBOT_BROKER_ID = "hummingbot"
 HBOT_ORDER_ID = "t-HBOT"
 
-REST_URL = "https://open-api.bingx.com/openapi"
-
-
-SYMBOL_PATH_URL = "/spot/v1/common/symbols"
-
-TRADE_EVENT_TYPE = "trade"
-DIFF_EVENT_TYPE = "depth"
-
-BINGX_USER_STREAM_PATH_URL = "/user/auth/userDataStream"
+REST_URL = "https://open-api.bingx.com/openApi"
 SOURCE_KEY = 'Hummingbot'
+
+ENABLE_ANTI_SPOOFING = False  
+SPOOFING_MIN_CONFIRMATION_TIME_MS = 601

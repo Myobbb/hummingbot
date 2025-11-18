@@ -1,6 +1,7 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from bidict import bidict
@@ -14,7 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate, OrderState
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -22,8 +23,6 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 s_logger = None
 s_decimal_NaN = Decimal("nan")
@@ -33,9 +32,11 @@ class BybitExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
+  
                  bybit_api_key: str,
                  bybit_api_secret: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
@@ -48,7 +49,7 @@ class BybitExchange(ExchangePyBase):
         self._last_trades_poll_bybit_timestamp = 1.0
         self._account_type = None  # To be update on firtst call to balances
         self._category = CONSTANTS.TRADE_CATEGORY  # Required by the V5 API
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
     def bybit_order_type(order_type: OrderType) -> str:
@@ -271,6 +272,10 @@ class BybitExchange(ExchangePyBase):
             headers={"referer": CONSTANTS.HBOT_BROKER_ID},
         )
         if response["retCode"] != 0:
+            # If the exchange reports the order no longer exists, treat as already canceled
+            msg = str(response.get("retMsg", ""))
+            if "does not exist" in msg or "not exist" in msg or "Not Found" in msg:
+                return True
             raise ValueError(f"{response['retMsg']}")
         if isinstance(response, dict) and "orderLinkId" in response["result"]:
             return True
@@ -502,7 +507,14 @@ class BybitExchange(ExchangePyBase):
             limit_id=CONSTANTS.GET_ORDERS_PATH_URL
         )
         if not len(updated_order_data["result"]["list"]):
-            raise ValueError(f"No order found for {client_order_id} or {exchange_order_id}")
+            # Treat missing order as a terminal failure to avoid lost-order recovery attempts
+            return OrderUpdate(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=OrderState.FAILED,
+            )
         order_data = updated_order_data["result"]["list"][0]
         order_status = order_data["orderStatus"]
 

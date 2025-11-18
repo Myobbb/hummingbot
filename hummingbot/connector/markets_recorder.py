@@ -88,14 +88,15 @@ class MarketsRecorder:
         self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
         self._market_data_collection_task: Optional[asyncio.Task] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
-        for market in self._markets:
-            trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
-            market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
-                                                                               tf.exchange_trade_id,
-                                                                               tf.symbol) for tf in trade_fills})
-
-            exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
-            market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
+        # DISABLED: Loading missing orders from previous runs to prevent duplicate trade fill errors
+        # for market in self._markets:
+        #     trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
+        #     market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
+        #                                                                        tf.exchange_trade_id,
+        #                                                                        tf.symbol) for tf in trade_fills})
+        #
+        #     exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
+        #     market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
 
         self._create_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_create_order)
         self._fill_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_fill_order)
@@ -188,16 +189,17 @@ class MarketsRecorder:
         if market not in self._markets:
             self._markets.append(market)
 
-            # Add trade fills from recorder
-            trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
-            market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
-                                                                               tf.exchange_trade_id,
-                                                                               tf.symbol) for tf in trade_fills
-                                                         if tf.market == market.name})
-
-            # Add exchange order IDs
-            exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
-            market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
+            # DISABLED: Loading missing orders from previous runs to prevent duplicate trade fill errors
+            # # Add trade fills from recorder
+            # trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
+            # market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
+            #                                                                    tf.exchange_trade_id,
+            #                                                                    tf.symbol) for tf in trade_fills
+            #                                              if tf.market == market.name})
+            #
+            # # Add exchange order IDs
+            # exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
+            # market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
 
             # Add event listeners
             for event_pair in self._event_pairs:
@@ -379,28 +381,43 @@ class MarketsRecorder:
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
-                order_record: Order = Order(id=evt.order_id,
-                                            config_file_path=self._config_file_path,
-                                            strategy=self._strategy_name,
-                                            market=market.display_name,
-                                            symbol=evt.trading_pair,
-                                            base_asset=base_asset,
-                                            quote_asset=quote_asset,
-                                            creation_timestamp=timestamp,
-                                            order_type=evt.type.name,
-                                            amount=Decimal(evt.amount),
-                                            leverage=evt.leverage if evt.leverage else 1,
-                                            price=Decimal(evt.price) if evt.price == evt.price else Decimal(0),
-                                            position=evt.position if evt.position else PositionAction.NIL.value,
-                                            last_status=event_type.name,
-                                            last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id)
+                # Check if order already exists to avoid UNIQUE constraint errors
+                # This can happen when the same order event is processed multiple times
+                # (e.g., local creation + websocket confirmation)
+                existing_order: Optional[Order] = session.query(Order).filter(Order.id == evt.order_id).one_or_none()
+                
+                if existing_order is None:
+                    # Order doesn't exist, create new record
+                    order_record: Order = Order(id=evt.order_id,
+                                                config_file_path=self._config_file_path,
+                                                strategy=self._strategy_name,
+                                                market=market.display_name,
+                                                symbol=evt.trading_pair,
+                                                base_asset=base_asset,
+                                                quote_asset=quote_asset,
+                                                creation_timestamp=timestamp,
+                                                order_type=evt.type.name,
+                                                amount=Decimal(evt.amount),
+                                                leverage=evt.leverage if evt.leverage else 1,
+                                                price=Decimal(evt.price) if evt.price == evt.price else Decimal(0),
+                                                position=evt.position if evt.position else PositionAction.NIL.value,
+                                                last_status=event_type.name,
+                                                last_update_timestamp=timestamp,
+                                                exchange_order_id=evt.exchange_order_id)
+                    session.add(order_record)
+                    market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
+                else:
+                    # Order already exists, just update the status if needed
+                    order_record = existing_order
+                    if timestamp > existing_order.last_update_timestamp:
+                        existing_order.last_status = event_type.name
+                        existing_order.last_update_timestamp = timestamp
+                
+                # Always add order status record (even for existing orders)
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
                                                         status=event_type.name)
-                session.add(order_record)
                 session.add(order_status)
-                market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
                 self.save_market_states(self._config_file_path, market, session=session)
 
     def _did_fill_order(self,

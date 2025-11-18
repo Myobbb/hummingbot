@@ -4,7 +4,7 @@ import logging
 import math
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, AsyncIterable, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterable, Callable, Dict, List, Optional, Tuple
 
 from async_timeout import timeout
 
@@ -33,21 +33,20 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.logger import HummingbotLogger
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class ExchangePyBase(ExchangeBase, ABC):
     _logger = None
 
-    SHORT_POLL_INTERVAL = 5.0
-    LONG_POLL_INTERVAL = 120.0
+    SHORT_POLL_INTERVAL = 10.0
+    LONG_POLL_INTERVAL = 60.0
     TRADING_RULES_INTERVAL = 30 * MINUTE
     TRADING_FEES_INTERVAL = TWELVE_HOURS
     TICK_INTERVAL_LIMIT = 60.0
 
-    def __init__(self, client_config_map: "ClientConfigAdapter"):
-        super().__init__(client_config_map)
+    def __init__(self,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100")):
+        super().__init__(balance_asset_limit)
 
         self._last_poll_timestamp = 0
         self._last_timestamp = 0
@@ -64,7 +63,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._time_synchronizer = TimeSynchronizer()
         self._throttler = AsyncThrottler(
             rate_limits=self.rate_limits_rules,
-            limits_share_percentage=client_config_map.rate_limits_share_pct)
+            limits_share_percentage=rate_limits_share_pct)
         self._poll_notifier = asyncio.Event()
 
         # init Auth and Api factory
@@ -485,7 +484,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             update_timestamp=update_timestamp,
             new_state=OrderState.OPEN,
         )
-        self._order_tracker.process_order_update(order_update)
+        await self._order_tracker._process_order_update(order_update)
 
         return exchange_order_id
 
@@ -682,7 +681,8 @@ class ExchangePyBase(ExchangeBase, ABC):
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
             self._user_stream_tracker_task = self._create_user_stream_tracker_task()
             self._user_stream_event_listener_task = safe_ensure_future(self._user_stream_event_listener())
-            self._lost_orders_update_task = safe_ensure_future(self._lost_orders_update_polling_loop())
+            # Lost order recovery loop disabled by design: we no longer attempt to recover or
+            # continuously poll for orders considered lost by the tracker.
 
     async def check_network(self) -> NetworkStatus:
         """
@@ -846,7 +846,44 @@ class ExchangePyBase(ExchangeBase, ABC):
                 await self._sleep(1.0)
 
     def _is_user_stream_initialized(self):
-        return self._user_stream_tracker.data_source.last_recv_time > 0 or not self.is_trading_required
+        """
+        Check if user stream is initialized with grace period for reconnections.
+        
+        Returns True if:
+        1. User stream is currently connected (last_recv_time > 0)
+        2. User stream has been initialized before and is within 60s grace period for reconnection
+        3. Trading is not required (orderbook-only connector)
+        
+        The grace period prevents false negatives during legitimate reconnections where
+        last_recv_time temporarily drops to 0 while _ws_assistant is None.
+        """
+        if not self.is_trading_required:
+            return True
+        
+        last_recv = self._user_stream_tracker.data_source.last_recv_time
+        
+        # Initialize grace period tracking on first call
+        if not hasattr(self, '_user_stream_ever_initialized'):
+            self._user_stream_ever_initialized = False
+            self._user_stream_last_good_time = 0.0
+        
+        # Update tracking when connected (last_recv > 0 means _ws_assistant exists and receiving)
+        if last_recv > 0:
+            self._user_stream_ever_initialized = True
+            self._user_stream_last_good_time = last_recv
+            return True  # Currently connected and working
+        
+        # Not currently connected (last_recv == 0), check grace period
+        # If we were ever initialized, give 60s grace period for reconnections
+        if self._user_stream_ever_initialized and self._user_stream_last_good_time > 0:
+            import time
+            time_since_disconnect = time.time() - self._user_stream_last_good_time
+            if time_since_disconnect < 60.0:
+                # Within grace period - consider still initialized (reconnection in progress)
+                return True
+        
+        # Never initialized or grace period expired
+        return False
 
     def _create_user_stream_tracker(self):
         return UserStreamTracker(data_source=self._create_user_stream_data_source())
@@ -858,11 +895,13 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     async def _update_trading_rules(self):
         exchange_info = await self._make_trading_rules_request()
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+
         trading_rules_list = await self._format_trading_rules(exchange_info)
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+        
 
     async def _api_get(self, *args, **kwargs):
         kwargs["method"] = RESTMethod.GET
