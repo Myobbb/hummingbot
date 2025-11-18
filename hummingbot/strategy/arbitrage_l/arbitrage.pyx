@@ -121,6 +121,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     sell_off_spread_pct: float = 0.1,
                     # Position balancer - order management
                     position_balancer_refresh_interval: float = 10.0,
+                    position_balancer_order_size_usd: float = 100.0,
                     orchestrated_mode: bool = False):
         """Initialize arbitrage strategy with configurable parameters"""
         
@@ -204,7 +205,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 sell_off_enabled,
                 sell_off_target_usd,
                 sell_off_spread_pct,
-                position_balancer_refresh_interval)
+                position_balancer_refresh_interval,
+                position_balancer_order_size_usd)
         else:
             self._position_balancer = None
 

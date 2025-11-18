@@ -16,6 +16,8 @@ cdef class PositionBalancerHandler:
         bint _sell_enabled
         double _sell_target_usd
         double _sell_spread_pct
+        # Order size configuration
+        double _order_size_usd
         # Completion tracking
         bint _buy_completed
         bint _sell_completed

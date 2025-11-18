@@ -339,6 +339,7 @@ class ArbitrageMInstanceConfig(BaseModel):
 
       Order Management:
         - position_balancer_refresh_interval: 10.0 (seconds, how often to refresh limit orders)
+        - position_balancer_order_size_usd: 100.0 (USD, maximum order size per position balancer order)
 
     Timing (arbitrage_l defaults):
       - status_report_interval: 60.0 (seconds)
@@ -420,6 +421,10 @@ class ArbitrageMInstanceConfig(BaseModel):
     position_balancer_refresh_interval: float = Field(
         default=10.0,
         description="How often to cancel and replace limit orders (seconds)"
+    )
+    position_balancer_order_size_usd: float = Field(
+        default=100.0,
+        description="Maximum order size in USD per position balancer order (e.g., 100.0 = $100 max per order)"
     )
 
     # Timing parameters
@@ -770,6 +775,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             "sell_off_spread_pct": config.sell_off_spread_pct,
             # Position balancer - order management
             "position_balancer_refresh_interval": config.position_balancer_refresh_interval,
+            "position_balancer_order_size_usd": config.position_balancer_order_size_usd,
             "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
         }
 
@@ -1576,6 +1582,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 'sell_off_spread_pct': single_config.get('sell_off_spread_pct', 0.1),
                 # Position balancer - order management
                 'position_balancer_refresh_interval': single_config.get('position_balancer_refresh_interval', 10.0),
+                'position_balancer_order_size_usd': single_config.get('position_balancer_order_size_usd', 100.0),
                 # Timing parameters
                 'status_report_interval': single_config.get('status_report_interval', 60.0),
                 'next_trade_delay_interval': single_config.get('next_trade_delay_interval', 2.0),
