@@ -447,6 +447,9 @@ cdef class PositionBalancerHandler:
                         # Find market tuple for this order
                         for mp in self.strategy._market_pairs:
                             if mp.first.base_asset == asset:
+                                # Mark as timeout-cancelled to prevent cooldown enforcement
+                                self.strategy._timeout_cancelled_orders.add(order_id)
+
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Cancelled stale buy order {order_id} for {asset} (refresh)")
@@ -464,6 +467,9 @@ cdef class PositionBalancerHandler:
                         # Find market tuple for this order
                         for mp in self.strategy._market_pairs:
                             if mp.first.base_asset == asset:
+                                # Mark as timeout-cancelled to prevent cooldown enforcement
+                                self.strategy._timeout_cancelled_orders.add(order_id)
+
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Cancelled stale sell order {order_id} for {asset} (refresh)")
