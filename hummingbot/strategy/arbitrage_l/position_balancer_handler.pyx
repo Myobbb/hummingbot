@@ -18,6 +18,7 @@ from libc.stdint cimport int64_t
 from libcpp.pair cimport pair
 from libcpp.string cimport string
 
+from hummingbot.connector.exchange_base cimport ExchangeBase
 from hummingbot.core.data_type.common import OrderType
 from hummingbot.core.data_type.order_book cimport OrderBook
 
@@ -535,7 +536,7 @@ cdef class PositionBalancerHandler:
 
         cdef:
             str asset_key = buy_market_tuple.base_asset
-            object market = buy_market_tuple.market
+            ExchangeBase market = buy_market_tuple.market
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
             double base_bal = self.c_get_adjusted_base_balance(asset_key)
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
