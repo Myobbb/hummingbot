@@ -34,6 +34,8 @@ cdef class PositionBalancerHandler:
         dict _active_sell_orders
 
     # Core methods
+    cdef void c_cancel_all_buy_orders(self)
+    cdef void c_cancel_all_sell_orders(self)
     cdef void c_maybe_disable_buy(self)
     cdef void c_maybe_disable_sell(self)
     cdef double c_get_pending_buy_base(self, str asset)

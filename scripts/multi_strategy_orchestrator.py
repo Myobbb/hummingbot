@@ -177,7 +177,11 @@ from hummingbot.strategy.strategy_base import StrategyBase
 logger = None
 
 # Export convenience functions for easy import
-__all__ = ['pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove', 'MultiStrategyOrchestrator']
+__all__ = [
+    'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
+    'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff',
+    'MultiStrategyOrchestrator'
+]
 
 # Global reference to orchestrator instance for convenience functions
 _orchestrator_instance: Optional['MultiStrategyOrchestrator'] = None
@@ -236,6 +240,78 @@ def resume(identifier: str) -> bool:
     """
     orchestrator = _get_orchestrator()
     return orchestrator.resume_strategy_by_identifier(identifier)
+
+
+def enable_buyin(identifier: str) -> bool:
+    """
+    Enable buy-in mode for a strategy's position balancer by name or token symbol.
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> enable_buyin("arb_bsx_gate_bitmart")  # By full name
+        >>> enable_buyin("BSX")                    # By token symbol
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.enable_buyin_by_identifier(identifier)
+
+
+def disable_buyin(identifier: str) -> bool:
+    """
+    Disable buy-in mode for a strategy's position balancer by name or token symbol.
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> disable_buyin("arb_bsx_gate_bitmart")
+        >>> disable_buyin("BSX")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.disable_buyin_by_identifier(identifier)
+
+
+def enable_selloff(identifier: str) -> bool:
+    """
+    Enable sell-off mode for a strategy's position balancer by name or token symbol.
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> enable_selloff("arb_bsx_gate_bitmart")
+        >>> enable_selloff("BSX")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.enable_selloff_by_identifier(identifier)
+
+
+def disable_selloff(identifier: str) -> bool:
+    """
+    Disable sell-off mode for a strategy's position balancer by name or token symbol.
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> disable_selloff("arb_bsx_gate_bitmart")
+        >>> disable_selloff("BSX")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.disable_selloff_by_identifier(identifier)
 
 
 def list_arb() -> Dict[str, Dict[str, Any]]:
@@ -1264,6 +1340,284 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if self.resume_strategy(strategy_instance.name):
                     count += 1
         return count
+
+    # Position Balancer Control Methods
+
+    def enable_buyin_by_identifier(self, identifier: str) -> bool:
+        """
+        Enable buy-in mode for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.enable_buyin(identifier)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.enable_buyin(strategy_instance.name)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def disable_buyin_by_identifier(self, identifier: str) -> bool:
+        """
+        Disable buy-in mode for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.disable_buyin(identifier)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.disable_buyin(strategy_instance.name)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def enable_selloff_by_identifier(self, identifier: str) -> bool:
+        """
+        Enable sell-off mode for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.enable_selloff(identifier)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.enable_selloff(strategy_instance.name)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def disable_selloff_by_identifier(self, identifier: str) -> bool:
+        """
+        Disable sell-off mode for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.disable_selloff(identifier)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.disable_selloff(strategy_instance.name)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def enable_buyin(self, strategy_name: str) -> bool:
+        """
+        Enable buy-in mode for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance, '_position_balancer') or strategy_instance._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Enable buy-in
+        strategy_instance._position_balancer.enable_buy_in()
+        return True
+
+    def disable_buyin(self, strategy_name: str) -> bool:
+        """
+        Disable buy-in mode for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance, '_position_balancer') or strategy_instance._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Disable buy-in
+        strategy_instance._position_balancer.disable_buy_in()
+        return True
+
+    def enable_selloff(self, strategy_name: str) -> bool:
+        """
+        Enable sell-off mode for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance, '_position_balancer') or strategy_instance._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Enable sell-off
+        strategy_instance._position_balancer.enable_sell_off()
+        return True
+
+    def disable_selloff(self, strategy_name: str) -> bool:
+        """
+        Disable sell-off mode for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance, '_position_balancer') or strategy_instance._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Disable sell-off
+        strategy_instance._position_balancer.disable_sell_off()
+        return True
 
     def remove_strategy_by_identifier(self, identifier: str) -> bool:
         """
