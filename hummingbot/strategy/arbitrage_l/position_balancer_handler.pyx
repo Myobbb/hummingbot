@@ -333,6 +333,9 @@ cdef class PositionBalancerHandler:
     def handle_order_completion(self, str order_id, bint is_buy):
         """Clean up pending order tracking on order completion."""
         try:
+            # Remove from position balancer tracking set
+            self.strategy._position_balancer_orders.discard(order_id)
+
             if is_buy:
                 pend = self._pending_buy_orders.pop(order_id, None)
                 if pend is not None:
@@ -433,6 +436,70 @@ cdef class PositionBalancerHandler:
 
         return lines
 
+    cdef object c_find_best_buy_market(self, str asset):
+        """
+        Find the best market to place a buy order for the given asset.
+        Returns the market tuple with the highest bid price.
+        """
+        cdef:
+            object best_market = None
+            double best_bid = 0.0
+            double current_bid
+            OrderBook ob
+            object mp
+            object market_tuple
+
+        try:
+            for mp in self.strategy._market_pairs:
+                # Check both first and second markets for this asset
+                for market_tuple in [mp.first, mp.second]:
+                    if market_tuple.base_asset == asset:
+                        try:
+                            ob = market_tuple.market.c_get_order_book(market_tuple.trading_pair)
+                            current_bid = ob._best_bid
+
+                            if current_bid > best_bid:
+                                best_bid = current_bid
+                                best_market = market_tuple
+                        except Exception:
+                            continue
+        except Exception as e:
+            self.strategy.logger().warning(f"Error finding best buy market for {asset}: {e}")
+
+        return best_market
+
+    cdef object c_find_best_sell_market(self, str asset):
+        """
+        Find the best market to place a sell order for the given asset.
+        Returns the market tuple with the lowest ask price.
+        """
+        cdef:
+            object best_market = None
+            double best_ask = 1e100  # Large number
+            double current_ask
+            OrderBook ob
+            object mp
+            object market_tuple
+
+        try:
+            for mp in self.strategy._market_pairs:
+                # Check both first and second markets for this asset
+                for market_tuple in [mp.first, mp.second]:
+                    if market_tuple.base_asset == asset:
+                        try:
+                            ob = market_tuple.market.c_get_order_book(market_tuple.trading_pair)
+                            current_ask = ob._best_ask
+
+                            if current_ask < best_ask and current_ask > 0:
+                                best_ask = current_ask
+                                best_market = market_tuple
+                        except Exception:
+                            continue
+        except Exception as e:
+            self.strategy.logger().warning(f"Error finding best sell market for {asset}: {e}")
+
+        return best_market
+
     cdef void c_cancel_stale_orders(self, str asset):
         """Cancel stale buy/sell limit orders for refresh."""
         cdef double current_time = self.strategy._current_timestamp
@@ -449,6 +516,8 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
+                                # Remove from position balancer tracking to prevent main timeout check
+                                self.strategy._position_balancer_orders.discard(order_id)
 
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
@@ -469,6 +538,8 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
+                                # Remove from position balancer tracking to prevent main timeout check
+                                self.strategy._position_balancer_orders.discard(order_id)
 
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
@@ -482,6 +553,9 @@ cdef class PositionBalancerHandler:
         Main entry point for position balancing.
         Decides whether to buy or sell based on current position.
         Returns True if an order was placed.
+
+        Note: buy_market_tuple and sell_market_tuple params are kept for compatibility
+        but we now select the best market internally based on bid/ask prices.
         """
         # CRITICAL SAFEGUARD: Prevent double execution
         if self.strategy._last_global_trade_timestamp == self.strategy._current_timestamp:
@@ -498,6 +572,8 @@ cdef class PositionBalancerHandler:
             double current_value
             double shortfall_or_excess
             bint placed = False
+            object selected_buy_market = None
+            object selected_sell_market = None
 
         # Cancel stale orders for refresh
         self.c_cancel_stale_orders(asset_key)
@@ -512,9 +588,15 @@ cdef class PositionBalancerHandler:
                 # Check if already have pending buy order
                 if asset_key not in self._active_buy_orders:
                     if not self.c_try_mark_buy_complete(asset_key, current_value, shortfall_or_excess):
-                        placed = self.c_execute_buy_limit(buy_market_tuple, sell_market_tuple)
-                        if placed:
-                            return True
+                        # Find the best market to buy on (highest bid)
+                        selected_buy_market = self.c_find_best_buy_market(asset_key)
+                        if selected_buy_market is not None:
+                            # For sell market, just use the other market from the pair
+                            # (not critical since we're only buying)
+                            selected_sell_market = sell_market_tuple
+                            placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
+                            if placed:
+                                return True
 
         # Check if we need to sell
         if self._sell_enabled and not self._sell_completed:
@@ -526,9 +608,15 @@ cdef class PositionBalancerHandler:
                 # Check if already have pending sell order
                 if asset_key not in self._active_sell_orders:
                     if not self.c_try_mark_sell_complete(asset_key, current_value, shortfall_or_excess):
-                        placed = self.c_execute_sell_limit(buy_market_tuple, sell_market_tuple)
-                        if placed:
-                            return True
+                        # Find the best market to sell on (lowest ask)
+                        selected_sell_market = self.c_find_best_sell_market(asset_key)
+                        if selected_sell_market is not None:
+                            # For buy market, just use the other market from the pair
+                            # (not critical since we're only selling)
+                            selected_buy_market = buy_market_tuple
+                            placed = self.c_execute_sell_limit(selected_buy_market, selected_sell_market)
+                            if placed:
+                                return True
 
         return False
 
@@ -643,6 +731,12 @@ cdef class PositionBalancerHandler:
             self.strategy._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track pending buy order by market: {e}")
+
+        # Mark as position balancer order to prevent main strategy timeout cancellation
+        try:
+            self.strategy._position_balancer_orders.add(buy_order_id)
+        except Exception as e:
+            self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
         # Track in balancer
         try:
@@ -777,6 +871,12 @@ cdef class PositionBalancerHandler:
             self.strategy._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track pending sell order by market: {e}")
+
+        # Mark as position balancer order to prevent main strategy timeout cancellation
+        try:
+            self.strategy._position_balancer_orders.add(sell_order_id)
+        except Exception as e:
+            self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
         # Track in balancer
         try:
