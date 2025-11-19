@@ -83,6 +83,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._pending_sell_orders_by_market = {}  # market_tuple -> set of sell order_ids
         # Track orders cancelled due to timeout (to avoid cooldown on timeout cancellations)
         self._timeout_cancelled_orders = set()
+        # Track position balancer orders (to prevent main strategy from canceling them)
+        self._position_balancer_orders = set()
         # Timers and caches
         self._all_markets_ready = False
         self._last_timestamp = 0
@@ -192,6 +194,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         try:
             self._timeout_cancelled_orders.clear()
+        except Exception:
+            pass
+        try:
+            self._position_balancer_orders.clear()
         except Exception:
             pass
 
@@ -891,10 +897,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
                     # Check for timeout
                     if time_elapsed > timeout_threshold:
+                        # Skip position balancer orders - they have their own refresh interval
+                        if order_id in self._position_balancer_orders:
+                            continue
+
                         # Check if this order is already being cancelled to prevent duplicates
                         if self._sb_order_tracker.c_has_in_flight_cancel(order_id):
                             continue  # Skip if already being cancelled
-                        
+
                         # Mark this order as timeout-cancelled to prevent cooldown enforcement
                         self._timeout_cancelled_orders.add(order_id)
                         
@@ -959,6 +969,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Check if filled order has exceeded its timeout
             if time_since_fill > self._filled_order_timeout:
+                # Skip position balancer orders - they have their own refresh interval
+                if order_id in self._position_balancer_orders:
+                    continue
+
                 # Find the market tuple for this order
                 market_tuple = None
                 for mt, orders in all_market_orders.items():
