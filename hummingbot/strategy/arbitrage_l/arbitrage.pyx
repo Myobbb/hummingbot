@@ -201,8 +201,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Position balancer handler (create if either buy or sell enabled)
-        if buy_in_enabled or sell_off_enabled:
+        # Position balancer handler (create if position balancer targets configured)
+        # Create handler even if both modes disabled to allow runtime enabling
+        if buy_in_target_usd > 0 or sell_off_target_usd > 0:
             self._position_balancer = PositionBalancerHandler(
                 self,
                 buy_in_enabled,
