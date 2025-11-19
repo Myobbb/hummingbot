@@ -116,11 +116,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # Position balancer - buy-in configuration
                     buy_in_enabled: bool = True,
                     buy_in_target_usd: float = 1100.0,
-                    buy_in_spread_pct: object = min,  # float or 'min'
+                    buy_in_spread_pct: object = 'min',  # float or 'min'
                     # Position balancer - sell-off configuration
                     sell_off_enabled: bool = False,
                     sell_off_target_usd: float = 3000.0,
-                    sell_off_spread_pct: object = min,  # float or 'min'
+                    sell_off_spread_pct: object = 'min',  # float or 'min'
                     # Position balancer - order management
                     position_balancer_refresh_interval: float = 600.0,
                     position_balancer_order_size_usd: float = 100.0,
