@@ -672,7 +672,7 @@ cdef class PositionBalancerHandler:
 
         cdef:
             str asset_key = sell_market_tuple.base_asset
-            object market = sell_market_tuple.market
+            ExchangeBase market = sell_market_tuple.market
             double base_bal_raw = float(market.c_get_available_balance(sell_market_tuple.base_asset))
             double base_bal = self.c_get_adjusted_base_balance(asset_key)
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
