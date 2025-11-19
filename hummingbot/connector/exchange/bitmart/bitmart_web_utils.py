@@ -1,4 +1,5 @@
 from typing import Callable, Optional
+import time
 from urllib.parse import urljoin
 
 import hummingbot.connector.exchange.bitmart.bitmart_constants as CONSTANTS
@@ -56,11 +57,20 @@ async def get_current_server_time(
         domain: str = CONSTANTS.DEFAULT_DOMAIN) -> float:
     api_factory = build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
     rest_assistant = await api_factory.get_rest_assistant()
-    response = await rest_assistant.execute_request(
-        url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH),
-        method=RESTMethod.GET,
-        throttler_limit_id=CONSTANTS.SERVER_TIME_PATH,
-    )
-    server_time = float(response["data"]["server_time"])
-
-    return server_time
+    try:
+        response = await rest_assistant.execute_request(
+            url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH),
+            method=RESTMethod.GET,
+            throttler_limit_id=CONSTANTS.SERVER_TIME_PATH,
+        )
+        # Support both {"data": {"server_time": ...}} and {"server_time": ...}
+        data = response.get("data", response)
+        server_time_value = data.get("server_time")
+        if server_time_value is None:
+            # Fallback if field name changes (rare)
+            server_time_value = data.get("serverTime")
+        server_time = float(server_time_value)
+        return server_time
+    except Exception:
+        # Fallback to local time in milliseconds to avoid hard failures/noisy logs
+        return float(int(time.time() * 1_000))

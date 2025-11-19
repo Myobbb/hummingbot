@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.gate_io import gate_io_constants as CONSTANTS
@@ -28,6 +29,7 @@ class GateIoAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._auth: GateIoAuth = auth
         self._trading_pairs: List[str] = trading_pairs
         self._connector = connector
+        self._ping_task: Optional[asyncio.Task] = None
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -78,13 +80,36 @@ class GateIoAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await websocket_assistant.send(subscribe_balance_request)
 
             self.logger().info("Subscribed to private order changes and balance updates channels...")
+            # Start JSON ping loop per Gate WS v4 guidance (application ping)
+            if self._ping_task is None or self._ping_task.done():
+                self._ping_task = asyncio.create_task(self._json_ping_loop(websocket_assistant))
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger().exception("Unexpected error occurred subscribing to user streams...")
             raise
 
+    async def _json_ping_loop(self, websocket_assistant: WSAssistant):
+        try:
+            while True:
+                await asyncio.sleep(CONSTANTS.PING_TIMEOUT)
+                try:
+                    ping_payload = {
+                        "time": int(time.time()),
+                        "channel": "spot.ping",
+                        "event": "",
+                        "payload": [],
+                    }
+                    await websocket_assistant.send(WSJSONRequest(payload=ping_payload))
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            return
+
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
+        # Ignore application-level pong replies
+        if event_message.get("channel") == CONSTANTS.PONG_CHANNEL_NAME:
+            return
         if event_message.get("error") is not None:
             err_msg = event_message.get("error", {}).get("message", event_message.get("error"))
             raise IOError({

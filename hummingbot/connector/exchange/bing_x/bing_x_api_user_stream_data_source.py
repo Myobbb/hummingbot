@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import re
 from typing import Optional
 
 import hummingbot.connector.exchange.bing_x.bing_x_constants as CONSTANTS
@@ -10,7 +11,7 @@ from hummingbot.connector.exchange.bing_x.bing_x_auth import BingXAuth
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -18,7 +19,7 @@ from hummingbot.logger import HummingbotLogger
 
 class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
-    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800
+    LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800  # 30 minutes per BingX docs (key valid 60 min, docs recommend ping every 30 min)
 
     _bausds_logger: Optional[HummingbotLogger] = None
 
@@ -42,6 +43,10 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
         self._current_listen_key = None
+        self._connected_listen_key = None  # Track which key the WS is connected with
+        self._manage_listen_key_task = None
+        self._listen_key_lock: asyncio.Lock = asyncio.Lock()  # Prevent concurrent key creation
+        self._reconnect_attempts: int = 0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -68,34 +73,39 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         ws = None
         while True:
+            reconnect_delay = 1.0
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
-                # await ws.connect(ws_url=CONSTANTS.WSS_PRIVATE_URL[self._domain])
-                # await self._authenticate_connection(ws)
+                # Store which key we're connected with
+                self._connected_listen_key = self._current_listen_key
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
-                while True:
-                    try:
-                        seconds_until_next_ping = (CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL -
-                                                   (self._time() - self._last_ws_message_sent_timestamp))
-                        await asyncio.wait_for(
-                            self._process_ws_messages(ws=ws, output=output), timeout=seconds_until_next_ping)
-                    except asyncio.TimeoutError:
-                        ping_time = self._time()
-                        payload = {
-                            "ping": int(ping_time * 1e3)
-                        }
-                        ping_request = WSJSONRequest(payload=payload)
-                        await ws.send(request=ping_request)
-                        self._last_ws_message_sent_timestamp = ping_time
+
+                # Simply process messages continuously - no timeout logic needed
+                # BingX server sends pings every 5 seconds, we respond in _process_ws_messages
+                await self._process_ws_messages(ws=ws, output=output)
+
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().exception("Unexpected error while listening to user stream. Retrying after 5 seconds...")
+            except (ConnectionError, Exception) as e:
+                self._reconnect_attempts += 1
+                # Treat listen key rotations as expected, not errors
+                if isinstance(e, ConnectionError) and "Listen key changed" in str(e):
+                    self.logger().info("Listen key rotated; reconnecting with new key")
+                    reconnect_delay = self._backoff_seconds(transient=True)
+                else:
+                    code = self._extract_close_code(e)
+                    if self._is_transient_ws_close_exception(e):
+                        self.logger().warning(f"BingX private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                        reconnect_delay = self._backoff_seconds(transient=True)
+                    else:
+                        self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
+                        reconnect_delay = self._backoff_seconds(transient=False)
             finally:
-                # Make sure no background task is leaked.
-                ws and await ws.disconnect()
-                await self._sleep(5)
+                # Ensure proper cleanup (disconnect WS, stop key manager, best-effort delete old key)
+                await self._on_user_stream_interruption(websocket_assistant=ws)
+                self._connected_listen_key = None
+                await self._sleep(reconnect_delay)
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -105,12 +115,14 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         try:
             trade_payload = {
                 "id": "usertrade",
+                "reqType": "sub",
                 "dataType": "spot.executionReport"
             }
             subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
 
             balance_payload = {
                 "id": "userbalance",
+                "reqType": "sub",
                 "dataType": "ACCOUNT_UPDATE"
             }
             subscribe_balance_request: WSJSONRequest = WSJSONRequest(payload=balance_payload)
@@ -137,20 +149,99 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     #     await ws.send(auth_message)
 
     async def _process_ws_messages(self, ws: WSAssistant, output: asyncio.Queue):
-        # self.logger().info('process ws msgs')
         self._last_recv_time = self._time()
         async for ws_response in ws.iter_messages():
+            # CRITICAL: Check if listen key changed - if so, reconnect immediately
+            if (self._connected_listen_key is not None and
+                self._current_listen_key is not None and
+                self._connected_listen_key != self._current_listen_key):
+                self.logger().warning(
+                    f"Listen key changed from {self._connected_listen_key[:8]}... to "
+                    f"{self._current_listen_key[:8]}... - reconnecting with new key"
+                )
+                raise ConnectionError("Listen key changed - reconnection required")
+
             data = utils.decompress_ws_message(ws_response.data)
+
+            # Respond to server heartbeat ping per BingX spec (JSON or raw text frames)
+            if isinstance(data, dict) and "ping" in data:
+                try:
+                    pong_payload = {"pong": data.get("ping")}
+                    if data.get("time") is not None:
+                        pong_payload["time"] = data.get("time")
+                    await ws.send(request=WSJSONRequest(payload=pong_payload))
+                    self._last_ws_message_sent_timestamp = self._time()
+                except Exception as e:
+                    self.logger().error(f"Failed to send pong: {e}")
+                    raise
+                continue
+
+            # Fallback: detect raw text ping frames
+            try:
+                raw = None
+                if isinstance(ws_response.data, bytes):
+                    try:
+                        raw = ws_response.data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw = None
+                elif isinstance(ws_response.data, str):
+                    raw = ws_response.data
+                if raw and ("ping" in raw.lower()):
+                    try:
+                        # Per docs examples, reply with plain text Pong for raw ping frames
+                        await ws.send(request=WSPlainTextRequest(payload="Pong"))
+                        self._last_ws_message_sent_timestamp = self._time()
+                        continue
+                    except Exception as e:
+                        self.logger().error(f"Failed to send Pong (raw): {e}")
+                        raise
+            except Exception:
+                pass
+
+            # Process actual data events
+            # Handle subscription acknowledgments per BingX spec: {"id": "...", "code": 0, "msg": ""}
+            # Acks do not contain dataType. Private subscription uses explicit sub payloads above.
+            if isinstance(data, dict) and "code" in data and "id" in data and "dataType" not in data:
+                code = data.get("code")
+                if code == 0:
+                    self.logger().debug(f"Private WS subscribed: id={data.get('id')}")
+                    continue
+                else:
+                    self.logger().warning(
+                        f"Private WS subscription ack error: id={data.get('id')} code={code} msg={data.get('msg')}"
+                    )
+                    # Force reconnect on subscription failure
+                    raise ConnectionError(f"Private subscription failed for id={data.get('id')} (code={code})")
             if data.get("e") == "ACCOUNT_UPDATE":
+                # Ignore funding/non-spot reasons per requirement
+                reason = str(data.get("a", {}).get("m", "")).upper()
+                if reason in ("INIT", "FUNDING_FEE"):
+                    continue
                 output.put_nowait(data)
-            elif (data.get("dataType") == "spot.executionReport"):
+            elif data.get("dataType") == "spot.executionReport":
                 output.put_nowait(data)
-            # if isinstance(data, list):
-            #     for message in data:
-            #         if message["e"] in ["executionReport", "outboundAccountInfo"]:
-            #             output.put_nowait(message)
-            # elif data.get("auth") == "fail":
-            #     raise IOError("Private channel authentication failed.")
+
+    def _extract_close_code(self, exc: Exception) -> Optional[str]:
+        try:
+            text = str(exc)
+        except Exception:
+            return None
+        match = re.search(r"Close code\s*=\s*(\d+)", text)
+        if match:
+            return match.group(1)
+        if "1006" in text:
+            return "1006"
+        return None
+
+    def _is_transient_ws_close_exception(self, exc: Exception) -> bool:
+        code = self._extract_close_code(exc)
+        return code in {"1000", "1001", "1005", "1006", "1012", "1013"}
+
+    def _backoff_seconds(self, transient: bool) -> float:
+        if transient:
+            return 1.0
+        exponent = min(self._reconnect_attempts, 5)
+        return float(min(30, 2 ** max(1, exponent)))
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:
@@ -160,14 +251,43 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     def _time(self):
         return time.time()
 
+    async def _ensure_listen_key_task_running(self):
+        """
+        Ensures the listen key management task is running.
+
+        Creates a new task if none exists or if the previous task has completed.
+        This method is idempotent and safe to call multiple times.
+        """
+        # If task is already running, do nothing
+        if self._manage_listen_key_task is not None and not self._manage_listen_key_task.done():
+            return
+
+        # Cancel old task if it exists and is done (failed)
+        if self._manage_listen_key_task is not None:
+            self._manage_listen_key_task.cancel()
+            try:
+                await self._manage_listen_key_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # Ignore any exception from the failed task
+
+        # Create new task
+        self._manage_listen_key_task = safe_ensure_future(self._manage_listen_key_task_loop())
+
     async def _get_listen_key(self):
-        rest_assistant = await self._api_factory.get_rest_assistant()
         try:
-            data = await rest_assistant.execute_request(
-                url=web_utils.rest_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
+            # Signed request per docs: include timestamp and signature
+            data = await web_utils.api_request(
+                path=CONSTANTS.USER_STREAM_PATH_URL,
+                api_factory=self._api_factory,
+                throttler=self._throttler,
+                time_synchronizer=None,
+                domain=self._domain,
                 method=RESTMethod.POST,
-                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL,
-                headers=self._auth.header_for_authentication()
+                is_auth_required=True,
+                headers=self._auth.header_for_authentication(),
+                limit_id=CONSTANTS.USER_STREAM_PATH_URL,
             )
         except asyncio.CancelledError:
             raise
@@ -177,66 +297,248 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return data["listenKey"]
 
     async def _ping_listen_key(self) -> bool:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        # self.logger().info("start renew listen key")
+        """
+        Extends the validity period of the current listen key.
+
+        NOTE: This method should only be called from within _listen_key_lock to prevent race conditions.
+        If the key is not found (404), it will clear the current key to trigger a new key creation.
+
+        :return: True if renewal was successful, False otherwise
+        """
         try:
-            data = await rest_assistant.execute_request(
-                url=web_utils.rest_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
-                params={"listenKey": self._current_listen_key},
+            # CRITICAL: BingX docs show paramsMap={} (empty) for PUT request sample code,
+            # meaning listenKey should NOT be included in the HMAC signature calculation.
+            # We need to manually build the request:
+            # 1. Sign with only timestamp (empty params)
+            # 2. Add listenKey to the final URL AFTER the signature
+            
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            base_url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            
+            # Generate signature with EMPTY params (only timestamp will be added)
+            signed_params = self._auth.add_auth_to_params(params={})
+            
+            # Manually build URL with signature first, then add listenKey
+            # Format: ?timestamp=XXX&signature=YYY&listenKey=ZZZ
+            from urllib.parse import urlencode
+            query_string = urlencode(signed_params) + f"&listenKey={self._current_listen_key}"
+            full_url = f"{base_url}?{query_string}"
+            
+            # Create request WITHOUT is_auth_required (we did auth manually above)
+            request = RESTRequest(
                 method=RESTMethod.PUT,
-                return_err=True,
+                url=full_url,
+                params=None,  # Already in URL
+                headers=self._auth.header_for_authentication(),
+                is_auth_required=False,  # Already signed manually
                 throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
             )
-            self.logger().info(data)
+
+            async with self._throttler.execute_task(limit_id=CONSTANTS.USER_STREAM_PATH_URL):
+                response = await rest_assistant.call(request=request, timeout=10)
+                
+                # BingX returns 204 No Content on successful PUT
+                if response.status == 204:
+                    self.logger().debug(f"Successfully renewed listen key {self._current_listen_key} (204 No Content)")
+                    return True
+                    
+                # BingX might also return 200 with empty body
+                if response.status == 200:
+                    self.logger().debug(f"Successfully renewed listen key {self._current_listen_key} (200 OK)")
+                    return True
+                
+                # Handle 404 - key not found, need new key
+                if response.status == 404:
+                    self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
+                    self._current_listen_key = None
+                    self._listen_key_initialized_event.clear()
+                    return False
+                
+                # Other error status
+                try:
+                    error_text = await response.text()
+                    self.logger().warning(
+                        f"Failed to refresh listen key {self._current_listen_key}: "
+                        f"HTTP {response.status} - {error_text}"
+                    )
+                except Exception:
+                    self.logger().warning(
+                        f"Failed to refresh listen key {self._current_listen_key}: HTTP {response.status}"
+                    )
+                return False
 
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {exception}")
+            self.logger().warning(f"Exception refreshing listen key {self._current_listen_key}: {exception}")
+            # Check if it's a 404 error in the exception message
+            if "404" in str(exception):
+                self._current_listen_key = None
+                self._listen_key_initialized_event.clear()
             return False
 
-        return True
-
     async def _manage_listen_key_task_loop(self):
+        """
+        Background task that manages the listen key lifecycle.
+
+        Uses a lock to prevent multiple concurrent tasks from creating duplicate listen keys.
+        This ensures only one API call is made when the key needs to be created or renewed.
+        """
         try:
             while True:
                 now = int(time.time())
-                if self._current_listen_key is None:
-                    self._current_listen_key = await self._get_listen_key()
-                    self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
-                    self._listen_key_initialized_event.set()
-                    self._last_listen_key_ping_ts = int(time.time())
 
+                # Create new listen key if needed - use lock to prevent concurrent creation
+                if self._current_listen_key is None:
+                    async with self._listen_key_lock:
+                        # Double-check after acquiring lock - another task might have created it
+                        if self._current_listen_key is None:
+                            try:
+                                new_key = await self._get_listen_key()
+                            except Exception as e:
+                                # Keep the manager alive; retry shortly
+                                self.logger().warning(f"Failed to obtain listen key; will retry shortly. Error: {e}")
+                                await self._sleep(5)
+                                continue
+                            else:
+                                self._current_listen_key = new_key
+                                self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
+                                self._listen_key_initialized_event.set()
+                                self._last_listen_key_ping_ts = int(time.time())
+
+                # Renew listen key periodically
                 if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
-                    success: bool = await self._ping_listen_key()
-                    if not success:
-                        self.logger().error("Error occurred renewing listen key ...")
-                        break
-                    else:
-                        self.logger().info(f"Refreshed listen key {self._current_listen_key}.")
-                        self._last_listen_key_ping_ts = int(time.time())
+                    # Use lock to ensure only one renewal happens at a time
+                    async with self._listen_key_lock:
+                        # Check again after acquiring lock
+                        if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
+                            success: bool = await self._ping_listen_key()
+                            if not success:
+                                # _ping_listen_key already cleared the key if it was 404
+                                # Just log and continue - next iteration will create new key
+                                self.logger().warning("Error occurred renewing listen key, will get a new one...")
+                                await self._sleep(5)  # Brief delay before retry
+                                continue
+                            else:
+                                self.logger().debug(f"Refreshed listen key {self._current_listen_key}.")
+                                self._last_listen_key_ping_ts = int(time.time())
                 else:
-                    await self._sleep(self.LISTEN_KEY_KEEP_ALIVE_INTERVAL)
+                    # Sleep shorter to ensure timely renewal regardless of drift
+                    next_renewal = self._last_listen_key_ping_ts + self.LISTEN_KEY_KEEP_ALIVE_INTERVAL
+                    sleep_duration = max(5, next_renewal - int(time.time()))
+                    await self._sleep(min(sleep_duration, 300))  # Cap at 5 minutes
+        except asyncio.CancelledError:
+            self.logger().info("Listen key management task cancelled")
+            raise
+        except Exception as e:
+            self.logger().error(f"Unexpected error in listen key management: {e}", exc_info=True)
+            raise
         finally:
-            self._current_listen_key = None
-            self._listen_key_initialized_event.clear()
+            # Only clear state on task termination (cancellation or error)
+            async with self._listen_key_lock:
+                self._current_listen_key = None
+                self._listen_key_initialized_event.clear()
+
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Creates an instance of WSAssistant connected to the exchange
+        Creates an instance of WSAssistant connected to the exchange.
+
+        This method ensures the listen key management task is running before connecting.
+        The connection process follows these steps:
+        1. Ensures the listen key management task is running (creates if needed)
+        2. Waits for a valid listen key to be obtained
+        3. Establishes websocket connection with the listen key
         """
-        self._manage_listen_key_task = safe_ensure_future(self._manage_listen_key_task_loop())
+        # Ensure only one listen key management task is running
+        await self._ensure_listen_key_task_running()
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._get_ws_assistant()
-        web_utils.wss_url(path_url=CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain),
         url = f"{CONSTANTS.WSS_PRIVATE_URL[self._domain]}?listenKey={self._current_listen_key}"
-        await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        # Disable protocol heartbeat; rely on JSON ping/pong; allow larger frames; request gzip
+        await ws.connect(
+            ws_url=url,
+            ping_timeout=None,
+            message_timeout=60,
+            ws_headers={"Accept-Encoding": "gzip"},
+            max_msg_size=16 * 1024 * 1024,
+        )
         return ws
-
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        """
+        Handles websocket disconnection by cleaning up resources.
+
+        This method is called when the websocket connection is interrupted.
+        It ensures proper cleanup by:
+        1. Cancelling the listen key management task
+        2. Disconnecting the websocket assistant if it exists
+        3. Clearing the current listen key to force renewal on reconnection
+        4. Resetting the initialization event to block new connections until ready
+        """
         await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
-        self._manage_listen_key_task and self._manage_listen_key_task.cancel()
-        self._current_listen_key = None
-        self._listen_key_initialized_event.clear()
+
+        # Cancel listen key management task if it exists
+        if self._manage_listen_key_task and not self._manage_listen_key_task.done():
+            self._manage_listen_key_task.cancel()
+            try:
+                await self._manage_listen_key_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # Ignore any exception from the task
+            self._manage_listen_key_task = None
+
+        # Best-effort: delete the previous connected listen key if it differs from the current one
+        try:
+            old_connected = self._connected_listen_key
+            if old_connected:
+                await self._delete_listen_key(old_connected)
+        except Exception:
+            # Non-fatal cleanup
+            self.logger().debug("Best-effort listen key delete failed (ignored)")
+
+        # Clear listen key state - use lock to prevent race conditions
+        async with self._listen_key_lock:
+            self._current_listen_key = None
+            self._listen_key_initialized_event.clear()
+
         await self._sleep(5)
+
+    async def _delete_listen_key(self, listen_key: str) -> None:
+        """Best-effort deletion of a listen key to clean up server state."""
+        if not listen_key:
+            return
+        try:
+            # Same pattern as _ping_listen_key: listenKey should NOT be in signature
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            base_url = web_utils.rest_url(CONSTANTS.USER_STREAM_PATH_URL, domain=self._domain)
+            
+            # Generate signature with EMPTY params (only timestamp)
+            signed_params = self._auth.add_auth_to_params(params={})
+            
+            # Build URL with signature first, then add listenKey
+            from urllib.parse import urlencode
+            query_string = urlencode(signed_params) + f"&listenKey={listen_key}"
+            full_url = f"{base_url}?{query_string}"
+            
+            request = RESTRequest(
+                method=RESTMethod.DELETE,
+                url=full_url,
+                params=None,
+                headers=self._auth.header_for_authentication(),
+                is_auth_required=False,  # Already signed manually
+                throttler_limit_id=CONSTANTS.USER_STREAM_PATH_URL
+            )
+
+            async with self._throttler.execute_task(limit_id=CONSTANTS.USER_STREAM_PATH_URL):
+                response = await rest_assistant.call(request=request, timeout=10)
+                if response.status in (200, 204):
+                    self.logger().debug(f"Deleted stale listen key {listen_key}")
+                else:
+                    self.logger().debug(f"Failed to delete listen key {listen_key}: HTTP {response.status}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Silently ignore failures to delete
+            self.logger().debug(f"Failed to delete listen key {listen_key} (ignored)")

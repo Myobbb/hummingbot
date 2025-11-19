@@ -9,18 +9,19 @@ DOMAIN = ""
 MAX_CLIENT_ORDER_ID_LENGTH = 64
 
 
-REST_URL = "https://api.huobi.pro"
-WS_PUBLIC_URL = "wss://api.huobi.pro/ws"
-WS_PRIVATE_URL = "wss://api.huobi.pro/ws/v2"
+# Use AWS-hosted endpoints for improved stability
+REST_URL = "https://api-aws.huobi.pro"
+WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
+WS_PRIVATE_URL = "wss://api-aws.huobi.pro/ws/v2"
 
-WS_HEARTBEAT_TIME_INTERVAL = 5  # seconds
+
+WS_HEARTBEAT_TIME_INTERVAL = 20  # seconds
 
 # Websocket event types
 TRADE_CHANNEL_SUFFIX = "trade.detail"
 ORDERBOOK_CHANNEL_SUFFIX = "depth.step0"
 
 TRADE_INFO_URL = "/v1/settings/common/market-symbols"
-MOST_RECENT_TRADE_URL = "/market/tickers"
 DEPTH_URL = "/market/depth"
 LAST_TRADE_URL = "/market/trade"
 
@@ -36,7 +37,7 @@ BATCH_CANCEL_URL = "/v1/order/orders/batchcancel"
 
 HTX_ACCOUNT_UPDATE_TOPIC = "accounts.update#2"
 HTX_ORDER_UPDATE_TOPIC = "orders#{}"
-HTX_TRADE_DETAILS_TOPIC = "trade.clearing#{}#0"
+HTX_TRADE_DETAILS_TOPIC = "trade.clearing#{}"
 
 HTX_SUBSCRIBE_TOPICS = {HTX_ORDER_UPDATE_TOPIC, HTX_ACCOUNT_UPDATE_TOPIC, HTX_TRADE_DETAILS_TOPIC}
 
@@ -51,7 +52,6 @@ RATE_LIMITS = [
     RateLimit(WS_CONNECTION_LIMIT_ID, limit=50, time_interval=1),
     RateLimit(WS_REQUEST_LIMIT_ID, limit=10, time_interval=1),
     RateLimit(limit_id=TRADE_INFO_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=MOST_RECENT_TRADE_URL, limit=10, time_interval=1),
     RateLimit(limit_id=DEPTH_URL, limit=10, time_interval=1),
     RateLimit(limit_id=LAST_TRADE_URL, limit=10, time_interval=1),
     RateLimit(limit_id=SERVER_TIME_URL, limit=10, time_interval=1),
@@ -76,3 +76,7 @@ ORDER_STATE = {
     "created": OrderState.PENDING_CREATE,
     "canceling": OrderState.PENDING_CANCEL
 }
+
+# Timeout (seconds) after last partial-filled update to auto-finalize as FILLED
+# Keeps strategies from hanging when HTX never emits a final filled state.
+PARTIAL_FINALIZE_TIMEOUT_S = 6.0

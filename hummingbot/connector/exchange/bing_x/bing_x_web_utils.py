@@ -77,7 +77,6 @@ async def api_request(path: str,
     time_synchronizer = time_synchronizer or TimeSynchronizer()
 
     # If api_factory is not provided a default one is created
-    # The default instance has no authentication capabilities and all authenticated requests will fail
     api_factory = api_factory or build_api_factory(
         throttler=throttler,
         time_synchronizer=time_synchronizer,
@@ -105,6 +104,11 @@ async def api_request(path: str,
 
     async with throttler.execute_task(limit_id=limit_id if limit_id else path):
         response = await rest_assistant.call(request=request, timeout=timeout)
+        
+        # Handle 204 No Content as success (common for PUT /userDataStream)
+        if response.status == 204:
+            return {}  # Return empty dict for successful no-content response
+            
         if response.status != 200:
             if return_err:
                 # noinspection PyProtectedMember

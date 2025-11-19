@@ -7,6 +7,7 @@ from hummingbot.core.data_type.order_book_message import OrderBookMessage, Order
 
 class MexcOrderBook(OrderBook):
 
+
     @classmethod
     def snapshot_message_from_exchange(cls,
                                        msg: Dict[str, any],

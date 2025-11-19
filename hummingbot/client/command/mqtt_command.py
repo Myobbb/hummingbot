@@ -97,7 +97,7 @@ class MQTTCommand:
             except Exception as e:
                 self.logger().error(f'Failed to stop MQTT Bridge: {str(e)}')
         else:
-            self.logger().error("MQTT is already stopped!")
+            self.logger().debug("MQTT is already stopped!")
             self.notify('MQTT Bridge is already stopped!')
 
     async def restart_mqtt_async(self,  # type: HummingbotApplication
