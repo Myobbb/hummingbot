@@ -1,13 +1,13 @@
 # distutils: language=c++
 from libcpp.pair cimport pair
-
+from hummingbot.strategy.arbitrage_l.arbitrage cimport ArbitrageLStrategy
 cdef class PositionBalancerHandler:
     """
     Universal position balancing handler for ArbitrageL strategy.
     Supports both buying (when below target) and selling (when above target).
     """
     cdef:
-        object strategy
+        ArbitrageLStrategy strategy
         # Buy-in configuration
         bint _buy_enabled
         double _buy_target_usd
