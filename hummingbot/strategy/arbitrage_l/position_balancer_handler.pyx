@@ -1047,4 +1047,54 @@ cdef class PositionBalancerHandler:
         if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
             self.c_maybe_disable_sell()
 
+    # Runtime control methods
+
+    def enable_buy_in(self):
+        """
+        Enable buy-in mode and reset completion flag.
+        Allows buy-in to restart after target was previously reached.
+        """
+        if not self._buy_enabled:
+            self._buy_enabled = True
+            self._buy_completed = False
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Buy-in mode enabled - position balancer will acquire assets to reach target")
+
+    def disable_buy_in(self):
+        """
+        Disable buy-in mode and cancel all active buy orders.
+        Cleans up all tracking and stops placing new buy orders.
+        """
+        if self._buy_enabled:
+            self._buy_enabled = False
+            self.c_cancel_all_buy_orders()
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Buy-in mode disabled - cancelled all buy orders and cleared tracking")
+
+    def enable_sell_off(self):
+        """
+        Enable sell-off mode and reset completion flag.
+        Allows sell-off to restart after target was previously reached.
+        """
+        if not self._sell_enabled:
+            self._sell_enabled = True
+            self._sell_completed = False
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Sell-off mode enabled - position balancer will reduce assets to reach target")
+
+    def disable_sell_off(self):
+        """
+        Disable sell-off mode and cancel all active sell orders.
+        Cleans up all tracking and stops placing new sell orders.
+        """
+        if self._sell_enabled:
+            self._sell_enabled = False
+            self.c_cancel_all_sell_orders()
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Sell-off mode disabled - cancelled all sell orders and cleared tracking")
+
         return True
