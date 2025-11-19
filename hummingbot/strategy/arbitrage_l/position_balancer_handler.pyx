@@ -663,10 +663,13 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
+                               
+                                
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Position balancer: Cancelled buy order {order_id} for {asset} ({cancel_reason})")
+                                self._active_buy_orders.pop(asset, None)
                                 break
                     except Exception as e:
                         self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order: {e}")
@@ -697,10 +700,12 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
+                             
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Position balancer: Cancelled sell order {order_id} for {asset} ({cancel_reason})")
+                                self._active_sell_orders.pop(asset, None)
                                 break
                     except Exception as e:
                         self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order: {e}")
