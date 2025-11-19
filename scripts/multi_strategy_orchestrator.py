@@ -1503,7 +1503,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
         # Check if strategy has position balancer
-        if not hasattr(strategy_instance, '_position_balancer') or strategy_instance._position_balancer is None:
+        has_attr = hasattr(strategy_instance, '_position_balancer')
+        is_none = strategy_instance._position_balancer is None if has_attr else True
+        self.logger().info(f"Position balancer check for '{strategy_name}': has_attr={has_attr}, is_none={is_none}")
+        if not has_attr or is_none:
             self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
             return False
 
