@@ -475,7 +475,7 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Target minimum USD value (buy when below this)"
     )
     buy_in_spread_pct: Union[float, str] = Field(
-        default=min,
+        default="min",
         description="Spread for buy limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
@@ -489,7 +489,7 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Target maximum USD value (sell when above this)"
     )
     sell_off_spread_pct: Union[float, str] = Field(
-        default=min,
+        default="min",
         description="Spread for sell limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
