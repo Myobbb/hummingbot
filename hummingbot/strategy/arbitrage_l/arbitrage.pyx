@@ -203,6 +203,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Position balancer handler (create if position balancer targets configured)
         # Create handler even if both modes disabled to allow runtime enabling
+        self.logger().info(f"Position balancer init: buy_target={buy_in_target_usd}, sell_target={sell_off_target_usd}")
         if buy_in_target_usd > 0 or sell_off_target_usd > 0:
             self._position_balancer = PositionBalancerHandler(
                 self,
@@ -214,8 +215,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 sell_off_spread_pct,
                 position_balancer_refresh_interval,
                 position_balancer_order_size_usd)
+            self.logger().info(f"Position balancer handler CREATED for targets: buy={buy_in_target_usd}, sell={sell_off_target_usd}")
         else:
             self._position_balancer = None
+            self.logger().info(f"Position balancer handler NOT created (both targets are 0)")
 
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
