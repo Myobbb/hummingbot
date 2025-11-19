@@ -51,7 +51,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _last_rate_update
         
         # Position balancer handler (None when disabled)
-        PositionBalancerHandler _position_balancer
+        public PositionBalancerHandler _position_balancer
 
 
 
