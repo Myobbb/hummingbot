@@ -445,7 +445,7 @@ cdef class PositionBalancerHandler:
             object best_market = None
             double best_bid = 0.0
             double current_bid
-            OrderBook ob
+            object ob  # Changed from OrderBook to object for Python compatibility
             object mp
             object market_tuple
             int checked_count = 0
@@ -459,8 +459,9 @@ cdef class PositionBalancerHandler:
                     if market_tuple.base_asset == asset:
                         matched_count += 1
                         try:
-                            ob = market_tuple.market.c_get_order_book(market_tuple.trading_pair)
-                            current_bid = ob._best_bid
+                            # Use Python-level get_order_book for compatibility with all exchanges
+                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
+                            current_bid = float(ob.get_price(False))  # False = bid side
 
                             self.strategy.logger().info(
                                 f"Position balancer: Checking {market_tuple.market.name} for {asset}: "
@@ -496,7 +497,7 @@ cdef class PositionBalancerHandler:
             object best_market = None
             double best_ask = 1e100  # Large number
             double current_ask
-            OrderBook ob
+            object ob  # Changed from OrderBook to object for Python compatibility
             object mp
             object market_tuple
 
@@ -506,8 +507,9 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset == asset:
                         try:
-                            ob = market_tuple.market.c_get_order_book(market_tuple.trading_pair)
-                            current_ask = ob._best_ask
+                            # Use Python-level get_order_book for compatibility with all exchanges
+                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
+                            current_ask = float(ob.get_price(True))  # True = ask side
 
                             if current_ask < best_ask and current_ask > 0:
                                 best_ask = current_ask
@@ -673,9 +675,9 @@ cdef class PositionBalancerHandler:
         if quote_bal <= 0:
             return False
 
-        # Get top bid price from cached order book value
+        # Get top bid price from order book
         cdef:
-            OrderBook ob = market.c_get_order_book(buy_market_tuple.trading_pair)
+            object ob  # Use object for Python compatibility
             double top_bid
             double buy_price
             double max_affordable_base
@@ -687,7 +689,9 @@ cdef class PositionBalancerHandler:
             string buy_id_str
 
         try:
-            top_bid = ob._best_bid
+            # Use Python-level get_order_book for compatibility with all exchanges
+            ob = market.get_order_book(buy_market_tuple.trading_pair)
+            top_bid = float(ob.get_price(False))  # False = bid side
         except Exception:
             return False
 
@@ -815,9 +819,9 @@ cdef class PositionBalancerHandler:
         if base_bal_raw <= 0:
             return False
 
-        # Get top ask price from cached order book value
+        # Get top ask price from order book
         cdef:
-            OrderBook ob = market.c_get_order_book(sell_market_tuple.trading_pair)
+            object ob  # Use object for Python compatibility
             double top_ask
             double sell_price
             double amount_to_sell
@@ -828,7 +832,9 @@ cdef class PositionBalancerHandler:
             string sell_id_str
 
         try:
-            top_ask = ob._best_ask
+            # Use Python-level get_order_book for compatibility with all exchanges
+            ob = market.get_order_book(sell_market_tuple.trading_pair)
+            top_ask = float(ob.get_price(True))  # True = ask side
         except Exception:
             return False
 
