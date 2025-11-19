@@ -76,7 +76,19 @@ def update_oracle_settings(value: str):
         # Either not using oracle or assets match - no oracle needed
         settings.required_rate_oracle = False
         settings.rate_oracle_pairs = []
-
+        
+def validate_spread_value(value: str) -> Optional[str]:
+    """
+    Validate spread value - accepts either:
+    - A decimal percentage (0-100)
+    - The string 'min' for minimum tick spread
+    """
+    if isinstance(value, str) and value.lower().strip() == 'min':
+        return None  # Valid
+    # Otherwise validate as decimal
+    return validate_decimal(value, Decimal(0), Decimal("100"), inclusive=True)
+ 
+ 
 
 def _assets_differ() -> bool:
     c_map = arbitrage_l_config_map
@@ -204,11 +216,11 @@ arbitrage_l_config_map = {
     ),
     "buy_in_spread_pct": ConfigVar(
         key="buy_in_spread_pct",
-        prompt="Spread percentage below top bid for buy limit orders (e.g., 0.1 for 0.1%) >>> ",
+        prompt="Spread percentage below top bid for buy limit orders (e.g., 0.1 for 0.1%, or 'min' for minimum tick) >>> ",
         prompt_on_new=False,
-        default=Decimal("min"),
-        validator=lambda v: validate_decimal(v, Decimal(0), Decimal("100"), inclusive=True),
-        type_str="decimal",
+        default="min",
+        validator=validate_spread_value,
+        type_str="str",
         required_if=_is_buy_in_enabled,
     ),
     # Position Balancer - Sell-off Configuration
@@ -231,11 +243,11 @@ arbitrage_l_config_map = {
     ),
     "sell_off_spread_pct": ConfigVar(
         key="sell_off_spread_pct",
-        prompt="Spread percentage above top ask for sell limit orders (e.g., 0.1 for 0.1%) >>> ",
+        prompt="Spread percentage above top ask for sell limit orders (e.g., 0.1 for 0.1%, or 'min' for minimum tick) >>> ",
         prompt_on_new=False,
-        default=Decimal("min"),
-        validator=lambda v: validate_decimal(v, Decimal(0), Decimal("100"), inclusive=True),
-        type_str="decimal",
+        default="min",
+        validator=validate_spread_value,
+        type_str="str",
         required_if=_is_sell_off_enabled,
     ),
     # Position Balancer - Order Management
