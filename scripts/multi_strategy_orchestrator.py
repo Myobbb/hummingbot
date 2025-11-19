@@ -83,9 +83,9 @@ Optimizations for 40-50 Strategies (Reconnection Performance):
    - Coordinated re-initialization after full reconnection events
    - Prevents redundant startup logic across 40-50 strategies
 
-2. Individual Strategy Buy-in:
-   - Each strategy handles its own buy-in logic in orchestrated mode
-   - Buy-in check runs when strategy first detects markets are ready
+2. Individual Strategy Position Balancing:
+   - Each strategy handles its own position balancer logic in orchestrated mode
+   - Position balancer check runs when strategy first detects markets are ready
    - No orchestrator-level coordination needed (strategies are self-contained)
 
 3. Optimized Readiness Checking:
@@ -326,10 +326,20 @@ class ArbitrageMInstanceConfig(BaseModel):
     Profitability:
       - min_profitability: 0.5 (%)
 
-    Buy-in Module (arbitrage_l uses this to acquire initial inventory):
-      - buy_in_enabled: True
-      - buy_in_target_usd: 100.0 (USD)
-      - buy_in_min_profitability: 0.5 (%)
+    Position Balancer (arbitrage_l uses this to manage inventory):
+      Buy-in (acquire assets when below target):
+        - buy_in_enabled: False
+        - buy_in_target_usd: 1000.0 (USD, minimum asset value)
+        - buy_in_spread_pct: 0.1 (%, spread below top bid for buy limit orders)
+
+      Sell-off (reduce assets when above target):
+        - sell_off_enabled: False
+        - sell_off_target_usd: 2000.0 (USD, maximum asset value)
+        - sell_off_spread_pct: 0.1 (%, spread above top ask for sell limit orders)
+
+      Order Management:
+        - position_balancer_refresh_interval: 10.0 (seconds, how often to refresh limit orders)
+        - position_balancer_order_size_usd: 100.0 (USD, maximum order size per position balancer order)
 
     Timing (arbitrage_l defaults):
       - status_report_interval: 60.0 (seconds)
@@ -379,18 +389,42 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Conversion rate for quote asset from secondary to primary"
     )
 
-    # Buy-in configuration
+    # Position balancer configuration - Buy-in
     buy_in_enabled: bool = Field(
-        default=True,
-        description="Enable buy-in module to acquire initial inventory"
+        default=False,
+        description="Enable buy-in to acquire assets when below target"
     )
     buy_in_target_usd: float = Field(
-        default=100.0,
-        description="Target USD value for buy-in operations"
+        default=1000.0,
+        description="Target minimum USD value (buy when below this)"
     )
-    buy_in_min_profitability: float = Field(
-        default=0.5,
-        description="Min profitability percentage for buy-in (e.g., 0.5 for 0.5%)"
+    buy_in_spread_pct: float = Field(
+        default=0.1,
+        description="Spread percentage below top bid for buy limit orders (e.g., 0.1 = 0.1%)"
+    )
+
+    # Position balancer configuration - Sell-off
+    sell_off_enabled: bool = Field(
+        default=False,
+        description="Enable sell-off to reduce assets when above target"
+    )
+    sell_off_target_usd: float = Field(
+        default=2000.0,
+        description="Target maximum USD value (sell when above this)"
+    )
+    sell_off_spread_pct: float = Field(
+        default=0.1,
+        description="Spread percentage above top ask for sell limit orders (e.g., 0.1 = 0.1%)"
+    )
+
+    # Position balancer - Order management
+    position_balancer_refresh_interval: float = Field(
+        default=10.0,
+        description="How often to cancel and replace limit orders (seconds)"
+    )
+    position_balancer_order_size_usd: float = Field(
+        default=100.0,
+        description="Maximum order size in USD per position balancer order (e.g., 100.0 = $100 max per order)"
     )
 
     # Timing parameters
@@ -399,7 +433,7 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Interval in seconds between status reports"
     )
     next_trade_delay_interval: float = Field(
-        default=4.0,
+        default=2.0,
         description="Delay in seconds between trade executions"
     )
     order_timeout: float = Field(
@@ -731,9 +765,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             "secondary_to_primary_base_conversion_rate": config.secondary_to_primary_base_conversion_rate,
             "secondary_to_primary_quote_conversion_rate": config.secondary_to_primary_quote_conversion_rate,
             "hb_app_notification": True,
+            # Position balancer - buy-in configuration
             "buy_in_enabled": config.buy_in_enabled,
             "buy_in_target_usd": config.buy_in_target_usd,
-            "buy_in_min_profitability": float(config.buy_in_min_profitability) / 100.0,
+            "buy_in_spread_pct": config.buy_in_spread_pct,
+            # Position balancer - sell-off configuration
+            "sell_off_enabled": config.sell_off_enabled,
+            "sell_off_target_usd": config.sell_off_target_usd,
+            "sell_off_spread_pct": config.sell_off_spread_pct,
+            # Position balancer - order management
+            "position_balancer_refresh_interval": config.position_balancer_refresh_interval,
+            "position_balancer_order_size_usd": config.position_balancer_order_size_usd,
             "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
         }
 
@@ -845,10 +887,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         This performs ONE-TIME initialization for all strategies:
         1. Log market ready status (once for all strategies)
-        2. Perform coordinated buy-in initialization (single wallet query)
+        2. Perform coordinated initialization (single wallet query)
         3. Notify strategies that markets are ready
 
-        This replaces 40-50 individual strategy readiness checks and buy-in scans.
+        This replaces 40-50 individual strategy readiness checks and position balancer scans.
         """
         self.logger().info("=" * 70)
         self.logger().info("MARKETS READY - Coordinated Initialization")
@@ -859,10 +901,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             status = connector.status_dict
             self.logger().info(f"{name}: {status}")
 
-        # Buy-in coordination is handled by individual strategies in orchestrated mode
-        # Each strategy calls its own buy-in check when it first detects markets are ready
-        # arbitrage_m: calls self.c_scan_and_mark_buyin_completion()
-        # arbitrage_l: calls self._buy_in_handler.c_scan_and_mark_completion()
+        # Position balancer coordination is handled by individual strategies in orchestrated mode
+        # Each strategy calls its own position balancer check when it first detects markets are ready
+        # arbitrage_l: calls self._position_balancer.c_scan_and_mark_completion()
         # No orchestrator-level coordination needed - strategies handle it internally
 
         self.logger().info("=" * 70)
@@ -1531,9 +1572,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 'use_oracle_conversion_rate': single_config.get('use_oracle_conversion_rate', False),
                 'secondary_to_primary_base_conversion_rate': single_config.get('secondary_to_primary_base_conversion_rate', 1.0),
                 'secondary_to_primary_quote_conversion_rate': single_config.get('secondary_to_primary_quote_conversion_rate', 1.0),
+                # Position balancer - buy-in configuration
                 'buy_in_enabled': single_config.get('buy_in_enabled', False),
-                'buy_in_target_usd': single_config.get('buy_in_target_usdt', single_config.get('buy_in_target_usd', 100.0)),
-                'buy_in_min_profitability': single_config.get('buy_in_min_profitability', 0.5),
+                'buy_in_target_usd': single_config.get('buy_in_target_usdt', single_config.get('buy_in_target_usd', 1000.0)),
+                'buy_in_spread_pct': single_config.get('buy_in_spread_pct', 0.1),
+                # Position balancer - sell-off configuration (new, defaults to disabled)
+                'sell_off_enabled': single_config.get('sell_off_enabled', False),
+                'sell_off_target_usd': single_config.get('sell_off_target_usd', 2000.0),
+                'sell_off_spread_pct': single_config.get('sell_off_spread_pct', 0.1),
+                # Position balancer - order management
+                'position_balancer_refresh_interval': single_config.get('position_balancer_refresh_interval', 10.0),
+                'position_balancer_order_size_usd': single_config.get('position_balancer_order_size_usd', 100.0),
+                # Timing parameters
                 'status_report_interval': single_config.get('status_report_interval', 60.0),
                 'next_trade_delay_interval': single_config.get('next_trade_delay_interval', 2.0),
                 'order_timeout': single_config.get('order_timeout', 300.0),
@@ -1831,7 +1881,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     lines.append(f"{markets_fmt} | best {r['best']}")
 
         if buyin_sections:
-            lines.append("\nBuy-in active:")
+            lines.append("\nPosition Balancer active:")
             for name, blines in buyin_sections:
                 lines.append(f"  {name}:")
                 lines.extend([f"    {ln}" for ln in blines])
@@ -2016,8 +2066,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         return f"{global_base}-{global_quote} {'_'.join(parts)}"
 
     def _extract_buyin_lines(self, status_blob: str) -> List[str]:
-        """Extract the buy-in header and asset rows from a strategy status output.
-        Returns [] when buy-in is not active (no section present)."""
+        """Extract the position balancer header and asset rows from a strategy status output.
+        Returns [] when position balancer is not active (no section present).
+        Supports both old 'Buy-in:' and new 'Position Balancer:' formats."""
         if not status_blob:
             return []
         raw_lines = status_blob.split("\n")
@@ -2025,10 +2076,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         collecting = False
         for raw in raw_lines:
             s = raw.strip()
-            if s.startswith("Buy-in:"):
-                # Reformat min_prof to one decimal if present
+            # Support both old "Buy-in:" and new "Position Balancer:" formats
+            if s.startswith("Buy-in:") or s.startswith("Position Balancer:"):
+                # Reformat min_prof to one decimal if present (old format compatibility)
                 try:
-                    # Example: Buy-in: target=1000.000000 min_prof=2.50%
+                    # Example old format: Buy-in: target=1000.000000 min_prof=2.50%
+                    # Example new format: Position Balancer: buy_target=1000.000000 sell_target=2000.000000
                     m = re.search(r"min_prof\s*=\s*([0-9]+(?:\.[0-9]+)?)%", s)
                     if m:
                         val = float(m.group(1))
