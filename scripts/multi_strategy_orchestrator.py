@@ -1502,6 +1502,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             )
             return False
 
+        # Debug: Check wrapper structure
+        self.logger().info(f"DEBUG enable_buyin: strategy_instance type = {type(strategy_instance)}")
+        self.logger().info(f"DEBUG enable_buyin: has 'strategy' attr = {hasattr(strategy_instance, 'strategy')}")
+        if hasattr(strategy_instance, 'strategy'):
+            self.logger().info(f"DEBUG enable_buyin: strategy type = {type(strategy_instance.strategy)}")
+            self.logger().info(f"DEBUG enable_buyin: strategy has '_position_balancer' = {hasattr(strategy_instance.strategy, '_position_balancer')}")
+            if hasattr(strategy_instance.strategy, '_position_balancer'):
+                self.logger().info(f"DEBUG enable_buyin: _position_balancer is None = {strategy_instance.strategy._position_balancer is None}")
+
         # Check if strategy has position balancer (access wrapped strategy object)
         if not hasattr(strategy_instance.strategy, '_position_balancer') or \
            strategy_instance.strategy._position_balancer is None:
@@ -1510,6 +1519,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Enable buy-in
         strategy_instance.strategy._position_balancer.enable_buy_in()
+        self.logger().info(f"Buy-in enabled successfully for '{strategy_name}'")
         return True
 
     def disable_buyin(self, strategy_name: str) -> bool:
