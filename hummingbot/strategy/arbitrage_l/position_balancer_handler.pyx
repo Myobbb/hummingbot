@@ -41,10 +41,10 @@ cdef class PositionBalancerHandler:
                  object strategy,
                  bint buy_enabled,
                  double buy_target_usd,
-                 double buy_spread_pct,
+                 object buy_spread_pct,  # float or 'min'
                  bint sell_enabled,
                  double sell_target_usd,
-                 double sell_spread_pct,
+                 object sell_spread_pct,  # float or 'min'
                  double limit_refresh_interval,
                  double order_size_usd=100.0):
         """
@@ -54,10 +54,14 @@ cdef class PositionBalancerHandler:
             strategy: Reference to ArbitrageLStrategy instance
             buy_enabled: Whether buy-in is enabled
             buy_target_usd: Target minimum asset value in quote currency
-            buy_spread_pct: Spread percentage below top bid for buy orders (e.g., 0.1 = 0.1%)
+            buy_spread_pct: Spread percentage or 'min' for minimum tick
+                - float (e.g., 0.1 = 0.1% above top bid)
+                - 'min' = one minimum tick above top bid (maker order frontrunning)
             sell_enabled: Whether sell-off is enabled
             sell_target_usd: Target maximum asset value in quote currency
-            sell_spread_pct: Spread percentage above top ask for sell orders (e.g., 0.1 = 0.1%)
+            sell_spread_pct: Spread percentage or 'min' for minimum tick
+                - float (e.g., 0.1 = 0.1% below top ask)
+                - 'min' = one minimum tick below top ask (maker order frontrunning)
             limit_refresh_interval: How often to cancel and replace limit orders (seconds)
             order_size_usd: Maximum order size in USD per order (default: 100.0)
         """
@@ -66,12 +70,24 @@ cdef class PositionBalancerHandler:
         # Buy-in configuration
         self._buy_enabled = buy_enabled
         self._buy_target_usd = buy_target_usd
-        self._buy_spread_pct = buy_spread_pct / 100.0  # Convert to decimal
+        # Handle 'min' or numeric spread
+        if isinstance(buy_spread_pct, str) and buy_spread_pct.lower() == 'min':
+            self._buy_spread_pct = -1.0  # Special flag for minimum tick
+            self._buy_spread_is_min = True
+        else:
+            self._buy_spread_pct = float(buy_spread_pct) / 100.0  # Convert to decimal
+            self._buy_spread_is_min = False
 
         # Sell-off configuration
         self._sell_enabled = sell_enabled
         self._sell_target_usd = sell_target_usd
-        self._sell_spread_pct = sell_spread_pct / 100.0  # Convert to decimal
+        # Handle 'min' or numeric spread
+        if isinstance(sell_spread_pct, str) and sell_spread_pct.lower() == 'min':
+            self._sell_spread_pct = -1.0  # Special flag for minimum tick
+            self._sell_spread_is_min = True
+        else:
+            self._sell_spread_pct = float(sell_spread_pct) / 100.0  # Convert to decimal
+            self._sell_spread_is_min = False
 
         # Order size configuration
         self._order_size_usd = order_size_usd
@@ -786,10 +802,11 @@ cdef class PositionBalancerHandler:
         if quote_bal <= 0:
             return False
 
-        # Get top ask price from order book (we selected market with lowest ask)
+        # Get order book prices from market (we selected market with lowest ask)
         cdef:
             object ob  # Use object for Python compatibility
             double top_ask
+            double top_bid
             double buy_price
             double max_affordable_base
             double amount_to_buy
@@ -798,20 +815,41 @@ cdef class PositionBalancerHandler:
             double volume_usd
             str buy_order_id
             string buy_id_str
+            object trading_rule
+            object min_price_increment
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
             ob = market.get_order_book(buy_market_tuple.trading_pair)
             top_ask = float(ob.get_price(True))  # True = ask side
+            top_bid = float(ob.get_price(False))  # False = bid side
         except Exception:
             return False
 
         if top_ask <= 0:
             return False
 
-        # Calculate limit price: frontrun by placing slightly below top ask
-        # With spread_pct=0, we place AT the ask. With spread_pct>0, we place below ask.
-        buy_price = top_ask * (1.0 - self._buy_spread_pct)
+        # Calculate limit price based on spread mode
+        if self._buy_spread_is_min:
+            # 'min' mode: Place one tick above top bid (frontrun other buyers with maker order)
+            if top_bid <= 0:
+                return False
+            try:
+                trading_rule = market._trading_rules.get(buy_market_tuple.trading_pair)
+                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                    min_price_increment = float(trading_rule.min_price_increment)
+                    buy_price = top_bid + min_price_increment
+                    # Ensure we don't exceed the ask (would be taker)
+                    if buy_price >= top_ask:
+                        buy_price = top_ask  # Fall back to taker
+                else:
+                    # No min_price_increment available, fall back to taker
+                    buy_price = top_ask
+            except Exception:
+                buy_price = top_ask  # Fall back to taker on error
+        else:
+            # Percentage mode: Place below top ask (0% = AT ask, >0% = below ask)
+            buy_price = top_ask * (1.0 - self._buy_spread_pct)
 
         # Calculate amount based on shortfall, available quote, and order size limit
         max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
@@ -892,9 +930,15 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id}: {e}")
 
-        self.strategy.logger().info(
-            f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
-            f"at {buy_price:.8f} (spread: {self._buy_spread_pct * 100:.2f}%)")
+        # Log order placement
+        if self._buy_spread_is_min:
+            self.strategy.logger().info(
+                f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"at {buy_price:.8f} (spread: min tick)")
+        else:
+            self.strategy.logger().info(
+                f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"at {buy_price:.8f} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
         # Check if target reached
         base_bal = self.c_get_adjusted_base_balance(asset_key)
@@ -931,10 +975,11 @@ cdef class PositionBalancerHandler:
         if base_bal_raw <= 0:
             return False
 
-        # Get top bid price from order book (we selected market with highest bid)
+        # Get order book prices from market (we selected market with highest bid)
         cdef:
             object ob  # Use object for Python compatibility
             double top_bid
+            double top_ask
             double sell_price
             double amount_to_sell
             object quantized_amount
@@ -942,20 +987,41 @@ cdef class PositionBalancerHandler:
             double volume_usd
             str sell_order_id
             string sell_id_str
+            object trading_rule
+            object min_price_increment
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
             ob = market.get_order_book(sell_market_tuple.trading_pair)
             top_bid = float(ob.get_price(False))  # False = bid side
+            top_ask = float(ob.get_price(True))  # True = ask side
         except Exception:
             return False
 
         if top_bid <= 0:
             return False
 
-        # Calculate limit price: frontrun by placing slightly above top bid
-        # With spread_pct=0, we place AT the bid. With spread_pct>0, we place above bid.
-        sell_price = top_bid * (1.0 + self._sell_spread_pct)
+        # Calculate limit price based on spread mode
+        if self._sell_spread_is_min:
+            # 'min' mode: Place one tick below top ask (frontrun other sellers with maker order)
+            if top_ask <= 0:
+                return False
+            try:
+                trading_rule = market._trading_rules.get(sell_market_tuple.trading_pair)
+                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                    min_price_increment = float(trading_rule.min_price_increment)
+                    sell_price = top_ask - min_price_increment
+                    # Ensure we don't go below the bid (would be taker)
+                    if sell_price <= top_bid:
+                        sell_price = top_bid  # Fall back to taker
+                else:
+                    # No min_price_increment available, fall back to taker
+                    sell_price = top_bid
+            except Exception:
+                sell_price = top_bid  # Fall back to taker on error
+        else:
+            # Percentage mode: Place above top bid (0% = AT bid, >0% = above bid)
+            sell_price = top_bid * (1.0 + self._sell_spread_pct)
 
         # Calculate amount based on excess, available base, and order size limit
         max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
@@ -1035,9 +1101,15 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id}: {e}")
 
-        self.strategy.logger().info(
-            f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-            f"at {sell_price:.8f} (spread: {self._sell_spread_pct * 100:.2f}%)")
+        # Log order placement
+        if self._sell_spread_is_min:
+            self.strategy.logger().info(
+                f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"at {sell_price:.8f} (spread: min tick)")
+        else:
+            self.strategy.logger().info(
+                f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"at {sell_price:.8f} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
         # Check if target reached
         base_bal = self.c_get_adjusted_base_balance(asset_key)
