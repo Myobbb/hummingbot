@@ -1502,33 +1502,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             )
             return False
 
-        # Debug: Check wrapper structure
-        self.logger().info(f"DEBUG enable_buyin: strategy_instance type = {type(strategy_instance)}")
-        self.logger().info(f"DEBUG enable_buyin: has 'strategy' attr = {hasattr(strategy_instance, 'strategy')}")
-        if hasattr(strategy_instance, 'strategy'):
-            self.logger().info(f"DEBUG enable_buyin: strategy type = {type(strategy_instance.strategy)}")
-            self.logger().info(f"DEBUG enable_buyin: strategy has '_position_balancer' = {hasattr(strategy_instance.strategy, '_position_balancer')}")
-
-            # Check all attributes on the strategy object
-            strategy_attrs = [attr for attr in dir(strategy_instance.strategy) if '_position' in attr.lower() or '_balancer' in attr.lower()]
-            self.logger().info(f"DEBUG enable_buyin: strategy attributes with 'position' or 'balancer': {strategy_attrs}")
-
-            # Try to access via getattr with default
-            pb = getattr(strategy_instance.strategy, '_position_balancer', 'ATTRIBUTE_NOT_FOUND')
-            self.logger().info(f"DEBUG enable_buyin: getattr(_position_balancer) = {type(pb)} - {pb}")
-
-            if hasattr(strategy_instance.strategy, '_position_balancer'):
-                self.logger().info(f"DEBUG enable_buyin: _position_balancer is None = {strategy_instance.strategy._position_balancer is None}")
-
-        # Check if strategy has position balancer (access wrapped strategy object)
+        # Check if strategy has position balancer
         if not hasattr(strategy_instance.strategy, '_position_balancer') or \
            strategy_instance.strategy._position_balancer is None:
             self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
             return False
 
-        # Enable buy-in
+        # Enable buy-in and check if target already reached
         strategy_instance.strategy._position_balancer.enable_buy_in()
-        self.logger().info(f"Buy-in enabled successfully for '{strategy_name}'")
         return True
 
     def disable_buyin(self, strategy_name: str) -> bool:
