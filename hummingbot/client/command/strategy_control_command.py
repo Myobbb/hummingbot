@@ -19,13 +19,17 @@ class StrategyControlCommand:
         Main entry point for strategy control commands.
 
         Usage:
-            control list              - List all strategies with their status
-            control pause <id>        - Pause a strategy by name or token
-            control resume <id>       - Resume a paused strategy
-            control pause_all         - Pause all strategies
-            control resume_all        - Resume all strategies
-            control remove <id>       - Remove a strategy (edits config file)
-            control add <file>        - Add a strategy from config file (conf/strategies/)
+            control list                   - List all strategies with their status
+            control pause <id>             - Pause a strategy by name or token
+            control resume <id>            - Resume a paused strategy
+            control pause_all              - Pause all strategies
+            control resume_all             - Resume all strategies
+            control remove <id>            - Remove a strategy (edits config file)
+            control add <file>             - Add a strategy from config file (conf/strategies/)
+            control enable_buyin <id>      - Enable buy-in for position balancer
+            control disable_buyin <id>     - Disable buy-in for position balancer
+            control enable_selloff <id>    - Enable sell-off for position balancer
+            control disable_selloff <id>   - Disable sell-off for position balancer
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -88,9 +92,50 @@ class StrategyControlCommand:
                 self.notify("The current strategy does not support adding strategies.")
                 return
             safe_ensure_future(self._control_add(identifier), loop=self.ev_loop)
+        elif action == "enable_buyin":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control enable_buyin <strategy_name_or_token>")
+                return
+            # Check if enable_buyin capability exists
+            if not hasattr(strategy, 'enable_buyin_by_identifier'):
+                self.notify("The current strategy does not support position balancer controls.")
+                return
+            safe_ensure_future(self._control_enable_buyin(identifier), loop=self.ev_loop)
+        elif action == "disable_buyin":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control disable_buyin <strategy_name_or_token>")
+                return
+            # Check if disable_buyin capability exists
+            if not hasattr(strategy, 'disable_buyin_by_identifier'):
+                self.notify("The current strategy does not support position balancer controls.")
+                return
+            safe_ensure_future(self._control_disable_buyin(identifier), loop=self.ev_loop)
+        elif action == "enable_selloff":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control enable_selloff <strategy_name_or_token>")
+                return
+            # Check if enable_selloff capability exists
+            if not hasattr(strategy, 'enable_selloff_by_identifier'):
+                self.notify("The current strategy does not support position balancer controls.")
+                return
+            safe_ensure_future(self._control_enable_selloff(identifier), loop=self.ev_loop)
+        elif action == "disable_selloff":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control disable_selloff <strategy_name_or_token>")
+                return
+            # Check if disable_selloff capability exists
+            if not hasattr(strategy, 'disable_selloff_by_identifier'):
+                self.notify("The current strategy does not support position balancer controls.")
+                return
+            safe_ensure_future(self._control_disable_selloff(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
-            self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add")
+            self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
+                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -135,12 +180,16 @@ class StrategyControlCommand:
 
             self.notify("\n" + "=" * 80)
             self.notify("\nCommands:")
-            self.notify("  control pause <name_or_token>   - Pause a strategy")
-            self.notify("  control resume <name_or_token>  - Resume a strategy")
-            self.notify("  control pause_all               - Pause all strategies")
-            self.notify("  control resume_all              - Resume all strategies")
-            self.notify("  control remove <name_or_token>  - Remove a strategy (edits config file)")
-            self.notify("  control add <config_file>       - Add strategy from conf/strategies/")
+            self.notify("  control pause <name_or_token>          - Pause a strategy")
+            self.notify("  control resume <name_or_token>         - Resume a strategy")
+            self.notify("  control pause_all                      - Pause all strategies")
+            self.notify("  control resume_all                     - Resume all strategies")
+            self.notify("  control remove <name_or_token>         - Remove a strategy (edits config file)")
+            self.notify("  control add <config_file>              - Add strategy from conf/strategies/")
+            self.notify("  control enable_buyin <name_or_token>   - Enable position balancer buy-in")
+            self.notify("  control disable_buyin <name_or_token>  - Disable position balancer buy-in")
+            self.notify("  control enable_selloff <name_or_token> - Enable position balancer sell-off")
+            self.notify("  control disable_selloff <name_or_token>- Disable position balancer sell-off")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -246,3 +295,79 @@ class StrategyControlCommand:
         except Exception as e:
             self.notify(f"Error adding strategy: {e}")
             self.logger().error(f"Error in control add: {e}", exc_info=True)
+
+    async def _control_enable_buyin(self,  # type: HummingbotApplication
+                                    identifier: str):
+        """Enable buy-in mode for a strategy's position balancer."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.enable_buyin_by_identifier(identifier)
+
+            if success:
+                self.notify(f"\n✓ Buy-in enabled successfully for {identifier}")
+                self.notify("  Position balancer will acquire assets to reach target")
+            else:
+                self.notify(f"\n✗ Failed to enable buy-in for: {identifier}")
+                self.notify("  Strategy may not have position balancer enabled")
+                self.notify("  Use 'control list' to see available strategies")
+
+        except Exception as e:
+            self.notify(f"Error enabling buy-in: {e}")
+            self.logger().error(f"Error in control enable_buyin: {e}", exc_info=True)
+
+    async def _control_disable_buyin(self,  # type: HummingbotApplication
+                                     identifier: str):
+        """Disable buy-in mode for a strategy's position balancer."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.disable_buyin_by_identifier(identifier)
+
+            if success:
+                self.notify(f"\n✓ Buy-in disabled successfully for {identifier}")
+                self.notify("  All buy orders cancelled and tracking cleared")
+            else:
+                self.notify(f"\n✗ Failed to disable buy-in for: {identifier}")
+                self.notify("  Strategy may not have position balancer enabled")
+                self.notify("  Use 'control list' to see available strategies")
+
+        except Exception as e:
+            self.notify(f"Error disabling buy-in: {e}")
+            self.logger().error(f"Error in control disable_buyin: {e}", exc_info=True)
+
+    async def _control_enable_selloff(self,  # type: HummingbotApplication
+                                      identifier: str):
+        """Enable sell-off mode for a strategy's position balancer."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.enable_selloff_by_identifier(identifier)
+
+            if success:
+                self.notify(f"\n✓ Sell-off enabled successfully for {identifier}")
+                self.notify("  Position balancer will reduce assets to reach target")
+            else:
+                self.notify(f"\n✗ Failed to enable sell-off for: {identifier}")
+                self.notify("  Strategy may not have position balancer enabled")
+                self.notify("  Use 'control list' to see available strategies")
+
+        except Exception as e:
+            self.notify(f"Error enabling sell-off: {e}")
+            self.logger().error(f"Error in control enable_selloff: {e}", exc_info=True)
+
+    async def _control_disable_selloff(self,  # type: HummingbotApplication
+                                       identifier: str):
+        """Disable sell-off mode for a strategy's position balancer."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.disable_selloff_by_identifier(identifier)
+
+            if success:
+                self.notify(f"\n✓ Sell-off disabled successfully for {identifier}")
+                self.notify("  All sell orders cancelled and tracking cleared")
+            else:
+                self.notify(f"\n✗ Failed to disable sell-off for: {identifier}")
+                self.notify("  Strategy may not have position balancer enabled")
+                self.notify("  Use 'control list' to see available strategies")
+
+        except Exception as e:
+            self.notify(f"Error disabling sell-off: {e}")
+            self.logger().error(f"Error in control disable_selloff: {e}", exc_info=True)
