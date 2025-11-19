@@ -448,21 +448,40 @@ cdef class PositionBalancerHandler:
             OrderBook ob
             object mp
             object market_tuple
+            int checked_count = 0
+            int matched_count = 0
 
         try:
             for mp in self.strategy._market_pairs:
                 # Check both first and second markets for this asset
                 for market_tuple in [mp.first, mp.second]:
+                    checked_count += 1
                     if market_tuple.base_asset == asset:
+                        matched_count += 1
                         try:
                             ob = market_tuple.market.c_get_order_book(market_tuple.trading_pair)
                             current_bid = ob._best_bid
 
+                            self.strategy.logger().info(
+                                f"Position balancer: Checking {market_tuple.market.name} for {asset}: "
+                                f"bid={current_bid:.8f}, current_best={best_bid:.8f}")
+
                             if current_bid > best_bid:
                                 best_bid = current_bid
                                 best_market = market_tuple
-                        except Exception:
+                        except Exception as e:
+                            self.strategy.logger().warning(
+                                f"Position balancer: Failed to get orderbook for {market_tuple.market.name}: {e}")
                             continue
+
+            if best_market is not None:
+                self.strategy.logger().info(
+                    f"Position balancer: Best buy market for {asset}: {best_market.market.name} "
+                    f"with bid={best_bid:.8f} (checked {checked_count} tuples, {matched_count} matched)")
+            else:
+                self.strategy.logger().warning(
+                    f"Position balancer: No valid buy market found for {asset} "
+                    f"(checked {checked_count} tuples, {matched_count} matched)")
         except Exception as e:
             self.strategy.logger().warning(f"Error finding best buy market for {asset}: {e}")
 
@@ -591,12 +610,21 @@ cdef class PositionBalancerHandler:
                         # Find the best market to buy on (highest bid)
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
+                            self.strategy.logger().info(
+                                f"Position balancer: Selected {selected_buy_market.market.name} for buy order "
+                                f"(asset={asset_key}, shortfall=${shortfall_or_excess:.2f})")
                             # For sell market, just use the other market from the pair
                             # (not critical since we're only buying)
                             selected_sell_market = sell_market_tuple
                             placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
                             if placed:
                                 return True
+                        else:
+                            self.strategy.logger().warning(
+                                f"Position balancer: No valid market found for buy order (asset={asset_key})")
+                else:
+                    self.strategy.logger().info(
+                        f"Position balancer: Skipping buy order - already have active order for {asset_key}")
 
         # Check if we need to sell
         if self._sell_enabled and not self._sell_completed:
