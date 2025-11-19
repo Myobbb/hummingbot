@@ -1125,6 +1125,7 @@ cdef class PositionBalancerHandler:
         """
         Enable buy-in mode and reset completion flag.
         Allows buy-in to restart after target was previously reached.
+        Checks if target is already reached and immediately disables if so.
         """
         if not self._buy_enabled:
             self._buy_enabled = True
@@ -1132,6 +1133,8 @@ cdef class PositionBalancerHandler:
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Buy-in mode enabled - position balancer will acquire assets to reach target")
+            # Check if target is already reached and disable immediately if so
+            self.c_scan_and_mark_completion()
 
     def disable_buy_in(self):
         """
@@ -1149,6 +1152,7 @@ cdef class PositionBalancerHandler:
         """
         Enable sell-off mode and reset completion flag.
         Allows sell-off to restart after target was previously reached.
+        Checks if target is already reached and immediately disables if so.
         """
         if not self._sell_enabled:
             self._sell_enabled = True
@@ -1156,6 +1160,8 @@ cdef class PositionBalancerHandler:
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Sell-off mode enabled - position balancer will reduce assets to reach target")
+            # Check if target is already reached and disable immediately if so
+            self.c_scan_and_mark_completion()
 
     def disable_sell_off(self):
         """
