@@ -156,7 +156,7 @@ from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 from pydantic import BaseModel, Field
@@ -474,9 +474,9 @@ class ArbitrageMInstanceConfig(BaseModel):
         default=1000.0,
         description="Target minimum USD value (buy when below this)"
     )
-    buy_in_spread_pct: float = Field(
+    buy_in_spread_pct: Union[float, str] = Field(
         default=0.1,
-        description="Spread percentage below top bid for buy limit orders (e.g., 0.1 = 0.1%)"
+        description="Spread for buy limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
     # Position balancer configuration - Sell-off
@@ -488,9 +488,9 @@ class ArbitrageMInstanceConfig(BaseModel):
         default=2000.0,
         description="Target maximum USD value (sell when above this)"
     )
-    sell_off_spread_pct: float = Field(
+    sell_off_spread_pct: Union[float, str] = Field(
         default=0.1,
-        description="Spread percentage above top ask for sell limit orders (e.g., 0.1 = 0.1%)"
+        description="Spread for sell limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
     # Position balancer - Order management
