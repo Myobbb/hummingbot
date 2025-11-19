@@ -439,65 +439,14 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_buy_market(self, str asset):
         """
         Find the best market to place a buy order for the given asset.
-        Returns the market tuple with the highest bid price.
+        Returns the market tuple with the LOWEST ASK price (cheapest place to buy).
+        We frontrun by placing limit buy slightly below this ask.
         """
         cdef:
             object best_market = None
-            double best_bid = 0.0
-            double current_bid
-            object ob  # Changed from OrderBook to object for Python compatibility
-            object mp
-            object market_tuple
-            int checked_count = 0
-            int matched_count = 0
-
-        try:
-            for mp in self.strategy._market_pairs:
-                # Check both first and second markets for this asset
-                for market_tuple in [mp.first, mp.second]:
-                    checked_count += 1
-                    if market_tuple.base_asset == asset:
-                        matched_count += 1
-                        try:
-                            # Use Python-level get_order_book for compatibility with all exchanges
-                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
-                            current_bid = float(ob.get_price(False))  # False = bid side
-
-                            self.strategy.logger().info(
-                                f"Position balancer: Checking {market_tuple.market.name} for {asset}: "
-                                f"bid={current_bid:.8f}, current_best={best_bid:.8f}")
-
-                            if current_bid > best_bid:
-                                best_bid = current_bid
-                                best_market = market_tuple
-                        except Exception as e:
-                            self.strategy.logger().warning(
-                                f"Position balancer: Failed to get orderbook for {market_tuple.market.name}: {e}")
-                            continue
-
-            if best_market is not None:
-                self.strategy.logger().info(
-                    f"Position balancer: Best buy market for {asset}: {best_market.market.name} "
-                    f"with bid={best_bid:.8f} (checked {checked_count} tuples, {matched_count} matched)")
-            else:
-                self.strategy.logger().warning(
-                    f"Position balancer: No valid buy market found for {asset} "
-                    f"(checked {checked_count} tuples, {matched_count} matched)")
-        except Exception as e:
-            self.strategy.logger().warning(f"Error finding best buy market for {asset}: {e}")
-
-        return best_market
-
-    cdef object c_find_best_sell_market(self, str asset):
-        """
-        Find the best market to place a sell order for the given asset.
-        Returns the market tuple with the lowest ask price.
-        """
-        cdef:
-            object best_market = None
-            double best_ask = 1e100  # Large number
+            double best_ask = 1e100  # Start with very high number
             double current_ask
-            object ob  # Changed from OrderBook to object for Python compatibility
+            object ob
             object mp
             object market_tuple
 
@@ -517,7 +466,41 @@ cdef class PositionBalancerHandler:
                         except Exception:
                             continue
         except Exception as e:
-            self.strategy.logger().warning(f"Error finding best sell market for {asset}: {e}")
+            self.strategy.logger().warning(f"Position balancer: Error finding best buy market for {asset}: {e}")
+
+        return best_market
+
+    cdef object c_find_best_sell_market(self, str asset):
+        """
+        Find the best market to place a sell order for the given asset.
+        Returns the market tuple with the HIGHEST BID price (best place to sell).
+        We frontrun by placing limit sell slightly above this bid.
+        """
+        cdef:
+            object best_market = None
+            double best_bid = 0.0
+            double current_bid
+            object ob
+            object mp
+            object market_tuple
+
+        try:
+            for mp in self.strategy._market_pairs:
+                # Check both first and second markets for this asset
+                for market_tuple in [mp.first, mp.second]:
+                    if market_tuple.base_asset == asset:
+                        try:
+                            # Use Python-level get_order_book for compatibility with all exchanges
+                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
+                            current_bid = float(ob.get_price(False))  # False = bid side
+
+                            if current_bid > best_bid:
+                                best_bid = current_bid
+                                best_market = market_tuple
+                        except Exception:
+                            continue
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset}: {e}")
 
         return best_market
 
@@ -609,24 +592,15 @@ cdef class PositionBalancerHandler:
                 # Check if already have pending buy order
                 if asset_key not in self._active_buy_orders:
                     if not self.c_try_mark_buy_complete(asset_key, current_value, shortfall_or_excess):
-                        # Find the best market to buy on (highest bid)
+                        # Find the best market to buy on (lowest ask)
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
-                            self.strategy.logger().info(
-                                f"Position balancer: Selected {selected_buy_market.market.name} for buy order "
-                                f"(asset={asset_key}, shortfall=${shortfall_or_excess:.2f})")
                             # For sell market, just use the other market from the pair
                             # (not critical since we're only buying)
                             selected_sell_market = sell_market_tuple
                             placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
                             if placed:
                                 return True
-                        else:
-                            self.strategy.logger().warning(
-                                f"Position balancer: No valid market found for buy order (asset={asset_key})")
-                else:
-                    self.strategy.logger().info(
-                        f"Position balancer: Skipping buy order - already have active order for {asset_key}")
 
         # Check if we need to sell
         if self._sell_enabled and not self._sell_completed:
@@ -675,10 +649,10 @@ cdef class PositionBalancerHandler:
         if quote_bal <= 0:
             return False
 
-        # Get top bid price from order book
+        # Get top ask price from order book (we selected market with lowest ask)
         cdef:
             object ob  # Use object for Python compatibility
-            double top_bid
+            double top_ask
             double buy_price
             double max_affordable_base
             double amount_to_buy
@@ -691,15 +665,16 @@ cdef class PositionBalancerHandler:
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
             ob = market.get_order_book(buy_market_tuple.trading_pair)
-            top_bid = float(ob.get_price(False))  # False = bid side
+            top_ask = float(ob.get_price(True))  # True = ask side
         except Exception:
             return False
 
-        if top_bid <= 0:
+        if top_ask <= 0:
             return False
 
-        # Calculate limit price: top_bid * (1 - spread_pct)
-        buy_price = top_bid * (1.0 - self._buy_spread_pct)
+        # Calculate limit price: frontrun by placing slightly below top ask
+        # With spread_pct=0, we place AT the ask. With spread_pct>0, we place below ask.
+        buy_price = top_ask * (1.0 - self._buy_spread_pct)
 
         # Calculate amount based on shortfall, available quote, and order size limit
         max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
@@ -819,10 +794,10 @@ cdef class PositionBalancerHandler:
         if base_bal_raw <= 0:
             return False
 
-        # Get top ask price from order book
+        # Get top bid price from order book (we selected market with highest bid)
         cdef:
             object ob  # Use object for Python compatibility
-            double top_ask
+            double top_bid
             double sell_price
             double amount_to_sell
             object quantized_amount
@@ -834,15 +809,16 @@ cdef class PositionBalancerHandler:
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
             ob = market.get_order_book(sell_market_tuple.trading_pair)
-            top_ask = float(ob.get_price(True))  # True = ask side
+            top_bid = float(ob.get_price(False))  # False = bid side
         except Exception:
             return False
 
-        if top_ask <= 0:
+        if top_bid <= 0:
             return False
 
-        # Calculate limit price: top_ask * (1 + spread_pct)
-        sell_price = top_ask * (1.0 + self._sell_spread_pct)
+        # Calculate limit price: frontrun by placing slightly above top bid
+        # With spread_pct=0, we place AT the bid. With spread_pct>0, we place above bid.
+        sell_price = top_bid * (1.0 + self._sell_spread_pct)
 
         # Calculate amount based on excess, available base, and order size limit
         max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
