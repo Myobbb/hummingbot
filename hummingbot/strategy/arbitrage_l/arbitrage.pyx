@@ -758,6 +758,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object order_type = order_filled_event.order_type
             string order_id_str = self._to_cpp_str(order_id)
             object market_pair_tuple
+            double filled_amount
         # Track fills for any order type (we only change cooldown logic for MARKET)
         try:
             self._orders_with_fills.add(order_id)
@@ -766,6 +767,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._order_fill_timestamps[order_id] = self._current_timestamp
         except Exception:
             pass
+
+        # Notify position balancer of fill for partial fill tracking
+        if self._position_balancer is not None:
+            try:
+                filled_amount = float(order_filled_event.amount)
+                self._position_balancer.handle_order_fill(order_id, filled_amount)
+            except Exception:
+                pass
 
         # If we previously enforced cooldown due to cancel/timeout, remove it upon seeing fills
         market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)

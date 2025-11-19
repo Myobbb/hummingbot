@@ -128,21 +128,91 @@ cdef class PositionBalancerHandler:
         """Returns True if sell-off target has been reached."""
         return self._sell_completed
 
+    cdef void c_cancel_all_buy_orders(self):
+        """Cancel all active buy orders and clean up tracking."""
+        cdef:
+            list assets_to_cancel = list(self._active_buy_orders.keys())
+            str asset
+            str order_id
+
+        for asset in assets_to_cancel:
+            order_id = self._active_buy_orders.get(asset)
+            if order_id:
+                try:
+                    # Find market tuple for this order
+                    for mp in self.strategy._market_pairs:
+                        if mp.first.base_asset == asset:
+                            # Mark as timeout-cancelled to prevent cooldown
+                            self.strategy._timeout_cancelled_orders.add(order_id)
+                            # Remove from position balancer tracking
+                            self.strategy._position_balancer_orders.discard(order_id)
+                            # Cancel the order
+                            self.strategy.c_cancel_order(mp.first, order_id)
+                            self.strategy.logger().info(
+                                f"Position balancer: Cancelled buy order {order_id} for {asset} (target reached)")
+                            break
+                except Exception as e:
+                    self.strategy.logger().warning(
+                        f"Position balancer: Failed to cancel buy order {order_id}: {e}")
+
+        # Clear all buy tracking
+        self._active_buy_orders.clear()
+        self._pending_buy_orders.clear()
+        self._pending_buy_by_asset.clear()
+        self._last_buy_order_time.clear()
+
+    cdef void c_cancel_all_sell_orders(self):
+        """Cancel all active sell orders and clean up tracking."""
+        cdef:
+            list assets_to_cancel = list(self._active_sell_orders.keys())
+            str asset
+            str order_id
+
+        for asset in assets_to_cancel:
+            order_id = self._active_sell_orders.get(asset)
+            if order_id:
+                try:
+                    # Find market tuple for this order
+                    for mp in self.strategy._market_pairs:
+                        if mp.first.base_asset == asset:
+                            # Mark as timeout-cancelled to prevent cooldown
+                            self.strategy._timeout_cancelled_orders.add(order_id)
+                            # Remove from position balancer tracking
+                            self.strategy._position_balancer_orders.discard(order_id)
+                            # Cancel the order
+                            self.strategy.c_cancel_order(mp.first, order_id)
+                            self.strategy.logger().info(
+                                f"Position balancer: Cancelled sell order {order_id} for {asset} (target reached)")
+                            break
+                except Exception as e:
+                    self.strategy.logger().warning(
+                        f"Position balancer: Failed to cancel sell order {order_id}: {e}")
+
+        # Clear all sell tracking
+        self._active_sell_orders.clear()
+        self._pending_sell_orders.clear()
+        self._pending_sell_by_asset.clear()
+        self._last_sell_order_time.clear()
+
     cdef void c_maybe_disable_buy(self):
-        """Disable buy-in globally once target is reached."""
+        """Disable buy-in globally once target is reached, cancel orders, and clean up."""
         if self._buy_completed and self._buy_enabled:
             self._buy_enabled = False
+            # Cancel all active buy orders
+            self.c_cancel_all_buy_orders()
             self.strategy.log_with_clock(
                 logging.INFO,
-                "Buy-in target reached. Disabling buy-in for this session.")
+                "Buy-in target reached. Cancelled all buy orders and disabled buy-in for this session.")
 
     cdef void c_maybe_disable_sell(self):
-        """Disable sell-off globally once target is reached."""
+        """Disable sell-off globally once target is reached, cancel orders, and clean up."""
         if self._sell_completed and self._sell_enabled:
             self._sell_enabled = False
+            # Cancel all active sell orders
+            self.c_cancel_all_sell_orders()
             self.strategy.log_with_clock(
                 logging.INFO,
-                "Sell-off target reached. Disabling sell-off for this session.")
+                "Sell-off target reached. Cancelled all sell orders and disabled sell-off for this session.")
 
     cdef double c_get_pending_buy_base(self, str asset):
         """Return in-flight buy order base amount for asset."""
@@ -330,8 +400,42 @@ cdef class PositionBalancerHandler:
         self.c_maybe_disable_buy()
         self.c_maybe_disable_sell()
 
+    def handle_order_fill(self, str order_id, double filled_amount):
+        """
+        Update pending amounts when order receives a fill.
+        This ensures accurate balance tracking for partial fills.
+        """
+        try:
+            # Check if this is a buy order
+            if order_id in self._pending_buy_orders:
+                asset_key, total_amt, prev_filled = self._pending_buy_orders[order_id]
+                new_filled = prev_filled + filled_amount
+                self._pending_buy_orders[order_id] = (asset_key, total_amt, new_filled)
+                # Subtract filled amount from pending (it's now in our balance)
+                self._pending_buy_by_asset[asset_key] = max(
+                    0.0,
+                    float(self._pending_buy_by_asset.get(asset_key, 0.0)) - filled_amount)
+                if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
+                    self._pending_buy_by_asset.pop(asset_key, None)
+            # Check if this is a sell order
+            elif order_id in self._pending_sell_orders:
+                asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
+                new_filled = prev_filled + filled_amount
+                self._pending_sell_orders[order_id] = (asset_key, total_amt, new_filled)
+                # Subtract filled amount from pending (we've sold it)
+                self._pending_sell_by_asset[asset_key] = max(
+                    0.0,
+                    float(self._pending_sell_by_asset.get(asset_key, 0.0)) - filled_amount)
+                if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
+                    self._pending_sell_by_asset.pop(asset_key, None)
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to handle fill for {order_id}: {e}")
+
     def handle_order_completion(self, str order_id, bint is_buy):
-        """Clean up pending order tracking on order completion."""
+        """
+        Clean up pending order tracking on order completion.
+        Only subtracts unfilled amount (filled amounts already subtracted in handle_order_fill).
+        """
         try:
             # Remove from position balancer tracking set
             self.strategy._position_balancer_orders.discard(order_id)
@@ -339,29 +443,35 @@ cdef class PositionBalancerHandler:
             if is_buy:
                 pend = self._pending_buy_orders.pop(order_id, None)
                 if pend is not None:
-                    asset_key, amt = pend
-                    self._pending_buy_by_asset[asset_key] = max(
-                        0.0,
-                        float(self._pending_buy_by_asset.get(asset_key, 0.0)) - float(amt))
-                    if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
-                        self._pending_buy_by_asset.pop(asset_key, None)
+                    asset_key, total_amt, filled_amt = pend
+                    unfilled_amt = total_amt - filled_amt
+                    # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
+                    if unfilled_amt > 0:
+                        self._pending_buy_by_asset[asset_key] = max(
+                            0.0,
+                            float(self._pending_buy_by_asset.get(asset_key, 0.0)) - unfilled_amt)
+                        if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
+                            self._pending_buy_by_asset.pop(asset_key, None)
                     # Remove from active tracking
                     if self._active_buy_orders.get(asset_key) == order_id:
                         self._active_buy_orders.pop(asset_key, None)
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
                 if pend is not None:
-                    asset_key, amt = pend
-                    self._pending_sell_by_asset[asset_key] = max(
-                        0.0,
-                        float(self._pending_sell_by_asset.get(asset_key, 0.0)) - float(amt))
-                    if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
-                        self._pending_sell_by_asset.pop(asset_key, None)
+                    asset_key, total_amt, filled_amt = pend
+                    unfilled_amt = total_amt - filled_amt
+                    # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
+                    if unfilled_amt > 0:
+                        self._pending_sell_by_asset[asset_key] = max(
+                            0.0,
+                            float(self._pending_sell_by_asset.get(asset_key, 0.0)) - unfilled_amt)
+                        if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
+                            self._pending_sell_by_asset.pop(asset_key, None)
                     # Remove from active tracking
                     if self._active_sell_orders.get(asset_key) == order_id:
                         self._active_sell_orders.pop(asset_key, None)
-        except Exception:
-            pass
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
 
     def handle_order_cancellation(self, str order_id):
         """Clean up pending order tracking on order cancellation."""
@@ -505,15 +615,30 @@ cdef class PositionBalancerHandler:
         return best_market
 
     cdef void c_cancel_stale_orders(self, str asset):
-        """Cancel stale buy/sell limit orders for refresh."""
+        """
+        Cancel stale buy/sell limit orders for refresh.
+        Also cancels orphaned orders if mode is disabled.
+        """
         cdef double current_time = self.strategy._current_timestamp
 
         # Check buy orders
         if asset in self._active_buy_orders:
-            last_time = self._last_buy_order_time.get(asset, 0.0)
-            if current_time - last_time > self._limit_refresh_interval:
-                order_id = self._active_buy_orders.get(asset)
-                if order_id:
+            order_id = self._active_buy_orders.get(asset)
+            if order_id:
+                last_time = self._last_buy_order_time.get(asset, 0.0)
+                should_cancel = False
+                cancel_reason = ""
+
+                # Cancel if mode disabled (orphaned order)
+                if not self._buy_enabled:
+                    should_cancel = True
+                    cancel_reason = "mode disabled"
+                # Cancel if stale (needs refresh)
+                elif current_time - last_time > self._limit_refresh_interval:
+                    should_cancel = True
+                    cancel_reason = "refresh"
+
+                if should_cancel:
                     try:
                         # Find market tuple for this order
                         for mp in self.strategy._market_pairs:
@@ -522,20 +647,32 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
-
+                                # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
-                                    f"Cancelled stale buy order {order_id} for {asset} (refresh)")
+                                    f"Position balancer: Cancelled buy order {order_id} for {asset} ({cancel_reason})")
                                 break
                     except Exception as e:
-                        self.strategy.logger().warning(f"Failed to cancel stale buy order: {e}")
+                        self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order: {e}")
 
         # Check sell orders
         if asset in self._active_sell_orders:
-            last_time = self._last_sell_order_time.get(asset, 0.0)
-            if current_time - last_time > self._limit_refresh_interval:
-                order_id = self._active_sell_orders.get(asset)
-                if order_id:
+            order_id = self._active_sell_orders.get(asset)
+            if order_id:
+                last_time = self._last_sell_order_time.get(asset, 0.0)
+                should_cancel = False
+                cancel_reason = ""
+
+                # Cancel if mode disabled (orphaned order)
+                if not self._sell_enabled:
+                    should_cancel = True
+                    cancel_reason = "mode disabled"
+                # Cancel if stale (needs refresh)
+                elif current_time - last_time > self._limit_refresh_interval:
+                    should_cancel = True
+                    cancel_reason = "refresh"
+
+                if should_cancel:
                     try:
                         # Find market tuple for this order
                         for mp in self.strategy._market_pairs:
@@ -544,13 +681,13 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
-
+                                # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
-                                    f"Cancelled stale sell order {order_id} for {asset} (refresh)")
+                                    f"Position balancer: Cancelled sell order {order_id} for {asset} ({cancel_reason})")
                                 break
                     except Exception as e:
-                        self.strategy.logger().warning(f"Failed to cancel stale sell order: {e}")
+                        self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order: {e}")
 
     cdef bint c_handle_position_balancing(self, object buy_market_tuple, object sell_market_tuple):
         """
@@ -745,9 +882,9 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
-        # Track in balancer
+        # Track in balancer (asset_key, total_amount, filled_amount)
         try:
-            self._pending_buy_orders[buy_order_id] = (asset_key, float(quantized_amount))
+            self._pending_buy_orders[buy_order_id] = (asset_key, float(quantized_amount), 0.0)
             self._pending_buy_by_asset[asset_key] = (
                 float(self._pending_buy_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_buy_orders[asset_key] = buy_order_id
@@ -888,9 +1025,9 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
-        # Track in balancer
+        # Track in balancer (asset_key, total_amount, filled_amount)
         try:
-            self._pending_sell_orders[sell_order_id] = (asset_key, float(quantized_amount))
+            self._pending_sell_orders[sell_order_id] = (asset_key, float(quantized_amount), 0.0)
             self._pending_sell_by_asset[asset_key] = (
                 float(self._pending_sell_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_sell_orders[asset_key] = sell_order_id
