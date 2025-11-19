@@ -12,10 +12,12 @@ cdef class PositionBalancerHandler:
         bint _buy_enabled
         double _buy_target_usd
         double _buy_spread_pct
+        bint _buy_spread_is_min
         # Sell-off configuration
         bint _sell_enabled
         double _sell_target_usd
         double _sell_spread_pct
+        bint _sell_spread_is_min
         # Order size configuration
         double _order_size_usd
         # Completion tracking
