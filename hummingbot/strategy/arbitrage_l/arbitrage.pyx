@@ -577,32 +577,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # Not enough edge for normal arbitrage. Still try position balancing.
                 # Attempt with current best direction (respect pending/cool-off)
                 placed = False
-                ready_orders = self.c_ready_for_new_orders([best_buy, best_sell])
-                books_ready = self.c_books_ready_for_direction(best_buy, best_sell)
-                self.logger().info(
-                    f"Position balancer path 2: ready_orders={ready_orders}, books_ready={books_ready}, "
-                    f"best_buy={best_buy.market.name}, best_sell={best_sell.market.name}")
-                if ready_orders and books_ready:
+                if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
                     placed = self._position_balancer.c_handle_position_balancing(best_buy, best_sell) or False
                 # Also attempt reversed only if nothing was placed in current direction
                 if (not placed) and self._position_balancer.is_active:
-                    ready_orders_rev = self.c_ready_for_new_orders([best_sell, best_buy])
-                    books_ready_rev = self.c_books_ready_for_direction(best_sell, best_buy)
-                    self.logger().info(
-                        f"Position balancer path 2-reverse: ready_orders={ready_orders_rev}, "
-                        f"books_ready={books_ready_rev}")
-                    if ready_orders_rev and books_ready_rev:
+                    if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
                         self._position_balancer.c_handle_position_balancing(best_sell, best_buy)
             elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is None:
                 # No arbitrageable pair found. Proactively scan all pairs for position balancing.
-                self.logger().info("Position balancer path 3: Scanning all market pairs (no profitable opportunity found)")
                 for market_pair in self._market_pairs:
-                    ready_orders = self.c_ready_for_new_orders([market_pair.first, market_pair.second])
-                    books_ready = self.c_books_ready_for_direction(market_pair.first, market_pair.second)
-                    self.logger().info(
-                        f"Position balancer path 3: Checking {market_pair.first.market.name}/{market_pair.second.market.name} - "
-                        f"ready_orders={ready_orders}, books_ready={books_ready}")
-                    if ready_orders and books_ready:
+                    if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                         if self._position_balancer.c_handle_position_balancing(market_pair.first, market_pair.second):
                             break
 
