@@ -343,7 +343,7 @@ class ArbitrageMInstanceConfig(BaseModel):
 
     Timing (arbitrage_l defaults):
       - status_report_interval: 60.0 (seconds)
-      - next_trade_delay_interval: 4.0 (seconds)
+      - next_trade_delay_interval: 2.0 (seconds)
       - order_timeout: 180.0 (seconds)
       - filled_order_timeout: 3600.0 (seconds, arbitrage_l only)
 
