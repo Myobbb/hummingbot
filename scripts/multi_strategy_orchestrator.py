@@ -405,16 +405,16 @@ class ArbitrageMInstanceConfig(BaseModel):
     Position Balancer (arbitrage_l uses this to manage inventory):
       Buy-in (acquire assets when below target):
         - buy_in_enabled: False
-        - buy_in_target_usd: 1000.0 (USD, minimum asset value)
-        - buy_in_spread_pct: 0.1 (%, spread below top bid for buy limit orders)
+        - buy_in_target_usd: 1100.0 (USD, minimum asset value)
+        - buy_in_spread_pct: min (%, spread below top bid for buy limit orders)
 
       Sell-off (reduce assets when above target):
         - sell_off_enabled: False
-        - sell_off_target_usd: 2000.0 (USD, maximum asset value)
-        - sell_off_spread_pct: 0.1 (%, spread above top ask for sell limit orders)
+        - sell_off_target_usd: 3000.0 (USD, maximum asset value)
+        - sell_off_spread_pct: min (%, spread above top ask for sell limit orders)
 
       Order Management:
-        - position_balancer_refresh_interval: 10.0 (seconds, how often to refresh limit orders)
+        - position_balancer_refresh_interval: 600.0 (seconds, how often to refresh limit orders)
         - position_balancer_order_size_usd: 100.0 (USD, maximum order size per position balancer order)
 
     Timing (arbitrage_l defaults):
@@ -447,7 +447,7 @@ class ArbitrageMInstanceConfig(BaseModel):
 
     # Profitability
     min_profitability: Decimal = Field(
-        default=Decimal("0.5"),
+        default=Decimal("1.5"),
         description="Minimum profitability percentage (e.g., 0.5 for 0.5%)"
     )
 
@@ -471,11 +471,11 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Enable buy-in to acquire assets when below target"
     )
     buy_in_target_usd: float = Field(
-        default=1000.0,
+        default=1100.0,
         description="Target minimum USD value (buy when below this)"
     )
     buy_in_spread_pct: Union[float, str] = Field(
-        default=0.1,
+        default=min,
         description="Spread for buy limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
@@ -485,17 +485,17 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Enable sell-off to reduce assets when above target"
     )
     sell_off_target_usd: float = Field(
-        default=2000.0,
+        default=3000.0,
         description="Target maximum USD value (sell when above this)"
     )
     sell_off_spread_pct: Union[float, str] = Field(
-        default=0.1,
+        default=min,
         description="Spread for sell limit orders: float (e.g., 0.1 = 0.1%) or 'min' (minimum tick)"
     )
 
     # Position balancer - Order management
     position_balancer_refresh_interval: float = Field(
-        default=10.0,
+        default=600.0,
         description="How often to cancel and replace limit orders (seconds)"
     )
     position_balancer_order_size_usd: float = Field(

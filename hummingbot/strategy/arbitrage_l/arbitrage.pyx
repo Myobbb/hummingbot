@@ -102,7 +102,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     min_profitability: Decimal,
                     logging_options: int = OPTION_LOG_STATUS_REPORT,
                     status_report_interval: float = 60.0,
-                    next_trade_delay_interval: float = 4.0,
+                    next_trade_delay_interval: float = 2.0,
                     order_timeout: float = 180.0,
                     filled_order_timeout: float = DEFAULT_FILLED_ORDER_TIMEOUT,
                     use_oracle_conversion_rate: bool = False,
@@ -115,14 +115,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
                     # Position balancer - buy-in configuration
                     buy_in_enabled: bool = True,
-                    buy_in_target_usd: float = 100.0,
-                    buy_in_spread_pct: object = 0.1,  # float or 'min'
+                    buy_in_target_usd: float = 1100.0,
+                    buy_in_spread_pct: object = min,  # float or 'min'
                     # Position balancer - sell-off configuration
                     sell_off_enabled: bool = False,
-                    sell_off_target_usd: float = 1000.0,
-                    sell_off_spread_pct: object = 0.1,  # float or 'min'
+                    sell_off_target_usd: float = 3000.0,
+                    sell_off_spread_pct: object = min,  # float or 'min'
                     # Position balancer - order management
-                    position_balancer_refresh_interval: float = 10.0,
+                    position_balancer_refresh_interval: float = 600.0,
                     position_balancer_order_size_usd: float = 100.0,
                     orchestrated_mode: bool = False):
         """Initialize arbitrage strategy with configurable parameters"""
