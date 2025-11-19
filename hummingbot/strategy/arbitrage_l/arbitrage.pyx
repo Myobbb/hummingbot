@@ -202,7 +202,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
 
         # Position balancer handler (create if either buy or sell enabled)
-        if buy_in_enabled or sell_off_enabled:
+        if buy_in_target_usd > 0 or sell_off_target_usd > 0:
             self._position_balancer = PositionBalancerHandler(
                 self,
                 buy_in_enabled,
