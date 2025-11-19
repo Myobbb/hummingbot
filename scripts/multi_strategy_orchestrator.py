@@ -1508,6 +1508,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if hasattr(strategy_instance, 'strategy'):
             self.logger().info(f"DEBUG enable_buyin: strategy type = {type(strategy_instance.strategy)}")
             self.logger().info(f"DEBUG enable_buyin: strategy has '_position_balancer' = {hasattr(strategy_instance.strategy, '_position_balancer')}")
+
+            # Check all attributes on the strategy object
+            strategy_attrs = [attr for attr in dir(strategy_instance.strategy) if '_position' in attr.lower() or '_balancer' in attr.lower()]
+            self.logger().info(f"DEBUG enable_buyin: strategy attributes with 'position' or 'balancer': {strategy_attrs}")
+
+            # Try to access via getattr with default
+            pb = getattr(strategy_instance.strategy, '_position_balancer', 'ATTRIBUTE_NOT_FOUND')
+            self.logger().info(f"DEBUG enable_buyin: getattr(_position_balancer) = {type(pb)} - {pb}")
+
             if hasattr(strategy_instance.strategy, '_position_balancer'):
                 self.logger().info(f"DEBUG enable_buyin: _position_balancer is None = {strategy_instance.strategy._position_balancer is None}")
 
