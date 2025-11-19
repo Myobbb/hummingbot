@@ -1,6 +1,7 @@
 # distutils: language=c++
 from hummingbot.strategy.strategy_base cimport StrategyBase
 from hummingbot.connector.exchange_base cimport ExchangeBase
+from hummingbot.strategy.arbitrage_l.position_balancer_handler cimport PositionBalancerHandler
 from libc.stdint cimport int64_t
 from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
@@ -50,7 +51,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _last_rate_update
         
         # Position balancer handler (None when disabled)
-        object _position_balancer
+        PositionBalancerHandler _position_balancer
+
 
 
         # Order tracking - single unified map
