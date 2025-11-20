@@ -1148,6 +1148,37 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         return None
 
+    def _resolve_identifier_to_name(self, identifier: str, log_token_match: bool = True) -> Optional[str]:
+        """
+        Resolve an identifier (name or token) to a strategy name.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            log_token_match: Whether to log when a token match is found
+
+        Returns:
+            Strategy name if found, None otherwise
+        """
+        # First try exact name match
+        strategy_instance = next((s for s in self.strategies if s.name == identifier), None)
+        if strategy_instance:
+            return identifier
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            if log_token_match:
+                self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return strategy_instance.name
+
+        # Not found
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return None
+
     def pause_strategy_by_identifier(self, identifier: str) -> bool:
         """
         Pause a strategy by full name or token symbol.
@@ -1158,28 +1189,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match (silently)
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.pause_strategy(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.pause_strategy(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.pause_strategy(strategy_name) if strategy_name else False
 
     def resume_strategy_by_identifier(self, identifier: str) -> bool:
         """
@@ -1191,28 +1202,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match (silently)
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.resume_strategy(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.resume_strategy(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.resume_strategy(strategy_name) if strategy_name else False
 
     def pause_strategy(self, strategy_name: str) -> bool:
         """
@@ -1353,28 +1344,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.enable_buyin(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.enable_buyin(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.enable_buyin(strategy_name) if strategy_name else False
 
     def disable_buyin_by_identifier(self, identifier: str) -> bool:
         """
@@ -1386,28 +1357,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.disable_buyin(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.disable_buyin(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.disable_buyin(strategy_name) if strategy_name else False
 
     def enable_selloff_by_identifier(self, identifier: str) -> bool:
         """
@@ -1419,28 +1370,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.enable_selloff(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.enable_selloff(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.enable_selloff(strategy_name) if strategy_name else False
 
     def disable_selloff_by_identifier(self, identifier: str) -> bool:
         """
@@ -1452,28 +1383,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.disable_selloff(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.disable_selloff(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.disable_selloff(strategy_name) if strategy_name else False
 
     def enable_buyin(self, strategy_name: str) -> bool:
         """
@@ -1634,28 +1545,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_buy_target(identifier, target_usd)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_buy_target(strategy_instance.name, target_usd)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_buy_target(strategy_name, target_usd) if strategy_name else False
 
     def set_buy_target(self, strategy_name: str, target_usd: float) -> bool:
         """
@@ -1710,28 +1601,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_sell_target(identifier, target_usd)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_sell_target(strategy_instance.name, target_usd)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_sell_target(strategy_name, target_usd) if strategy_name else False
 
     def set_sell_target(self, strategy_name: str, target_usd: float) -> bool:
         """
@@ -1786,28 +1657,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_buy_spread(identifier, spread_pct)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_buy_spread(strategy_instance.name, spread_pct)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_buy_spread(strategy_name, spread_pct) if strategy_name else False
 
     def set_buy_spread(self, strategy_name: str, spread_pct) -> bool:
         """
@@ -1858,28 +1709,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_sell_spread(identifier, spread_pct)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_sell_spread(strategy_instance.name, spread_pct)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_sell_spread(strategy_name, spread_pct) if strategy_name else False
 
     def set_sell_spread(self, strategy_name: str, spread_pct) -> bool:
         """
@@ -1930,28 +1761,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_order_size(identifier, order_size_usd)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_order_size(strategy_instance.name, order_size_usd)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_order_size(strategy_name, order_size_usd) if strategy_name else False
 
     def set_order_size(self, strategy_name: str, order_size_usd: float) -> bool:
         """
@@ -2006,28 +1817,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.set_refresh_interval(identifier, refresh_interval)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.set_refresh_interval(strategy_instance.name, refresh_interval)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_refresh_interval(strategy_name, refresh_interval) if strategy_name else False
 
     def set_refresh_interval(self, strategy_name: str, refresh_interval: float) -> bool:
         """
@@ -2081,28 +1872,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # First try exact name match (silently)
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == identifier),
-            None
-        )
-
-        if strategy_instance:
-            return self.remove_strategy(identifier)
-
-        # If not found by name, try token lookup
-        strategy_instance = self._find_strategy_by_token(identifier)
-        if strategy_instance:
-            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
-            return self.remove_strategy(strategy_instance.name)
-
-        # Not found by either method
-        self.logger().error(
-            f"No strategy found for '{identifier}'. "
-            f"Available: {[s.name for s in self.strategies]}. "
-            f"Use list_arb() for details."
-        )
-        return False
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.remove_strategy(strategy_name) if strategy_name else False
 
     def remove_strategy(self, strategy_name: str) -> bool:
         """
@@ -2348,7 +2119,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
     def _convert_single_to_multi_config(self, single_config: Dict[str, Any], source_file: str) -> Optional[Dict[str, Any]]:
-        """Convert single-strategy config format to multi-strategy format."""
+        """
+        Convert single-strategy config format to multi-strategy format.
+        Only includes fields that are explicitly set in the source config or required.
+        All other fields use defaults from ArbitrageMInstanceConfig.
+        """
         try:
             # Generate strategy name from config if not provided
             name = single_config.get('name')
@@ -2358,43 +2133,56 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 base_name = base_name.replace('conf_', '').replace('_strategy', '')
                 name = base_name
 
-            # Parse additional_markets field (can be string or list)
-            additional_markets = single_config.get('additional_markets', [])
-            if isinstance(additional_markets, str):
-                if additional_markets.strip():
-                    # Parse comma-separated string: "mexc:SLF-USDT, htx:SLF-USDT"
-                    additional_markets = [m.strip() for m in additional_markets.split(',') if m.strip()]
-                else:
-                    additional_markets = []
-
-            # Build multi-strategy config
+            # Start with required fields only
             multi_config = {
                 'name': name,
                 'primary_market': single_config['primary_market'],
                 'secondary_market': single_config['secondary_market'],
                 'primary_trading_pair': single_config['primary_market_trading_pair'],
                 'secondary_trading_pair': single_config['secondary_market_trading_pair'],
-                'min_profitability': single_config.get('min_profitability', 0.5),
-                'use_oracle_conversion_rate': single_config.get('use_oracle_conversion_rate', False),
-                'secondary_to_primary_base_conversion_rate': single_config.get('secondary_to_primary_base_conversion_rate', 1.0),
-                'secondary_to_primary_quote_conversion_rate': single_config.get('secondary_to_primary_quote_conversion_rate', 1.0),
-                # Position balancer - buy-in configuration
-                'buy_in_enabled': single_config.get('buy_in_enabled', False),
-                'buy_in_target_usd': single_config.get('buy_in_target_usdt', single_config.get('buy_in_target_usd', 1000.0)),
-                'buy_in_spread_pct': single_config.get('buy_in_spread_pct', 0.1),
-                # Position balancer - sell-off configuration (new, defaults to disabled)
-                'sell_off_enabled': single_config.get('sell_off_enabled', False),
-                'sell_off_target_usd': single_config.get('sell_off_target_usd', 2000.0),
-                'sell_off_spread_pct': single_config.get('sell_off_spread_pct', 0.1),
-                # Position balancer - order management
-                'position_balancer_refresh_interval': single_config.get('position_balancer_refresh_interval', 10.0),
-                'position_balancer_order_size_usd': single_config.get('position_balancer_order_size_usd', 100.0),
-                # Timing parameters
-                'status_report_interval': single_config.get('status_report_interval', 60.0),
-                'next_trade_delay_interval': single_config.get('next_trade_delay_interval', 2.0),
-                'order_timeout': single_config.get('order_timeout', 300.0),
-                'additional_markets': additional_markets,
             }
+
+            # Only add optional fields if they exist in source config
+            optional_fields = [
+                'strategy_type',
+                'min_profitability',
+                'use_oracle_conversion_rate',
+                'secondary_to_primary_base_conversion_rate',
+                'secondary_to_primary_quote_conversion_rate',
+                'buy_in_enabled',
+                'buy_in_target_usd',
+                'buy_in_target_usdt',  # Legacy field
+                'buy_in_spread_pct',
+                'buy_in_min_profitability',
+                'sell_off_enabled',
+                'sell_off_target_usd',
+                'sell_off_spread_pct',
+                'position_balancer_refresh_interval',
+                'position_balancer_order_size_usd',
+                'status_report_interval',
+                'next_trade_delay_interval',
+                'order_timeout',
+                'filled_order_timeout',
+            ]
+
+            for field in optional_fields:
+                if field in single_config and single_config[field] is not None:
+                    # Handle legacy buy_in_target_usdt -> buy_in_target_usd rename
+                    if field == 'buy_in_target_usdt':
+                        multi_config['buy_in_target_usd'] = single_config[field]
+                    else:
+                        multi_config[field] = single_config[field]
+
+            # Handle additional_markets (can be string or list)
+            if 'additional_markets' in single_config:
+                additional_markets = single_config['additional_markets']
+                if isinstance(additional_markets, str):
+                    if additional_markets.strip():
+                        # Parse comma-separated string: "mexc:SLF-USDT, htx:SLF-USDT"
+                        multi_config['additional_markets'] = [m.strip() for m in additional_markets.split(',') if m.strip()]
+                    # Empty string means no additional markets - use default
+                elif isinstance(additional_markets, list) and additional_markets:
+                    multi_config['additional_markets'] = additional_markets
 
             return multi_config
 
