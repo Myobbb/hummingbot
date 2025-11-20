@@ -289,11 +289,22 @@ cdef class PositionBalancerHandler:
             return 0.0
         return total
 
+    cdef double c_get_actual_base_balance(self, str asset):
+        """
+        Get ACTUAL base balance without including pending unfilled orders.
+        This is used for target completion checking.
+        Only counts what's actually in the wallet, not what's in open orders.
+        """
+        return self.c_get_aggregated_base_balance(asset)
+
     cdef double c_get_adjusted_base_balance(self, str asset):
         """
         Get adjusted base balance accounting for pending orders.
         For buy target checking: add pending buys
         For sell target checking: subtract pending sells
+
+        This is used for deciding whether to place NEW orders,
+        to avoid over-ordering when we already have pending orders.
         """
         cdef double agg = self.c_get_aggregated_base_balance(asset)
         cdef double pending_buy = self.c_get_pending_buy_base(asset)
@@ -345,6 +356,8 @@ cdef class PositionBalancerHandler:
             str asset_key
             double last_bid = 0.0
             double base_bal
+            double pending_buy
+            double pending_sell
             pair[double, double] val_short
             pair[double, double] val_excess
             double current_value_quote
@@ -367,15 +380,12 @@ cdef class PositionBalancerHandler:
         # Build balances
         unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
 
-        # Sum base balance
+        # Sum base balance - USE ACTUAL BALANCE for target completion checking
+        # Do NOT include pending orders here, only count what's actually filled
         base_bal = 0.0
         for t in unique_tuples:
             if t.base_asset == asset_key:
                 base_bal += float(balance_map.get((t.market.name, asset_key), 0.0))
-
-        # Include pending orders
-        base_bal += self.c_get_pending_buy_base(asset_key)
-        base_bal -= self.c_get_pending_sell_base(asset_key)
 
         # Check buy completion
         if self._buy_enabled and not self._buy_completed:
@@ -386,10 +396,11 @@ cdef class PositionBalancerHandler:
             try:
                 decision = "complete" if (current_value_quote >= self._buy_target_usd or
                                          (shortfall > 0 and shortfall < self.strategy._min_order_usd)) else "active"
+                pending_buy = self.c_get_pending_buy_base(asset_key)
                 self.strategy.log_with_clock(
                     logging.INFO,
-                    f"Buy-in check: asset={asset_key} base={base_bal:.6f} bid={last_bid:.6f} "
-                    f"value={current_value_quote:.6f} target={self._buy_target_usd:.6f} -> {decision}")
+                    f"Buy-in check: asset={asset_key} actual_base={base_bal:.6f} pending={pending_buy:.6f} "
+                    f"bid={last_bid:.6f} value={current_value_quote:.6f} target={self._buy_target_usd:.6f} -> {decision}")
             except Exception:
                 pass
 
@@ -404,10 +415,11 @@ cdef class PositionBalancerHandler:
             try:
                 decision = "complete" if (current_value_quote <= self._sell_target_usd or
                                          (excess > 0 and excess < self.strategy._min_order_usd)) else "active"
+                pending_sell = self.c_get_pending_sell_base(asset_key)
                 self.strategy.log_with_clock(
                     logging.INFO,
-                    f"Sell-off check: asset={asset_key} base={base_bal:.6f} bid={last_bid:.6f} "
-                    f"value={current_value_quote:.6f} target={self._sell_target_usd:.6f} -> {decision}")
+                    f"Sell-off check: asset={asset_key} actual_base={base_bal:.6f} pending={pending_sell:.6f} "
+                    f"bid={last_bid:.6f} value={current_value_quote:.6f} target={self._sell_target_usd:.6f} -> {decision}")
             except Exception:
                 pass
 
@@ -730,7 +742,9 @@ cdef class PositionBalancerHandler:
             str asset_key = buy_market_tuple.base_asset
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
             double base_bal = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_actual
             pair[double, double] val_result
+            pair[double, double] val_result_actual
             double current_value
             double shortfall_or_excess
             bint placed = False
@@ -749,7 +763,10 @@ cdef class PositionBalancerHandler:
             if shortfall_or_excess > 0:
                 # Check if already have pending buy order
                 if asset_key not in self._active_buy_orders:
-                    if not self.c_try_mark_buy_complete(asset_key, current_value, shortfall_or_excess):
+                    # For completion check, use ACTUAL balance (not adjusted)
+                    base_bal_actual = self.c_get_actual_base_balance(asset_key)
+                    val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
+                    if not self.c_try_mark_buy_complete(asset_key, val_result_actual.first, val_result_actual.second):
                         # Find the best market to buy on (lowest ask)
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
@@ -769,7 +786,10 @@ cdef class PositionBalancerHandler:
             if shortfall_or_excess > 0:
                 # Check if already have pending sell order
                 if asset_key not in self._active_sell_orders:
-                    if not self.c_try_mark_sell_complete(asset_key, current_value, shortfall_or_excess):
+                    # For completion check, use ACTUAL balance (not adjusted)
+                    base_bal_actual = self.c_get_actual_base_balance(asset_key)
+                    val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
+                    if not self.c_try_mark_sell_complete(asset_key, val_result_actual.first, val_result_actual.second):
                         # Find the best market to sell on (lowest ask)
                         selected_sell_market = self.c_find_best_sell_market(asset_key)
                         if selected_sell_market is not None:
@@ -794,13 +814,18 @@ cdef class PositionBalancerHandler:
             str asset_key = buy_market_tuple.base_asset
             ExchangeBase market = buy_market_tuple.market
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
-            double base_bal = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_actual = self.c_get_actual_base_balance(asset_key)
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
-            pair[double, double] val_short = self.c_compute_value_and_buy_shortfall(base_bal, last_bid)
-            double current_value_quote = val_short.first
-            double shortfall = val_short.second
+            # Use adjusted balance for shortfall calculation (accounts for pending orders)
+            pair[double, double] val_short_adjusted = self.c_compute_value_and_buy_shortfall(base_bal_adjusted, last_bid)
+            double shortfall_adjusted = val_short_adjusted.second
+            # Use actual balance for completion check (don't count unfilled orders)
+            pair[double, double] val_short_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
+            double current_value_quote = val_short_actual.first
+            double shortfall = val_short_actual.second
 
-        # Check if still needed
+        # Check if still needed - use ACTUAL balance to avoid premature completion
         if self.c_try_mark_buy_complete(asset_key, current_value_quote, shortfall):
             return False
 
@@ -822,6 +847,8 @@ cdef class PositionBalancerHandler:
             string buy_id_str
             object trading_rule
             object min_price_increment
+            # Variables for post-order completion check
+            pair[double, double] val_short
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
@@ -857,10 +884,11 @@ cdef class PositionBalancerHandler:
             buy_price = top_ask * (1.0 - self._buy_spread_pct)
 
         # Calculate amount based on shortfall, available quote, and order size limit
+        # Use ADJUSTED shortfall to account for pending orders and avoid over-ordering
         max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
         max_order_base = self._order_size_usd / buy_price if buy_price > 0 else 0.0
         amount_to_buy = min(
-            shortfall / last_bid if last_bid > 0 else 0.0,
+            shortfall_adjusted / last_bid if last_bid > 0 else 0.0,
             max_affordable_base,
             max_order_base
         )
@@ -945,9 +973,10 @@ cdef class PositionBalancerHandler:
                 f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"at {buy_price:.8f} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
-        # Check if target reached
-        base_bal = self.c_get_adjusted_base_balance(asset_key)
-        val_short = self.c_compute_value_and_buy_shortfall(base_bal, last_bid)
+        # Check if target reached - use ACTUAL balance (not adjusted)
+        # to avoid marking as complete when order hasn't filled yet
+        base_bal_actual = self.c_get_actual_base_balance(asset_key)
+        val_short = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
         current_value_quote = val_short.first
         shortfall = val_short.second
         if self.c_try_mark_buy_complete(asset_key, current_value_quote, shortfall):
@@ -967,13 +996,18 @@ cdef class PositionBalancerHandler:
             str asset_key = sell_market_tuple.base_asset
             ExchangeBase market = sell_market_tuple.market
             double base_bal_raw = float(market.c_get_available_balance(sell_market_tuple.base_asset))
-            double base_bal = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_actual = self.c_get_actual_base_balance(asset_key)
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
-            pair[double, double] val_excess = self.c_compute_value_and_sell_excess(base_bal, last_bid)
-            double current_value_quote = val_excess.first
-            double excess = val_excess.second
+            # Use adjusted balance for excess calculation (accounts for pending orders)
+            pair[double, double] val_excess_adjusted = self.c_compute_value_and_sell_excess(base_bal_adjusted, last_bid)
+            double excess_adjusted = val_excess_adjusted.second
+            # Use actual balance for completion check (don't count unfilled orders)
+            pair[double, double] val_excess_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
+            double current_value_quote = val_excess_actual.first
+            double excess = val_excess_actual.second
 
-        # Check if still needed
+        # Check if still needed - use ACTUAL balance to avoid premature completion
         if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
             return False
 
@@ -994,6 +1028,8 @@ cdef class PositionBalancerHandler:
             string sell_id_str
             object trading_rule
             object min_price_increment
+            # Variables for post-order completion check
+            pair[double, double] val_excess
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
@@ -1029,9 +1065,10 @@ cdef class PositionBalancerHandler:
             sell_price = top_bid * (1.0 + self._sell_spread_pct)
 
         # Calculate amount based on excess, available base, and order size limit
+        # Use ADJUSTED excess to account for pending orders and avoid over-ordering
         max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
         amount_to_sell = min(
-            excess / last_bid if last_bid > 0 else 0.0,
+            excess_adjusted / last_bid if last_bid > 0 else 0.0,
             base_bal_raw,
             max_order_base
         )
@@ -1116,9 +1153,10 @@ cdef class PositionBalancerHandler:
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"at {sell_price:.8f} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
-        # Check if target reached
-        base_bal = self.c_get_adjusted_base_balance(asset_key)
-        val_excess = self.c_compute_value_and_sell_excess(base_bal, last_bid)
+        # Check if target reached - use ACTUAL balance (not adjusted)
+        # to avoid marking as complete when order hasn't filled yet
+        base_bal_actual = self.c_get_actual_base_balance(asset_key)
+        val_excess = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
         current_value_quote = val_excess.first
         excess = val_excess.second
         if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):

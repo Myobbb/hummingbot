@@ -45,6 +45,7 @@ cdef class PositionBalancerHandler:
     cdef pair[double, double] c_compute_value_and_buy_shortfall(self, double base_balance, double last_bid)
     cdef pair[double, double] c_compute_value_and_sell_excess(self, double base_balance, double last_bid)
     cdef double c_get_aggregated_base_balance(self, str asset)
+    cdef double c_get_actual_base_balance(self, str asset)
     cdef double c_get_adjusted_base_balance(self, str asset)
     cdef bint c_try_mark_buy_complete(self, str pair, double current_value_quote, double shortfall)
     cdef bint c_try_mark_sell_complete(self, str pair, double current_value_quote, double excess)
