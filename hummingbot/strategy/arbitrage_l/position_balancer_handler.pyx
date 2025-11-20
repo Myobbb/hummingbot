@@ -1306,3 +1306,16 @@ cdef class PositionBalancerHandler:
         self.strategy.log_with_clock(
             logging.INFO,
             f"Order size updated: {old_size:.2f} -> {order_size_usd:.2f} USD")
+
+    def set_refresh_interval(self, double refresh_interval):
+        """
+        Set the limit order refresh interval in seconds.
+
+        Args:
+            refresh_interval: How often to cancel and replace limit orders (seconds)
+        """
+        old_interval = self._limit_refresh_interval
+        self._limit_refresh_interval = refresh_interval
+        self.strategy.log_with_clock(
+            logging.INFO,
+            f"Limit order refresh interval updated: {old_interval:.0f} -> {refresh_interval:.0f} seconds")

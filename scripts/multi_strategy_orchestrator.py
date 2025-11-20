@@ -1995,6 +1995,82 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         strategy_instance.strategy._position_balancer.set_order_size(order_size_usd)
         return True
 
+    def set_refresh_interval_by_identifier(self, identifier: str, refresh_interval: float) -> bool:
+        """
+        Set refresh interval for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            refresh_interval: How often to cancel and replace limit orders (seconds)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_refresh_interval(identifier, refresh_interval)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_refresh_interval(strategy_instance.name, refresh_interval)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_refresh_interval(self, strategy_name: str, refresh_interval: float) -> bool:
+        """
+        Set refresh interval for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            refresh_interval: How often to cancel and replace limit orders (seconds)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        if refresh_interval <= 0:
+            self.logger().error("Refresh interval must be positive")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set refresh interval
+        strategy_instance.strategy._position_balancer.set_refresh_interval(refresh_interval)
+        return True
+
     def remove_strategy_by_identifier(self, identifier: str) -> bool:
         """
         Remove a strategy by full name or token symbol.

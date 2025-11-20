@@ -20,22 +20,23 @@ class StrategyControlCommand:
         Main entry point for strategy control commands.
 
         Usage:
-            control list                          - List all strategies with their status
-            control pause <id>                    - Pause a strategy by name or token
-            control resume <id>                   - Resume a paused strategy
-            control pause_all                     - Pause all strategies
-            control resume_all                    - Resume all strategies
-            control remove <id>                   - Remove a strategy (edits config file)
-            control add <file>                    - Add a strategy from config file (conf/strategies/)
-            control enable_buyin <id>             - Enable buy-in for position balancer
-            control disable_buyin <id>            - Disable buy-in for position balancer
-            control enable_selloff <id>           - Enable sell-off for position balancer
-            control disable_selloff <id>          - Disable sell-off for position balancer
-            control set buyin <id> <value>        - Set buy-in target in USD
-            control set selloff <id> <value>      - Set sell-off target in USD
-            control set buy_spread <id> <value>   - Set buy spread (% or 'min')
-            control set sell_spread <id> <value>  - Set sell spread (% or 'min')
-            control set order_size <id> <value>   - Set order size in USD
+            control list                                - List all strategies with their status
+            control pause <id>                          - Pause a strategy by name or token
+            control resume <id>                         - Resume a paused strategy
+            control pause_all                           - Pause all strategies
+            control resume_all                          - Resume all strategies
+            control remove <id>                         - Remove a strategy (edits config file)
+            control add <file>                          - Add a strategy from config file (conf/strategies/)
+            control enable_buyin <id>                   - Enable buy-in for position balancer
+            control disable_buyin <id>                  - Disable buy-in for position balancer
+            control enable_selloff <id>                 - Enable sell-off for position balancer
+            control disable_selloff <id>                - Disable sell-off for position balancer
+            control set buyin <id> <value>              - Set buy-in target in USD
+            control set selloff <id> <value>            - Set sell-off target in USD
+            control set buy_spread <id> <value>         - Set buy spread (% or 'min')
+            control set sell_spread <id> <value>        - Set sell spread (% or 'min')
+            control set order_size <id> <value>         - Set order size in USD
+            control set refresh_interval <id> <value>   - Set limit order refresh interval in seconds
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -200,21 +201,22 @@ class StrategyControlCommand:
 
             self.notify("\n" + "=" * 80)
             self.notify("\nCommands:")
-            self.notify("  control pause <name_or_token>               - Pause a strategy")
-            self.notify("  control resume <name_or_token>              - Resume a strategy")
-            self.notify("  control pause_all                           - Pause all strategies")
-            self.notify("  control resume_all                          - Resume all strategies")
-            self.notify("  control remove <name_or_token>              - Remove a strategy (edits config file)")
-            self.notify("  control add <config_file>                   - Add strategy from conf/strategies/")
-            self.notify("  control enable_buyin <name_or_token>        - Enable position balancer buy-in")
-            self.notify("  control disable_buyin <name_or_token>       - Disable position balancer buy-in")
-            self.notify("  control enable_selloff <name_or_token>      - Enable position balancer sell-off")
-            self.notify("  control disable_selloff <name_or_token>     - Disable position balancer sell-off")
-            self.notify("  control set buyin <name_or_token> <value>   - Set buy-in target (USD)")
-            self.notify("  control set selloff <name_or_token> <value> - Set sell-off target (USD)")
-            self.notify("  control set buy_spread <name> <value>       - Set buy spread (% or 'min')")
-            self.notify("  control set sell_spread <name> <value>      - Set sell spread (% or 'min')")
-            self.notify("  control set order_size <name> <value>       - Set order size (USD)")
+            self.notify("  control pause <name_or_token>                    - Pause a strategy")
+            self.notify("  control resume <name_or_token>                   - Resume a strategy")
+            self.notify("  control pause_all                                - Pause all strategies")
+            self.notify("  control resume_all                               - Resume all strategies")
+            self.notify("  control remove <name_or_token>                   - Remove a strategy (edits config file)")
+            self.notify("  control add <config_file>                        - Add strategy from conf/strategies/")
+            self.notify("  control enable_buyin <name_or_token>             - Enable position balancer buy-in")
+            self.notify("  control disable_buyin <name_or_token>            - Disable position balancer buy-in")
+            self.notify("  control enable_selloff <name_or_token>           - Enable position balancer sell-off")
+            self.notify("  control disable_selloff <name_or_token>          - Disable position balancer sell-off")
+            self.notify("  control set buyin <name_or_token> <value>        - Set buy-in target (USD)")
+            self.notify("  control set selloff <name_or_token> <value>      - Set sell-off target (USD)")
+            self.notify("  control set buy_spread <name> <value>            - Set buy spread (% or 'min')")
+            self.notify("  control set sell_spread <name> <value>           - Set sell spread (% or 'min')")
+            self.notify("  control set order_size <name> <value>            - Set order size (USD)")
+            self.notify("  control set refresh_interval <name> <value>      - Set refresh interval (seconds)")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -550,9 +552,31 @@ class StrategyControlCommand:
                     self.notify(f"\n✗ Failed to set order size for: {strategy_id}")
                     self.notify("  Use 'control list' to see available strategies")
 
+            elif parameter == "refresh_interval":
+                # Set refresh interval
+                if not hasattr(strategy, 'set_refresh_interval_by_identifier'):
+                    self.notify("The current strategy does not support position balancer controls.")
+                    return
+
+                try:
+                    value = float(value_str)
+                    if value <= 0:
+                        self.notify("Error: Refresh interval must be positive")
+                        return
+                except ValueError:
+                    self.notify(f"Error: Invalid value '{value_str}'. Must be a number.")
+                    return
+
+                success = strategy.set_refresh_interval_by_identifier(strategy_id, value)
+                if success:
+                    self.notify(f"\n✓ Refresh interval set to {value:.0f} seconds for {strategy_id}")
+                else:
+                    self.notify(f"\n✗ Failed to set refresh interval for: {strategy_id}")
+                    self.notify("  Use 'control list' to see available strategies")
+
             else:
                 self.notify(f"Unknown parameter: {parameter}")
-                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size")
+                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval")
 
         except Exception as e:
             self.notify(f"Error setting parameter: {e}")
