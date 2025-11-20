@@ -1180,4 +1180,91 @@ cdef class PositionBalancerHandler:
                 logging.INFO,
                 "Sell-off mode disabled - cancelled all sell orders and cleared tracking")
 
-        return True
+    def set_buy_target(self, double target_usd):
+        """
+        Set the buy-in target value in USD.
+
+        Args:
+            target_usd: New target minimum asset value in quote currency
+        """
+        old_target = self._buy_target_usd
+        self._buy_target_usd = target_usd
+        self.strategy.log_with_clock(
+            logging.INFO,
+            f"Buy-in target updated: {old_target:.2f} -> {target_usd:.2f} USD")
+        # Reset completion flag to allow re-evaluation
+        if self._buy_enabled:
+            self._buy_completed = False
+            self.c_scan_and_mark_completion()
+
+    def set_sell_target(self, double target_usd):
+        """
+        Set the sell-off target value in USD.
+
+        Args:
+            target_usd: New target maximum asset value in quote currency
+        """
+        old_target = self._sell_target_usd
+        self._sell_target_usd = target_usd
+        self.strategy.log_with_clock(
+            logging.INFO,
+            f"Sell-off target updated: {old_target:.2f} -> {target_usd:.2f} USD")
+        # Reset completion flag to allow re-evaluation
+        if self._sell_enabled:
+            self._sell_completed = False
+            self.c_scan_and_mark_completion()
+
+    def set_buy_spread(self, object spread_pct):
+        """
+        Set the buy spread percentage or mode.
+
+        Args:
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+        """
+        if isinstance(spread_pct, str) and spread_pct.lower() == 'min':
+            self._buy_spread_pct = -1.0
+            self._buy_spread_is_min = True
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Buy spread updated to: min tick")
+        else:
+            old_spread = self._buy_spread_pct * 100.0 if not self._buy_spread_is_min else "min"
+            self._buy_spread_pct = float(spread_pct) / 100.0
+            self._buy_spread_is_min = False
+            self.strategy.log_with_clock(
+                logging.INFO,
+                f"Buy spread updated: {old_spread} -> {spread_pct}%")
+
+    def set_sell_spread(self, object spread_pct):
+        """
+        Set the sell spread percentage or mode.
+
+        Args:
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+        """
+        if isinstance(spread_pct, str) and spread_pct.lower() == 'min':
+            self._sell_spread_pct = -1.0
+            self._sell_spread_is_min = True
+            self.strategy.log_with_clock(
+                logging.INFO,
+                "Sell spread updated to: min tick")
+        else:
+            old_spread = self._sell_spread_pct * 100.0 if not self._sell_spread_is_min else "min"
+            self._sell_spread_pct = float(spread_pct) / 100.0
+            self._sell_spread_is_min = False
+            self.strategy.log_with_clock(
+                logging.INFO,
+                f"Sell spread updated: {old_spread} -> {spread_pct}%")
+
+    def set_order_size(self, double order_size_usd):
+        """
+        Set the maximum order size in USD.
+
+        Args:
+            order_size_usd: Maximum order size in USD per order
+        """
+        old_size = self._order_size_usd
+        self._order_size_usd = order_size_usd
+        self.strategy.log_with_clock(
+            logging.INFO,
+            f"Order size updated: {old_size:.2f} -> {order_size_usd:.2f} USD")

@@ -1623,6 +1623,378 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         strategy_instance.strategy._position_balancer.disable_sell_off()
         return True
 
+    def set_buy_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
+        """
+        Set buy-in target for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            target_usd: New target minimum asset value in USD
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_buy_target(identifier, target_usd)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_buy_target(strategy_instance.name, target_usd)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_buy_target(self, strategy_name: str, target_usd: float) -> bool:
+        """
+        Set buy-in target for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            target_usd: New target minimum asset value in USD
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        if target_usd < 0:
+            self.logger().error("Target USD must be non-negative")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set buy target
+        strategy_instance.strategy._position_balancer.set_buy_target(target_usd)
+        return True
+
+    def set_sell_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
+        """
+        Set sell-off target for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            target_usd: New target maximum asset value in USD
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_sell_target(identifier, target_usd)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_sell_target(strategy_instance.name, target_usd)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_sell_target(self, strategy_name: str, target_usd: float) -> bool:
+        """
+        Set sell-off target for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            target_usd: New target maximum asset value in USD
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        if target_usd < 0:
+            self.logger().error("Target USD must be non-negative")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set sell target
+        strategy_instance.strategy._position_balancer.set_sell_target(target_usd)
+        return True
+
+    def set_buy_spread_by_identifier(self, identifier: str, spread_pct) -> bool:
+        """
+        Set buy spread for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_buy_spread(identifier, spread_pct)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_buy_spread(strategy_instance.name, spread_pct)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_buy_spread(self, strategy_name: str, spread_pct) -> bool:
+        """
+        Set buy spread for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set buy spread
+        strategy_instance.strategy._position_balancer.set_buy_spread(spread_pct)
+        return True
+
+    def set_sell_spread_by_identifier(self, identifier: str, spread_pct) -> bool:
+        """
+        Set sell spread for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_sell_spread(identifier, spread_pct)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_sell_spread(strategy_instance.name, spread_pct)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_sell_spread(self, strategy_name: str, spread_pct) -> bool:
+        """
+        Set sell spread for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            spread_pct: Spread percentage (e.g., 0.1 for 0.1%) or 'min' for minimum tick
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set sell spread
+        strategy_instance.strategy._position_balancer.set_sell_spread(spread_pct)
+        return True
+
+    def set_order_size_by_identifier(self, identifier: str, order_size_usd: float) -> bool:
+        """
+        Set order size for a strategy's position balancer by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            order_size_usd: Maximum order size in USD per order
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First try exact name match
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == identifier),
+            None
+        )
+
+        if strategy_instance:
+            return self.set_order_size(identifier, order_size_usd)
+
+        # If not found by name, try token lookup
+        strategy_instance = self._find_strategy_by_token(identifier)
+        if strategy_instance:
+            self.logger().info(f"Found strategy by token '{identifier}': {strategy_instance.name}")
+            return self.set_order_size(strategy_instance.name, order_size_usd)
+
+        # Not found by either method
+        self.logger().error(
+            f"No strategy found for '{identifier}'. "
+            f"Available: {[s.name for s in self.strategies]}. "
+            f"Use list_arb() for details."
+        )
+        return False
+
+    def set_order_size(self, strategy_name: str, order_size_usd: float) -> bool:
+        """
+        Set order size for a strategy's position balancer.
+
+        Args:
+            strategy_name: The name of the strategy
+            order_size_usd: Maximum order size in USD per order
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Validate input
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        if order_size_usd <= 0:
+            self.logger().error("Order size must be positive")
+            return False
+
+        strategy_instance = next(
+            (s for s in self.strategies if s.name == strategy_name),
+            None
+        )
+
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return False
+
+        # Check if strategy has position balancer
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return False
+
+        # Set order size
+        strategy_instance.strategy._position_balancer.set_order_size(order_size_usd)
+        return True
+
     def remove_strategy_by_identifier(self, identifier: str) -> bool:
         """
         Remove a strategy by full name or token symbol.

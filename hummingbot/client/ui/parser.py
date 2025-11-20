@@ -86,11 +86,14 @@ def load_parser(hummingbot: "HummingbotApplication", command_tabs) -> ThrowingAr
     control_parser = subparsers.add_parser("control", help="Control individual strategies in multi-strategy orchestrators")
     control_parser.add_argument("action", nargs="?", default=None,
                                 choices=["list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
-                                         "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff"],
+                                         "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set"],
                                 help="Action to perform: list, pause, resume, pause_all, resume_all, remove, add, "
-                                     "enable_buyin, disable_buyin, enable_selloff, disable_selloff")
+                                     "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set")
     control_parser.add_argument("identifier", nargs="?", default=None,
-                                help="Strategy name/token (pause/resume/remove/enable/disable) or config file (add)")
+                                help="Strategy name/token (pause/resume/remove/enable/disable), config file (add), "
+                                     "or parameter name (set: buyin, selloff, buy_spread, sell_spread, order_size)")
+    control_parser.add_argument("value", nargs="*", default=None,
+                                help="For 'set' action: '<strategy_id> <value>'")
     control_parser.set_defaults(func=hummingbot.control)
 
     history_parser = subparsers.add_parser("history", help="See the past performance of the current bot")
