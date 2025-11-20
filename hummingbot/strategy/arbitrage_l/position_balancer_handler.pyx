@@ -356,6 +356,8 @@ cdef class PositionBalancerHandler:
             str asset_key
             double last_bid = 0.0
             double base_bal
+            double pending_buy
+            double pending_sell
             pair[double, double] val_short
             pair[double, double] val_excess
             double current_value_quote
@@ -740,7 +742,9 @@ cdef class PositionBalancerHandler:
             str asset_key = buy_market_tuple.base_asset
             double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
             double base_bal = self.c_get_adjusted_base_balance(asset_key)
+            double base_bal_actual
             pair[double, double] val_result
+            pair[double, double] val_result_actual
             double current_value
             double shortfall_or_excess
             bint placed = False
@@ -843,6 +847,8 @@ cdef class PositionBalancerHandler:
             string buy_id_str
             object trading_rule
             object min_price_increment
+            # Variables for post-order completion check
+            pair[double, double] val_short
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
@@ -1022,6 +1028,8 @@ cdef class PositionBalancerHandler:
             string sell_id_str
             object trading_rule
             object min_price_increment
+            # Variables for post-order completion check
+            pair[double, double] val_excess
 
         try:
             # Use Python-level get_order_book for compatibility with all exchanges
