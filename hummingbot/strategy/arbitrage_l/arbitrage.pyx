@@ -69,6 +69,20 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
     def __cinit__(self):
         # Initialize defaults so attributes exist even if init_params isn't called yet
+        self._market_pairs = []  # Initialize to empty list to avoid NoneType errors
+        self._min_profitability = 0.01  # Default 1% (will be overridden in init_params)
+        self._logging_options = 0  # No logging by default
+        self._status_report_interval = 60.0  # Default 60 seconds
+        self._next_trade_delay = 2.0  # Default 2 seconds
+        self._order_timeout = 180.0  # Default 3 minutes
+        self._filled_order_timeout = 3600.0  # Default 1 hour
+        self._order_warning_delay = 60.0  # Default 1 minute
+        self._min_order_usd = 10.0  # Default minimum order size
+        self._rate_cache_duration = 10.0  # Default rate cache duration
+        self._max_tracked_orders = 1000  # Default max tracked orders
+        self._use_oracle_conversion_rate = False  # Default no oracle
+        self._fixed_base_rate = 1.0  # Default conversion rate
+        self._fixed_quote_rate = 1.0  # Default conversion rate
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
         self._position_balancer = None  # Will be initialized in init_params if enabled
