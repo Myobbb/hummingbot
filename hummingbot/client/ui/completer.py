@@ -80,7 +80,10 @@ class HummingbotCompleter(Completer):
         self._mqtt_completer = WordCompleter(["start", "stop", "restart"], ignore_case=True)
         self._control_completer = WordCompleter([
             "list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
-            "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff"
+            "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set"
+        ], ignore_case=True)
+        self._control_set_completer = WordCompleter([
+            "buyin", "selloff", "buy_spread", "sell_spread", "order_size"
         ], ignore_case=True)
         self._gateway_chains = GATEWAY_CHAINS
         self._gateway_networks = []
@@ -434,8 +437,17 @@ class HummingbotCompleter(Completer):
 
     def _complete_control_arguments(self, document: Document) -> bool:
         text_before_cursor: str = document.text_before_cursor
-        return text_before_cursor.startswith("control ")
-        
+        return text_before_cursor.startswith("control ") and not text_before_cursor.startswith("control set ")
+
+    def _complete_control_set_arguments(self, document: Document) -> bool:
+        text_before_cursor: str = document.text_before_cursor
+        if not text_before_cursor.startswith("control set "):
+            return False
+        # Complete parameter name only if we're at the first argument after "set"
+        args_after_set = text_before_cursor[12:]  # Remove "control set "
+        # Complete only if no space (still typing parameter) or just the parameter with trailing space
+        return " " not in args_after_set.strip()
+
     def _complete_control_add_config(self, document: Document) -> bool:
         text_before_cursor: str = document.text_before_cursor
         return text_before_cursor.startswith("control add ")
@@ -634,6 +646,10 @@ class HummingbotCompleter(Completer):
 
         elif self._complete_mqtt_arguments(document):
             for c in self._mqtt_completer.get_completions(document, complete_event):
+                yield c
+
+        elif self._complete_control_set_arguments(document):
+            for c in self._control_set_completer.get_completions(document, complete_event):
                 yield c
 
         elif self._complete_control_arguments(document):
