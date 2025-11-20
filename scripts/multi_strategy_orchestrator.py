@@ -1907,9 +1907,13 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"Config file is empty or invalid: {config_path}")
                 return False
 
-            # Validate it's an arbitrage_m strategy
-            if single_config.get('strategy') != 'arbitrage_m':
-                self.logger().error(f"Only arbitrage_m strategies are supported. Found: {single_config.get('strategy')}")
+            # Validate it's an arbitrage strategy (both arbitrage_l and arbitrage_m supported)
+            strategy_type = single_config.get('strategy')
+            if strategy_type not in ['arbitrage_l', 'arbitrage_m']:
+                self.logger().error(
+                    f"Unsupported strategy type: {strategy_type}. "
+                    f"Only 'arbitrage_l' and 'arbitrage_m' are supported."
+                )
                 return False
 
             # Convert single-strategy config to multi-strategy format
@@ -1960,6 +1964,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 'primary_trading_pair': single_config['primary_market_trading_pair'],
                 'secondary_trading_pair': single_config['secondary_market_trading_pair'],
             }
+
+            # Map 'strategy' field to 'strategy_type' (single-strategy uses 'strategy', multi uses 'strategy_type')
+            if 'strategy' in single_config and single_config['strategy']:
+                multi_config['strategy_type'] = single_config['strategy']
 
             # Only add optional fields if they exist in source config
             optional_fields = [
