@@ -1179,6 +1179,51 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         )
         return None
 
+    def _get_strategy_instance(self, strategy_name: str) -> Optional[V1StrategyInstance]:
+        """
+        Get strategy instance by name with validation.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            V1StrategyInstance if found, None otherwise
+        """
+        if not strategy_name or not strategy_name.strip():
+            self.logger().error("Strategy name cannot be empty")
+            return None
+
+        strategy_instance = next((s for s in self.strategies if s.name == strategy_name), None)
+        if not strategy_instance:
+            self.logger().error(
+                f"Strategy '{strategy_name}' not found. Available strategies: "
+                f"{[s.name for s in self.strategies]}"
+            )
+            return None
+
+        return strategy_instance
+
+    def _get_strategy_position_balancer(self, strategy_name: str):
+        """
+        Get position balancer for a strategy with validation.
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            Position balancer instance if found, None otherwise
+        """
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return None
+
+        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
+           strategy_instance.strategy._position_balancer is None:
+            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
+            return None
+
+        return strategy_instance.strategy._position_balancer
+
     def pause_strategy_by_identifier(self, identifier: str) -> bool:
         """
         Pause a strategy by full name or token symbol.
@@ -1215,21 +1260,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
+        strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
             return False
 
         if strategy_instance.paused:
@@ -1238,11 +1270,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info(f"Pausing strategy: {strategy_name}")
         strategy_instance.paused = True
-        
+
         # Note: We do NOT cancel open orders on pause
         # Let the strategy's timeout logic handle any pending orders
         # Canceling orders could interfere with connector state during reconnection
-        
+
         self.logger().info(f"Strategy '{strategy_name}' paused successfully")
         return True
 
@@ -1269,21 +1301,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     missing.append(f"{ex_name}:{mt.trading_pair}")
             return (len(missing) == 0), missing
 
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
+        strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
             return False
 
         if not strategy_instance.paused:
@@ -1299,10 +1318,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 f"{'...' if len(missing) > 5 else ''}. Will remain PAUSED."
             )
             return False
-        else:
-            strategy_instance.paused = False
-            self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
-            return True
+
+        strategy_instance.paused = False
+        self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
+        return True
 
     def pause_all_strategies(self) -> int:
         """Pause all running strategies.
@@ -1396,31 +1415,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Enable buy-in and check if target already reached
-        strategy_instance.strategy._position_balancer.enable_buy_in()
+        position_balancer.enable_buy_in()
         return True
 
     def disable_buyin(self, strategy_name: str) -> bool:
@@ -1433,31 +1432,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer (access wrapped strategy object)
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Disable buy-in
-        strategy_instance.strategy._position_balancer.disable_buy_in()
+        position_balancer.disable_buy_in()
         return True
 
     def enable_selloff(self, strategy_name: str) -> bool:
@@ -1470,31 +1449,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer (access wrapped strategy object)
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Enable sell-off
-        strategy_instance.strategy._position_balancer.enable_sell_off()
+        position_balancer.enable_sell_off()
         return True
 
     def disable_selloff(self, strategy_name: str) -> bool:
@@ -1507,31 +1466,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer (access wrapped strategy object)
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Disable sell-off
-        strategy_instance.strategy._position_balancer.disable_sell_off()
+        position_balancer.disable_sell_off()
         return True
 
     def set_buy_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
@@ -1559,35 +1498,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
         if target_usd < 0:
             self.logger().error("Target USD must be non-negative")
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set buy target
-        strategy_instance.strategy._position_balancer.set_buy_target(target_usd)
+        position_balancer.set_buy_target(target_usd)
         return True
 
     def set_sell_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
@@ -1615,35 +1534,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
         if target_usd < 0:
             self.logger().error("Target USD must be non-negative")
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set sell target
-        strategy_instance.strategy._position_balancer.set_sell_target(target_usd)
+        position_balancer.set_sell_target(target_usd)
         return True
 
     def set_buy_spread_by_identifier(self, identifier: str, spread_pct) -> bool:
@@ -1671,31 +1570,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set buy spread
-        strategy_instance.strategy._position_balancer.set_buy_spread(spread_pct)
+        position_balancer.set_buy_spread(spread_pct)
         return True
 
     def set_sell_spread_by_identifier(self, identifier: str, spread_pct) -> bool:
@@ -1723,31 +1602,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
-            return False
-
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set sell spread
-        strategy_instance.strategy._position_balancer.set_sell_spread(spread_pct)
+        position_balancer.set_sell_spread(spread_pct)
         return True
 
     def set_order_size_by_identifier(self, identifier: str, order_size_usd: float) -> bool:
@@ -1775,35 +1634,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
         if order_size_usd <= 0:
             self.logger().error("Order size must be positive")
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set order size
-        strategy_instance.strategy._position_balancer.set_order_size(order_size_usd)
+        position_balancer.set_order_size(order_size_usd)
         return True
 
     def set_refresh_interval_by_identifier(self, identifier: str, refresh_interval: float) -> bool:
@@ -1831,35 +1670,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Returns:
             True if successful, False otherwise
         """
-        # Validate input
-        if not strategy_name or not strategy_name.strip():
-            self.logger().error("Strategy name cannot be empty")
-            return False
-
         if refresh_interval <= 0:
             self.logger().error("Refresh interval must be positive")
             return False
 
-        strategy_instance = next(
-            (s for s in self.strategies if s.name == strategy_name),
-            None
-        )
-
-        if not strategy_instance:
-            self.logger().error(
-                f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
-            )
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
             return False
 
-        # Check if strategy has position balancer
-        if not hasattr(strategy_instance.strategy, '_position_balancer') or \
-           strategy_instance.strategy._position_balancer is None:
-            self.logger().error(f"Strategy '{strategy_name}' does not have position balancer enabled")
-            return False
-
-        # Set refresh interval
-        strategy_instance.strategy._position_balancer.set_refresh_interval(refresh_interval)
+        position_balancer.set_refresh_interval(refresh_interval)
         return True
 
     def remove_strategy_by_identifier(self, identifier: str) -> bool:
