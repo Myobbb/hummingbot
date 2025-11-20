@@ -153,11 +153,11 @@ async def start(self):
             # Position balancer - buy-in configuration
             buy_in_enabled=bool(buy_in_enabled),
             buy_in_target_usd=float(buy_in_target_usdt),
-            buy_in_spread_pct=float(buy_in_spread_pct),
+            buy_in_spread_pct=buy_in_spread_pct,  # Pass as-is (can be 'min' string or numeric)
             # Position balancer - sell-off configuration
             sell_off_enabled=bool(sell_off_enabled),
             sell_off_target_usd=float(sell_off_target_usd),
-            sell_off_spread_pct=float(sell_off_spread_pct),
+            sell_off_spread_pct=sell_off_spread_pct,  # Pass as-is (can be 'min' string or numeric)
             # Position balancer - order management
             position_balancer_refresh_interval=float(position_balancer_refresh_interval)
         )
