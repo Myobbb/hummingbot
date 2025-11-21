@@ -1,4 +1,5 @@
 # distutils: language=c++
+# distutils: sources=hummingbot/core/cpp/OrderBookEntry.cpp
 # cython: cdivision=True
 # cython: boundscheck=False
 # cython: wraparound=False
