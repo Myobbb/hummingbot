@@ -108,6 +108,8 @@ cdef class PositionBalancerHandler:
         self._last_sell_order_time = {}   # asset -> timestamp
         self._active_buy_orders = {}      # asset -> order_id
         self._active_sell_orders = {}     # asset -> order_id
+        self._active_buy_order_details = {}   # asset -> (market_name, price)
+        self._active_sell_order_details = {}  # asset -> (market_name, price)
 
     @property
     def is_buy_active(self):
@@ -176,6 +178,7 @@ cdef class PositionBalancerHandler:
         self._pending_buy_orders.clear()
         self._pending_buy_by_asset.clear()
         self._last_buy_order_time.clear()
+        self._active_buy_order_details.clear()
 
     cdef void c_cancel_all_sell_orders(self):
         """Cancel all active sell orders and clean up tracking."""
@@ -209,6 +212,7 @@ cdef class PositionBalancerHandler:
         self._pending_sell_orders.clear()
         self._pending_sell_by_asset.clear()
         self._last_sell_order_time.clear()
+        self._active_sell_order_details.clear()
 
     cdef void c_maybe_disable_buy(self):
         """Disable buy-in globally once target is reached, cancel orders, and clean up."""
@@ -483,6 +487,8 @@ cdef class PositionBalancerHandler:
                     # Remove from active tracking
                     if self._active_buy_orders.get(asset_key) == order_id:
                         self._active_buy_orders.pop(asset_key, None)
+                        # Also remove order details
+                        self._active_buy_order_details.pop(asset_key, None)
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
                 if pend is not None:
@@ -498,6 +504,8 @@ cdef class PositionBalancerHandler:
                     # Remove from active tracking
                     if self._active_sell_orders.get(asset_key) == order_id:
                         self._active_sell_orders.pop(asset_key, None)
+                        # Also remove order details
+                        self._active_sell_order_details.pop(asset_key, None)
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
 
@@ -578,8 +586,9 @@ cdef class PositionBalancerHandler:
         """
         Find the best market to place a buy order for the given asset.
 
-        For 'min' mode: Returns market with LOWEST BID (we place at top_bid + min_tick)
-        For percentage mode: Returns market with LOWEST ASK (we place below ask)
+        - Aggressive (0%): Select market with LOWEST ASK (taker)
+        - Percentage (>0%): Select market with LOWEST BID (maker above bid)
+        - 'min' mode: Select market with LOWEST BID (maker above bid + min_tick)
         """
         cdef:
             object best_market = None
@@ -588,7 +597,7 @@ cdef class PositionBalancerHandler:
             object ob
             object mp
             object market_tuple
-            bint use_bid_price = self._buy_spread_is_min  # Use bid for 'min' mode
+            bint use_ask_price = (not self._buy_spread_is_min and self._buy_spread_pct == 0.0)
 
         try:
             for mp in self.strategy._market_pairs:
@@ -599,14 +608,12 @@ cdef class PositionBalancerHandler:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
 
-                            if use_bid_price:
-                                # 'min' mode: select market with LOWEST BID
-                                # (we'll place buy order at top_bid + min_tick)
-                                current_price = float(ob.get_price(False))  # False = bid side
-                            else:
-                                # Percentage mode: select market with LOWEST ASK
-                                # (we'll place buy order below ask)
+                            if use_ask_price:
+                                # Aggressive mode (0%): select market with LOWEST ASK (taker)
                                 current_price = float(ob.get_price(True))  # True = ask side
+                            else:
+                                # Percentage or 'min' mode: select market with LOWEST BID (maker)
+                                current_price = float(ob.get_price(False))  # False = bid side
 
                             if current_price < best_price and current_price > 0:
                                 best_price = current_price
@@ -622,8 +629,9 @@ cdef class PositionBalancerHandler:
         """
         Find the best market to place a sell order for the given asset.
 
-        For 'min' mode: Returns market with HIGHEST ASK (we place at top_ask - min_tick)
-        For percentage mode: Returns market with HIGHEST BID (we place above bid)
+        - Aggressive (0%): Select market with HIGHEST BID (taker)
+        - Percentage (>0%): Select market with HIGHEST ASK (maker below ask)
+        - 'min' mode: Select market with HIGHEST ASK (maker below ask - min_tick)
         """
         cdef:
             object best_market = None
@@ -632,7 +640,7 @@ cdef class PositionBalancerHandler:
             object ob
             object mp
             object market_tuple
-            bint use_ask_price = self._sell_spread_is_min  # Use ask for 'min' mode
+            bint use_bid_price = (not self._sell_spread_is_min and self._sell_spread_pct == 0.0)
 
         try:
             for mp in self.strategy._market_pairs:
@@ -643,14 +651,12 @@ cdef class PositionBalancerHandler:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
 
-                            if use_ask_price:
-                                # 'min' mode: select market with HIGHEST ASK
-                                # (we'll place sell order at top_ask - min_tick)
-                                current_price = float(ob.get_price(True))  # True = ask side
-                            else:
-                                # Percentage mode: select market with HIGHEST BID
-                                # (we'll place sell order above bid)
+                            if use_bid_price:
+                                # Aggressive mode (0%): select market with HIGHEST BID (taker)
                                 current_price = float(ob.get_price(False))  # False = bid side
+                            else:
+                                # Percentage or 'min' mode: select market with HIGHEST ASK (maker)
+                                current_price = float(ob.get_price(True))  # True = ask side
 
                             if current_price > best_price:
                                 best_price = current_price
@@ -665,9 +671,20 @@ cdef class PositionBalancerHandler:
     cdef void c_cancel_stale_orders(self, str asset):
         """
         Cancel stale buy/sell limit orders for refresh.
-        Also cancels orphaned orders if mode is disabled.
+        Smart cancellation: only cancel if:
+        1. Mode is disabled (orphaned order)
+        2. Better market became available
+        3. Got frontrun (price moved significantly)
         """
-        cdef double current_time = self.strategy._current_timestamp
+        cdef:
+            double current_time = self.strategy._current_timestamp
+            object current_best_market
+            object current_ob
+            double current_best_price
+            tuple order_details
+            str order_market_name
+            double order_price
+            double price_diff_pct
 
         # Check buy orders
         if asset in self._active_buy_orders:
@@ -681,10 +698,44 @@ cdef class PositionBalancerHandler:
                 if not self._buy_enabled:
                     should_cancel = True
                     cancel_reason = "mode disabled"
-                # Cancel if stale (needs refresh)
+                # Check if refresh interval passed AND conditions changed
                 elif current_time - last_time > self._limit_refresh_interval:
-                    should_cancel = True
-                    cancel_reason = "refresh"
+                    # Smart cancellation: only cancel if market/price changed
+                    try:
+                        # Find current best market
+                        current_best_market = self.c_find_best_buy_market(asset)
+                        if current_best_market is not None:
+                            # Get order details (market, price)
+                            order_details = self._active_buy_order_details.get(asset)
+                            if order_details is not None:
+                                order_market_name, order_price = order_details
+
+                                # Check if different market became better
+                                if current_best_market.market.name != order_market_name:
+                                    should_cancel = True
+                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                else:
+                                    # Same market - check if price moved (got frontrun)
+                                    try:
+                                        current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
+                                        # Get current best price we would place at
+                                        if self._buy_spread_pct == 0.0 and not self._buy_spread_is_min:
+                                            # Aggressive: use ask
+                                            current_best_price = float(current_ob.get_price(True))
+                                        else:
+                                            # Percentage/min: use bid
+                                            current_best_price = float(current_ob.get_price(False))
+
+                                        # Cancel if price moved more than 0.1% (got frontrun)
+                                        if order_price > 0:
+                                            price_diff_pct = abs(current_best_price - order_price) / order_price
+                                            if price_diff_pct > 0.001:  # 0.1% threshold
+                                                should_cancel = True
+                                                cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
 
                 if should_cancel:
                     try:
@@ -722,10 +773,44 @@ cdef class PositionBalancerHandler:
                 if not self._sell_enabled:
                     should_cancel = True
                     cancel_reason = "mode disabled"
-                # Cancel if stale (needs refresh)
+                # Check if refresh interval passed AND conditions changed
                 elif current_time - last_time > self._limit_refresh_interval:
-                    should_cancel = True
-                    cancel_reason = "refresh"
+                    # Smart cancellation: only cancel if market/price changed
+                    try:
+                        # Find current best market
+                        current_best_market = self.c_find_best_sell_market(asset)
+                        if current_best_market is not None:
+                            # Get order details (market, price)
+                            order_details = self._active_sell_order_details.get(asset)
+                            if order_details is not None:
+                                order_market_name, order_price = order_details
+
+                                # Check if different market became better
+                                if current_best_market.market.name != order_market_name:
+                                    should_cancel = True
+                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                else:
+                                    # Same market - check if price moved (got frontrun)
+                                    try:
+                                        current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
+                                        # Get current best price we would place at
+                                        if self._sell_spread_pct == 0.0 and not self._sell_spread_is_min:
+                                            # Aggressive: use bid
+                                            current_best_price = float(current_ob.get_price(False))
+                                        else:
+                                            # Percentage/min: use ask
+                                            current_best_price = float(current_ob.get_price(True))
+
+                                        # Cancel if price moved more than 0.1% (got frontrun)
+                                        if order_price > 0:
+                                            price_diff_pct = abs(current_best_price - order_price) / order_price
+                                            if price_diff_pct > 0.001:  # 0.1% threshold
+                                                should_cancel = True
+                                                cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
 
                 if should_cancel:
                     try:
@@ -891,7 +976,7 @@ cdef class PositionBalancerHandler:
 
         # Calculate limit price based on spread mode
         if self._buy_spread_is_min:
-            # 'min' mode: Place one tick above top bid (frontrun other buyers with maker order)
+            # 'min' mode: Place one tick above top bid (maker order)
             if top_bid <= 0:
                 return False
             try:
@@ -907,9 +992,18 @@ cdef class PositionBalancerHandler:
                     buy_price = top_ask
             except Exception:
                 buy_price = top_ask  # Fall back to taker on error
+        elif self._buy_spread_pct == 0.0:
+            # Aggressive mode (0%): Buy at ask (taker)
+            buy_price = top_ask
         else:
-            # Percentage mode: Place below top ask (0% = AT ask, >0% = below ask)
-            buy_price = top_ask * (1.0 - self._buy_spread_pct)
+            # Percentage mode (>0%): Place above top bid (maker order)
+            # buy_price = top_bid + (top_bid * spread_pct)
+            if top_bid <= 0:
+                return False
+            buy_price = top_bid * (1.0 + self._buy_spread_pct)
+            # Ensure we don't exceed the ask (would be taker)
+            if buy_price >= top_ask:
+                buy_price = top_ask  # Fall back to taker
 
         # Calculate amount based on shortfall, available quote, and order size limit
         # Use ADJUSTED shortfall to account for pending orders and avoid over-ordering
@@ -988,6 +1082,8 @@ cdef class PositionBalancerHandler:
                 float(self._pending_buy_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_buy_orders[asset_key] = buy_order_id
             self._last_buy_order_time[asset_key] = self.strategy._current_timestamp
+            # Store order details for smart cancellation (market name, price)
+            self._active_buy_order_details[asset_key] = (buy_market_tuple.market.name, buy_price)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id}: {e}")
 
@@ -1072,7 +1168,7 @@ cdef class PositionBalancerHandler:
 
         # Calculate limit price based on spread mode
         if self._sell_spread_is_min:
-            # 'min' mode: Place one tick below top ask (frontrun other sellers with maker order)
+            # 'min' mode: Place one tick below top ask (maker order)
             if top_ask <= 0:
                 return False
             try:
@@ -1088,9 +1184,18 @@ cdef class PositionBalancerHandler:
                     sell_price = top_bid
             except Exception:
                 sell_price = top_bid  # Fall back to taker on error
+        elif self._sell_spread_pct == 0.0:
+            # Aggressive mode (0%): Sell at bid (taker)
+            sell_price = top_bid
         else:
-            # Percentage mode: Place above top bid (0% = AT bid, >0% = above bid)
-            sell_price = top_bid * (1.0 + self._sell_spread_pct)
+            # Percentage mode (>0%): Place below top ask (maker order)
+            # sell_price = top_ask - (top_ask * spread_pct)
+            if top_ask <= 0:
+                return False
+            sell_price = top_ask * (1.0 - self._sell_spread_pct)
+            # Ensure we don't go below the bid (would be taker)
+            if sell_price <= top_bid:
+                sell_price = top_bid  # Fall back to taker
 
         # Calculate amount based on excess, available base, and order size limit
         # Use ADJUSTED excess to account for pending orders and avoid over-ordering
@@ -1168,6 +1273,8 @@ cdef class PositionBalancerHandler:
                 float(self._pending_sell_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_sell_orders[asset_key] = sell_order_id
             self._last_sell_order_time[asset_key] = self.strategy._current_timestamp
+            # Store order details for smart cancellation (market name, price)
+            self._active_sell_order_details[asset_key] = (sell_market_tuple.market.name, sell_price)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id}: {e}")
 
