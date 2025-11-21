@@ -34,6 +34,8 @@ cdef class PositionBalancerHandler:
         dict _last_sell_order_time
         dict _active_buy_orders
         dict _active_sell_orders
+        dict _active_buy_order_details
+        dict _active_sell_order_details
 
     # Core methods
     cdef void c_cancel_all_buy_orders(self)
