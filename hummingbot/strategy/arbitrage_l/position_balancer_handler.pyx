@@ -668,6 +668,7 @@ cdef class PositionBalancerHandler:
            - BUY: market moved DOWN → can buy cheaper
            - SELL: market moved UP → can sell higher
         5. Significant spread gap → our order is too far from competitive price
+        6. Stuck cancel detection → force cleanup if cancel pending too long (safety net)
         """
         cdef:
             double current_time = self.strategy._current_timestamp
@@ -685,6 +686,7 @@ cdef class PositionBalancerHandler:
             double price_diff_pct
             double cancel_threshold_abs
             double cancel_threshold_pct
+            double time_since_order_placed
             str order_id
 
         # ========================================================================
@@ -692,7 +694,27 @@ cdef class PositionBalancerHandler:
         # ========================================================================
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
-            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+            if order_id:
+                # SAFETY NET: Detect stuck cancels (cancel event never arrived)
+                # If we've been waiting for a cancel for 2x the refresh interval, force cleanup
+                # This prevents permanent stuck states due to missed cancel events
+                if order_id in self.strategy._timeout_cancelled_orders:
+                    last_time = self._last_buy_order_time.get(asset, 0.0)
+                    time_since_order_placed = current_time - last_time
+                    # Force cleanup if cancel has been pending for > 2x refresh interval
+                    if time_since_order_placed > (self._limit_refresh_interval * 2.0):
+                        self.strategy.logger().warning(
+                            f"Position balancer: Stuck cancel detected for buy order {order_id} "
+                            f"(pending {time_since_order_placed:.0f}s > {self._limit_refresh_interval * 2.0:.0f}s) - force cleanup")
+                        # Force cleanup by calling handle_order_cancellation
+                        # This will remove from _active_buy_orders and other tracking
+                        self.handle_order_cancellation(order_id)
+                        # Also clean up from timeout set (in case main strategy didn't)
+                        self.strategy._timeout_cancelled_orders.discard(order_id)
+                    # Skip normal processing - already in cancellation state
+                    return
+
+                # Normal processing - order not in cancellation state
                 # Only process if we haven't already sent a cancel request
                 last_time = self._last_buy_order_time.get(asset, 0.0)
                 should_cancel = False
@@ -832,7 +854,27 @@ cdef class PositionBalancerHandler:
         # ========================================================================
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
-            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+            if order_id:
+                # SAFETY NET: Detect stuck cancels (cancel event never arrived)
+                # If we've been waiting for a cancel for 2x the refresh interval, force cleanup
+                # This prevents permanent stuck states due to missed cancel events
+                if order_id in self.strategy._timeout_cancelled_orders:
+                    last_time = self._last_sell_order_time.get(asset, 0.0)
+                    time_since_order_placed = current_time - last_time
+                    # Force cleanup if cancel has been pending for > 2x refresh interval
+                    if time_since_order_placed > (self._limit_refresh_interval * 2.0):
+                        self.strategy.logger().warning(
+                            f"Position balancer: Stuck cancel detected for sell order {order_id} "
+                            f"(pending {time_since_order_placed:.0f}s > {self._limit_refresh_interval * 2.0:.0f}s) - force cleanup")
+                        # Force cleanup by calling handle_order_cancellation
+                        # This will remove from _active_sell_orders and other tracking
+                        self.handle_order_cancellation(order_id)
+                        # Also clean up from timeout set (in case main strategy didn't)
+                        self.strategy._timeout_cancelled_orders.discard(order_id)
+                    # Skip normal processing - already in cancellation state
+                    return
+
+                # Normal processing - order not in cancellation state
                 # Only process if we haven't already sent a cancel request
                 last_time = self._last_sell_order_time.get(asset, 0.0)
                 should_cancel = False
@@ -1271,6 +1313,14 @@ cdef class PositionBalancerHandler:
 
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:
+            # Safety check: warn if we're replacing an existing active order (shouldn't happen)
+            if asset_key in self._active_buy_orders:
+                old_order_id = self._active_buy_orders[asset_key]
+                if old_order_id != buy_order_id:
+                    self.strategy.logger().warning(
+                        f"Position balancer: Replacing active buy order {old_order_id} with {buy_order_id} for {asset_key} "
+                        f"(old order may not have been cleaned up properly)")
+
             self._pending_buy_orders[buy_order_id] = (asset_key, float(quantized_amount), 0.0)
             self._pending_buy_by_asset[asset_key] = (
                 float(self._pending_buy_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
@@ -1462,6 +1512,14 @@ cdef class PositionBalancerHandler:
 
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:
+            # Safety check: warn if we're replacing an existing active order (shouldn't happen)
+            if asset_key in self._active_sell_orders:
+                old_order_id = self._active_sell_orders[asset_key]
+                if old_order_id != sell_order_id:
+                    self.strategy.logger().warning(
+                        f"Position balancer: Replacing active sell order {old_order_id} with {sell_order_id} for {asset_key} "
+                        f"(old order may not have been cleaned up properly)")
+
             self._pending_sell_orders[sell_order_id] = (asset_key, float(quantized_amount), 0.0)
             self._pending_sell_by_asset[asset_key] = (
                 float(self._pending_sell_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
