@@ -23,6 +23,8 @@ from cython.operator cimport(
     address as address_of,
 )
 
+from hummingbot.core.clock cimport Clock
+
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.connector.exchange_base cimport ExchangeBase
 from hummingbot.core.data_type.common import TradeType, OrderType
@@ -126,7 +128,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     hb_app_notification: bool = False,
                     min_order_usd: float = DEFAULT_MIN_ORDER_USD,
                     rate_cache_duration: float = DEFAULT_RATE_CACHE_DURATION,
-                    order_warning_delay: float = DEFAULT_ORDER_WARNING_DELAY,
+
                     max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
                     # Position balancer - buy-in configuration
                     buy_in_enabled: bool = True,
@@ -1005,34 +1007,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self.logger().info(f"Quote conversion rate: {self._cached_quote_rate:.6f}")
 
 
-    cdef void c_remove_pending_order(self, object market_tuple, str order_id, str context="order"):
-        """
-        Remove order from pending buy/sell order tracking.
-        Checks both pending buy and sell dicts and cleans up empty entries.
 
-        Args:
-            market_tuple: Market pair tuple to remove order from
-            order_id: Order ID to remove
-            context: Context string for error logging (e.g., "completed", "cancelled")
-        """
-        try:
-            if market_tuple is not None:
-                # Try removing from pending buy orders
-                pending_buys = self._pending_buy_orders_by_market.get(market_tuple)
-                if pending_buys is not None and order_id in pending_buys:
-                    pending_buys.discard(order_id)
-                    if len(pending_buys) == 0:
-                        self._pending_buy_orders_by_market.pop(market_tuple, None)
-
-                # Try removing from pending sell orders
-                pending_sells = self._pending_sell_orders_by_market.get(market_tuple)
-                if pending_sells is not None and order_id in pending_sells:
-                    pending_sells.discard(order_id)
-                    if len(pending_sells) == 0:
-                        self._pending_sell_orders_by_market.pop(market_tuple, None)
-        except Exception as e:
-            if context:
-                self.logger().warning(f"Failed to remove {context} order from pending tracking: {e}")
 
     cdef bint c_ready_for_new_orders(self, list market_tuples):
         """
