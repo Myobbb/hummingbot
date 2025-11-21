@@ -162,8 +162,8 @@ cdef class PositionBalancerHandler:
                         if mp.first.base_asset == asset:
                             # Mark as timeout-cancelled to prevent cooldown
                             self.strategy._timeout_cancelled_orders.add(order_id)
-                            # Remove from position balancer tracking
-                            self.strategy._position_balancer_orders.discard(order_id)
+                            # NOTE: Don't remove from _position_balancer_orders here!
+                            # Let handle_order_completion clean it up when cancel completes
                             # Cancel the order
                             self.strategy.c_cancel_order(mp.first, order_id)
                             self.strategy.logger().info(
@@ -196,8 +196,8 @@ cdef class PositionBalancerHandler:
                         if mp.first.base_asset == asset:
                             # Mark as timeout-cancelled to prevent cooldown
                             self.strategy._timeout_cancelled_orders.add(order_id)
-                            # Remove from position balancer tracking
-                            self.strategy._position_balancer_orders.discard(order_id)
+                            # NOTE: Don't remove from _position_balancer_orders here!
+                            # Let handle_order_completion clean it up when cancel completes
                             # Cancel the order
                             self.strategy.c_cancel_order(mp.first, order_id)
                             self.strategy.logger().info(
@@ -689,7 +689,8 @@ cdef class PositionBalancerHandler:
         # Check buy orders
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
-            if order_id:
+            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+                # Only process if we haven't already sent a cancel request
                 last_time = self._last_buy_order_time.get(asset, 0.0)
                 should_cancel = False
                 cancel_reason = ""
@@ -718,17 +719,31 @@ cdef class PositionBalancerHandler:
                                     # Same market - check if price moved (got frontrun)
                                     try:
                                         current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                        # Get current best price we would place at
-                                        if self._buy_spread_pct == 0.0 and not self._buy_spread_is_min:
-                                            # Aggressive: use ask
-                                            current_best_price = float(current_ob.get_price(True))
-                                        else:
-                                            # Percentage/min: use bid
-                                            current_best_price = float(current_ob.get_price(False))
+                                        current_bid = float(current_ob.get_price(False))
+                                        current_ask = float(current_ob.get_price(True))
 
-                                        # Cancel if price moved more than 0.1% (got frontrun)
+                                        # Calculate what the order price WOULD BE now with current conditions
+                                        if self._buy_spread_is_min:
+                                            # 'min' mode: bid + min_tick
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    current_calculated_price = current_bid + min_price_increment
+                                                else:
+                                                    current_calculated_price = current_ask
+                                            except Exception:
+                                                current_calculated_price = current_ask
+                                        elif self._buy_spread_pct == 0.0:
+                                            # Aggressive: at ask
+                                            current_calculated_price = current_ask
+                                        else:
+                                            # Percentage: bid * (1 + spread)
+                                            current_calculated_price = current_bid * (1.0 + self._buy_spread_pct)
+
+                                        # Cancel if calculated price would be different by >0.1%
                                         if order_price > 0:
-                                            price_diff_pct = abs(current_best_price - order_price) / order_price
+                                            price_diff_pct = abs(current_calculated_price - order_price) / order_price
                                             if price_diff_pct > 0.001:  # 0.1% threshold
                                                 should_cancel = True
                                                 cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
@@ -744,9 +759,9 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
-                                # Remove from position balancer tracking to prevent main timeout check
-                                self.strategy._position_balancer_orders.discard(order_id)
-
+                                # NOTE: Don't remove from _position_balancer_orders here!
+                                # Main strategy skips timeout checks for orders in this set.
+                                # Only remove when order actually completes/cancels (in handle_order_completion)
 
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
@@ -764,7 +779,8 @@ cdef class PositionBalancerHandler:
         # Check sell orders
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
-            if order_id:
+            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+                # Only process if we haven't already sent a cancel request
                 last_time = self._last_sell_order_time.get(asset, 0.0)
                 should_cancel = False
                 cancel_reason = ""
@@ -793,17 +809,31 @@ cdef class PositionBalancerHandler:
                                     # Same market - check if price moved (got frontrun)
                                     try:
                                         current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                        # Get current best price we would place at
-                                        if self._sell_spread_pct == 0.0 and not self._sell_spread_is_min:
-                                            # Aggressive: use bid
-                                            current_best_price = float(current_ob.get_price(False))
-                                        else:
-                                            # Percentage/min: use ask
-                                            current_best_price = float(current_ob.get_price(True))
+                                        current_bid = float(current_ob.get_price(False))
+                                        current_ask = float(current_ob.get_price(True))
 
-                                        # Cancel if price moved more than 0.1% (got frontrun)
+                                        # Calculate what the order price WOULD BE now with current conditions
+                                        if self._sell_spread_is_min:
+                                            # 'min' mode: ask - min_tick
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    current_calculated_price = current_ask - min_price_increment
+                                                else:
+                                                    current_calculated_price = current_bid
+                                            except Exception:
+                                                current_calculated_price = current_bid
+                                        elif self._sell_spread_pct == 0.0:
+                                            # Aggressive: at bid
+                                            current_calculated_price = current_bid
+                                        else:
+                                            # Percentage: ask * (1 - spread)
+                                            current_calculated_price = current_ask * (1.0 - self._sell_spread_pct)
+
+                                        # Cancel if calculated price would be different by >0.1%
                                         if order_price > 0:
-                                            price_diff_pct = abs(current_best_price - order_price) / order_price
+                                            price_diff_pct = abs(current_calculated_price - order_price) / order_price
                                             if price_diff_pct > 0.001:  # 0.1% threshold
                                                 should_cancel = True
                                                 cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
@@ -819,8 +849,9 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
-                                # Remove from position balancer tracking to prevent main timeout check
-                                self.strategy._position_balancer_orders.discard(order_id)
+                                # NOTE: Don't remove from _position_balancer_orders here!
+                                # Main strategy skips timeout checks for orders in this set.
+                                # Only remove when order actually completes/cancels (in handle_order_completion)
 
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
