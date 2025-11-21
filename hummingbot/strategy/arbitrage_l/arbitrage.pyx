@@ -1082,6 +1082,358 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self.logger().info(f"Quote conversion rate: {self._cached_quote_rate:.6f}")
 
 
+    cdef bint c_ready_for_new_orders(self, list market_tuples):
+        """Check if ready for new orders"""
+        cdef:
+            double time_elapsed
+            string order_id_str
+            object order_id
+            
+        # Check pending orders for provided markets
+        for market_tuple in market_tuples:
+            # Check both limit and market orders
+            for orders in [self._sb_order_tracker.c_get_limit_orders().get(market_tuple, {}),
+                          self._sb_order_tracker.c_get_market_orders().get(market_tuple, {})]:
+                if orders:
+                    for order_id in orders:
+                        order_id_str = self._to_cpp_str(order_id)
+                        
+                        # Track new orders
+                        if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
+                            self._order_timestamps[order_id_str] = self._current_timestamp
+                        
+                        time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
+                        
+                        # Check timeout
+                        if time_elapsed > self._order_timeout:
+                            # Don't cancel position balancer orders here - they have their own lifecycle
+                            if order_id in self._position_balancer_orders:
+                                continue
+
+                            self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s - forcibly removing from tracker")
+                            self._order_timestamps.erase(order_id_str)
+                            
+                            # Try to cancel on exchange (may or may not succeed)
+                            try:
+                                self.c_cancel_order(market_tuple, order_id)
+                            except:
+                                pass  # Continue even if cancel fails
+                            
+                            # Force removal from tracker to unblock trading
+                            self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
+                            self._sb_order_tracker.c_stop_tracking_market_order(market_tuple, order_id)
+                            continue
+                        else:
+                            # Still waiting
+                            if time_elapsed > self._order_warning_delay:
+                                self.logger().warning(f"Order {order_id} pending for {time_elapsed:.2f}s")
+                            return False
+        
+        return True
+
+    cdef pair[double, double] c_calculate_profitability(self, object market_pair):
+        """Calculate profitability for both arbitrage directions"""
+        cdef:
+            double bid1 = float(market_pair.first.get_price(False))
+            double ask1 = float(market_pair.first.get_price(True))
+            double bid2 = float(market_pair.second.get_price(False))
+            double ask2 = float(market_pair.second.get_price(True))
+            double conv_rate = 1.0
+            bint needs_conversion = False
+            
+        # Sanity check - prices must be positive
+        if bid1 <= 0 or ask1 <= 0 or bid2 <= 0 or ask2 <= 0:
+            return pair[double, double](0.0, 0.0)
+            
+        # Check if conversion is needed
+        if (market_pair.first.quote_asset != market_pair.second.quote_asset or
+            market_pair.first.base_asset != market_pair.second.base_asset):
+            # Only calculate conversion if not using fixed 1:1 rates
+            if self._use_oracle_conversion_rate or self._fixed_base_rate != 1.0 or self._fixed_quote_rate != 1.0:
+                conv_rate = self.c_get_market_to_market_conversion_rate(market_pair.first, market_pair.second)
+                needs_conversion = True
+        
+        # Apply conversion only if needed
+        if needs_conversion:
+            bid2 *= conv_rate
+            ask2 *= conv_rate
+        
+        # Calculate profitability without fees (fees considered in execution)
+        # Direction 1: Buy from market2, sell to market1
+        cdef double prof1 = (bid1 / ask2 - 1.0) if ask2 > 0 else -1.0
+        # Direction 2: Buy from market1, sell to market2  
+        cdef double prof2 = (bid2 / ask1 - 1.0) if ask1 > 0 else -1.0
+        
+        return pair[double, double](prof1, prof2)
+
+    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple):
+        """Execute arbitrage trade"""
+        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
+        self._last_global_trade_timestamp = self._current_timestamp
+
+        cdef:
+            tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
+            double amount = <double>result[0]
+            double profitability = <double>result[1]
+            double sell_price = <double>result[2]  # Worst sell price (limit)
+            double buy_price = <double>result[3]   # Worst buy price (limit)
+            double volume_usd
+            ExchangeBase buy_market = buy_market_tuple.market
+            ExchangeBase sell_market = sell_market_tuple.market
+            string buy_id_str
+            string sell_id_str
+            
+        if amount <= 0:
+            if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
+                self.logger().info("Insufficient balance or no profitable amount found")
+            return
+        
+        # Convert to Decimal for market operations
+        dec_amount = Decimal(str(amount))
+        
+        # Quantize amounts
+        quantized_buy = buy_market.c_quantize_order_amount(buy_market_tuple.trading_pair, dec_amount)
+        quantized_sell = sell_market.c_quantize_order_amount(sell_market_tuple.trading_pair, dec_amount)
+        quantized_amount = min(quantized_buy, quantized_sell)
+        
+        # Check minimum order size
+        volume_usd = float(quantized_amount) * sell_price
+        if volume_usd < self._min_order_usd:
+            return
+        
+        # Declare all variables before the if block (Cython requirement)
+        cdef double order_start_time
+        cdef object buy_order_type = OrderType.LIMIT
+        cdef object sell_order_type = OrderType.LIMIT
+        cdef object buy_price_decimal
+        cdef object sell_price_decimal
+        cdef double placement_latency
+        cdef str buy_order_id
+        cdef str sell_order_id
+        
+        if quantized_amount > Decimal("0"):
+            # Log timing for latency monitoring
+            order_start_time = self._current_timestamp
+            if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Executing arbitrage: buy {quantized_amount:.8f} {buy_market_tuple.trading_pair} "
+                    f"@ {buy_market.name}, sell @ {sell_market.name}, "
+                    f"profitability: {profitability * 100:.2f}%")
+            
+            # Quantize prices
+            buy_price_decimal = buy_market.quantize_order_price(buy_market_tuple.trading_pair, Decimal(str(buy_price)))
+            sell_price_decimal = sell_market.quantize_order_price(sell_market_tuple.trading_pair, Decimal(str(sell_price)))
+            
+            # Execute both orders in rapid succession
+            try:
+                buy_order_id = self.c_buy_with_specific_market(
+                    buy_market_tuple, quantized_amount,
+                    order_type=buy_order_type,
+                    price=buy_price_decimal,
+                    expiration_seconds=self._next_trade_delay)
+            except Exception as e:
+                self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
+                self.logger().warning(f"Error submitting buy limit order: {e}")
+                return
+
+            try:
+                sell_order_id = self.c_sell_with_specific_market(
+                    sell_market_tuple, quantized_amount,
+                    order_type=sell_order_type,
+                    price=sell_price_decimal,
+                    expiration_seconds=self._next_trade_delay)
+            except Exception as e:
+                self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
+                self.logger().warning(f"Error submitting sell limit order: {e}")
+                # Note: We already placed the buy order! In a real production strategy, 
+                # we might want to cancel it or let it ride. Here we proceed.
+                return
+            
+            # Track orders
+            buy_id_str = self._to_cpp_str(buy_order_id)
+            sell_id_str = self._to_cpp_str(sell_order_id)
+            self._order_timestamps[buy_id_str] = order_start_time
+            self._order_timestamps[sell_id_str] = order_start_time
+            
+            # Log order placement latency for monitoring
+            placement_latency = self._current_timestamp - order_start_time
+            if placement_latency > 0.1:  # Log if latency exceeds 100ms
+                self.logger().warning(
+                    f"High order placement latency detected: {placement_latency:.3f}s. "
+                    f"Consider colocating servers or optimizing network connectivity.")
+
+    cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
+        """Unified order completion handler"""
+        cdef:
+            str order_id = order_event.order_id
+            object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+            double time_elapsed
+            string order_id_str = self._to_cpp_str(order_id)
+            str order_type = "Buy" if is_buy else "Sell"
+            
+        # Also notify position balancer
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_completion(order_id, is_buy)
+            
+        # Remove from position balancer tracking if present
+        self._position_balancer_orders.discard(order_id)
+
+        if market_pair_tuple is None:
+            # Might be a position balancer order or old order
+            if order_id_str in self._order_timestamps:
+                self._order_timestamps.erase(order_id_str)
+            return
+            
+        try:
+            # Check completion time
+            if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
+                time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
+                self.logger().info(f"{order_type} order {order_id} completed in {time_elapsed:.2f}s")
+                self._order_timestamps.erase(order_id_str)
+            
+            if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
+                
+        except Exception as e:
+            self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
+
+    cdef c_did_complete_buy_order(self, object buy_order_completed_event):
+        """Handle buy order completion"""
+        self.c_handle_order_completion(buy_order_completed_event, True)
+    
+    cdef c_did_complete_sell_order(self, object sell_order_completed_event):
+        """Handle sell order completion"""
+        self.c_handle_order_completion(sell_order_completed_event, False)
+
+    cdef c_did_fill_order(self, object order_filled_event):
+        """Handle order fill event"""
+        cdef:
+            str order_id = order_filled_event.order_id
+            double filled_amount = order_filled_event.amount
+        
+        # Notify position balancer
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_fill(order_id, filled_amount)
+            
+        # Track fill for timeout logic
+        if order_id not in self._orders_with_fills:
+            self._orders_with_fills.add(order_id)
+            self._order_fill_timestamps[order_id] = self._current_timestamp
+
+    cdef c_did_fail_order(self, object order_failed_event):
+        """Handle order failure"""
+        cdef:
+            str order_id = order_failed_event.order_id
+            string order_id_str = self._to_cpp_str(order_id)
+            
+        # Notify position balancer
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_completion(order_id, True) # Assume buy for cleanup
+            self._position_balancer.handle_order_completion(order_id, False) # Assume sell for cleanup
+            self._position_balancer_orders.discard(order_id)
+
+        if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
+            self._order_timestamps.erase(order_id_str)
+
+    cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
+        """Handle order cancellation"""
+        cdef:
+            str order_id = order_cancelled_event.order_id
+            string order_id_str = self._to_cpp_str(order_id)
+            
+        # Notify position balancer
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_cancellation(order_id)
+            self._position_balancer_orders.discard(order_id)
+
+        if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
+            self._order_timestamps.erase(order_id_str)
+            
+        # Clean up fill tracking
+        self._orders_with_fills.discard(order_id)
+        self._order_fill_timestamps.pop(order_id, None)
+
+    cdef void c_check_all_order_timeouts(self):
+        """Check ALL pending orders for timeouts"""
+        cdef:
+            double time_elapsed
+            string order_id_str
+            double timestamp
+            vector[string] to_remove
+            str order_id
+            
+        for order_id_str, timestamp in self._order_timestamps:
+            time_elapsed = self._current_timestamp - timestamp
+            
+            if time_elapsed > self._order_timeout:
+                order_id = order_id_str.decode('utf-8')
+                
+                # Skip position balancer orders
+                if order_id in self._position_balancer_orders:
+                    continue
+                    
+                # Skip orders that have received fills (handled by filled timeout)
+                if order_id in self._orders_with_fills:
+                    continue
+                
+                self.logger().warning(f"Order {order_id} timed out after {time_elapsed:.2f}s")
+                to_remove.push_back(order_id_str)
+                
+                # Mark as timeout cancelled
+                self._timeout_cancelled_orders.add(order_id)
+                
+                # Force cancel
+                # Need to find market tuple for this order
+                market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+                if market_pair is not None:
+                    try:
+                        self.c_cancel_order(market_pair, order_id)
+                    except Exception:
+                        pass
+        
+        # Remove from tracking
+        for order_id_str in to_remove:
+            self._order_timestamps.erase(order_id_str)
+            
+    cdef void c_check_filled_order_timeouts(self):
+        """Check filled orders for extended timeout"""
+        cdef:
+            double time_elapsed
+            str order_id
+            double timestamp
+            list to_remove = []
+            string order_id_str
+            
+        for order_id, timestamp in self._order_fill_timestamps.items():
+            time_elapsed = self._current_timestamp - timestamp
+            
+            if time_elapsed > self._filled_order_timeout:
+                self.logger().warning(f"Filled order {order_id} timed out after {time_elapsed:.2f}s")
+                to_remove.append(order_id)
+                
+                # Mark as timeout cancelled
+                self._timeout_cancelled_orders.add(order_id)
+                
+                # Force cancel
+                market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+                if market_pair is not None:
+                    try:
+                        self.c_cancel_order(market_pair, order_id)
+                    except Exception:
+                        pass
+                        
+                # Clean up tracking
+                order_id_str = self._to_cpp_str(order_id)
+                self._order_timestamps.erase(order_id_str)
+
+        # Remove from fill timestamps
+        for order_id in to_remove:
+            self._order_fill_timestamps.pop(order_id, None)
+            self._orders_with_fills.discard(order_id)
+
 
 cdef void c_find_profitable_arbitrage_orders(
     double min_profitability,
