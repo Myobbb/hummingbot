@@ -663,6 +663,8 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_buy_market(self, str asset):
         """
         Find the best market to place a buy order for the given asset.
+        For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
+        and selects the best one regardless of name.
 
         - Aggressive (0%): Select market with LOWEST ASK (taker)
         - Percentage (>0%): Select market with LOWEST BID (maker above bid)
@@ -675,13 +677,17 @@ cdef class PositionBalancerHandler:
             object ob
             object mp
             object market_tuple
+            list asset_aliases
             bint use_ask_price = (not self._buy_spread_is_min and self._buy_spread_pct == 0.0)
+
+        # Get all aliases for this asset (includes asset itself)
+        asset_aliases = self._get_all_asset_aliases(asset)
 
         try:
             for mp in self.strategy._market_pairs:
-                # Check both first and second markets for this asset
+                # Check both first and second markets for ANY asset alias
                 for market_tuple in [mp.first, mp.second]:
-                    if market_tuple.base_asset == asset:
+                    if market_tuple.base_asset in asset_aliases:
                         try:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
@@ -699,13 +705,15 @@ cdef class PositionBalancerHandler:
                         except Exception:
                             continue
         except Exception as e:
-            self.strategy.logger().warning(f"Position balancer: Error finding best buy market for {asset}: {e}")
+            self.strategy.logger().warning(f"Position balancer: Error finding best buy market for {asset} (aliases: {asset_aliases}): {e}")
 
         return best_market
 
     cdef object c_find_best_sell_market(self, str asset):
         """
         Find the best market to place a sell order for the given asset.
+        For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
+        and selects the best one regardless of name.
 
         - Aggressive (0%): Select market with HIGHEST BID (taker)
         - Percentage (>0%): Select market with HIGHEST ASK (maker below ask)
@@ -718,13 +726,17 @@ cdef class PositionBalancerHandler:
             object ob
             object mp
             object market_tuple
+            list asset_aliases
             bint use_bid_price = (not self._sell_spread_is_min and self._sell_spread_pct == 0.0)
+
+        # Get all aliases for this asset (includes asset itself)
+        asset_aliases = self._get_all_asset_aliases(asset)
 
         try:
             for mp in self.strategy._market_pairs:
-                # Check both first and second markets for this asset
+                # Check both first and second markets for ANY asset alias
                 for market_tuple in [mp.first, mp.second]:
-                    if market_tuple.base_asset == asset:
+                    if market_tuple.base_asset in asset_aliases:
                         try:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
@@ -742,7 +754,7 @@ cdef class PositionBalancerHandler:
                         except Exception:
                             continue
         except Exception as e:
-            self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset}: {e}")
+            self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset} (aliases: {asset_aliases}): {e}")
 
         return best_market
 
