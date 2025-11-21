@@ -577,16 +577,18 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_buy_market(self, str asset):
         """
         Find the best market to place a buy order for the given asset.
-        Returns the market tuple with the LOWEST ASK price (cheapest place to buy).
-        We frontrun by placing limit buy slightly below this ask.
+
+        For 'min' mode: Returns market with LOWEST BID (we place at top_bid + min_tick)
+        For percentage mode: Returns market with LOWEST ASK (we place below ask)
         """
         cdef:
             object best_market = None
-            double best_ask = 1e100  # Start with very high number
-            double current_ask
+            double best_price = 1e100  # Start with very high number
+            double current_price
             object ob
             object mp
             object market_tuple
+            bint use_bid_price = self._buy_spread_is_min  # Use bid for 'min' mode
 
         try:
             for mp in self.strategy._market_pairs:
@@ -596,10 +598,18 @@ cdef class PositionBalancerHandler:
                         try:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
-                            current_ask = float(ob.get_price(True))  # True = ask side
 
-                            if current_ask < best_ask and current_ask > 0:
-                                best_ask = current_ask
+                            if use_bid_price:
+                                # 'min' mode: select market with LOWEST BID
+                                # (we'll place buy order at top_bid + min_tick)
+                                current_price = float(ob.get_price(False))  # False = bid side
+                            else:
+                                # Percentage mode: select market with LOWEST ASK
+                                # (we'll place buy order below ask)
+                                current_price = float(ob.get_price(True))  # True = ask side
+
+                            if current_price < best_price and current_price > 0:
+                                best_price = current_price
                                 best_market = market_tuple
                         except Exception:
                             continue
@@ -611,16 +621,18 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_sell_market(self, str asset):
         """
         Find the best market to place a sell order for the given asset.
-        Returns the market tuple with the HIGHEST BID price (best place to sell).
-        We frontrun by placing limit sell slightly above this bid.
+
+        For 'min' mode: Returns market with HIGHEST ASK (we place at top_ask - min_tick)
+        For percentage mode: Returns market with HIGHEST BID (we place above bid)
         """
         cdef:
             object best_market = None
-            double best_bid = 0.0
-            double current_bid
+            double best_price = 0.0
+            double current_price
             object ob
             object mp
             object market_tuple
+            bint use_ask_price = self._sell_spread_is_min  # Use ask for 'min' mode
 
         try:
             for mp in self.strategy._market_pairs:
@@ -630,10 +642,18 @@ cdef class PositionBalancerHandler:
                         try:
                             # Use Python-level get_order_book for compatibility with all exchanges
                             ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
-                            current_bid = float(ob.get_price(False))  # False = bid side
 
-                            if current_bid > best_bid:
-                                best_bid = current_bid
+                            if use_ask_price:
+                                # 'min' mode: select market with HIGHEST ASK
+                                # (we'll place sell order at top_ask - min_tick)
+                                current_price = float(ob.get_price(True))  # True = ask side
+                            else:
+                                # Percentage mode: select market with HIGHEST BID
+                                # (we'll place sell order above bid)
+                                current_price = float(ob.get_price(False))  # False = bid side
+
+                            if current_price > best_price:
+                                best_price = current_price
                                 best_market = market_tuple
                         except Exception:
                             continue
@@ -675,16 +695,20 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
-                               
-                                
+
+
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Position balancer: Cancelled buy order {order_id} for {asset} ({cancel_reason})")
-                                self._active_buy_orders.pop(asset, None)
+                                # NOTE: Don't remove from _active_buy_orders here!
+                                # Let handle_order_cancellation() clean it up when cancel event arrives
+                                # This prevents tracking loss if cancel fails or is delayed
                                 break
                     except Exception as e:
                         self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order: {e}")
+                        # Clean up timeout marker if cancel failed
+                        self.strategy._timeout_cancelled_orders.discard(order_id)
 
         # Check sell orders
         if asset in self._active_sell_orders:
@@ -712,15 +736,19 @@ cdef class PositionBalancerHandler:
                                 self.strategy._timeout_cancelled_orders.add(order_id)
                                 # Remove from position balancer tracking to prevent main timeout check
                                 self.strategy._position_balancer_orders.discard(order_id)
-                             
+
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
                                 self.strategy.logger().info(
                                     f"Position balancer: Cancelled sell order {order_id} for {asset} ({cancel_reason})")
-                                self._active_sell_orders.pop(asset, None)
+                                # NOTE: Don't remove from _active_sell_orders here!
+                                # Let handle_order_cancellation() clean it up when cancel event arrives
+                                # This prevents tracking loss if cancel fails or is delayed
                                 break
                     except Exception as e:
                         self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order: {e}")
+                        # Clean up timeout marker if cancel failed
+                        self.strategy._timeout_cancelled_orders.discard(order_id)
 
     cdef bint c_handle_position_balancing(self, object buy_market_tuple, object sell_market_tuple):
         """
