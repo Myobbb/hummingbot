@@ -1090,7 +1090,7 @@ cdef void c_find_profitable_arbitrage_orders(
     double sell_conversion_rate,
     double target_base_amount,
     double overshoot_ratio,
-    vector[ArbOpportunity] *output_vector) nogil:
+    vector[ArbOpportunity] *output_vector) nogil noexcept:
     """
     Find profitable arbitrage opportunities between two markets.
     Populates output_vector with ArbOpportunity structs.
@@ -1122,72 +1122,68 @@ cdef void c_find_profitable_arbitrage_orders(
         overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
     # Now scan the books (C-level iteration)
-    try:
-        bid_it = sell_bids.rbegin()
-        bid_end = sell_bids.rend()
-        ask_it = buy_asks.begin()
-        ask_end = buy_asks.end()
+    
+    bid_it = sell_bids.rbegin()
+    bid_end = sell_bids.rend()
+    ask_it = buy_asks.begin()
+    ask_end = buy_asks.end()
 
-        if bid_it == bid_end or ask_it == ask_end:
-            return
+    if bid_it == bid_end or ask_it == ask_end:
+        return
 
-        bid_entry = deref(bid_it)
-        ask_entry = deref(ask_it)
+    bid_entry = deref(bid_it)
+    ask_entry = deref(ask_it)
 
-        bid_leftover = bid_entry.getAmount()
-        ask_leftover = ask_entry.getAmount()
+    bid_leftover = bid_entry.getAmount()
+    ask_leftover = ask_entry.getAmount()
 
-        while levels_processed < max_levels and bid_it != bid_end and ask_it != ask_end:
-            # Get prices (original, unconverted)
-            orig_bid_price = bid_entry.getPrice()
-            orig_ask_price = ask_entry.getPrice()
+    while levels_processed < max_levels and bid_it != bid_end and ask_it != ask_end:
+        # Get prices (original, unconverted)
+        orig_bid_price = bid_entry.getPrice()
+        orig_ask_price = ask_entry.getPrice()
 
-            # Sanity check
-            if orig_bid_price <= 0 or orig_ask_price <= 0:
+        # Sanity check
+        if orig_bid_price <= 0 or orig_ask_price <= 0:
+            break
+
+        # Apply conversion once per level
+        bid_price = orig_bid_price * sell_conversion_rate
+        ask_price = orig_ask_price * buy_conversion_rate
+
+        # Check profitability threshold
+        if bid_price / ask_price < min_prof_threshold:
+            break
+
+        # Calculate step amount
+        step_amount = bid_leftover if bid_leftover <= ask_leftover else ask_leftover
+
+        if step_amount > EPSILON:
+            opp.bid_price = bid_price
+            opp.ask_price = ask_price
+            opp.orig_bid_price = orig_bid_price
+            opp.orig_ask_price = orig_ask_price
+            opp.amount = step_amount
+            output_vector.push_back(opp)
+
+            # Capacity-aware early stop
+            cumulative_base += step_amount
+            if overshoot_stop > 0.0 and cumulative_base >= overshoot_stop:
                 break
 
-            # Apply conversion once per level
-            bid_price = orig_bid_price * sell_conversion_rate
-            ask_price = orig_ask_price * buy_conversion_rate
-
-            # Check profitability threshold
-            if bid_price / ask_price < min_prof_threshold:
+        # Advance to next level based on which side exhausted
+        if bid_leftover <= ask_leftover:
+            inc(bid_it)
+            levels_processed += 1
+            if bid_it == bid_end:
                 break
-
-            # Calculate step amount
-            step_amount = bid_leftover if bid_leftover <= ask_leftover else ask_leftover
-
-            if step_amount > EPSILON:
-                opp.bid_price = bid_price
-                opp.ask_price = ask_price
-                opp.orig_bid_price = orig_bid_price
-                opp.orig_ask_price = orig_ask_price
-                opp.amount = step_amount
-                output_vector.push_back(opp)
-
-                # Capacity-aware early stop
-                cumulative_base += step_amount
-                if overshoot_stop > 0.0 and cumulative_base >= overshoot_stop:
-                    break
-
-            # Advance to next level based on which side exhausted
-            if bid_leftover <= ask_leftover:
-                inc(bid_it)
-                levels_processed += 1
-                if bid_it == bid_end:
-                    break
-                bid_entry = deref(bid_it)
-                bid_leftover = bid_entry.getAmount()
-                ask_leftover -= step_amount
-            else:
-                inc(ask_it)
-                levels_processed += 1  
-                if ask_it == ask_end:
-                    break
-                ask_entry = deref(ask_it)
-                ask_leftover = ask_entry.getAmount()
-                bid_leftover -= step_amount
-
-    except:
-        # C++ exceptions in nogil block are swallowed or handleable here
-        pass
+            bid_entry = deref(bid_it)
+            bid_leftover = bid_entry.getAmount()
+            ask_leftover -= step_amount
+        else:
+            inc(ask_it)
+            levels_processed += 1  
+            if ask_it == ask_end:
+                break
+            ask_entry = deref(ask_it)
+            ask_leftover = ask_entry.getAmount()
+            bid_leftover -= step_amount

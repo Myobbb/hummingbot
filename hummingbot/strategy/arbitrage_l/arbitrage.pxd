@@ -9,6 +9,7 @@ from libcpp.pair cimport pair
 from libcpp.set cimport set as cpp_set
 from libcpp.vector cimport vector
 from hummingbot.core.data_type.order_book cimport OrderBook
+from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
 
 # Struct to pass arbitrage opportunities without Python Objects (allows nogil)
 cdef struct ArbOpportunity:

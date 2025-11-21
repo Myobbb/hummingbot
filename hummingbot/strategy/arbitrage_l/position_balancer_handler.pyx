@@ -1224,11 +1224,19 @@ cdef class PositionBalancerHandler:
                                         should_cancel = True
                                         cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                     else:
-                                    # Same market - evaluate if conditions changed
-                                    try:
-                                        current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                                        current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
-                                        current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
+                                        # Same market - evaluate if conditions changed
+                                        try:
+                                            current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                                            
+                                            if current_ob._bid_book.size() > 0:
+                                                current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
+                                            else:
+                                                current_bid = 0.0
+                                                
+                                            if current_ob._ask_book.size() > 0:
+                                                current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
+                                            else:
+                                                current_ask = 0.0
 
                                             # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
                                             trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
