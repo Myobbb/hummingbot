@@ -108,8 +108,8 @@ cdef class PositionBalancerHandler:
         self._last_sell_order_time = {}   # asset -> timestamp
         self._active_buy_orders = {}      # asset -> order_id
         self._active_sell_orders = {}     # asset -> order_id
-        self._active_buy_order_details = {}   # asset -> (market_name, price)
-        self._active_sell_order_details = {}  # asset -> (market_name, price)
+        self._active_buy_order_details = {}   # asset -> (market_tuple, price)
+        self._active_sell_order_details = {}  # asset -> (market_tuple, price)
 
     @property
     def is_buy_active(self):
@@ -741,15 +741,15 @@ cdef class PositionBalancerHandler:
                         except Exception as e:
                             self.strategy.logger().warning(f"Position balancer: Error finding best buy market: {e}")
                         if current_best_market is not None:
-                            # Get order details (market, price)
+                            # Get order details (market_tuple, price)
                             order_details = self._active_buy_order_details.get(asset)
                             if order_details is not None:
-                                order_market_name, order_price = order_details
+                                order_market_tuple, order_price = order_details
 
                                 # CONDITION 1: Check if different market became better
-                                if current_best_market.market.name != order_market_name:
+                                if current_best_market.market.name != order_market_tuple.market.name:
                                     should_cancel = True
-                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                 else:
                                     # Same market - evaluate if conditions changed
                                     try:
@@ -812,9 +812,10 @@ cdef class PositionBalancerHandler:
                                         # Determine smart threshold based on spread configuration
                                         # This allows small market noise while catching real movements/gaps
                                         if self._buy_spread_is_min:
-                                            # Min tick mode: cancel if difference > 1.5 ticks (got frontrun or gap appeared)
+                                            # Min tick mode: cancel if difference > 0.9 ticks (catches 1-tick gaps with tolerance)
+                                            # Using 0.9 instead of 1.0 to handle floating point precision issues
                                             if min_price_increment > 0:
-                                                cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                cancel_threshold_abs = min_price_increment * 0.9  # Catch 1-tick gaps
                                             else:
                                                 cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
                                             cancel_threshold_pct = 0.0  # Not used in min mode
@@ -832,6 +833,22 @@ cdef class PositionBalancerHandler:
                                             if current_bid > order_price:
                                                 should_cancel = True
                                                 cancel_reason = f"outbid (top bid {current_bid:.8f} > our {order_price:.8f})"
+
+                                        # CONDITION 2b: For 'min' mode, explicit 1-tick frontrun detection
+                                        # Check if our order is no longer at the optimal competitive position
+                                        # This catches edge cases where we're off by exactly 1 tick
+                                        if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
+                                            # In min mode, we should be at effective_bid + min_tick
+                                            # If we're not (within small tolerance), we've been displaced
+                                            expected_price = effective_bid + min_price_increment
+                                            price_misalignment = order_price - expected_price
+                                            # Allow small tolerance for floating point, but catch >= 1 tick deviation
+                                            if abs(price_misalignment) >= min_price_increment * 0.95:
+                                                should_cancel = True
+                                                if price_misalignment > 0:
+                                                    cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                else:
+                                                    cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                         # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
                                         # If ideal price < our order price, market moved in our favor
@@ -920,15 +937,15 @@ cdef class PositionBalancerHandler:
                             # Find current best market
                             current_best_market = self.c_find_best_sell_market(asset)
                             if current_best_market is not None:
-                                # Get order details (market, price)
+                                # Get order details (market_tuple, price)
                                 order_details = self._active_sell_order_details.get(asset)
                                 if order_details is not None:
-                                    order_market_name, order_price = order_details
+                                    order_market_tuple, order_price = order_details
 
                                     # CONDITION 1: Check if different market became better
-                                    if current_best_market.market.name != order_market_name:
+                                    if current_best_market.market.name != order_market_tuple.market.name:
                                         should_cancel = True
-                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                     else:
                                         # Same market - evaluate if conditions changed
                                         try:
@@ -990,9 +1007,10 @@ cdef class PositionBalancerHandler:
 
                                             # Determine smart threshold based on spread configuration
                                             if self._sell_spread_is_min:
-                                                # Min tick mode: cancel if difference > 1.5 ticks
+                                                # Min tick mode: cancel if difference > 0.9 ticks (catches 1-tick gaps with tolerance)
+                                                # Using 0.9 instead of 1.0 to handle floating point precision issues
                                                 if min_price_increment > 0:
-                                                    cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                    cancel_threshold_abs = min_price_increment * 0.9  # Catch 1-tick gaps
                                                 else:
                                                     cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
                                                 cancel_threshold_pct = 0.0  # Not used in min mode
@@ -1009,6 +1027,22 @@ cdef class PositionBalancerHandler:
                                                 if current_ask < order_price:
                                                     should_cancel = True
                                                     cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
+
+                                            # CONDITION 2b: For 'min' mode, explicit 1-tick undercut detection
+                                            # Check if our order is no longer at the optimal competitive position
+                                            # This catches edge cases where we're off by exactly 1 tick
+                                            if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
+                                                # In min mode, we should be at effective_ask - min_tick
+                                                # If we're not (within small tolerance), we've been displaced
+                                                expected_price = effective_ask - min_price_increment
+                                                price_misalignment = expected_price - order_price
+                                                # Allow small tolerance for floating point, but catch >= 1 tick deviation
+                                                if abs(price_misalignment) >= min_price_increment * 0.95:
+                                                    should_cancel = True
+                                                    if price_misalignment > 0:
+                                                        cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                    else:
+                                                        cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                             # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
                                             # If ideal price > our order price, market moved in our favor
@@ -1061,29 +1095,40 @@ cdef class PositionBalancerHandler:
         """
         Internal method to cancel a buy order with proper cleanup tracking.
         Ensures atomic cancellation with correct state management.
+
+        Uses stored market_tuple for robust direct cancellation by order_id.
         """
+        cdef:
+            tuple order_details
+            object market_tuple
+
         try:
-            # Find market tuple for this order
-            for mp in self.strategy._market_pairs:
-                if mp.first.base_asset == asset:
-                    # Mark as timeout-cancelled to prevent cooldown enforcement
-                    # This allows position balancer to be more aggressive with refreshes
-                    self.strategy._timeout_cancelled_orders.add(order_id)
+            # Get stored market_tuple from order details for direct cancellation
+            order_details = self._active_buy_order_details.get(asset)
+            if order_details is None:
+                self.strategy.logger().warning(
+                    f"Position balancer: Cannot cancel buy order {order_id} - no order details found for {asset}")
+                return
 
-                    # NOTE: Don't remove from _position_balancer_orders here!
-                    # Main strategy skips timeout checks for orders in this set.
-                    # Only remove when order actually completes/cancels (in handle_order_completion)
-                    # This prevents race conditions where we lose tracking if cancel is delayed.
+            market_tuple, _ = order_details  # Unpack (market_tuple, price)
 
-                    # Cancel the order
-                    self.strategy.c_cancel_order(mp.first, order_id)
-                    self.strategy.logger().info(
-                        f"Position balancer: Cancelled buy order {order_id} for {asset} ({reason})")
+            # Mark as timeout-cancelled to prevent cooldown enforcement
+            # This allows position balancer to be more aggressive with refreshes
+            self.strategy._timeout_cancelled_orders.add(order_id)
 
-                    # NOTE: Don't remove from _active_buy_orders here!
-                    # Let handle_order_cancellation() clean it up when cancel event arrives.
-                    # This prevents tracking loss if cancel fails or is delayed.
-                    break
+            # NOTE: Don't remove from _position_balancer_orders here!
+            # Main strategy skips timeout checks for orders in this set.
+            # Only remove when order actually completes/cancels (in handle_order_completion)
+            # This prevents race conditions where we lose tracking if cancel is delayed.
+
+            # Cancel the order using stored market_tuple (robust direct cancellation)
+            self.strategy.c_cancel_order(market_tuple, order_id)
+            self.strategy.logger().info(
+                f"Position balancer: Cancelled buy order {order_id} for {asset} on {market_tuple.market.name} ({reason})")
+
+            # NOTE: Don't remove from _active_buy_orders here!
+            # Let handle_order_cancellation() clean it up when cancel event arrives.
+            # This prevents tracking loss if cancel fails or is delayed.
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order {order_id}: {e}")
             # Clean up timeout marker if cancel failed
@@ -1093,29 +1138,40 @@ cdef class PositionBalancerHandler:
         """
         Internal method to cancel a sell order with proper cleanup tracking.
         Ensures atomic cancellation with correct state management.
+
+        Uses stored market_tuple for robust direct cancellation by order_id.
         """
+        cdef:
+            tuple order_details
+            object market_tuple
+
         try:
-            # Find market tuple for this order
-            for mp in self.strategy._market_pairs:
-                if mp.first.base_asset == asset:
-                    # Mark as timeout-cancelled to prevent cooldown enforcement
-                    # This allows position balancer to be more aggressive with refreshes
-                    self.strategy._timeout_cancelled_orders.add(order_id)
+            # Get stored market_tuple from order details for direct cancellation
+            order_details = self._active_sell_order_details.get(asset)
+            if order_details is None:
+                self.strategy.logger().warning(
+                    f"Position balancer: Cannot cancel sell order {order_id} - no order details found for {asset}")
+                return
 
-                    # NOTE: Don't remove from _position_balancer_orders here!
-                    # Main strategy skips timeout checks for orders in this set.
-                    # Only remove when order actually completes/cancels (in handle_order_completion)
-                    # This prevents race conditions where we lose tracking if cancel is delayed.
+            market_tuple, _ = order_details  # Unpack (market_tuple, price)
 
-                    # Cancel the order
-                    self.strategy.c_cancel_order(mp.first, order_id)
-                    self.strategy.logger().info(
-                        f"Position balancer: Cancelled sell order {order_id} for {asset} ({reason})")
+            # Mark as timeout-cancelled to prevent cooldown enforcement
+            # This allows position balancer to be more aggressive with refreshes
+            self.strategy._timeout_cancelled_orders.add(order_id)
 
-                    # NOTE: Don't remove from _active_sell_orders here!
-                    # Let handle_order_cancellation() clean it up when cancel event arrives.
-                    # This prevents tracking loss if cancel fails or is delayed.
-                    break
+            # NOTE: Don't remove from _position_balancer_orders here!
+            # Main strategy skips timeout checks for orders in this set.
+            # Only remove when order actually completes/cancels (in handle_order_completion)
+            # This prevents race conditions where we lose tracking if cancel is delayed.
+
+            # Cancel the order using stored market_tuple (robust direct cancellation)
+            self.strategy.c_cancel_order(market_tuple, order_id)
+            self.strategy.logger().info(
+                f"Position balancer: Cancelled sell order {order_id} for {asset} on {market_tuple.market.name} ({reason})")
+
+            # NOTE: Don't remove from _active_sell_orders here!
+            # Let handle_order_cancellation() clean it up when cancel event arrives.
+            # This prevents tracking loss if cancel fails or is delayed.
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order {order_id}: {e}")
             # Clean up timeout marker if cancel failed
@@ -1392,8 +1448,8 @@ cdef class PositionBalancerHandler:
                 float(self._pending_buy_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_buy_orders[asset_key] = buy_order_id
             self._last_buy_order_time[asset_key] = self.strategy._current_timestamp
-            # Store order details for smart cancellation (market name, price)
-            self._active_buy_order_details[asset_key] = (buy_market_tuple.market.name, buy_price)
+            # Store order details for smart cancellation (market_tuple, price)
+            self._active_buy_order_details[asset_key] = (buy_market_tuple, buy_price)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id}: {e}")
 
@@ -1607,8 +1663,8 @@ cdef class PositionBalancerHandler:
                 float(self._pending_sell_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_sell_orders[asset_key] = sell_order_id
             self._last_sell_order_time[asset_key] = self.strategy._current_timestamp
-            # Store order details for smart cancellation (market name, price)
-            self._active_sell_order_details[asset_key] = (sell_market_tuple.market.name, sell_price)
+            # Store order details for smart cancellation (market_tuple, price)
+            self._active_sell_order_details[asset_key] = (sell_market_tuple, sell_price)
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id}: {e}")
 
