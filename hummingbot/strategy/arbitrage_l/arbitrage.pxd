@@ -108,12 +108,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Trading logic
     cdef double c_get_reference_bid_for_asset(self, str asset_key)
-    cdef tuple c_find_best_buyin_amount(self,
-                                        object buy_market_tuple,
-                                        object sell_market_tuple,
-                                        double buy_quote_balance,
-                                        double max_spend_quote,
-                                        double min_profitability)
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                              object buy_market_tuple,
                                                              object sell_market_tuple,
