@@ -113,6 +113,12 @@ cdef class PositionBalancerHandler:
         self._buy_cancel_request_time = {}    # asset -> timestamp when cancel was requested
         self._sell_cancel_request_time = {}   # asset -> timestamp when cancel was requested
 
+        # Asset alias detection (for cross-exchange pairs with different token names)
+        # If base assets have 1:1 conversion (no oracle, conversion_rate=1.0), treat as aliases
+        self._asset_aliases = {}  # canonical_name -> [alias1, alias2, ...]
+        self._canonical_asset = {}  # alias -> canonical_name
+        self._build_asset_aliases()
+
     @property
     def is_buy_active(self):
         """Returns True if buy-in is enabled and not completed."""
@@ -147,6 +153,60 @@ cdef class PositionBalancerHandler:
     def is_sell_completed(self):
         """Returns True if sell-off target has been reached."""
         return self._sell_completed
+
+    cdef void _build_asset_aliases(self):
+        """
+        Build asset alias mappings for cross-exchange pairs with different token names.
+
+        When base assets have 1:1 conversion (no oracle, conversion_rate=1.0), they're treated
+        as the same asset with different names (e.g., NODE on kucoin, NODEOPS on htx).
+
+        This enables:
+        - Aggregating balances across both names (NODE + NODEOPS total)
+        - Managing orders for both assets as a unified position
+        - Preventing timeout issues from unmanaged "other" asset orders
+        """
+        try:
+            # Check if using 1:1 base conversion (no oracle, rate = 1.0)
+            if self.strategy._use_oracle_conversion_rate:
+                return  # Oracle mode - assets are independent
+
+            if abs(self.strategy._fixed_base_rate - 1.0) > 1e-9:
+                return  # Non-1:1 rate - assets are independent
+
+            # Collect unique base assets from all market pairs
+            assets = set()
+            for mp in self.strategy._market_pairs:
+                assets.add(mp.first.base_asset)
+                assets.add(mp.second.base_asset)
+
+            if len(assets) <= 1:
+                return  # Only one asset - no aliases needed
+
+            # Multiple assets with 1:1 conversion - treat as aliases
+            # Use alphabetically first asset as canonical name
+            assets_list = sorted(list(assets))
+            canonical = assets_list[0]
+
+            self._asset_aliases[canonical] = assets_list
+            for asset in assets_list:
+                self._canonical_asset[asset] = canonical
+
+            self.strategy.log_with_clock(
+                logging.INFO,
+                f"Position balancer: Detected asset aliases {assets_list} "
+                f"(1:1 conversion, using '{canonical}' as canonical name)")
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to build asset aliases: {e}")
+
+    cdef str _get_canonical_asset(self, str asset):
+        """Get canonical asset name for an asset (or return itself if no alias)."""
+        return self._canonical_asset.get(asset, asset)
+
+    cdef list _get_all_asset_aliases(self, str asset):
+        """Get all aliases for an asset (including itself)."""
+        canonical = self._get_canonical_asset(asset)
+        return self._asset_aliases.get(canonical, [asset])
 
     cdef void c_cancel_all_buy_orders(self):
         """
@@ -223,16 +283,36 @@ cdef class PositionBalancerHandler:
                 "Sell-off target reached. Cancelled all sell orders and disabled sell-off for this session.")
 
     cdef double c_get_pending_buy_base(self, str asset):
-        """Return in-flight buy order base amount for asset."""
+        """
+        Return in-flight buy order base amount for asset.
+        For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
+        """
+        cdef:
+            double total = 0.0
+            list aliases
+            str alias
         try:
-            return <double> self._pending_buy_by_asset.get(asset, 0.0)
+            aliases = self._get_all_asset_aliases(asset)
+            for alias in aliases:
+                total += <double> self._pending_buy_by_asset.get(alias, 0.0)
+            return total
         except Exception:
             return 0.0
 
     cdef double c_get_pending_sell_base(self, str asset):
-        """Return in-flight sell order base amount for asset."""
+        """
+        Return in-flight sell order base amount for asset.
+        For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
+        """
+        cdef:
+            double total = 0.0
+            list aliases
+            str alias
         try:
-            return <double> self._pending_sell_by_asset.get(asset, 0.0)
+            aliases = self._get_all_asset_aliases(asset)
+            for alias in aliases:
+                total += <double> self._pending_sell_by_asset.get(alias, 0.0)
+            return total
         except Exception:
             return 0.0
 
@@ -265,18 +345,25 @@ cdef class PositionBalancerHandler:
         return pair[double, double](current_value, excess)
 
     cdef double c_get_aggregated_base_balance(self, str asset):
-        """Aggregate base balance using the same source as status (balance_map)."""
+        """
+        Aggregate base balance using the same source as status (balance_map).
+        For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
+        """
         cdef:
             double total = 0.0
             list unique_tuples
             object assets_df
             dict balance_map
             object t
+            list aliases
+            str alias
         try:
             unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
+            # Get all aliases for this asset (includes asset itself)
+            aliases = self._get_all_asset_aliases(asset)
             for t in unique_tuples:
-                if t.base_asset == asset:
-                    total += float(balance_map.get((t.market.name, asset), 0.0))
+                if t.base_asset in aliases:
+                    total += float(balance_map.get((t.market.name, t.base_asset), 0.0))
         except Exception:
             return 0.0
         return total
@@ -346,6 +433,7 @@ cdef class PositionBalancerHandler:
         """Re-evaluate asset balance and complete buy/sell if targets reached."""
         cdef:
             str asset_key
+            str canonical_asset
             double last_bid = 0.0
             double base_bal
             double pending_buy
@@ -365,19 +453,17 @@ cdef class PositionBalancerHandler:
 
         # Determine the base asset from the first market pair
         asset_key = self.strategy._market_pairs[0].first.base_asset
+        canonical_asset = self._get_canonical_asset(asset_key)
 
-        # Get reference bid
-        last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
+        # Get reference bid using canonical asset
+        last_bid = self.strategy.c_get_reference_bid_for_asset(canonical_asset)
 
         # Build balances
         unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
 
-        # Sum base balance - USE ACTUAL BALANCE for target completion checking
+        # Sum base balance across ALL aliases - USE ACTUAL BALANCE for target completion checking
         # Do NOT include pending orders here, only count what's actually filled
-        base_bal = 0.0
-        for t in unique_tuples:
-            if t.base_asset == asset_key:
-                base_bal += float(balance_map.get((t.market.name, asset_key), 0.0))
+        base_bal = self.c_get_actual_base_balance(canonical_asset)
 
         # Check buy completion
         if self._buy_enabled and not self._buy_completed:
@@ -388,15 +474,15 @@ cdef class PositionBalancerHandler:
             try:
                 decision = "complete" if (current_value_quote >= self._buy_target_usd or
                                          (shortfall > 0 and shortfall < self.strategy._min_order_usd)) else "active"
-                pending_buy = self.c_get_pending_buy_base(asset_key)
+                pending_buy = self.c_get_pending_buy_base(canonical_asset)
                 self.strategy.log_with_clock(
                     logging.INFO,
-                    f"Buy-in check: asset={asset_key} actual_base={base_bal:.6f} pending={pending_buy:.6f} "
+                    f"Buy-in check: asset={canonical_asset} actual_base={base_bal:.6f} pending={pending_buy:.6f} "
                     f"bid={last_bid:.6f} value={current_value_quote:.6f} target={self._buy_target_usd:.6f} -> {decision}")
             except Exception:
                 pass
 
-            self.c_try_mark_buy_complete(asset_key, current_value_quote, shortfall)
+            self.c_try_mark_buy_complete(canonical_asset, current_value_quote, shortfall)
 
         # Check sell completion
         if self._sell_enabled and not self._sell_completed:
@@ -407,15 +493,15 @@ cdef class PositionBalancerHandler:
             try:
                 decision = "complete" if (current_value_quote <= self._sell_target_usd or
                                          (excess > 0 and excess < self.strategy._min_order_usd)) else "active"
-                pending_sell = self.c_get_pending_sell_base(asset_key)
+                pending_sell = self.c_get_pending_sell_base(canonical_asset)
                 self.strategy.log_with_clock(
                     logging.INFO,
-                    f"Sell-off check: asset={asset_key} actual_base={base_bal:.6f} pending={pending_sell:.6f} "
+                    f"Sell-off check: asset={canonical_asset} actual_base={base_bal:.6f} pending={pending_sell:.6f} "
                     f"bid={last_bid:.6f} value={current_value_quote:.6f} target={self._sell_target_usd:.6f} -> {decision}")
             except Exception:
                 pass
 
-            self.c_try_mark_sell_complete(asset_key, current_value_quote, excess)
+            self.c_try_mark_sell_complete(canonical_asset, current_value_quote, excess)
 
         self.c_maybe_disable_buy()
         self.c_maybe_disable_sell()
@@ -1311,8 +1397,10 @@ cdef class PositionBalancerHandler:
         Decides whether to buy or sell based on current position.
         Returns True if an order was placed.
 
-        Note: buy_market_tuple and sell_market_tuple params are kept for compatibility
-        but we now select the best market internally based on bid/ask prices.
+        For asset aliases (e.g., NODE/NODEOPS with 1:1 conversion):
+        - Aggregates balances across all aliases
+        - Manages orders for all alias names
+        - Prevents timeout issues from unmanaged aliases
         """
         # CRITICAL SAFEGUARD: Prevent double execution
         if self.strategy._last_global_trade_timestamp == self.strategy._current_timestamp:
@@ -1323,8 +1411,11 @@ cdef class PositionBalancerHandler:
 
         cdef:
             str asset_key = buy_market_tuple.base_asset
-            double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
-            double base_bal = self.c_get_adjusted_base_balance(asset_key)
+            str canonical_asset = self._get_canonical_asset(asset_key)
+            list asset_aliases = self._get_all_asset_aliases(asset_key)
+            double last_bid = self.strategy.c_get_reference_bid_for_asset(canonical_asset)
+            double base_bal = self.c_get_adjusted_base_balance(canonical_asset)
+            str alias
             double base_bal_actual
             pair[double, double] val_result
             pair[double, double] val_result_actual
@@ -1334,8 +1425,10 @@ cdef class PositionBalancerHandler:
             object selected_buy_market = None
             object selected_sell_market = None
 
-        # Cancel stale orders for refresh
-        self.c_cancel_stale_orders(asset_key)
+        # Cancel stale orders for refresh - handle ALL aliases
+        # This ensures orders for both NODE and NODEOPS (or any aliases) are refreshed
+        for alias in asset_aliases:
+            self.c_cancel_stale_orders(alias)
 
         # Check if we need to buy
         if self._buy_enabled and not self._buy_completed:
@@ -1344,12 +1437,19 @@ cdef class PositionBalancerHandler:
             shortfall_or_excess = val_result.second
 
             if shortfall_or_excess > 0:
-                # Check if already have pending buy order
-                if asset_key not in self._active_buy_orders:
+                # Check if already have pending buy order for ANY alias
+                # Only place new order if no aliases have active orders
+                has_active_order = False
+                for alias in asset_aliases:
+                    if alias in self._active_buy_orders:
+                        has_active_order = True
+                        break
+
+                if not has_active_order:
                     # For completion check, use ACTUAL balance (not adjusted)
-                    base_bal_actual = self.c_get_actual_base_balance(asset_key)
+                    base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
-                    if not self.c_try_mark_buy_complete(asset_key, val_result_actual.first, val_result_actual.second):
+                    if not self.c_try_mark_buy_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
                         # Find the best market to buy on (lowest ask)
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
@@ -1367,12 +1467,19 @@ cdef class PositionBalancerHandler:
             shortfall_or_excess = val_result.second
 
             if shortfall_or_excess > 0:
-                # Check if already have pending sell order
-                if asset_key not in self._active_sell_orders:
+                # Check if already have pending sell order for ANY alias
+                # Only place new order if no aliases have active orders
+                has_active_order = False
+                for alias in asset_aliases:
+                    if alias in self._active_sell_orders:
+                        has_active_order = True
+                        break
+
+                if not has_active_order:
                     # For completion check, use ACTUAL balance (not adjusted)
-                    base_bal_actual = self.c_get_actual_base_balance(asset_key)
+                    base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
-                    if not self.c_try_mark_sell_complete(asset_key, val_result_actual.first, val_result_actual.second):
+                    if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
                         # Find the best market to sell on (lowest ask)
                         selected_sell_market = self.c_find_best_sell_market(asset_key)
                         if selected_sell_market is not None:
