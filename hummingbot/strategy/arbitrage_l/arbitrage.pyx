@@ -1281,7 +1281,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         if market_pair_tuple is None:
             # Might be a position balancer order or old order
-            if order_id_str in self._order_timestamps:
+            if self._order_timestamps.find(order_id_str) != self._order_timestamps.end():
                 self._order_timestamps.erase(order_id_str)
             return
             
