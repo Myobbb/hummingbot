@@ -731,8 +731,26 @@ cdef class PositionBalancerHandler:
                     if not self._buy_enabled:
                         should_cancel = True
                         cancel_reason = "mode disabled"
+
+                    # IMMEDIATE CHECK: Outbid detection (don't wait for refresh interval)
+                    # Being frontrun is critical and requires immediate response
+                    if not should_cancel and (self._buy_spread_is_min or self._buy_spread_pct > 0.0):
+                        try:
+                            # Get current market state
+                            order_details = self._active_buy_order_details.get(asset)
+                            if order_details is not None:
+                                order_market_tuple, order_price = order_details
+                                current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
+                                current_bid = float(current_ob.get_price(False))
+                                # If someone placed a higher bid, cancel immediately (frontrun response)
+                                if current_bid > order_price:
+                                    should_cancel = True
+                                    cancel_reason = f"frontrun - immediate response (top bid {current_bid:.8f} > our {order_price:.8f})"
+                        except Exception:
+                            pass  # If check fails, continue to regular interval-based checks
+
                     # Check if refresh interval passed AND conditions changed
-                    elif current_time - last_time > self._limit_refresh_interval:
+                    if not should_cancel and current_time - last_time > self._limit_refresh_interval:
                         # Smart cancellation: only cancel if market/price changed
                         current_best_market = None
                         try:
@@ -930,8 +948,26 @@ cdef class PositionBalancerHandler:
                     if not self._sell_enabled:
                         should_cancel = True
                         cancel_reason = "mode disabled"
+
+                    # IMMEDIATE CHECK: Undercut detection (don't wait for refresh interval)
+                    # Being undercut is critical and requires immediate response
+                    if not should_cancel and (self._sell_spread_is_min or self._sell_spread_pct > 0.0):
+                        try:
+                            # Get current market state
+                            order_details = self._active_sell_order_details.get(asset)
+                            if order_details is not None:
+                                order_market_tuple, order_price = order_details
+                                current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
+                                current_ask = float(current_ob.get_price(True))
+                                # If someone placed a lower ask, cancel immediately (undercut response)
+                                if current_ask < order_price:
+                                    should_cancel = True
+                                    cancel_reason = f"undercut - immediate response (top ask {current_ask:.8f} < our {order_price:.8f})"
+                        except Exception:
+                            pass  # If check fails, continue to regular interval-based checks
+
                     # Check if refresh interval passed AND conditions changed
-                    elif current_time - last_time > self._limit_refresh_interval:
+                    if not should_cancel and current_time - last_time > self._limit_refresh_interval:
                         # Smart cancellation: only cancel if market/price changed
                         try:
                             # Find current best market
@@ -1325,7 +1361,29 @@ cdef class PositionBalancerHandler:
                 trading_rule = market._trading_rules.get(buy_market_tuple.trading_pair)
                 if trading_rule is not None and trading_rule.min_price_increment is not None:
                     min_price_increment = float(trading_rule.min_price_increment)
-                    buy_price = top_bid + min_price_increment
+
+                    # CRITICAL: Check if top bid is our own order being replaced
+                    # If we're replacing an existing order, the old order might still be in the orderbook
+                    # Use the second bid level to avoid placing above our own stale order
+                    reference_bid = top_bid
+                    if asset_key in self._active_buy_orders:
+                        # We have an active order - check if top bid matches it
+                        existing_order_details = self._active_buy_order_details.get(asset_key)
+                        if existing_order_details is not None:
+                            _, existing_price = existing_order_details
+                            # If top bid matches our existing order (within tolerance), use second bid
+                            if abs(top_bid - existing_price) < min_price_increment * 0.5:
+                                try:
+                                    bid_entries = ob.bid_entries()
+                                    if len(bid_entries) >= 2:
+                                        reference_bid = float(bid_entries[1].price)
+                                        self.strategy.logger().debug(
+                                            f"Position balancer: Top bid {top_bid:.8f} matches our existing order, "
+                                            f"using second bid {reference_bid:.8f} for new order price")
+                                except Exception as e:
+                                    self.strategy.logger().debug(f"Could not get second bid level: {e}")
+
+                    buy_price = reference_bid + min_price_increment
                     # Check if maker price would cross the spread (become taker)
                     if buy_price >= top_ask:
                         # IMPORTANT: Spread is too tight for maker order
@@ -1541,7 +1599,29 @@ cdef class PositionBalancerHandler:
                 trading_rule = market._trading_rules.get(sell_market_tuple.trading_pair)
                 if trading_rule is not None and trading_rule.min_price_increment is not None:
                     min_price_increment = float(trading_rule.min_price_increment)
-                    sell_price = top_ask - min_price_increment
+
+                    # CRITICAL: Check if top ask is our own order being replaced
+                    # If we're replacing an existing order, the old order might still be in the orderbook
+                    # Use the second ask level to avoid placing below our own stale order
+                    reference_ask = top_ask
+                    if asset_key in self._active_sell_orders:
+                        # We have an active order - check if top ask matches it
+                        existing_order_details = self._active_sell_order_details.get(asset_key)
+                        if existing_order_details is not None:
+                            _, existing_price = existing_order_details
+                            # If top ask matches our existing order (within tolerance), use second ask
+                            if abs(top_ask - existing_price) < min_price_increment * 0.5:
+                                try:
+                                    ask_entries = ob.ask_entries()
+                                    if len(ask_entries) >= 2:
+                                        reference_ask = float(ask_entries[1].price)
+                                        self.strategy.logger().debug(
+                                            f"Position balancer: Top ask {top_ask:.8f} matches our existing order, "
+                                            f"using second ask {reference_ask:.8f} for new order price")
+                                except Exception as e:
+                                    self.strategy.logger().debug(f"Could not get second ask level: {e}")
+
+                    sell_price = reference_ask - min_price_increment
                     # Check if maker price would cross the spread (become taker)
                     if sell_price <= top_bid:
                         # IMPORTANT: Spread is too tight for maker order
