@@ -112,6 +112,8 @@ cdef class PositionBalancerHandler:
         self._active_sell_order_details = {}  # asset -> (market_tuple, price)
         self._buy_cancel_request_time = {}    # asset -> timestamp when cancel was requested
         self._sell_cancel_request_time = {}   # asset -> timestamp when cancel was requested
+        self._last_buy_completion_time = {}   # asset -> timestamp when buy order completed
+        self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
 
         # Asset alias detection (for cross-exchange pairs with different token names)
         # If base assets have 1:1 conversion (no oracle, conversion_rate=1.0), treat as aliases
@@ -565,6 +567,8 @@ cdef class PositionBalancerHandler:
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._buy_cancel_request_time.pop(asset_key, None)
+                        # Record completion time for cooldown
+                        self._last_buy_completion_time[asset_key] = self.strategy._current_timestamp
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
                 if pend is not None:
@@ -584,6 +588,8 @@ cdef class PositionBalancerHandler:
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._sell_cancel_request_time.pop(asset_key, None)
+                        # Record completion time for cooldown
+                        self._last_sell_completion_time[asset_key] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
 
@@ -1459,6 +1465,11 @@ cdef class PositionBalancerHandler:
                         break
 
                 if not has_active_order:
+                    # Check 2-second cooldown after order completion
+                    time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
+                    if time_since_completion < 2.0:
+                        return False
+
                     # For completion check, use ACTUAL balance (not adjusted)
                     base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
@@ -1489,6 +1500,11 @@ cdef class PositionBalancerHandler:
                         break
 
                 if not has_active_order:
+                    # Check 2-second cooldown after order completion
+                    time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
+                    if time_since_completion < 2.0:
+                        return False
+
                     # For completion check, use ACTUAL balance (not adjusted)
                     base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
