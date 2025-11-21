@@ -162,8 +162,8 @@ cdef class PositionBalancerHandler:
                         if mp.first.base_asset == asset:
                             # Mark as timeout-cancelled to prevent cooldown
                             self.strategy._timeout_cancelled_orders.add(order_id)
-                            # Remove from position balancer tracking
-                            self.strategy._position_balancer_orders.discard(order_id)
+                            # NOTE: Don't remove from _position_balancer_orders here!
+                            # Let handle_order_completion clean it up when cancel completes
                             # Cancel the order
                             self.strategy.c_cancel_order(mp.first, order_id)
                             self.strategy.logger().info(
@@ -196,8 +196,8 @@ cdef class PositionBalancerHandler:
                         if mp.first.base_asset == asset:
                             # Mark as timeout-cancelled to prevent cooldown
                             self.strategy._timeout_cancelled_orders.add(order_id)
-                            # Remove from position balancer tracking
-                            self.strategy._position_balancer_orders.discard(order_id)
+                            # NOTE: Don't remove from _position_balancer_orders here!
+                            # Let handle_order_completion clean it up when cancel completes
                             # Cancel the order
                             self.strategy.c_cancel_order(mp.first, order_id)
                             self.strategy.logger().info(
@@ -759,9 +759,9 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
-                                # Remove from position balancer tracking to prevent main timeout check
-                                self.strategy._position_balancer_orders.discard(order_id)
-
+                                # NOTE: Don't remove from _position_balancer_orders here!
+                                # Main strategy skips timeout checks for orders in this set.
+                                # Only remove when order actually completes/cancels (in handle_order_completion)
 
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
@@ -849,8 +849,9 @@ cdef class PositionBalancerHandler:
                             if mp.first.base_asset == asset:
                                 # Mark as timeout-cancelled to prevent cooldown enforcement
                                 self.strategy._timeout_cancelled_orders.add(order_id)
-                                # Remove from position balancer tracking to prevent main timeout check
-                                self.strategy._position_balancer_orders.discard(order_id)
+                                # NOTE: Don't remove from _position_balancer_orders here!
+                                # Main strategy skips timeout checks for orders in this set.
+                                # Only remove when order actually completes/cancels (in handle_order_completion)
 
                                 # Cancel the order
                                 self.strategy.c_cancel_order(mp.first, order_id)
