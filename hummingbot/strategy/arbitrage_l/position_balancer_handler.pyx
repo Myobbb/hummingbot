@@ -687,6 +687,10 @@ cdef class PositionBalancerHandler:
             double cancel_threshold_abs
             double cancel_threshold_pct
             double time_since_order_placed
+            bint process_buy_order
+            bint process_sell_order
+            bint should_cancel
+            str cancel_reason
             str order_id
 
         # ========================================================================
@@ -698,6 +702,7 @@ cdef class PositionBalancerHandler:
                 # SAFETY NET: Detect stuck cancels (cancel event never arrived)
                 # If we've been waiting for a cancel for 2x the refresh interval, force cleanup
                 # This prevents permanent stuck states due to missed cancel events
+                process_buy_order = True  # Flag to control whether to process this order
                 if order_id in self.strategy._timeout_cancelled_orders:
                     last_time = self._last_buy_order_time.get(asset, 0.0)
                     time_since_order_placed = current_time - last_time
@@ -711,164 +716,166 @@ cdef class PositionBalancerHandler:
                         self.handle_order_cancellation(order_id)
                         # Also clean up from timeout set (in case main strategy didn't)
                         self.strategy._timeout_cancelled_orders.discard(order_id)
-                    # Skip normal processing - already in cancellation state
-                    return
+                    # Skip buy order processing - already in cancellation state
+                    # But continue to check sell orders below (don't return!)
+                    process_buy_order = False
 
-                # Normal processing - order not in cancellation state
-                # Only process if we haven't already sent a cancel request
-                last_time = self._last_buy_order_time.get(asset, 0.0)
-                should_cancel = False
-                cancel_reason = ""
+                if process_buy_order:
+                    # Normal processing - order not in cancellation state
+                    # Only process if we haven't already sent a cancel request
+                    last_time = self._last_buy_order_time.get(asset, 0.0)
+                    should_cancel = False
+                    cancel_reason = ""
 
-                # Cancel if mode disabled (orphaned order)
-                if not self._buy_enabled:
-                    should_cancel = True
-                    cancel_reason = "mode disabled"
-                # Check if refresh interval passed AND conditions changed
-                elif current_time - last_time > self._limit_refresh_interval:
-                    # Smart cancellation: only cancel if market/price changed
-                    try:
-                        # Find current best market
-                        current_best_market = self.c_find_best_buy_market(asset)
-                        if current_best_market is not None:
-                            # Get order details (market, price)
-                            order_details = self._active_buy_order_details.get(asset)
-                            if order_details is not None:
-                                order_market_name, order_price = order_details
+                    # Cancel if mode disabled (orphaned order)
+                    if not self._buy_enabled:
+                        should_cancel = True
+                        cancel_reason = "mode disabled"
+                    # Check if refresh interval passed AND conditions changed
+                    elif current_time - last_time > self._limit_refresh_interval:
+                        # Smart cancellation: only cancel if market/price changed
+                        try:
+                            # Find current best market
+                            current_best_market = self.c_find_best_buy_market(asset)
+                            if current_best_market is not None:
+                                # Get order details (market, price)
+                                order_details = self._active_buy_order_details.get(asset)
+                                if order_details is not None:
+                                    order_market_name, order_price = order_details
 
-                                # CONDITION 1: Check if different market became better
-                                if current_best_market.market.name != order_market_name:
-                                    should_cancel = True
-                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
-                                else:
-                                    # Same market - evaluate if conditions changed
-                                    try:
-                                        current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                        current_bid = float(current_ob.get_price(False))
-                                        current_ask = float(current_ob.get_price(True))
+                                    # CONDITION 1: Check if different market became better
+                                    if current_best_market.market.name != order_market_name:
+                                        should_cancel = True
+                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                    else:
+                                        # Same market - evaluate if conditions changed
+                                        try:
+                                            current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
+                                            current_bid = float(current_ob.get_price(False))
+                                            current_ask = float(current_ob.get_price(True))
 
-                                        # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
-                                        trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                        min_price_increment = 0.0
-                                        if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                            min_price_increment = float(trading_rule.min_price_increment)
+                                            # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
+                                            trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                            min_price_increment = 0.0
+                                            if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                min_price_increment = float(trading_rule.min_price_increment)
 
-                                        # IMPORTANT: For 'min' mode gap detection, check if top bid is OUR order
-                                        # If so, we need to look at the SECOND level to detect gaps below us
-                                        # Percentage mode uses current_bid directly since it's less likely to be exactly at top
-                                        effective_bid = current_bid  # The bid price we'll use for calculations
-                                        if self._buy_spread_is_min and min_price_increment > 0:
-                                            # Check if current top bid matches our order price (within half tick tolerance)
-                                            # If it does, it's likely our own order, so look at the second bid level
-                                            if abs(current_bid - order_price) < min_price_increment * 0.5:
-                                                # Get second bid level for gap detection
-                                                try:
-                                                    bid_entries = current_ob.bid_entries()
-                                                    if len(bid_entries) >= 2:
-                                                        # Use second best bid for gap detection
-                                                        effective_bid = float(bid_entries[1].price)
-                                                        self.strategy.logger().debug(
-                                                            f"Position balancer: Top bid {current_bid:.8f} is our order {order_price:.8f}, "
-                                                            f"using second bid {effective_bid:.8f} for gap detection")
-                                                except Exception:
-                                                    pass  # Fall back to using current_bid
+                                            # IMPORTANT: For 'min' mode gap detection, check if top bid is OUR order
+                                            # If so, we need to look at the SECOND level to detect gaps below us
+                                            # Percentage mode uses current_bid directly since it's less likely to be exactly at top
+                                            effective_bid = current_bid  # The bid price we'll use for calculations
+                                            if self._buy_spread_is_min and min_price_increment > 0:
+                                                # Check if current top bid matches our order price (within half tick tolerance)
+                                                # If it does, it's likely our own order, so look at the second bid level
+                                                if abs(current_bid - order_price) < min_price_increment * 0.5:
+                                                    # Get second bid level for gap detection
+                                                    try:
+                                                        bid_entries = current_ob.bid_entries()
+                                                        if len(bid_entries) >= 2:
+                                                            # Use second best bid for gap detection
+                                                            effective_bid = float(bid_entries[1].price)
+                                                            self.strategy.logger().debug(
+                                                                f"Position balancer: Top bid {current_bid:.8f} is our order {order_price:.8f}, "
+                                                                f"using second bid {effective_bid:.8f} for gap detection")
+                                                    except Exception:
+                                                        pass  # Fall back to using current_bid
 
-                                        # Calculate what our order price SHOULD be now with current market conditions
-                                        ideal_order_price = 0.0  # What the price should be if we placed order now
-                                        if self._buy_spread_is_min:
-                                            # 'min' mode: place at bid + min_tick to be at front
-                                            if min_price_increment > 0:
-                                                # Use effective_bid (second bid if top is our order)
-                                                ideal_order_price = effective_bid + min_price_increment
-                                            else:
-                                                ideal_order_price = current_ask  # Fallback if no min_price_increment
-                                        elif self._buy_spread_pct == 0.0:
-                                            # Aggressive mode (0%): take at ask
-                                            ideal_order_price = current_ask
-                                        else:
-                                            # Percentage mode: place above bid by spread percentage
-                                            # Note: Percentage mode doesn't need second-level bid detection because:
-                                            # - Our order is unlikely to be exactly at bid * (1 + spread_pct)
-                                            # - Even if someone matches our price, we still use current_bid for reference
-                                            ideal_order_price = current_bid * (1.0 + self._buy_spread_pct)
-
-                                        # Calculate price difference between ideal and actual
-                                        price_diff_abs = abs(ideal_order_price - order_price)
-                                        if order_price > 0:
-                                            price_diff_pct = price_diff_abs / order_price
-                                        else:
-                                            price_diff_pct = 0.0
-
-                                        # Determine smart threshold based on spread configuration
-                                        # This allows small market noise while catching real movements/gaps
-                                        if self._buy_spread_is_min:
-                                            # Min tick mode: cancel if difference > 1.5 ticks (got frontrun or gap appeared)
-                                            if min_price_increment > 0:
-                                                cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
-                                            else:
-                                                cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
-                                            cancel_threshold_pct = 0.0  # Not used in min mode
-                                        else:
-                                            # Percentage mode: cancel if difference > 50% of spread or 0.1% minimum
-                                            # This ensures we only cancel when movement is significant relative to our spread
-                                            cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
-                                            cancel_threshold_abs = 0.0  # Not used in percentage mode
-
-                                        # CONDITION 2: Got outbid - someone placed HIGHER bid than our order
-                                        # FIXED BUG: Use strict > instead of >= to avoid canceling our own order
-                                        # When our order is at the front, current_bid might equal our order_price
-                                        # Only cancel if someone actually placed HIGHER bid (current_bid > order_price)
-                                        if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
-                                            if current_bid > order_price:
-                                                should_cancel = True
-                                                cancel_reason = f"outbid (top bid {current_bid:.8f} > our {order_price:.8f})"
-
-                                        # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
-                                        # If ideal price < our order price, market moved in our favor
-                                        # For buys, this means we can buy at a lower price now
-                                        if not should_cancel and ideal_order_price < order_price:
-                                            gap_down = order_price - ideal_order_price
+                                            # Calculate what our order price SHOULD be now with current market conditions
+                                            ideal_order_price = 0.0  # What the price should be if we placed order now
                                             if self._buy_spread_is_min:
-                                                # Min mode: check absolute threshold
-                                                if gap_down > cancel_threshold_abs:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                                # 'min' mode: place at bid + min_tick to be at front
+                                                if min_price_increment > 0:
+                                                    # Use effective_bid (second bid if top is our order)
+                                                    ideal_order_price = effective_bid + min_price_increment
+                                                else:
+                                                    ideal_order_price = current_ask  # Fallback if no min_price_increment
+                                            elif self._buy_spread_pct == 0.0:
+                                                # Aggressive mode (0%): take at ask
+                                                ideal_order_price = current_ask
                                             else:
-                                                # Percentage mode: check percentage threshold
-                                                gap_pct = gap_down / order_price if order_price > 0 else 0.0
-                                                if gap_pct > cancel_threshold_pct:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8f} vs {order_price:.8f})"
+                                                # Percentage mode: place above bid by spread percentage
+                                                # Note: Percentage mode doesn't need second-level bid detection because:
+                                                # - Our order is unlikely to be exactly at bid * (1 + spread_pct)
+                                                # - Even if someone matches our price, we still use current_bid for reference
+                                                ideal_order_price = current_bid * (1.0 + self._buy_spread_pct)
 
-                                        # CONDITION 4: Market moved UP significantly - got closer to being filled
-                                        # If ideal price > our order price, market moved against us
-                                        # For aggressive buys (0%), check if bid moved very close to our ask order
-                                        if not should_cancel and self._buy_spread_pct == 0.0:
-                                            if current_bid >= order_price * 0.999:  # Within 0.1% of our ask order
-                                                should_cancel = True
-                                                cancel_reason = "market moved to our price (aggressive mode)"
+                                            # Calculate price difference between ideal and actual
+                                            price_diff_abs = abs(ideal_order_price - order_price)
+                                            if order_price > 0:
+                                                price_diff_pct = price_diff_abs / order_price
+                                            else:
+                                                price_diff_pct = 0.0
 
-                                        # CONDITION 5: Significant price divergence - any direction
-                                        # Catches edge cases and ensures we stay aligned with current market
-                                        if not should_cancel:
+                                            # Determine smart threshold based on spread configuration
+                                            # This allows small market noise while catching real movements/gaps
                                             if self._buy_spread_is_min:
-                                                if price_diff_abs > cancel_threshold_abs:
-                                                    should_cancel = True
-                                                    cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                # Min tick mode: cancel if difference > 1.5 ticks (got frontrun or gap appeared)
+                                                if min_price_increment > 0:
+                                                    cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                else:
+                                                    cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
+                                                cancel_threshold_pct = 0.0  # Not used in min mode
                                             else:
-                                                if price_diff_pct > cancel_threshold_pct:
+                                                # Percentage mode: cancel if difference > 50% of spread or 0.1% minimum
+                                                # This ensures we only cancel when movement is significant relative to our spread
+                                                cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
+                                                cancel_threshold_abs = 0.0  # Not used in percentage mode
+
+                                            # CONDITION 2: Got outbid - someone placed HIGHER bid than our order
+                                            # FIXED BUG: Use strict > instead of >= to avoid canceling our own order
+                                            # When our order is at the front, current_bid might equal our order_price
+                                            # Only cancel if someone actually placed HIGHER bid (current_bid > order_price)
+                                            if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
+                                                if current_bid > order_price:
                                                     should_cancel = True
-                                                    cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                    cancel_reason = f"outbid (top bid {current_bid:.8f} > our {order_price:.8f})"
+
+                                            # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
+                                            # If ideal price < our order price, market moved in our favor
+                                            # For buys, this means we can buy at a lower price now
+                                            if not should_cancel and ideal_order_price < order_price:
+                                                gap_down = order_price - ideal_order_price
+                                                if self._buy_spread_is_min:
+                                                    # Min mode: check absolute threshold
+                                                    if gap_down > cancel_threshold_abs:
+                                                        should_cancel = True
+                                                        cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                                else:
+                                                    # Percentage mode: check percentage threshold
+                                                    gap_pct = gap_down / order_price if order_price > 0 else 0.0
+                                                    if gap_pct > cancel_threshold_pct:
+                                                        should_cancel = True
+                                                        cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8f} vs {order_price:.8f})"
+
+                                            # CONDITION 4: Market moved UP significantly - got closer to being filled
+                                            # If ideal price > our order price, market moved against us
+                                            # For aggressive buys (0%), check if bid moved very close to our ask order
+                                            if not should_cancel and self._buy_spread_pct == 0.0:
+                                                if current_bid >= order_price * 0.999:  # Within 0.1% of our ask order
+                                                    should_cancel = True
+                                                    cancel_reason = "market moved to our price (aggressive mode)"
+
+                                            # CONDITION 5: Significant price divergence - any direction
+                                            # Catches edge cases and ensures we stay aligned with current market
+                                            if not should_cancel:
+                                                if self._buy_spread_is_min:
+                                                    if price_diff_abs > cancel_threshold_abs:
+                                                        should_cancel = True
+                                                        cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                else:
+                                                    if price_diff_pct > cancel_threshold_pct:
+                                                        should_cancel = True
+                                                        cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
 
                                     except Exception as e:
                                         self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
                                         pass
-                    except Exception as e:
-                        self.strategy.logger().warning(f"Position balancer: Error finding best buy market: {e}")
-                        pass
+                        except Exception as e:
+                            self.strategy.logger().warning(f"Position balancer: Error finding best buy market: {e}")
+                            pass
 
-                if should_cancel:
-                    self._cancel_buy_order(asset, order_id, cancel_reason)
+                    if should_cancel:
+                        self._cancel_buy_order(asset, order_id, cancel_reason)
 
         # ========================================================================
         # CHECK SELL ORDERS
@@ -879,6 +886,7 @@ cdef class PositionBalancerHandler:
                 # SAFETY NET: Detect stuck cancels (cancel event never arrived)
                 # If we've been waiting for a cancel for 2x the refresh interval, force cleanup
                 # This prevents permanent stuck states due to missed cancel events
+                process_sell_order = True  # Flag to control whether to process this order
                 if order_id in self.strategy._timeout_cancelled_orders:
                     last_time = self._last_sell_order_time.get(asset, 0.0)
                     time_since_order_placed = current_time - last_time
@@ -892,162 +900,163 @@ cdef class PositionBalancerHandler:
                         self.handle_order_cancellation(order_id)
                         # Also clean up from timeout set (in case main strategy didn't)
                         self.strategy._timeout_cancelled_orders.discard(order_id)
-                    # Skip normal processing - already in cancellation state
-                    return
+                    # Skip sell order processing - already in cancellation state
+                    process_sell_order = False
 
-                # Normal processing - order not in cancellation state
-                # Only process if we haven't already sent a cancel request
-                last_time = self._last_sell_order_time.get(asset, 0.0)
-                should_cancel = False
-                cancel_reason = ""
+                if process_sell_order:
+                    # Normal processing - order not in cancellation state
+                    # Only process if we haven't already sent a cancel request
+                    last_time = self._last_sell_order_time.get(asset, 0.0)
+                    should_cancel = False
+                    cancel_reason = ""
 
-                # Cancel if mode disabled (orphaned order)
-                if not self._sell_enabled:
-                    should_cancel = True
-                    cancel_reason = "mode disabled"
-                # Check if refresh interval passed AND conditions changed
-                elif current_time - last_time > self._limit_refresh_interval:
-                    # Smart cancellation: only cancel if market/price changed
-                    try:
-                        # Find current best market
-                        current_best_market = self.c_find_best_sell_market(asset)
-                        if current_best_market is not None:
-                            # Get order details (market, price)
-                            order_details = self._active_sell_order_details.get(asset)
-                            if order_details is not None:
-                                order_market_name, order_price = order_details
+                    # Cancel if mode disabled (orphaned order)
+                    if not self._sell_enabled:
+                        should_cancel = True
+                        cancel_reason = "mode disabled"
+                    # Check if refresh interval passed AND conditions changed
+                    elif current_time - last_time > self._limit_refresh_interval:
+                        # Smart cancellation: only cancel if market/price changed
+                        try:
+                            # Find current best market
+                            current_best_market = self.c_find_best_sell_market(asset)
+                            if current_best_market is not None:
+                                # Get order details (market, price)
+                                order_details = self._active_sell_order_details.get(asset)
+                                if order_details is not None:
+                                    order_market_name, order_price = order_details
 
-                                # CONDITION 1: Check if different market became better
-                                if current_best_market.market.name != order_market_name:
-                                    should_cancel = True
-                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
-                                else:
-                                    # Same market - evaluate if conditions changed
-                                    try:
-                                        current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                        current_bid = float(current_ob.get_price(False))
-                                        current_ask = float(current_ob.get_price(True))
+                                    # CONDITION 1: Check if different market became better
+                                    if current_best_market.market.name != order_market_name:
+                                        should_cancel = True
+                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
+                                    else:
+                                        # Same market - evaluate if conditions changed
+                                        try:
+                                            current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
+                                            current_bid = float(current_ob.get_price(False))
+                                            current_ask = float(current_ob.get_price(True))
 
-                                        # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
-                                        trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                        min_price_increment = 0.0
-                                        if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                            min_price_increment = float(trading_rule.min_price_increment)
+                                            # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
+                                            trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                            min_price_increment = 0.0
+                                            if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                min_price_increment = float(trading_rule.min_price_increment)
 
-                                        # IMPORTANT: For 'min' mode gap detection, check if top ask is OUR order
-                                        # If so, we need to look at the SECOND level to detect gaps above us
-                                        # Percentage mode uses current_ask directly since it's less likely to be exactly at top
-                                        effective_ask = current_ask  # The ask price we'll use for calculations
-                                        if self._sell_spread_is_min and min_price_increment > 0:
-                                            # Check if current top ask matches our order price (within half tick tolerance)
-                                            # If it does, it's likely our own order, so look at the second ask level
-                                            if abs(current_ask - order_price) < min_price_increment * 0.5:
-                                                # Get second ask level for gap detection
-                                                try:
-                                                    ask_entries = current_ob.ask_entries()
-                                                    if len(ask_entries) >= 2:
-                                                        # Use second best ask for gap detection
-                                                        effective_ask = float(ask_entries[1].price)
-                                                        self.strategy.logger().debug(
-                                                            f"Position balancer: Top ask {current_ask:.8f} is our order {order_price:.8f}, "
-                                                            f"using second ask {effective_ask:.8f} for gap detection")
-                                                except Exception:
-                                                    pass  # Fall back to using current_ask
+                                            # IMPORTANT: For 'min' mode gap detection, check if top ask is OUR order
+                                            # If so, we need to look at the SECOND level to detect gaps above us
+                                            # Percentage mode uses current_ask directly since it's less likely to be exactly at top
+                                            effective_ask = current_ask  # The ask price we'll use for calculations
+                                            if self._sell_spread_is_min and min_price_increment > 0:
+                                                # Check if current top ask matches our order price (within half tick tolerance)
+                                                # If it does, it's likely our own order, so look at the second ask level
+                                                if abs(current_ask - order_price) < min_price_increment * 0.5:
+                                                    # Get second ask level for gap detection
+                                                    try:
+                                                        ask_entries = current_ob.ask_entries()
+                                                        if len(ask_entries) >= 2:
+                                                            # Use second best ask for gap detection
+                                                            effective_ask = float(ask_entries[1].price)
+                                                            self.strategy.logger().debug(
+                                                                f"Position balancer: Top ask {current_ask:.8f} is our order {order_price:.8f}, "
+                                                                f"using second ask {effective_ask:.8f} for gap detection")
+                                                    except Exception:
+                                                        pass  # Fall back to using current_ask
 
-                                        # Calculate what our order price SHOULD be now with current market conditions
-                                        ideal_order_price = 0.0  # What the price should be if we placed order now
-                                        if self._sell_spread_is_min:
-                                            # 'min' mode: place at ask - min_tick to be at front
-                                            if min_price_increment > 0:
-                                                # Use effective_ask (second ask if top is our order)
-                                                ideal_order_price = effective_ask - min_price_increment
-                                            else:
-                                                ideal_order_price = current_bid  # Fallback if no min_price_increment
-                                        elif self._sell_spread_pct == 0.0:
-                                            # Aggressive mode (0%): take at bid
-                                            ideal_order_price = current_bid
-                                        else:
-                                            # Percentage mode: place below ask by spread percentage
-                                            # Note: Percentage mode doesn't need second-level ask detection because:
-                                            # - Our order is unlikely to be exactly at ask * (1 - spread_pct)
-                                            # - Even if someone matches our price, we still use current_ask for reference
-                                            ideal_order_price = current_ask * (1.0 - self._sell_spread_pct)
-
-                                        # Calculate price difference between ideal and actual
-                                        price_diff_abs = abs(ideal_order_price - order_price)
-                                        if order_price > 0:
-                                            price_diff_pct = price_diff_abs / order_price
-                                        else:
-                                            price_diff_pct = 0.0
-
-                                        # Determine smart threshold based on spread configuration
-                                        if self._sell_spread_is_min:
-                                            # Min tick mode: cancel if difference > 1.5 ticks
-                                            if min_price_increment > 0:
-                                                cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
-                                            else:
-                                                cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
-                                            cancel_threshold_pct = 0.0  # Not used in min mode
-                                        else:
-                                            # Percentage mode: cancel if difference > 50% of spread or 0.1% minimum
-                                            cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
-                                            cancel_threshold_abs = 0.0  # Not used in percentage mode
-
-                                        # CONDITION 2: Got undercut - someone placed LOWER ask than our order
-                                        # FIXED BUG: Use strict < instead of <= to avoid canceling our own order
-                                        # When our order is at the front, current_ask might equal our order_price
-                                        # Only cancel if someone actually placed LOWER ask (current_ask < order_price)
-                                        if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
-                                            if current_ask < order_price:
-                                                should_cancel = True
-                                                cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
-
-                                        # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
-                                        # If ideal price > our order price, market moved in our favor
-                                        # For sells, this means we can sell at a higher price now
-                                        if not should_cancel and ideal_order_price > order_price:
-                                            gap_up = ideal_order_price - order_price
+                                            # Calculate what our order price SHOULD be now with current market conditions
+                                            ideal_order_price = 0.0  # What the price should be if we placed order now
                                             if self._sell_spread_is_min:
-                                                # Min mode: check absolute threshold
-                                                if gap_up > cancel_threshold_abs:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
+                                                # 'min' mode: place at ask - min_tick to be at front
+                                                if min_price_increment > 0:
+                                                    # Use effective_ask (second ask if top is our order)
+                                                    ideal_order_price = effective_ask - min_price_increment
+                                                else:
+                                                    ideal_order_price = current_bid  # Fallback if no min_price_increment
+                                            elif self._sell_spread_pct == 0.0:
+                                                # Aggressive mode (0%): take at bid
+                                                ideal_order_price = current_bid
                                             else:
-                                                # Percentage mode: check percentage threshold
-                                                gap_pct = gap_up / order_price if order_price > 0 else 0.0
-                                                if gap_pct > cancel_threshold_pct:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8f} vs {order_price:.8f})"
+                                                # Percentage mode: place below ask by spread percentage
+                                                # Note: Percentage mode doesn't need second-level ask detection because:
+                                                # - Our order is unlikely to be exactly at ask * (1 - spread_pct)
+                                                # - Even if someone matches our price, we still use current_ask for reference
+                                                ideal_order_price = current_ask * (1.0 - self._sell_spread_pct)
 
-                                        # CONDITION 4: Market moved DOWN significantly - got closer to being filled
-                                        # If ideal price < our order price, market moved against us
-                                        # For aggressive sells (0%), check if ask moved very close to our bid order
-                                        if not should_cancel and self._sell_spread_pct == 0.0:
-                                            if current_ask <= order_price * 1.001:  # Within 0.1% of our bid order
-                                                should_cancel = True
-                                                cancel_reason = "market moved to our price (aggressive mode)"
+                                            # Calculate price difference between ideal and actual
+                                            price_diff_abs = abs(ideal_order_price - order_price)
+                                            if order_price > 0:
+                                                price_diff_pct = price_diff_abs / order_price
+                                            else:
+                                                price_diff_pct = 0.0
 
-                                        # CONDITION 5: Significant price divergence - any direction
-                                        # Catches edge cases and ensures we stay aligned with current market
-                                        if not should_cancel:
+                                            # Determine smart threshold based on spread configuration
                                             if self._sell_spread_is_min:
-                                                if price_diff_abs > cancel_threshold_abs:
-                                                    should_cancel = True
-                                                    cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                # Min tick mode: cancel if difference > 1.5 ticks
+                                                if min_price_increment > 0:
+                                                    cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                else:
+                                                    cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
+                                                cancel_threshold_pct = 0.0  # Not used in min mode
                                             else:
-                                                if price_diff_pct > cancel_threshold_pct:
+                                                # Percentage mode: cancel if difference > 50% of spread or 0.1% minimum
+                                                cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
+                                                cancel_threshold_abs = 0.0  # Not used in percentage mode
+
+                                            # CONDITION 2: Got undercut - someone placed LOWER ask than our order
+                                            # FIXED BUG: Use strict < instead of <= to avoid canceling our own order
+                                            # When our order is at the front, current_ask might equal our order_price
+                                            # Only cancel if someone actually placed LOWER ask (current_ask < order_price)
+                                            if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
+                                                if current_ask < order_price:
                                                     should_cancel = True
-                                                    cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                    cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
 
-                                    except Exception as e:
-                                        self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
-                                        pass
-                    except Exception as e:
-                        self.strategy.logger().warning(f"Position balancer: Error finding best sell market: {e}")
-                        pass
+                                            # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
+                                            # If ideal price > our order price, market moved in our favor
+                                            # For sells, this means we can sell at a higher price now
+                                            if not should_cancel and ideal_order_price > order_price:
+                                                gap_up = ideal_order_price - order_price
+                                                if self._sell_spread_is_min:
+                                                    # Min mode: check absolute threshold
+                                                    if gap_up > cancel_threshold_abs:
+                                                        should_cancel = True
+                                                        cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
+                                                else:
+                                                    # Percentage mode: check percentage threshold
+                                                    gap_pct = gap_up / order_price if order_price > 0 else 0.0
+                                                    if gap_pct > cancel_threshold_pct:
+                                                        should_cancel = True
+                                                        cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8f} vs {order_price:.8f})"
 
-                if should_cancel:
-                    self._cancel_sell_order(asset, order_id, cancel_reason)
+                                            # CONDITION 4: Market moved DOWN significantly - got closer to being filled
+                                            # If ideal price < our order price, market moved against us
+                                            # For aggressive sells (0%), check if ask moved very close to our bid order
+                                            if not should_cancel and self._sell_spread_pct == 0.0:
+                                                if current_ask <= order_price * 1.001:  # Within 0.1% of our bid order
+                                                    should_cancel = True
+                                                    cancel_reason = "market moved to our price (aggressive mode)"
+
+                                            # CONDITION 5: Significant price divergence - any direction
+                                            # Catches edge cases and ensures we stay aligned with current market
+                                            if not should_cancel:
+                                                if self._sell_spread_is_min:
+                                                    if price_diff_abs > cancel_threshold_abs:
+                                                        should_cancel = True
+                                                        cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+                                                else:
+                                                    if price_diff_pct > cancel_threshold_pct:
+                                                        should_cancel = True
+                                                        cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
+
+                                        except Exception as e:
+                                            self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
+                                            pass
+                        except Exception as e:
+                            self.strategy.logger().warning(f"Position balancer: Error finding best sell market: {e}")
+                            pass
+
+                    if should_cancel:
+                        self._cancel_sell_order(asset, order_id, cancel_reason)
 
     cdef void _cancel_buy_order(self, str asset, str order_id, str reason):
         """
