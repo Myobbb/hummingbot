@@ -136,7 +136,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     sell_off_target_usd: float = 3000.0,
                     sell_off_spread_pct: object = "min",  # float or 'min'
                     # Position balancer - order management
-                    position_balancer_refresh_interval: float = 600.0,
+                    position_balancer_refresh_interval: float = 60.0,
                     position_balancer_order_size_usd: float = 100.0,
                     orchestrated_mode: bool = False):
         """Initialize arbitrage strategy with configurable parameters"""

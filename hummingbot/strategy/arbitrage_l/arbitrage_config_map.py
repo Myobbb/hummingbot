@@ -255,7 +255,7 @@ arbitrage_l_config_map = {
         key="position_balancer_refresh_interval",
         prompt="How often to cancel and replace limit orders (seconds) >>> ",
         prompt_on_new=False,
-        default=Decimal("600"),
+        default=Decimal("60"),
         validator=lambda v: validate_decimal(v, Decimal(1), inclusive=True),
         type_str="decimal",
     ),

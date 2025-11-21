@@ -414,7 +414,7 @@ class ArbitrageMInstanceConfig(BaseModel):
         - sell_off_spread_pct: min (%, spread above top ask for sell limit orders)
 
       Order Management:
-        - position_balancer_refresh_interval: 600.0 (seconds, how often to refresh limit orders)
+        - position_balancer_refresh_interval: 60.0 (seconds, how often to refresh limit orders)
         - position_balancer_order_size_usd: 100.0 (USD, maximum order size per position balancer order)
 
     Timing (arbitrage_l defaults):
@@ -495,7 +495,7 @@ class ArbitrageMInstanceConfig(BaseModel):
 
     # Position balancer - Order management
     position_balancer_refresh_interval: float = Field(
-        default=600.0,
+        default=60.0,
         description="How often to cancel and replace limit orders (seconds)"
     )
     position_balancer_order_size_usd: float = Field(
