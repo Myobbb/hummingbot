@@ -20,6 +20,7 @@ from libcpp.set cimport set as cpp_set
 from cython.operator cimport(
     dereference as deref,
     postincrement as inc,
+    address as address_of,
 )
 
 from hummingbot.connector.exchange_base import ExchangeBase
@@ -1109,8 +1110,8 @@ cdef void c_find_profitable_arbitrage_orders(
         cpp_set[OrderBookEntryCPP].reverse_iterator bid_end
         cpp_set[OrderBookEntryCPP].iterator ask_it
         cpp_set[OrderBookEntryCPP].iterator ask_end
-        OrderBookEntryCPP bid_entry
-        OrderBookEntryCPP ask_entry
+        OrderBookEntryCPP *bid_entry_ptr
+        OrderBookEntryCPP *ask_entry_ptr
         double orig_bid_price
         double orig_ask_price
         double bid_price
@@ -1122,6 +1123,7 @@ cdef void c_find_profitable_arbitrage_orders(
         overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
     # Now scan the books (C-level iteration)
+    
     bid_it = sell_bids.rbegin()
     bid_end = sell_bids.rend()
     ask_it = buy_asks.begin()
@@ -1130,16 +1132,16 @@ cdef void c_find_profitable_arbitrage_orders(
     if bid_it == bid_end or ask_it == ask_end:
         return
 
-    bid_entry = deref(bid_it)
-    ask_entry = deref(ask_it)
+    bid_entry_ptr = &deref(bid_it)
+    ask_entry_ptr = &deref(ask_it)
 
-    bid_leftover = bid_entry.getAmount()
-    ask_leftover = ask_entry.getAmount()
+    bid_leftover = bid_entry_ptr.getAmount()
+    ask_leftover = ask_entry_ptr.getAmount()
 
     while levels_processed < max_levels and bid_it != bid_end and ask_it != ask_end:
         # Get prices (original, unconverted)
-        orig_bid_price = bid_entry.getPrice()
-        orig_ask_price = ask_entry.getPrice()
+        orig_bid_price = bid_entry_ptr.getPrice()
+        orig_ask_price = ask_entry_ptr.getPrice()
 
         # Sanity check
         if orig_bid_price <= 0 or orig_ask_price <= 0:
@@ -1175,14 +1177,14 @@ cdef void c_find_profitable_arbitrage_orders(
             levels_processed += 1
             if bid_it == bid_end:
                 break
-            bid_entry = deref(bid_it)
-            bid_leftover = bid_entry.getAmount()
+            bid_entry_ptr = &deref(bid_it)
+            bid_leftover = bid_entry_ptr.getAmount()
             ask_leftover -= step_amount
         else:
             inc(ask_it)
             levels_processed += 1  
             if ask_it == ask_end:
                 break
-            ask_entry = deref(ask_it)
-            ask_leftover = ask_entry.getAmount()
+            ask_entry_ptr = &deref(ask_it)
+            ask_leftover = ask_entry_ptr.getAmount()
             bid_leftover -= step_amount
