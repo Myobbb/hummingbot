@@ -17,6 +17,7 @@ from decimal import Decimal
 from libc.stdint cimport int64_t
 from libcpp.pair cimport pair
 from libcpp.string cimport string
+from cython.operator cimport dereference as deref
 
 from hummingbot.connector.exchange_base cimport ExchangeBase
 from hummingbot.core.data_type.common import OrderType
@@ -680,7 +681,7 @@ cdef class PositionBalancerHandler:
             object best_market = None
             double best_price = 1e100  # Start with very high number
             double current_price
-            object ob
+            OrderBook ob
             object mp
             object market_tuple
             list asset_aliases
@@ -695,15 +696,21 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset in asset_aliases:
                         try:
-                            # Use Python-level get_order_book for compatibility with all exchanges
-                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
+                            # Use C-level get_order_book for compatibility with all exchanges
+                            ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 
                             if use_ask_price:
                                 # Aggressive mode (0%): select market with LOWEST ASK (taker)
-                                current_price = float(ob.get_price(True))  # True = ask side
+                                if ob._ask_book.size() > 0:
+                                    current_price = float(deref(ob._ask_book.begin()).getPrice())
+                                else:
+                                    continue
                             else:
                                 # Percentage or 'min' mode: select market with LOWEST BID (maker)
-                                current_price = float(ob.get_price(False))  # False = bid side
+                                if ob._bid_book.size() > 0:
+                                    current_price = float(deref(ob._bid_book.rbegin()).getPrice())
+                                else:
+                                    continue
 
                             if current_price < best_price and current_price > 0:
                                 best_price = current_price
@@ -729,7 +736,7 @@ cdef class PositionBalancerHandler:
             object best_market = None
             double best_price = 0.0
             double current_price
-            object ob
+            OrderBook ob
             object mp
             object market_tuple
             list asset_aliases
@@ -744,15 +751,21 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset in asset_aliases:
                         try:
-                            # Use Python-level get_order_book for compatibility with all exchanges
-                            ob = market_tuple.market.get_order_book(market_tuple.trading_pair)
+                            # Use C-level get_order_book for compatibility with all exchanges
+                            ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 
                             if use_bid_price:
                                 # Aggressive mode (0%): select market with HIGHEST BID (taker)
-                                current_price = float(ob.get_price(False))  # False = bid side
+                                if ob._bid_book.size() > 0:
+                                    current_price = float(deref(ob._bid_book.rbegin()).getPrice())
+                                else:
+                                    continue
                             else:
                                 # Percentage or 'min' mode: select market with HIGHEST ASK (maker)
-                                current_price = float(ob.get_price(True))  # True = ask side
+                                if ob._ask_book.size() > 0:
+                                    current_price = float(deref(ob._ask_book.begin()).getPrice())
+                                else:
+                                    continue
 
                             if current_price > best_price:
                                 best_price = current_price
@@ -783,7 +796,7 @@ cdef class PositionBalancerHandler:
         cdef:
             double current_time = self.strategy._current_timestamp
             object current_best_market
-            object current_ob
+            OrderBook current_ob
             object trading_rule
             tuple order_details
             str order_market_name
@@ -854,9 +867,17 @@ cdef class PositionBalancerHandler:
                             order_details = self._active_buy_order_details.get(asset)
                             if order_details is not None:
                                 order_market_tuple, order_price = order_details
-                                current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
-                                current_bid = float(current_ob.get_price(False))
-                                current_ask = float(current_ob.get_price(True))
+                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
+                                
+                                if current_ob._bid_book.size() > 0:
+                                    current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
+                                else:
+                                    current_bid = 0.0
+                                    
+                                if current_ob._ask_book.size() > 0:
+                                    current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
+                                else:
+                                    current_ask = 0.0
 
                                 # Get min_price_increment for gap detection
                                 trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
@@ -869,6 +890,8 @@ cdef class PositionBalancerHandler:
                                 if self._buy_spread_is_min and min_price_increment > 0:
                                     if abs(current_bid - order_price) < min_price_increment * 0.5:
                                         try:
+                                            # Manual second level check using C++ iterators would be cleaner
+                                            # but sticking to python API fallback for now if direct access is tricky
                                             bid_entries = current_ob.bid_entries()
                                             if len(bid_entries) >= 2:
                                                 effective_bid = float(bid_entries[1].price)
@@ -920,9 +943,17 @@ cdef class PositionBalancerHandler:
                                 else:
                                     # Same market - evaluate if conditions changed
                                     try:
-                                        current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                        current_bid = float(current_ob.get_price(False))
-                                        current_ask = float(current_ob.get_price(True))
+                                        current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                                        
+                                        if current_ob._bid_book.size() > 0:
+                                            current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
+                                        else:
+                                            current_bid = 0.0
+                                            
+                                        if current_ob._ask_book.size() > 0:
+                                            current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
+                                        else:
+                                            current_ask = 0.0
 
                                         # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
                                         trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
@@ -1124,9 +1155,17 @@ cdef class PositionBalancerHandler:
                             order_details = self._active_sell_order_details.get(asset)
                             if order_details is not None:
                                 order_market_tuple, order_price = order_details
-                                current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
-                                current_bid = float(current_ob.get_price(False))
-                                current_ask = float(current_ob.get_price(True))
+                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
+                                
+                                if current_ob._bid_book.size() > 0:
+                                    current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
+                                else:
+                                    current_bid = 0.0
+                                    
+                                if current_ob._ask_book.size() > 0:
+                                    current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
+                                else:
+                                    current_ask = 0.0
 
                                 # Get min_price_increment for gap detection
                                 trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
@@ -1185,11 +1224,11 @@ cdef class PositionBalancerHandler:
                                         should_cancel = True
                                         cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                     else:
-                                        # Same market - evaluate if conditions changed
-                                        try:
-                                            current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
-                                            current_bid = float(current_ob.get_price(False))
-                                            current_ask = float(current_ob.get_price(True))
+                                    # Same market - evaluate if conditions changed
+                                    try:
+                                        current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                                        current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
+                                        current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
 
                                             # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
                                             trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
@@ -1581,7 +1620,7 @@ cdef class PositionBalancerHandler:
 
         # Get order book prices from market (we selected market with lowest ask)
         cdef:
-            object ob  # Use object for Python compatibility
+            OrderBook ob
             double top_ask
             double top_bid
             double buy_price
@@ -1598,10 +1637,10 @@ cdef class PositionBalancerHandler:
             pair[double, double] val_short
 
         try:
-            # Use Python-level get_order_book for compatibility with all exchanges
-            ob = market.get_order_book(buy_market_tuple.trading_pair)
-            top_ask = float(ob.get_price(True))  # True = ask side
-            top_bid = float(ob.get_price(False))  # False = bid side
+            # Use C-level get_order_book for compatibility with all exchanges
+            ob = market.c_get_order_book(buy_market_tuple.trading_pair)
+            top_ask = float(deref(ob._ask_book.begin()).getPrice())
+            top_bid = float(deref(ob._bid_book.rbegin()).getPrice())
         except Exception:
             return False
 
@@ -1827,7 +1866,7 @@ cdef class PositionBalancerHandler:
 
         # Get order book prices from market (we selected market with highest bid)
         cdef:
-            object ob  # Use object for Python compatibility
+            OrderBook ob
             double top_bid
             double top_ask
             double sell_price
@@ -1843,10 +1882,10 @@ cdef class PositionBalancerHandler:
             pair[double, double] val_excess
 
         try:
-            # Use Python-level get_order_book for compatibility with all exchanges
-            ob = market.get_order_book(sell_market_tuple.trading_pair)
-            top_bid = float(ob.get_price(False))  # False = bid side
-            top_ask = float(ob.get_price(True))  # True = ask side
+            # Use C-level get_order_book for compatibility with all exchanges
+            ob = market.c_get_order_book(sell_market_tuple.trading_pair)
+            top_bid = float(deref(ob._bid_book.rbegin()).getPrice())
+            top_ask = float(deref(ob._ask_book.begin()).getPrice())
         except Exception:
             return False
 
@@ -2036,6 +2075,8 @@ cdef class PositionBalancerHandler:
         excess = val_excess.second
         if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
             self.c_maybe_disable_sell()
+
+        return True
 
     # Runtime control methods
 

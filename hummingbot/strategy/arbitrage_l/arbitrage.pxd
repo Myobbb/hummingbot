@@ -7,6 +7,16 @@ from libcpp.unordered_map cimport unordered_map
 from libcpp.string cimport string
 from libcpp.pair cimport pair
 from libcpp.set cimport set as cpp_set
+from libcpp.vector cimport vector
+from hummingbot.core.data_type.order_book cimport OrderBook
+
+# Struct to pass arbitrage opportunities without Python Objects (allows nogil)
+cdef struct ArbOpportunity:
+    double bid_price
+    double ask_price
+    double orig_bid_price
+    double orig_ask_price
+    double amount
 
 cdef class ArbitrageLStrategy(StrategyBase):
     """
@@ -52,8 +62,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Position balancer handler (None when disabled)
         public PositionBalancerHandler _position_balancer
-
-
 
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
@@ -130,13 +138,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_check_filled_order_timeouts(self)
     cdef void c_cleanup_old_orders(self)
 
-# Single optimized function for finding profitable orders
-cdef list c_find_profitable_arbitrage_orders(
+# Single optimized function for finding profitable orders (nogil compliant)
+cdef void c_find_profitable_arbitrage_orders(
     double min_profitability,
-    object buy_market_tuple,
-    object sell_market_tuple,
+    cpp_set[OrderBookEntry] &buy_asks,
+    cpp_set[OrderBookEntry] &sell_bids,
     double buy_conversion_rate,
     double sell_conversion_rate,
     double target_base_amount,
     double overshoot_ratio,
-    bint perform_top_check)
+    vector[ArbOpportunity] *output_vector) nogil
