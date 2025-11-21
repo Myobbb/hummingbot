@@ -747,14 +747,42 @@ cdef class PositionBalancerHandler:
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
+                                        # IMPORTANT: For 'min' mode gap detection, check if top bid is OUR order
+                                        # If so, we need to look at the SECOND level to detect gaps below us
+                                        bid_for_gap_detection = current_bid
+                                        if self._buy_spread_is_min:
+                                            # Check if current top bid matches our order price (within min tick tolerance)
+                                            # If it does, it's likely our own order, so look at the second bid level
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    # If top bid is within 1 tick of our order, it's probably us
+                                                    if abs(current_bid - order_price) < min_price_increment * 0.5:
+                                                        # Get second bid level for gap detection
+                                                        try:
+                                                            bid_entries = current_ob.bid_entries()
+                                                            if len(bid_entries) >= 2:
+                                                                # Use second best bid for gap detection
+                                                                bid_for_gap_detection = float(bid_entries[1].price)
+                                                                self.strategy.logger().debug(
+                                                                    f"Position balancer: Top bid {current_bid:.8f} is our order {order_price:.8f}, "
+                                                                    f"using second bid {bid_for_gap_detection:.8f} for gap detection")
+                                                        except Exception:
+                                                            pass  # Fall back to using current_bid
+                                            except Exception:
+                                                pass
+
                                         # Calculate what our order price SHOULD be now with current market conditions
+                                        # Use bid_for_gap_detection instead of current_bid for 'min' mode gap checks
                                         if self._buy_spread_is_min:
                                             # 'min' mode: place at bid + min_tick to be at front
                                             try:
                                                 trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
                                                 if trading_rule is not None and trading_rule.min_price_increment is not None:
                                                     min_price_increment = float(trading_rule.min_price_increment)
-                                                    current_calculated_price = current_bid + min_price_increment
+                                                    # Use bid_for_gap_detection (second bid if top is our order)
+                                                    current_calculated_price = bid_for_gap_detection + min_price_increment
                                                 else:
                                                     current_calculated_price = current_ask
                                             except Exception:
@@ -907,14 +935,42 @@ cdef class PositionBalancerHandler:
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
+                                        # IMPORTANT: For 'min' mode gap detection, check if top ask is OUR order
+                                        # If so, we need to look at the SECOND level to detect gaps above us
+                                        ask_for_gap_detection = current_ask
+                                        if self._sell_spread_is_min:
+                                            # Check if current top ask matches our order price (within min tick tolerance)
+                                            # If it does, it's likely our own order, so look at the second ask level
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    # If top ask is within 1 tick of our order, it's probably us
+                                                    if abs(current_ask - order_price) < min_price_increment * 0.5:
+                                                        # Get second ask level for gap detection
+                                                        try:
+                                                            ask_entries = current_ob.ask_entries()
+                                                            if len(ask_entries) >= 2:
+                                                                # Use second best ask for gap detection
+                                                                ask_for_gap_detection = float(ask_entries[1].price)
+                                                                self.strategy.logger().debug(
+                                                                    f"Position balancer: Top ask {current_ask:.8f} is our order {order_price:.8f}, "
+                                                                    f"using second ask {ask_for_gap_detection:.8f} for gap detection")
+                                                        except Exception:
+                                                            pass  # Fall back to using current_ask
+                                            except Exception:
+                                                pass
+
                                         # Calculate what our order price SHOULD be now with current market conditions
+                                        # Use ask_for_gap_detection instead of current_ask for 'min' mode gap checks
                                         if self._sell_spread_is_min:
                                             # 'min' mode: place at ask - min_tick to be at front
                                             try:
                                                 trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
                                                 if trading_rule is not None and trading_rule.min_price_increment is not None:
                                                     min_price_increment = float(trading_rule.min_price_increment)
-                                                    current_calculated_price = current_ask - min_price_increment
+                                                    # Use ask_for_gap_detection (second ask if top is our order)
+                                                    current_calculated_price = ask_for_gap_detection - min_price_increment
                                                 else:
                                                     current_calculated_price = current_bid
                                             except Exception:
