@@ -1696,6 +1696,13 @@ cdef class PositionBalancerHandler:
                 return False
             return False
 
+        # Quantize price to match exchange precision (prevents log/actual price mismatch)
+        try:
+            quantized_price = market.quantize_order_price(buy_market_tuple.trading_pair, Decimal(str(buy_price)))
+            buy_price = float(quantized_price)
+        except Exception:
+            pass  # Fall back to original price if quantization fails
+
         # Place limit buy order
         try:
             buy_order_id = self.strategy.c_buy_with_specific_market(
@@ -1932,6 +1939,13 @@ cdef class PositionBalancerHandler:
             if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
                 return False
             return False
+
+        # Quantize price to match exchange precision (prevents log/actual price mismatch)
+        try:
+            quantized_price = market.quantize_order_price(sell_market_tuple.trading_pair, Decimal(str(sell_price)))
+            sell_price = float(quantized_price)
+        except Exception:
+            pass  # Fall back to original price if quantization fails
 
         # Place limit sell order
         try:
