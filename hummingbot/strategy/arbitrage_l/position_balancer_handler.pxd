@@ -55,6 +55,8 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_buy_market(self, str asset)
     cdef object c_find_best_sell_market(self, str asset)
     cdef void c_cancel_stale_orders(self, str asset)
+    cdef void _cancel_buy_order(self, str asset, str order_id, str reason)
+    cdef void _cancel_sell_order(self, str asset, str order_id, str reason)
     cdef bint c_handle_position_balancing(self, object buy_market_tuple, object sell_market_tuple)
     cdef bint c_execute_buy_limit(self, object buy_market_tuple, object sell_market_tuple)
     cdef bint c_execute_sell_limit(self, object buy_market_tuple, object sell_market_tuple)
