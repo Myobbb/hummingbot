@@ -934,6 +934,7 @@ cdef class PositionBalancerHandler:
                                         # If so, we need to look at the SECOND level to detect gaps below us
                                         # Percentage mode uses current_bid directly since it's less likely to be exactly at top
                                         effective_bid = current_bid  # The bid price we'll use for calculations
+                                        got_valid_second_level = False  # Track if we successfully got second level
                                         if self._buy_spread_is_min and min_price_increment > 0:
                                             # Check if current top bid matches our order price (within half tick tolerance)
                                             # If it does, it's likely our own order, so look at the second bid level
@@ -944,11 +945,15 @@ cdef class PositionBalancerHandler:
                                                     if len(bid_entries) >= 2:
                                                         # Use second best bid for gap detection
                                                         effective_bid = float(bid_entries[1].price)
+                                                        got_valid_second_level = True
                                                         self.strategy.logger().debug(
                                                             f"Position balancer: Top bid {current_bid:.8f} is our order {order_price:.8f}, "
                                                             f"using second bid {effective_bid:.8f} for gap detection")
                                                 except Exception:
                                                     pass  # Fall back to using current_bid
+                                            else:
+                                                # Top bid is not our order, safe to use it
+                                                got_valid_second_level = True
 
                                         # Calculate what our order price SHOULD be now with current market conditions
                                         ideal_order_price = 0.0  # What the price should be if we placed order now
@@ -1008,7 +1013,7 @@ cdef class PositionBalancerHandler:
                                         if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
                                             # Skip check if effective_bid is our own order (couldn't get second level)
                                             # This prevents false "1-tick gap" when our order is the only bid
-                                            if abs(effective_bid - order_price) > min_price_increment * 0.1:
+                                            if got_valid_second_level:
                                                 # In min mode, we should be at effective_bid + min_tick
                                                 # If we're not (within small tolerance), we've been displaced
                                                 expected_price = effective_bid + min_price_increment
@@ -1024,11 +1029,12 @@ cdef class PositionBalancerHandler:
                                         # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
                                         # If ideal price < our order price, market moved in our favor
                                         # For buys, this means we can buy at a lower price now
+                                        # CRITICAL FIX: Only check gap if we have a valid reference point
                                         if not should_cancel and ideal_order_price < order_price:
                                             gap_down = order_price - ideal_order_price
                                             if self._buy_spread_is_min:
-                                                # Min mode: check absolute threshold
-                                                if gap_down > cancel_threshold_abs:
+                                                # Min mode: check absolute threshold, but only with valid second level
+                                                if got_valid_second_level and gap_down > cancel_threshold_abs:
                                                     should_cancel = True
                                                     cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
                                             else:
@@ -1048,9 +1054,13 @@ cdef class PositionBalancerHandler:
 
                                         # CONDITION 5: Significant price divergence - any direction
                                         # Catches edge cases and ensures we stay aligned with current market
+                                        # CRITICAL FIX: Only check divergence if we have a valid reference point
+                                        # In thin orderbooks, if we couldn't get second level, effective_bid might equal our order
+                                        # Comparing against ourselves would cause false 1-tick divergence
                                         if not should_cancel:
                                             if self._buy_spread_is_min:
-                                                if price_diff_abs > cancel_threshold_abs:
+                                                # Only check divergence if we have a valid second level OR top bid isn't our order
+                                                if got_valid_second_level and price_diff_abs > cancel_threshold_abs:
                                                     should_cancel = True
                                                     cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
                                             else:
@@ -1191,6 +1201,7 @@ cdef class PositionBalancerHandler:
                                             # If so, we need to look at the SECOND level to detect gaps above us
                                             # Percentage mode uses current_ask directly since it's less likely to be exactly at top
                                             effective_ask = current_ask  # The ask price we'll use for calculations
+                                            got_valid_second_level = False  # Track if we successfully got second level
                                             if self._sell_spread_is_min and min_price_increment > 0:
                                                 # Check if current top ask matches our order price (within half tick tolerance)
                                                 # If it does, it's likely our own order, so look at the second ask level
@@ -1201,11 +1212,15 @@ cdef class PositionBalancerHandler:
                                                         if len(ask_entries) >= 2:
                                                             # Use second best ask for gap detection
                                                             effective_ask = float(ask_entries[1].price)
+                                                            got_valid_second_level = True
                                                             self.strategy.logger().debug(
                                                                 f"Position balancer: Top ask {current_ask:.8f} is our order {order_price:.8f}, "
                                                                 f"using second ask {effective_ask:.8f} for gap detection")
                                                     except Exception:
                                                         pass  # Fall back to using current_ask
+                                                else:
+                                                    # Top ask is not our order, safe to use it
+                                                    got_valid_second_level = True
 
                                             # Calculate what our order price SHOULD be now with current market conditions
                                             ideal_order_price = 0.0  # What the price should be if we placed order now
@@ -1263,7 +1278,7 @@ cdef class PositionBalancerHandler:
                                             if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
                                                 # Skip check if effective_ask is our own order (couldn't get second level)
                                                 # This prevents false "1-tick gap" when our order is the only ask
-                                                if abs(effective_ask - order_price) > min_price_increment * 0.1:
+                                                if got_valid_second_level:
                                                     # In min mode, we should be at effective_ask - min_tick
                                                     # If we're not (within small tolerance), we've been displaced
                                                     expected_price = effective_ask - min_price_increment
@@ -1279,11 +1294,12 @@ cdef class PositionBalancerHandler:
                                             # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
                                             # If ideal price > our order price, market moved in our favor
                                             # For sells, this means we can sell at a higher price now
+                                            # CRITICAL FIX: Only check gap if we have a valid reference point
                                             if not should_cancel and ideal_order_price > order_price:
                                                 gap_up = ideal_order_price - order_price
                                                 if self._sell_spread_is_min:
-                                                    # Min mode: check absolute threshold
-                                                    if gap_up > cancel_threshold_abs:
+                                                    # Min mode: check absolute threshold, but only with valid second level
+                                                    if got_valid_second_level and gap_up > cancel_threshold_abs:
                                                         should_cancel = True
                                                         cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
                                                 else:
@@ -1303,9 +1319,13 @@ cdef class PositionBalancerHandler:
 
                                             # CONDITION 5: Significant price divergence - any direction
                                             # Catches edge cases and ensures we stay aligned with current market
+                                            # CRITICAL FIX: Only check divergence if we have a valid reference point
+                                            # In thin orderbooks, if we couldn't get second level, effective_ask might equal our order
+                                            # Comparing against ourselves would cause false 1-tick divergence
                                             if not should_cancel:
                                                 if self._sell_spread_is_min:
-                                                    if price_diff_abs > cancel_threshold_abs:
+                                                    # Only check divergence if we have a valid second level OR top ask isn't our order
+                                                    if got_valid_second_level and price_diff_abs > cancel_threshold_abs:
                                                         should_cancel = True
                                                         cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_order_price:.8f} vs order {order_price:.8f})"
                                                 else:
