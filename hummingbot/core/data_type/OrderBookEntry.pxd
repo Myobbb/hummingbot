@@ -3,14 +3,14 @@
 from libc.stdint cimport int64_t
 from libcpp.set cimport set
 
-cdef extern from "../cpp/OrderBookEntry.h":
+cdef extern from "../cpp/OrderBookEntry.h" nogil:
     cdef cppclass OrderBookEntry:
         OrderBookEntry()
         OrderBookEntry(double price, double amount, int64_t updateId)
         OrderBookEntry(const OrderBookEntry &other)
         OrderBookEntry &operator=(const OrderBookEntry &other)
-        double getPrice() const nogil
-        double getAmount() const nogil
-        int64_t getUpdateId() const nogil
+        double getPrice() const
+        double getAmount() const
+        int64_t getUpdateId() const
 
     void truncateOverlapEntries(set[OrderBookEntry] &bid_book, set[OrderBookEntry] &ask_book, const bint &dex)

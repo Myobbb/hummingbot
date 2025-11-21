@@ -23,7 +23,7 @@ from cython.operator cimport(
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.core.data_type.order_book_row import OrderBookRow
-from hummingbot.core.data_type.OrderBookEntry cimport truncateOverlapEntries
+from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry, truncateOverlapEntries
 from hummingbot.logger import HummingbotLogger
 from hummingbot.core.event.events import (
     OrderBookEvent,
