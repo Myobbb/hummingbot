@@ -567,7 +567,7 @@ cdef class PositionBalancerHandler:
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._buy_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for 2s cooldown
+                        # Record completion time for cooldown
                         self._last_buy_completion_time[asset_key] = self.strategy._current_timestamp
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
@@ -588,7 +588,7 @@ cdef class PositionBalancerHandler:
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._sell_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for 2s cooldown
+                        # Record completion time for cooldown
                         self._last_sell_completion_time[asset_key] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
@@ -1004,18 +1004,22 @@ cdef class PositionBalancerHandler:
                                         # CONDITION 2b: For 'min' mode, explicit 1-tick frontrun detection
                                         # Check if our order is no longer at the optimal competitive position
                                         # This catches edge cases where we're off by exactly 1 tick
+                                        # IMPORTANT: Only check if we got a valid second bid level (not our own order)
                                         if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
-                                            # In min mode, we should be at effective_bid + min_tick
-                                            # If we're not (within small tolerance), we've been displaced
-                                            expected_price = effective_bid + min_price_increment
-                                            price_misalignment = order_price - expected_price
-                                            # Allow small tolerance for floating point, but catch >= 1 tick deviation
-                                            if abs(price_misalignment) >= min_price_increment * 0.95:
-                                                should_cancel = True
-                                                if price_misalignment > 0:
-                                                    cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-                                                else:
-                                                    cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                            # Skip check if effective_bid is our own order (couldn't get second level)
+                                            # This prevents false "1-tick gap" when our order is the only bid
+                                            if abs(effective_bid - order_price) > min_price_increment * 0.1:
+                                                # In min mode, we should be at effective_bid + min_tick
+                                                # If we're not (within small tolerance), we've been displaced
+                                                expected_price = effective_bid + min_price_increment
+                                                price_misalignment = order_price - expected_price
+                                                # Allow small tolerance for floating point, but catch >= 1 tick deviation
+                                                if abs(price_misalignment) >= min_price_increment * 0.95:
+                                                    should_cancel = True
+                                                    if price_misalignment > 0:
+                                                        cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                    else:
+                                                        cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                         # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
                                         # If ideal price < our order price, market moved in our favor
@@ -1255,18 +1259,22 @@ cdef class PositionBalancerHandler:
                                             # CONDITION 2b: For 'min' mode, explicit 1-tick undercut detection
                                             # Check if our order is no longer at the optimal competitive position
                                             # This catches edge cases where we're off by exactly 1 tick
+                                            # IMPORTANT: Only check if we got a valid second ask level (not our own order)
                                             if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
-                                                # In min mode, we should be at effective_ask - min_tick
-                                                # If we're not (within small tolerance), we've been displaced
-                                                expected_price = effective_ask - min_price_increment
-                                                price_misalignment = expected_price - order_price
-                                                # Allow small tolerance for floating point, but catch >= 1 tick deviation
-                                                if abs(price_misalignment) >= min_price_increment * 0.95:
-                                                    should_cancel = True
-                                                    if price_misalignment > 0:
-                                                        cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-                                                    else:
-                                                        cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                # Skip check if effective_ask is our own order (couldn't get second level)
+                                                # This prevents false "1-tick gap" when our order is the only ask
+                                                if abs(effective_ask - order_price) > min_price_increment * 0.1:
+                                                    # In min mode, we should be at effective_ask - min_tick
+                                                    # If we're not (within small tolerance), we've been displaced
+                                                    expected_price = effective_ask - min_price_increment
+                                                    price_misalignment = expected_price - order_price
+                                                    # Allow small tolerance for floating point, but catch >= 1 tick deviation
+                                                    if abs(price_misalignment) >= min_price_increment * 0.95:
+                                                        should_cancel = True
+                                                        if price_misalignment > 0:
+                                                            cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                        else:
+                                                            cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                             # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
                                             # If ideal price > our order price, market moved in our favor
