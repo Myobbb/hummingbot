@@ -689,7 +689,8 @@ cdef class PositionBalancerHandler:
         # Check buy orders
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
-            if order_id:
+            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+                # Only process if we haven't already sent a cancel request
                 last_time = self._last_buy_order_time.get(asset, 0.0)
                 should_cancel = False
                 cancel_reason = ""
@@ -778,7 +779,8 @@ cdef class PositionBalancerHandler:
         # Check sell orders
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
-            if order_id:
+            if order_id and order_id not in self.strategy._timeout_cancelled_orders:
+                # Only process if we haven't already sent a cancel request
                 last_time = self._last_sell_order_time.get(asset, 0.0)
                 should_cancel = False
                 cancel_reason = ""
