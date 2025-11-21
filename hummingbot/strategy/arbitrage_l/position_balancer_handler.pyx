@@ -732,21 +732,56 @@ cdef class PositionBalancerHandler:
                         should_cancel = True
                         cancel_reason = "mode disabled"
 
-                    # IMMEDIATE CHECK: Outbid detection (don't wait for refresh interval)
-                    # Being frontrun is critical and requires immediate response
+                    # IMMEDIATE CHECK: Critical market conditions (don't wait for refresh interval)
+                    # Detects frontrun and large gaps that require immediate response
                     if not should_cancel and (self._buy_spread_is_min or self._buy_spread_pct > 0.0):
                         try:
-                            # Get current market state
+                            # Get current market state (query once, use for all checks)
                             order_details = self._active_buy_order_details.get(asset)
                             if order_details is not None:
                                 order_market_tuple, order_price = order_details
                                 current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
                                 current_bid = float(current_ob.get_price(False))
-                                # If someone placed a higher bid, cancel immediately (frontrun response)
+                                current_ask = float(current_ob.get_price(True))
+
+                                # Get min_price_increment for gap detection
+                                trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
+                                min_price_increment = 0.0
+                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                    min_price_increment = float(trading_rule.min_price_increment)
+
+                                # Calculate effective_bid (second level if top is our order)
+                                effective_bid = current_bid
+                                if self._buy_spread_is_min and min_price_increment > 0:
+                                    if abs(current_bid - order_price) < min_price_increment * 0.5:
+                                        try:
+                                            bid_entries = current_ob.bid_entries()
+                                            if len(bid_entries) >= 2:
+                                                effective_bid = float(bid_entries[1].price)
+                                        except Exception:
+                                            pass
+
+                                # IMMEDIATE CONDITION 1: Simple frontrun (someone bid higher)
                                 if current_bid > order_price:
                                     should_cancel = True
-                                    cancel_reason = f"frontrun - immediate response (top bid {current_bid:.8f} > our {order_price:.8f})"
-                        except Exception:
+                                    cancel_reason = f"frontrun (immediate) - top bid {current_bid:.8f} > our {order_price:.8f}"
+
+                                # IMMEDIATE CONDITION 2: Large gap detection (multi-tick gaps)
+                                # For 'min' mode, check if we're too far from optimal position
+                                # Use 2-tick threshold for immediate response (catches major gaps)
+                                if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
+                                    expected_price = effective_bid + min_price_increment
+                                    price_gap = abs(order_price - expected_price)
+                                    # Immediate cancel if gap >= 2 ticks (large gap, don't wait)
+                                    if price_gap >= min_price_increment * 1.9:
+                                        if order_price > expected_price:
+                                            should_cancel = True
+                                            cancel_reason = f"large gap (immediate) - order {order_price:.8f} vs optimal {expected_price:.8f}, gap {price_gap:.8f}"
+                                        else:
+                                            should_cancel = True
+                                            cancel_reason = f"large gap down (immediate) - can buy cheaper at {expected_price:.8f} vs {order_price:.8f}"
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
                             pass  # If check fails, continue to regular interval-based checks
 
                     # Check if refresh interval passed AND conditions changed
@@ -949,21 +984,56 @@ cdef class PositionBalancerHandler:
                         should_cancel = True
                         cancel_reason = "mode disabled"
 
-                    # IMMEDIATE CHECK: Undercut detection (don't wait for refresh interval)
-                    # Being undercut is critical and requires immediate response
+                    # IMMEDIATE CHECK: Critical market conditions (don't wait for refresh interval)
+                    # Detects undercut and large gaps that require immediate response
                     if not should_cancel and (self._sell_spread_is_min or self._sell_spread_pct > 0.0):
                         try:
-                            # Get current market state
+                            # Get current market state (query once, use for all checks)
                             order_details = self._active_sell_order_details.get(asset)
                             if order_details is not None:
                                 order_market_tuple, order_price = order_details
                                 current_ob = order_market_tuple.market.get_order_book(order_market_tuple.trading_pair)
+                                current_bid = float(current_ob.get_price(False))
                                 current_ask = float(current_ob.get_price(True))
-                                # If someone placed a lower ask, cancel immediately (undercut response)
+
+                                # Get min_price_increment for gap detection
+                                trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
+                                min_price_increment = 0.0
+                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                    min_price_increment = float(trading_rule.min_price_increment)
+
+                                # Calculate effective_ask (second level if top is our order)
+                                effective_ask = current_ask
+                                if self._sell_spread_is_min and min_price_increment > 0:
+                                    if abs(current_ask - order_price) < min_price_increment * 0.5:
+                                        try:
+                                            ask_entries = current_ob.ask_entries()
+                                            if len(ask_entries) >= 2:
+                                                effective_ask = float(ask_entries[1].price)
+                                        except Exception:
+                                            pass
+
+                                # IMMEDIATE CONDITION 1: Simple undercut (someone asked lower)
                                 if current_ask < order_price:
                                     should_cancel = True
-                                    cancel_reason = f"undercut - immediate response (top ask {current_ask:.8f} < our {order_price:.8f})"
-                        except Exception:
+                                    cancel_reason = f"undercut (immediate) - top ask {current_ask:.8f} < our {order_price:.8f}"
+
+                                # IMMEDIATE CONDITION 2: Large gap detection (multi-tick gaps)
+                                # For 'min' mode, check if we're too far from optimal position
+                                # Use 2-tick threshold for immediate response (catches major gaps)
+                                if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
+                                    expected_price = effective_ask - min_price_increment
+                                    price_gap = abs(order_price - expected_price)
+                                    # Immediate cancel if gap >= 2 ticks (large gap, don't wait)
+                                    if price_gap >= min_price_increment * 1.9:
+                                        if order_price < expected_price:
+                                            should_cancel = True
+                                            cancel_reason = f"large gap (immediate) - order {order_price:.8f} vs optimal {expected_price:.8f}, gap {price_gap:.8f}"
+                                        else:
+                                            should_cancel = True
+                                            cancel_reason = f"large gap up (immediate) - can sell higher at {expected_price:.8f} vs {order_price:.8f}"
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
                             pass  # If check fails, continue to regular interval-based checks
 
                     # Check if refresh interval passed AND conditions changed
