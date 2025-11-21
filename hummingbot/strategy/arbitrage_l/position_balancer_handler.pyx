@@ -722,31 +722,46 @@ cdef class PositionBalancerHandler:
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
-                                        # Calculate what the order price WOULD BE now with current conditions
-                                        if self._buy_spread_is_min:
-                                            # 'min' mode: bid + min_tick
-                                            try:
-                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                    min_price_increment = float(trading_rule.min_price_increment)
-                                                    current_calculated_price = current_bid + min_price_increment
-                                                else:
-                                                    current_calculated_price = current_ask
-                                            except Exception:
-                                                current_calculated_price = current_ask
-                                        elif self._buy_spread_pct == 0.0:
-                                            # Aggressive: at ask
-                                            current_calculated_price = current_ask
-                                        else:
-                                            # Percentage: bid * (1 + spread)
-                                            current_calculated_price = current_bid * (1.0 + self._buy_spread_pct)
-
-                                        # Cancel if calculated price would be different by >0.1%
-                                        if order_price > 0:
-                                            price_diff_pct = abs(current_calculated_price - order_price) / order_price
-                                            if price_diff_pct > 0.001:  # 0.1% threshold
+                                        # Check if we've been outbid (someone placed higher bid than our order)
+                                        if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
+                                            # Maker orders: check if current top bid >= our order price
+                                            # This means someone outbid us and we're no longer at the front
+                                            if current_bid >= order_price:
                                                 should_cancel = True
-                                                cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
+                                                cancel_reason = f"outbid (top bid {current_bid:.8f} >= our {order_price:.8f})"
+                                        else:
+                                            # Aggressive mode: check if bid moved up significantly (someone matched ask)
+                                            if current_bid >= order_price * 0.999:  # Within 0.1% of our ask order
+                                                should_cancel = True
+                                                cancel_reason = "market moved to our price"
+
+                                        if not should_cancel:
+                                            # Also check if calculated price would be significantly different
+                                            # Calculate what the order price WOULD BE now with current conditions
+                                            if self._buy_spread_is_min:
+                                                # 'min' mode: bid + min_tick
+                                                try:
+                                                    trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                        min_price_increment = float(trading_rule.min_price_increment)
+                                                        current_calculated_price = current_bid + min_price_increment
+                                                    else:
+                                                        current_calculated_price = current_ask
+                                                except Exception:
+                                                    current_calculated_price = current_ask
+                                            elif self._buy_spread_pct == 0.0:
+                                                # Aggressive: at ask
+                                                current_calculated_price = current_ask
+                                            else:
+                                                # Percentage: bid * (1 + spread)
+                                                current_calculated_price = current_bid * (1.0 + self._buy_spread_pct)
+
+                                            # Cancel if calculated price would be different by >0.1%
+                                            if order_price > 0:
+                                                price_diff_pct = abs(current_calculated_price - order_price) / order_price
+                                                if price_diff_pct > 0.001:  # 0.1% threshold
+                                                    should_cancel = True
+                                                    cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
                                     except Exception:
                                         pass
                     except Exception:
@@ -812,31 +827,46 @@ cdef class PositionBalancerHandler:
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
-                                        # Calculate what the order price WOULD BE now with current conditions
-                                        if self._sell_spread_is_min:
-                                            # 'min' mode: ask - min_tick
-                                            try:
-                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                    min_price_increment = float(trading_rule.min_price_increment)
-                                                    current_calculated_price = current_ask - min_price_increment
-                                                else:
-                                                    current_calculated_price = current_bid
-                                            except Exception:
-                                                current_calculated_price = current_bid
-                                        elif self._sell_spread_pct == 0.0:
-                                            # Aggressive: at bid
-                                            current_calculated_price = current_bid
-                                        else:
-                                            # Percentage: ask * (1 - spread)
-                                            current_calculated_price = current_ask * (1.0 - self._sell_spread_pct)
-
-                                        # Cancel if calculated price would be different by >0.1%
-                                        if order_price > 0:
-                                            price_diff_pct = abs(current_calculated_price - order_price) / order_price
-                                            if price_diff_pct > 0.001:  # 0.1% threshold
+                                        # Check if we've been undercut (someone placed lower ask than our order)
+                                        if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
+                                            # Maker orders: check if current top ask <= our order price
+                                            # This means someone undercut us and we're no longer at the front
+                                            if current_ask <= order_price:
                                                 should_cancel = True
-                                                cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
+                                                cancel_reason = f"undercut (top ask {current_ask:.8f} <= our {order_price:.8f})"
+                                        else:
+                                            # Aggressive mode: check if ask moved down significantly (someone matched bid)
+                                            if current_ask <= order_price * 1.001:  # Within 0.1% of our bid order
+                                                should_cancel = True
+                                                cancel_reason = "market moved to our price"
+
+                                        if not should_cancel:
+                                            # Also check if calculated price would be significantly different
+                                            # Calculate what the order price WOULD BE now with current conditions
+                                            if self._sell_spread_is_min:
+                                                # 'min' mode: ask - min_tick
+                                                try:
+                                                    trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                        min_price_increment = float(trading_rule.min_price_increment)
+                                                        current_calculated_price = current_ask - min_price_increment
+                                                    else:
+                                                        current_calculated_price = current_bid
+                                                except Exception:
+                                                    current_calculated_price = current_bid
+                                            elif self._sell_spread_pct == 0.0:
+                                                # Aggressive: at bid
+                                                current_calculated_price = current_bid
+                                            else:
+                                                # Percentage: ask * (1 - spread)
+                                                current_calculated_price = current_ask * (1.0 - self._sell_spread_pct)
+
+                                            # Cancel if calculated price would be different by >0.1%
+                                            if order_price > 0:
+                                                price_diff_pct = abs(current_calculated_price - order_price) / order_price
+                                                if price_diff_pct > 0.001:  # 0.1% threshold
+                                                    should_cancel = True
+                                                    cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
                                     except Exception:
                                         pass
                     except Exception:
