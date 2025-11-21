@@ -1096,20 +1096,28 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     async def on_stop(self):
         """
         Clean shutdown of all strategies.
-        
+
         Note: We do NOT stop or restart connectors. Connectors manage their own
         lifecycle and reconnection independently. We only stop strategies and let
         them unregister their event listeners.
         """
         self.logger().info("Stopping MultiStrategyOrchestrator...")
 
-        # Stop all V1 strategies with the SAME clock they were started with
-        if self._strategies_started and self._strategy_clock is not None:
+        # Try to get a valid clock reference
+        clock = self._strategy_clock
+        if clock is None and hasattr(self, "clock"):
+            clock = self.clock
+
+        # Stop all V1 strategies
+        # We iterate strategies regardless of _strategies_started flag because listeners
+        # are added in init_params (during __init__), so we must remove them even if
+        # start() was never called.
+        if self.strategies and clock is not None:
             for strategy_instance in self.strategies:
                 try:
                     self.logger().info(f"Stopping strategy: {strategy_instance.name}")
                     if hasattr(strategy_instance.strategy, "stop"):
-                        strategy_instance.strategy.stop(self._strategy_clock)
+                        strategy_instance.strategy.stop(clock)
                 except Exception as e:
                     self.logger().error(
                         f"Error stopping strategy '{strategy_instance.name}': {e}",
@@ -1118,6 +1126,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             self._strategies_started = False
             self.logger().info("All strategies stopped")
+        elif not clock:
+            self.logger().warning("Cannot stop strategies: No clock available")
 
         # Do NOT call any connector methods or cancel orders via TradingCore
         # This could interfere with connector reconnection logic

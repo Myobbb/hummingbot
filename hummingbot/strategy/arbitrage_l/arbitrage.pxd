@@ -36,7 +36,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _next_trade_delay
         double _order_timeout
         double _filled_order_timeout
-        double _order_warning_delay
+
         
         # Thresholds
         double _min_order_usd
