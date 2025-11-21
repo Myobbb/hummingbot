@@ -9,7 +9,8 @@ from libcpp.pair cimport pair
 from libcpp.set cimport set as cpp_set
 from libcpp.vector cimport vector
 from hummingbot.core.data_type.order_book cimport OrderBook
-from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
+# Explicitly import the C++ class from the module
+from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry as OrderBookEntryCPP
 
 # Struct to pass arbitrage opportunities without Python Objects (allows nogil)
 cdef struct ArbOpportunity:
@@ -142,10 +143,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
 # Single optimized function for finding profitable orders (nogil compliant)
 cdef void c_find_profitable_arbitrage_orders(
     double min_profitability,
-    cpp_set[OrderBookEntry] &buy_asks,
-    cpp_set[OrderBookEntry] &sell_bids,
+    cpp_set[OrderBookEntryCPP] &buy_asks,
+    cpp_set[OrderBookEntryCPP] &sell_bids,
     double buy_conversion_rate,
     double sell_conversion_rate,
     double target_base_amount,
     double overshoot_ratio,
-    vector[ArbOpportunity] *output_vector) nogil
+    vector[ArbOpportunity] *output_vector) noexcept nogil

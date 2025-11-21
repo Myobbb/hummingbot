@@ -34,7 +34,7 @@ from hummingbot.strategy.arbitrage_l.arbitrage_market_pair import ArbitrageLMark
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.arbitrage_l.arbitrage_config_map import arbitrage_l_config_map
 from hummingbot.core.data_type.order_book cimport OrderBook
-from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry
+from hummingbot.core.data_type.OrderBookEntry cimport OrderBookEntry as OrderBookEntryCPP
 from hummingbot.strategy.arbitrage_l.position_balancer_handler cimport PositionBalancerHandler
 
 # Constants - Now configurable via init_params
@@ -678,7 +678,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double last_bid = 0.0
             ExchangeBase _ex
             OrderBook _ob
-            cpp_set[OrderBookEntry].reverse_iterator _bid_it
+            cpp_set[OrderBookEntryCPP].reverse_iterator _bid_it
         for mp in self._market_pairs:
             if last_bid > 0.0:
                 break
@@ -723,8 +723,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef OrderBook sell_ob = sell_ex.c_get_order_book(sell_market_tuple.trading_pair)
         if sell_ob._bid_book.size() == 0 or buy_ob._ask_book.size() == 0:
             return pair[int, double](False, conv_rate)
-        cdef cpp_set[OrderBookEntry].reverse_iterator bid_it = sell_ob._bid_book.rbegin()
-        cdef cpp_set[OrderBookEntry].iterator ask_it = buy_ob._ask_book.begin()
+        cdef cpp_set[OrderBookEntryCPP].reverse_iterator bid_it = sell_ob._bid_book.rbegin()
+        cdef cpp_set[OrderBookEntryCPP].iterator ask_it = buy_ob._ask_book.begin()
         top_bid = deref(bid_it).getPrice()
         top_ask = deref(ask_it).getPrice()
         if top_bid <= 0 or top_ask <= 0:
@@ -864,7 +864,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Get approximate buy price for affordability check via C-level top-of-book
         cdef ExchangeBase _buy_ex = buy_market_tuple.market
         cdef OrderBook _buy_ob = _buy_ex.c_get_order_book(buy_market_tuple.trading_pair)
-        cdef cpp_set[OrderBookEntry].iterator _ask_it2
+        cdef cpp_set[OrderBookEntryCPP].iterator _ask_it2
         if _buy_ob._ask_book.size() > 0:
             _ask_it2 = _buy_ob._ask_book.begin()
             approx_ask = deref(_ask_it2).getPrice()
@@ -926,7 +926,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef double approx_ask = 0.0
         cdef ExchangeBase _buy_ex3 = buy_market_tuple.market
         cdef OrderBook _buy_ob3 = _buy_ex3.c_get_order_book(buy_market_tuple.trading_pair)
-        cdef cpp_set[OrderBookEntry].iterator _ask_it3
+        cdef cpp_set[OrderBookEntryCPP].iterator _ask_it3
         if _buy_ob3._ask_book.size() > 0:
             _ask_it3 = _buy_ob3._ask_book.begin()
             approx_ask = deref(_ask_it3).getPrice()
@@ -1084,13 +1084,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
 cdef void c_find_profitable_arbitrage_orders(
     double min_profitability,
-    cpp_set[OrderBookEntry] &buy_asks,
-    cpp_set[OrderBookEntry] &sell_bids,
+    cpp_set[OrderBookEntryCPP] &buy_asks,
+    cpp_set[OrderBookEntryCPP] &sell_bids,
     double buy_conversion_rate,
     double sell_conversion_rate,
     double target_base_amount,
     double overshoot_ratio,
-    vector[ArbOpportunity] *output_vector) nogil noexcept:
+    vector[ArbOpportunity] *output_vector) noexcept nogil:
     """
     Find profitable arbitrage opportunities between two markets.
     Populates output_vector with ArbOpportunity structs.
@@ -1105,12 +1105,12 @@ cdef void c_find_profitable_arbitrage_orders(
         double step_amount = 0.0
         double cumulative_base = 0.0
         double overshoot_stop = 0.0
-        cpp_set[OrderBookEntry].reverse_iterator bid_it
-        cpp_set[OrderBookEntry].reverse_iterator bid_end
-        cpp_set[OrderBookEntry].iterator ask_it
-        cpp_set[OrderBookEntry].iterator ask_end
-        OrderBookEntry bid_entry
-        OrderBookEntry ask_entry
+        cpp_set[OrderBookEntryCPP].reverse_iterator bid_it
+        cpp_set[OrderBookEntryCPP].reverse_iterator bid_end
+        cpp_set[OrderBookEntryCPP].iterator ask_it
+        cpp_set[OrderBookEntryCPP].iterator ask_end
+        OrderBookEntryCPP bid_entry
+        OrderBookEntryCPP ask_entry
         double orig_bid_price
         double orig_ask_price
         double bid_price
@@ -1122,7 +1122,6 @@ cdef void c_find_profitable_arbitrage_orders(
         overshoot_stop = target_base_amount * (1.0 + overshoot_ratio)
 
     # Now scan the books (C-level iteration)
-    
     bid_it = sell_bids.rbegin()
     bid_end = sell_bids.rend()
     ask_it = buy_asks.begin()
