@@ -38,8 +38,14 @@ cdef class PositionBalancerHandler:
         dict _active_sell_order_details
         dict _buy_cancel_request_time
         dict _sell_cancel_request_time
+        # Asset alias support (for cross-exchange pairs with different token names)
+        dict _asset_aliases
+        dict _canonical_asset
 
     # Core methods
+    cdef void _build_asset_aliases(self)
+    cdef str _get_canonical_asset(self, str asset)
+    cdef list _get_all_asset_aliases(self, str asset)
     cdef void c_cancel_all_buy_orders(self)
     cdef void c_cancel_all_sell_orders(self)
     cdef void c_maybe_disable_buy(self)
