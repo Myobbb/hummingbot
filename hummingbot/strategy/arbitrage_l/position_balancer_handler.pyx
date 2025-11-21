@@ -1422,6 +1422,7 @@ cdef class PositionBalancerHandler:
             double current_value
             double shortfall_or_excess
             bint placed = False
+            bint has_active_order
             object selected_buy_market = None
             object selected_sell_market = None
 
