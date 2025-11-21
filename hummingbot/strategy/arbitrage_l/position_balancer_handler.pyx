@@ -147,7 +147,16 @@ cdef class PositionBalancerHandler:
         return self._sell_completed
 
     cdef void c_cancel_all_buy_orders(self):
-        """Cancel all active buy orders and clean up tracking."""
+        """
+        Cancel all active buy orders and clean up tracking.
+
+        Uses the same pattern as individual order cancellation:
+        - Mark orders in _timeout_cancelled_orders to prevent cooldown
+        - Send cancel requests
+        - Wait for cancel events to clean up tracking (via handle_order_cancellation)
+
+        This ensures consistent state management and prevents race conditions.
+        """
         cdef:
             list assets_to_cancel = list(self._active_buy_orders.keys())
             str asset
@@ -156,32 +165,25 @@ cdef class PositionBalancerHandler:
         for asset in assets_to_cancel:
             order_id = self._active_buy_orders.get(asset)
             if order_id:
-                try:
-                    # Find market tuple for this order
-                    for mp in self.strategy._market_pairs:
-                        if mp.first.base_asset == asset:
-                            # Mark as timeout-cancelled to prevent cooldown
-                            self.strategy._timeout_cancelled_orders.add(order_id)
-                            # NOTE: Don't remove from _position_balancer_orders here!
-                            # Let handle_order_completion clean it up when cancel completes
-                            # Cancel the order
-                            self.strategy.c_cancel_order(mp.first, order_id)
-                            self.strategy.logger().info(
-                                f"Position balancer: Cancelled buy order {order_id} for {asset} (target reached)")
-                            break
-                except Exception as e:
-                    self.strategy.logger().warning(
-                        f"Position balancer: Failed to cancel buy order {order_id}: {e}")
+                # Use the centralized cancel method for consistency
+                self._cancel_buy_order(asset, order_id, "target reached / mode disabled")
 
-        # Clear all buy tracking
-        self._active_buy_orders.clear()
-        self._pending_buy_orders.clear()
-        self._pending_buy_by_asset.clear()
-        self._last_buy_order_time.clear()
-        self._active_buy_order_details.clear()
+        # NOTE: We do NOT clear tracking dictionaries here!
+        # Each order's tracking will be cleaned up when its cancel event arrives
+        # via handle_order_cancellation() -> handle_order_completion()
+        # This prevents race conditions and ensures atomic cleanup.
 
     cdef void c_cancel_all_sell_orders(self):
-        """Cancel all active sell orders and clean up tracking."""
+        """
+        Cancel all active sell orders and clean up tracking.
+
+        Uses the same pattern as individual order cancellation:
+        - Mark orders in _timeout_cancelled_orders to prevent cooldown
+        - Send cancel requests
+        - Wait for cancel events to clean up tracking (via handle_order_cancellation)
+
+        This ensures consistent state management and prevents race conditions.
+        """
         cdef:
             list assets_to_cancel = list(self._active_sell_orders.keys())
             str asset
@@ -190,29 +192,13 @@ cdef class PositionBalancerHandler:
         for asset in assets_to_cancel:
             order_id = self._active_sell_orders.get(asset)
             if order_id:
-                try:
-                    # Find market tuple for this order
-                    for mp in self.strategy._market_pairs:
-                        if mp.first.base_asset == asset:
-                            # Mark as timeout-cancelled to prevent cooldown
-                            self.strategy._timeout_cancelled_orders.add(order_id)
-                            # NOTE: Don't remove from _position_balancer_orders here!
-                            # Let handle_order_completion clean it up when cancel completes
-                            # Cancel the order
-                            self.strategy.c_cancel_order(mp.first, order_id)
-                            self.strategy.logger().info(
-                                f"Position balancer: Cancelled sell order {order_id} for {asset} (target reached)")
-                            break
-                except Exception as e:
-                    self.strategy.logger().warning(
-                        f"Position balancer: Failed to cancel sell order {order_id}: {e}")
+                # Use the centralized cancel method for consistency
+                self._cancel_sell_order(asset, order_id, "target reached / mode disabled")
 
-        # Clear all sell tracking
-        self._active_sell_orders.clear()
-        self._pending_sell_orders.clear()
-        self._pending_sell_by_asset.clear()
-        self._last_sell_order_time.clear()
-        self._active_sell_order_details.clear()
+        # NOTE: We do NOT clear tracking dictionaries here!
+        # Each order's tracking will be cleaned up when its cancel event arrives
+        # via handle_order_cancellation() -> handle_order_completion()
+        # This prevents race conditions and ensures atomic cleanup.
 
     cdef void c_maybe_disable_buy(self):
         """Disable buy-in globally once target is reached, cancel orders, and clean up."""
@@ -671,22 +657,39 @@ cdef class PositionBalancerHandler:
     cdef void c_cancel_stale_orders(self, str asset):
         """
         Cancel stale buy/sell limit orders for refresh.
-        Smart cancellation: only cancel if:
-        1. Mode is disabled (orphaned order)
-        2. Better market became available
-        3. Got frontrun (price moved significantly)
+
+        REAL-WORLD GOAL: Maintain competitive position in order book while getting best price.
+
+        Smart cancellation triggers:
+        1. Mode disabled → orphaned order cleanup
+        2. Better market available → switch to higher liquidity/better price
+        3. Got frontrun → someone placed more aggressive order, we're no longer at front
+        4. Market moved in our favor → opportunity to get better price (gap detection)
+           - BUY: market moved DOWN → can buy cheaper
+           - SELL: market moved UP → can sell higher
+        5. Significant spread gap → our order is too far from competitive price
         """
         cdef:
             double current_time = self.strategy._current_timestamp
             object current_best_market
             object current_ob
-            double current_best_price
+            object trading_rule
             tuple order_details
             str order_market_name
             double order_price
+            double current_bid
+            double current_ask
+            double current_calculated_price
+            double min_price_increment
+            double price_diff_abs
             double price_diff_pct
+            double cancel_threshold_abs
+            double cancel_threshold_pct
+            str order_id
 
-        # Check buy orders
+        # ========================================================================
+        # CHECK BUY ORDERS
+        # ========================================================================
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
             if order_id and order_id not in self.strategy._timeout_cancelled_orders:
@@ -711,87 +714,122 @@ cdef class PositionBalancerHandler:
                             if order_details is not None:
                                 order_market_name, order_price = order_details
 
-                                # Check if different market became better
+                                # CONDITION 1: Check if different market became better
                                 if current_best_market.market.name != order_market_name:
                                     should_cancel = True
                                     cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
                                 else:
-                                    # Same market - check if price moved (got frontrun)
+                                    # Same market - evaluate if conditions changed
                                     try:
                                         current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
-                                        # Check if we've been outbid (someone placed higher bid than our order)
-                                        if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
-                                            # Maker orders: check if current top bid >= our order price
-                                            # This means someone outbid us and we're no longer at the front
-                                            if current_bid >= order_price:
-                                                should_cancel = True
-                                                cancel_reason = f"outbid (top bid {current_bid:.8f} >= our {order_price:.8f})"
+                                        # Calculate what our order price SHOULD be now with current market conditions
+                                        if self._buy_spread_is_min:
+                                            # 'min' mode: place at bid + min_tick to be at front
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    current_calculated_price = current_bid + min_price_increment
+                                                else:
+                                                    current_calculated_price = current_ask
+                                            except Exception:
+                                                current_calculated_price = current_ask
+                                        elif self._buy_spread_pct == 0.0:
+                                            # Aggressive mode (0%): take at ask
+                                            current_calculated_price = current_ask
                                         else:
-                                            # Aggressive mode: check if bid moved up significantly (someone matched ask)
+                                            # Percentage mode: place above bid by spread percentage
+                                            current_calculated_price = current_bid * (1.0 + self._buy_spread_pct)
+
+                                        # Calculate price difference between ideal and actual
+                                        price_diff_abs = abs(current_calculated_price - order_price)
+                                        if order_price > 0:
+                                            price_diff_pct = price_diff_abs / order_price
+                                        else:
+                                            price_diff_pct = 0.0
+
+                                        # Determine smart threshold based on spread configuration
+                                        # This allows small market noise while catching real movements/gaps
+                                        if self._buy_spread_is_min:
+                                            # Min tick mode: cancel if difference > 1 tick (got frontrun or gap appeared)
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                else:
+                                                    cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
+                                            except Exception:
+                                                cancel_threshold_abs = order_price * 0.001
+                                            cancel_threshold_pct = 0.0  # Not used in min mode
+                                        else:
+                                            # Percentage mode: cancel if difference > spread percentage
+                                            # This ensures we only cancel when movement is significant relative to our spread
+                                            cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)  # 50% of spread or 0.1% minimum
+                                            cancel_threshold_abs = 0.0  # Not used in percentage mode
+
+                                        # CONDITION 2: Got outbid - someone placed HIGHER bid than our order
+                                        # FIXED BUG: Use strict > instead of >= to avoid canceling our own order
+                                        # When our order is at the front, current_bid might equal our order_price
+                                        # Only cancel if someone actually placed HIGHER bid (current_bid > order_price)
+                                        if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
+                                            if current_bid > order_price:
+                                                should_cancel = True
+                                                cancel_reason = f"outbid (top bid {current_bid:.8f} > our {order_price:.8f})"
+
+                                        # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
+                                        # If calculated price < our order price, market moved in our favor
+                                        # For buys, this means we can buy at a lower price now
+                                        if not should_cancel and current_calculated_price < order_price:
+                                            gap_down = order_price - current_calculated_price
+                                            if self._buy_spread_is_min:
+                                                # Min mode: check absolute threshold
+                                                if gap_down > cancel_threshold_abs:
+                                                    should_cancel = True
+                                                    cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                            else:
+                                                # Percentage mode: check percentage threshold
+                                                gap_pct = gap_down / order_price if order_price > 0 else 0.0
+                                                if gap_pct > cancel_threshold_pct:
+                                                    should_cancel = True
+                                                    cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {current_calculated_price:.8f} vs {order_price:.8f})"
+
+                                        # CONDITION 4: Market moved UP significantly - got closer to being filled
+                                        # If calculated price > our order price, market moved against us
+                                        # For aggressive buys (0%), check if bid moved very close to our ask order
+                                        if not should_cancel and self._buy_spread_pct == 0.0:
                                             if current_bid >= order_price * 0.999:  # Within 0.1% of our ask order
                                                 should_cancel = True
-                                                cancel_reason = "market moved to our price"
+                                                cancel_reason = "market moved to our price (aggressive mode)"
 
+                                        # CONDITION 5: Significant price divergence - any direction
+                                        # Catches edge cases and ensures we stay aligned with current market
                                         if not should_cancel:
-                                            # Also check if calculated price would be significantly different
-                                            # Calculate what the order price WOULD BE now with current conditions
                                             if self._buy_spread_is_min:
-                                                # 'min' mode: bid + min_tick
-                                                try:
-                                                    trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                        min_price_increment = float(trading_rule.min_price_increment)
-                                                        current_calculated_price = current_bid + min_price_increment
-                                                    else:
-                                                        current_calculated_price = current_ask
-                                                except Exception:
-                                                    current_calculated_price = current_ask
-                                            elif self._buy_spread_pct == 0.0:
-                                                # Aggressive: at ask
-                                                current_calculated_price = current_ask
-                                            else:
-                                                # Percentage: bid * (1 + spread)
-                                                current_calculated_price = current_bid * (1.0 + self._buy_spread_pct)
-
-                                            # Cancel if calculated price would be different by >0.1%
-                                            if order_price > 0:
-                                                price_diff_pct = abs(current_calculated_price - order_price) / order_price
-                                                if price_diff_pct > 0.001:  # 0.1% threshold
+                                                if price_diff_abs > cancel_threshold_abs:
                                                     should_cancel = True
-                                                    cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
-                                    except Exception:
+                                                    cancel_reason = f"price diverged {price_diff_abs:.8f} (calculated {current_calculated_price:.8f} vs order {order_price:.8f})"
+                                            else:
+                                                if price_diff_pct > cancel_threshold_pct:
+                                                    should_cancel = True
+                                                    cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (calculated {current_calculated_price:.8f} vs order {order_price:.8f})"
+
+                                    except Exception as e:
+                                        self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
                                         pass
-                    except Exception:
+                    except Exception as e:
+                        self.strategy.logger().warning(f"Position balancer: Error finding best buy market: {e}")
                         pass
 
                 if should_cancel:
-                    try:
-                        # Find market tuple for this order
-                        for mp in self.strategy._market_pairs:
-                            if mp.first.base_asset == asset:
-                                # Mark as timeout-cancelled to prevent cooldown enforcement
-                                self.strategy._timeout_cancelled_orders.add(order_id)
-                                # NOTE: Don't remove from _position_balancer_orders here!
-                                # Main strategy skips timeout checks for orders in this set.
-                                # Only remove when order actually completes/cancels (in handle_order_completion)
+                    self._cancel_buy_order(asset, order_id, cancel_reason)
 
-                                # Cancel the order
-                                self.strategy.c_cancel_order(mp.first, order_id)
-                                self.strategy.logger().info(
-                                    f"Position balancer: Cancelled buy order {order_id} for {asset} ({cancel_reason})")
-                                # NOTE: Don't remove from _active_buy_orders here!
-                                # Let handle_order_cancellation() clean it up when cancel event arrives
-                                # This prevents tracking loss if cancel fails or is delayed
-                                break
-                    except Exception as e:
-                        self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order: {e}")
-                        # Clean up timeout marker if cancel failed
-                        self.strategy._timeout_cancelled_orders.discard(order_id)
-
-        # Check sell orders
+        # ========================================================================
+        # CHECK SELL ORDERS
+        # ========================================================================
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
             if order_id and order_id not in self.strategy._timeout_cancelled_orders:
@@ -816,85 +854,180 @@ cdef class PositionBalancerHandler:
                             if order_details is not None:
                                 order_market_name, order_price = order_details
 
-                                # Check if different market became better
+                                # CONDITION 1: Check if different market became better
                                 if current_best_market.market.name != order_market_name:
                                     should_cancel = True
                                     cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_name})"
                                 else:
-                                    # Same market - check if price moved (got frontrun)
+                                    # Same market - evaluate if conditions changed
                                     try:
                                         current_ob = current_best_market.market.get_order_book(current_best_market.trading_pair)
                                         current_bid = float(current_ob.get_price(False))
                                         current_ask = float(current_ob.get_price(True))
 
-                                        # Check if we've been undercut (someone placed lower ask than our order)
-                                        if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
-                                            # Maker orders: check if current top ask <= our order price
-                                            # This means someone undercut us and we're no longer at the front
-                                            if current_ask <= order_price:
-                                                should_cancel = True
-                                                cancel_reason = f"undercut (top ask {current_ask:.8f} <= our {order_price:.8f})"
+                                        # Calculate what our order price SHOULD be now with current market conditions
+                                        if self._sell_spread_is_min:
+                                            # 'min' mode: place at ask - min_tick to be at front
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    current_calculated_price = current_ask - min_price_increment
+                                                else:
+                                                    current_calculated_price = current_bid
+                                            except Exception:
+                                                current_calculated_price = current_bid
+                                        elif self._sell_spread_pct == 0.0:
+                                            # Aggressive mode (0%): take at bid
+                                            current_calculated_price = current_bid
                                         else:
-                                            # Aggressive mode: check if ask moved down significantly (someone matched bid)
+                                            # Percentage mode: place below ask by spread percentage
+                                            current_calculated_price = current_ask * (1.0 - self._sell_spread_pct)
+
+                                        # Calculate price difference between ideal and actual
+                                        price_diff_abs = abs(current_calculated_price - order_price)
+                                        if order_price > 0:
+                                            price_diff_pct = price_diff_abs / order_price
+                                        else:
+                                            price_diff_pct = 0.0
+
+                                        # Determine smart threshold based on spread configuration
+                                        if self._sell_spread_is_min:
+                                            # Min tick mode: cancel if difference > 1 tick
+                                            try:
+                                                trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                    cancel_threshold_abs = min_price_increment * 1.5  # Allow 1.5 ticks tolerance
+                                                else:
+                                                    cancel_threshold_abs = order_price * 0.001  # 0.1% fallback
+                                            except Exception:
+                                                cancel_threshold_abs = order_price * 0.001
+                                            cancel_threshold_pct = 0.0  # Not used in min mode
+                                        else:
+                                            # Percentage mode: cancel if difference > spread percentage
+                                            cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)  # 50% of spread or 0.1% minimum
+                                            cancel_threshold_abs = 0.0  # Not used in percentage mode
+
+                                        # CONDITION 2: Got undercut - someone placed LOWER ask than our order
+                                        # FIXED BUG: Use strict < instead of <= to avoid canceling our own order
+                                        # When our order is at the front, current_ask might equal our order_price
+                                        # Only cancel if someone actually placed LOWER ask (current_ask < order_price)
+                                        if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
+                                            if current_ask < order_price:
+                                                should_cancel = True
+                                                cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
+
+                                        # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
+                                        # If calculated price > our order price, market moved in our favor
+                                        # For sells, this means we can sell at a higher price now
+                                        if not should_cancel and current_calculated_price > order_price:
+                                            gap_up = current_calculated_price - order_price
+                                            if self._sell_spread_is_min:
+                                                # Min mode: check absolute threshold
+                                                if gap_up > cancel_threshold_abs:
+                                                    should_cancel = True
+                                                    cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
+                                            else:
+                                                # Percentage mode: check percentage threshold
+                                                gap_pct = gap_up / order_price if order_price > 0 else 0.0
+                                                if gap_pct > cancel_threshold_pct:
+                                                    should_cancel = True
+                                                    cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {current_calculated_price:.8f} vs {order_price:.8f})"
+
+                                        # CONDITION 4: Market moved DOWN significantly - got closer to being filled
+                                        # If calculated price < our order price, market moved against us
+                                        # For aggressive sells (0%), check if ask moved very close to our bid order
+                                        if not should_cancel and self._sell_spread_pct == 0.0:
                                             if current_ask <= order_price * 1.001:  # Within 0.1% of our bid order
                                                 should_cancel = True
-                                                cancel_reason = "market moved to our price"
+                                                cancel_reason = "market moved to our price (aggressive mode)"
 
+                                        # CONDITION 5: Significant price divergence - any direction
+                                        # Catches edge cases and ensures we stay aligned with current market
                                         if not should_cancel:
-                                            # Also check if calculated price would be significantly different
-                                            # Calculate what the order price WOULD BE now with current conditions
                                             if self._sell_spread_is_min:
-                                                # 'min' mode: ask - min_tick
-                                                try:
-                                                    trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                        min_price_increment = float(trading_rule.min_price_increment)
-                                                        current_calculated_price = current_ask - min_price_increment
-                                                    else:
-                                                        current_calculated_price = current_bid
-                                                except Exception:
-                                                    current_calculated_price = current_bid
-                                            elif self._sell_spread_pct == 0.0:
-                                                # Aggressive: at bid
-                                                current_calculated_price = current_bid
-                                            else:
-                                                # Percentage: ask * (1 - spread)
-                                                current_calculated_price = current_ask * (1.0 - self._sell_spread_pct)
-
-                                            # Cancel if calculated price would be different by >0.1%
-                                            if order_price > 0:
-                                                price_diff_pct = abs(current_calculated_price - order_price) / order_price
-                                                if price_diff_pct > 0.001:  # 0.1% threshold
+                                                if price_diff_abs > cancel_threshold_abs:
                                                     should_cancel = True
-                                                    cancel_reason = f"price moved {price_diff_pct*100:.2f}%"
-                                    except Exception:
+                                                    cancel_reason = f"price diverged {price_diff_abs:.8f} (calculated {current_calculated_price:.8f} vs order {order_price:.8f})"
+                                            else:
+                                                if price_diff_pct > cancel_threshold_pct:
+                                                    should_cancel = True
+                                                    cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (calculated {current_calculated_price:.8f} vs order {order_price:.8f})"
+
+                                    except Exception as e:
+                                        self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
                                         pass
-                    except Exception:
+                    except Exception as e:
+                        self.strategy.logger().warning(f"Position balancer: Error finding best sell market: {e}")
                         pass
 
                 if should_cancel:
-                    try:
-                        # Find market tuple for this order
-                        for mp in self.strategy._market_pairs:
-                            if mp.first.base_asset == asset:
-                                # Mark as timeout-cancelled to prevent cooldown enforcement
-                                self.strategy._timeout_cancelled_orders.add(order_id)
-                                # NOTE: Don't remove from _position_balancer_orders here!
-                                # Main strategy skips timeout checks for orders in this set.
-                                # Only remove when order actually completes/cancels (in handle_order_completion)
+                    self._cancel_sell_order(asset, order_id, cancel_reason)
 
-                                # Cancel the order
-                                self.strategy.c_cancel_order(mp.first, order_id)
-                                self.strategy.logger().info(
-                                    f"Position balancer: Cancelled sell order {order_id} for {asset} ({cancel_reason})")
-                                # NOTE: Don't remove from _active_sell_orders here!
-                                # Let handle_order_cancellation() clean it up when cancel event arrives
-                                # This prevents tracking loss if cancel fails or is delayed
-                                break
-                    except Exception as e:
-                        self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order: {e}")
-                        # Clean up timeout marker if cancel failed
-                        self.strategy._timeout_cancelled_orders.discard(order_id)
+    cdef void _cancel_buy_order(self, str asset, str order_id, str reason):
+        """
+        Internal method to cancel a buy order with proper cleanup tracking.
+        Ensures atomic cancellation with correct state management.
+        """
+        try:
+            # Find market tuple for this order
+            for mp in self.strategy._market_pairs:
+                if mp.first.base_asset == asset:
+                    # Mark as timeout-cancelled to prevent cooldown enforcement
+                    # This allows position balancer to be more aggressive with refreshes
+                    self.strategy._timeout_cancelled_orders.add(order_id)
+
+                    # NOTE: Don't remove from _position_balancer_orders here!
+                    # Main strategy skips timeout checks for orders in this set.
+                    # Only remove when order actually completes/cancels (in handle_order_completion)
+                    # This prevents race conditions where we lose tracking if cancel is delayed.
+
+                    # Cancel the order
+                    self.strategy.c_cancel_order(mp.first, order_id)
+                    self.strategy.logger().info(
+                        f"Position balancer: Cancelled buy order {order_id} for {asset} ({reason})")
+
+                    # NOTE: Don't remove from _active_buy_orders here!
+                    # Let handle_order_cancellation() clean it up when cancel event arrives.
+                    # This prevents tracking loss if cancel fails or is delayed.
+                    break
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to cancel buy order {order_id}: {e}")
+            # Clean up timeout marker if cancel failed
+            self.strategy._timeout_cancelled_orders.discard(order_id)
+
+    cdef void _cancel_sell_order(self, str asset, str order_id, str reason):
+        """
+        Internal method to cancel a sell order with proper cleanup tracking.
+        Ensures atomic cancellation with correct state management.
+        """
+        try:
+            # Find market tuple for this order
+            for mp in self.strategy._market_pairs:
+                if mp.first.base_asset == asset:
+                    # Mark as timeout-cancelled to prevent cooldown enforcement
+                    # This allows position balancer to be more aggressive with refreshes
+                    self.strategy._timeout_cancelled_orders.add(order_id)
+
+                    # NOTE: Don't remove from _position_balancer_orders here!
+                    # Main strategy skips timeout checks for orders in this set.
+                    # Only remove when order actually completes/cancels (in handle_order_completion)
+                    # This prevents race conditions where we lose tracking if cancel is delayed.
+
+                    # Cancel the order
+                    self.strategy.c_cancel_order(mp.first, order_id)
+                    self.strategy.logger().info(
+                        f"Position balancer: Cancelled sell order {order_id} for {asset} ({reason})")
+
+                    # NOTE: Don't remove from _active_sell_orders here!
+                    # Let handle_order_cancellation() clean it up when cancel event arrives.
+                    # This prevents tracking loss if cancel fails or is delayed.
+                    break
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to cancel sell order {order_id}: {e}")
+            # Clean up timeout marker if cancel failed
+            self.strategy._timeout_cancelled_orders.discard(order_id)
 
     cdef bint c_handle_position_balancing(self, object buy_market_tuple, object sell_market_tuple):
         """
