@@ -567,7 +567,7 @@ cdef class PositionBalancerHandler:
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._buy_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for 2s cooldown
+                        # Record completion time for cooldown
                         self._last_buy_completion_time[asset_key] = self.strategy._current_timestamp
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
@@ -588,7 +588,7 @@ cdef class PositionBalancerHandler:
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._sell_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for 2s cooldown
+                        # Record completion time for cooldown
                         self._last_sell_completion_time[asset_key] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
