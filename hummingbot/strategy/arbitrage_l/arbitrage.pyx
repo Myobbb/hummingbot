@@ -1462,8 +1462,8 @@ cdef void c_find_profitable_arbitrage_orders(
         cpp_set[OrderBookEntryCPP].reverse_iterator bid_end
         cpp_set[OrderBookEntryCPP].iterator ask_it
         cpp_set[OrderBookEntryCPP].iterator ask_end
-        OrderBookEntryCPP *bid_entry_ptr
-        OrderBookEntryCPP *ask_entry_ptr
+        OrderBookEntryCPP bid_entry
+        OrderBookEntryCPP ask_entry
         double orig_bid_price
         double orig_ask_price
         double bid_price
@@ -1484,16 +1484,16 @@ cdef void c_find_profitable_arbitrage_orders(
     if bid_it == bid_end or ask_it == ask_end:
         return
 
-    bid_entry_ptr = &deref(bid_it)
-    ask_entry_ptr = &deref(ask_it)
+    bid_entry = deref(bid_it)
+    ask_entry = deref(ask_it)
 
-    bid_leftover = bid_entry_ptr.getAmount()
-    ask_leftover = ask_entry_ptr.getAmount()
+    bid_leftover = bid_entry.getAmount()
+    ask_leftover = ask_entry.getAmount()
 
     while levels_processed < max_levels and bid_it != bid_end and ask_it != ask_end:
         # Get prices (original, unconverted)
-        orig_bid_price = bid_entry_ptr.getPrice()
-        orig_ask_price = ask_entry_ptr.getPrice()
+        orig_bid_price = bid_entry.getPrice()
+        orig_ask_price = ask_entry.getPrice()
 
         # Sanity check
         if orig_bid_price <= 0 or orig_ask_price <= 0:
@@ -1529,14 +1529,14 @@ cdef void c_find_profitable_arbitrage_orders(
             levels_processed += 1
             if bid_it == bid_end:
                 break
-            bid_entry_ptr = &deref(bid_it)
-            bid_leftover = bid_entry_ptr.getAmount()
+            bid_entry = deref(bid_it)
+            bid_leftover = bid_entry.getAmount()
             ask_leftover -= step_amount
         else:
             inc(ask_it)
             levels_processed += 1  
             if ask_it == ask_end:
                 break
-            ask_entry_ptr = &deref(ask_it)
-            ask_leftover = ask_entry_ptr.getAmount()
+            ask_entry = deref(ask_it)
+            ask_leftover = ask_entry.getAmount()
             bid_leftover -= step_amount
