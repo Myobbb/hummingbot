@@ -388,6 +388,20 @@ class V1StrategyInstance:
     market_pairs: List[MarketTradingPairTuple]
     paused: bool = False  # Runtime pause state
     _last_ready_state: bool = True  # Track ready transitions for reconnection logging
+    _connectors: Optional[Set[ConnectorBase]] = None  # Cached connector set (structure only)
+    
+    # Health monitoring fields
+    exception_count: int = 0
+    last_exception_time: Optional[float] = None
+    last_exception_msg: Optional[str] = None
+    last_successful_tick: Optional[float] = None
+    
+    @property
+    def connectors(self) -> Set[ConnectorBase]:
+        """Get cached set of connectors used by this strategy (structure only, not state)"""
+        if self._connectors is None:
+            self._connectors = {mp.market for mp in self.market_pairs}
+        return self._connectors
 
 
 class ArbitrageMInstanceConfig(BaseModel):
@@ -621,6 +635,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Storage for V1 strategy instances
         self.strategies: List[V1StrategyInstance] = []
+        self._strategy_by_name: Dict[str, V1StrategyInstance] = {}  # O(1) lookup by name
         self._strategies_started: bool = False
         self._strategy_clock = None
 
@@ -666,7 +681,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._show_runtime_help()
 
     def _validate_config_structure(self):
-        """Validate configuration structure and return diagnostic information"""
+        """Validate configuration structure and values, return diagnostic information"""
         issues = []
         
         # Check if config has the required sections
@@ -680,9 +695,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         elif not self.config.markets:
             issues.append("'markets' section is empty")
         
-        # Validate individual strategies
+        # Validate individual strategies with enhanced checks
         if hasattr(self.config, 'arbitrage_m_strategies') and self.config.arbitrage_m_strategies:
             for i, strategy_config in enumerate(self.config.arbitrage_m_strategies):
+                # Check required fields
                 required_fields = ['name', 'primary_market', 'secondary_market', 
                                  'primary_trading_pair', 'secondary_trading_pair']
                 
@@ -694,11 +710,81 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if missing_fields:
                     strategy_name = getattr(strategy_config, 'name', f'strategy_{i}')
                     issues.append(f"Strategy '{strategy_name}' missing fields: {', '.join(missing_fields)}")
+                    continue  # Skip value validation if required fields are missing
+                
+                # Enhanced value validation
+                strategy_name = strategy_config.name
+                
+                # Validate min_profitability
+                if hasattr(strategy_config, 'min_profitability'):
+                    min_prof = strategy_config.min_profitability
+                    try:
+                        min_prof_float = float(min_prof)
+                        if min_prof_float < -100 or min_prof_float > 1000:
+                            issues.append(
+                                f"Strategy '{strategy_name}': invalid min_profitability {min_prof}% "
+                                f"(must be -100 to 1000)"
+                            )
+                    except (ValueError, TypeError):
+                        issues.append(f"Strategy '{strategy_name}': min_profitability must be numeric")
+                
+                # Validate buy_in_target_usd
+                if hasattr(strategy_config, 'buy_in_target_usd'):
+                    try:
+                        if float(strategy_config.buy_in_target_usd) < 0:
+                            issues.append(f"Strategy '{strategy_name}': buy_in_target_usd cannot be negative")
+                    except (ValueError, TypeError):
+                        issues.append(f"Strategy '{strategy_name}': buy_in_target_usd must be numeric")
+                
+                # Validate sell_off_target_usd
+                if hasattr(strategy_config, 'sell_off_target_usd'):
+                    try:
+                        if float(strategy_config.sell_off_target_usd) < 0:
+                            issues.append(f"Strategy '{strategy_name}': sell_off_target_usd cannot be negative")
+                    except (ValueError, TypeError):
+                        issues.append(f"Strategy '{strategy_name}': sell_off_target_usd must be numeric")
+                
+                # Validate spread values
+                for spread_field in ['buy_in_spread_pct', 'sell_off_spread_pct']:
+                    if hasattr(strategy_config, spread_field):
+                        spread_val = getattr(strategy_config, spread_field)
+                        if spread_val != 'min':
+                            try:
+                                spread_float = float(spread_val)
+                                if spread_float < 0 or spread_float > 100:
+                                    issues.append(
+                                        f"Strategy '{strategy_name}': {spread_field} must be 'min' or 0-100% "
+                                        f"(got {spread_val})"
+                                    )
+                            except (ValueError, TypeError):
+                                issues.append(
+                                    f"Strategy '{strategy_name}': {spread_field} must be 'min' or numeric percentage"
+                                )
+                
+                # Validate order_timeout
+                if hasattr(strategy_config, 'order_timeout'):
+                    try:
+                        if float(strategy_config.order_timeout) <= 0:
+                            issues.append(f"Strategy '{strategy_name}': order_timeout must be positive")
+                    except (ValueError, TypeError):
+                        issues.append(f"Strategy '{strategy_name}': order_timeout must be numeric")
+                
+                # Validate position_balancer_order_size_usd
+                if hasattr(strategy_config, 'position_balancer_order_size_usd'):
+                    try:
+                        if float(strategy_config.position_balancer_order_size_usd) <= 0:
+                            issues.append(
+                                f"Strategy '{strategy_name}': position_balancer_order_size_usd must be positive"
+                            )
+                    except (ValueError, TypeError):
+                        issues.append(
+                            f"Strategy '{strategy_name}': position_balancer_order_size_usd must be numeric"
+                        )
         
         return issues
 
     def _initialize_arbitrage_m_strategies(self):
-        """Initialize all arbitrage_m strategy instances"""
+        """Initialize all arbitrage_m strategy instances with retry logic"""
         # First validate config structure
         config_issues = self._validate_config_structure()
         if config_issues:
@@ -708,12 +794,33 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return
         
         for strategy_config in self.config.arbitrage_m_strategies:
-            try:
-                self._add_arbitrage_m_strategy(strategy_config)
-            except Exception as e:
-                error_msg = str(e)
-                self._init_errors.append((strategy_config.name, error_msg))
-                self.logger().error(f"Failed to initialize strategy '{strategy_config.name}': {e}", exc_info=True)
+            max_retries = 3
+            success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    self._add_arbitrage_m_strategy(strategy_config)
+                    success = True
+                    break  # Success, move to next strategy
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    if attempt < max_retries - 1:
+                        # Retry with exponential backoff
+                        wait_time = 2 ** attempt  # 1s, 2s, 4s
+                        self.logger().warning(
+                            f"Failed to initialize strategy '{strategy_config.name}' (attempt {attempt + 1}/{max_retries}): {e}. "
+                            f"Retrying in {wait_time}s..."
+                        )
+                        import time
+                        time.sleep(wait_time)
+                    else:
+                        # Final attempt failed
+                        self._init_errors.append((strategy_config.name, error_msg))
+                        self.logger().error(
+                            f"Failed to initialize strategy '{strategy_config.name}' after {max_retries} attempts: {e}",
+                            exc_info=True
+                        )
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
@@ -873,6 +980,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             paused=paused  # Set initial pause state
         )
         self.strategies.append(strategy_instance)
+        self._strategy_by_name[config.name] = strategy_instance  # Add to index
 
         self.logger().info(
             f"Strategy '{config.name}' initialized: "
@@ -1013,11 +1121,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
 
     def _get_strategy_connectors(self, strategy_instance: V1StrategyInstance) -> Set[ConnectorBase]:
-        """Get the unique set of connectors used by a strategy."""
-        connectors = set()
-        for market_pair in strategy_instance.market_pairs:
-            connectors.add(market_pair.market)
-        return connectors
+        """Get the unique set of connectors used by a strategy (cached)."""
+        return strategy_instance.connectors
 
     def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
         """
@@ -1087,9 +1192,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             try:
                 # Call the Python-level tick() method
                 strategy_instance.strategy.tick(current_timestamp)
+                strategy_instance.last_successful_tick = current_timestamp
+                # Reset exception count on successful tick
+                if strategy_instance.exception_count > 0:
+                    strategy_instance.exception_count = 0
             except Exception as e:
+                # Track exception for health monitoring
+                strategy_instance.exception_count += 1
+                strategy_instance.last_exception_time = current_timestamp
+                strategy_instance.last_exception_msg = str(e)[:200]  # Truncate long messages
+                
+                # Auto-pause after 10 consecutive failures to prevent runaway issues
+                if strategy_instance.exception_count >= 10:
+                    self.logger().error(
+                        f"Strategy '{strategy_instance.name}' auto-paused after {strategy_instance.exception_count} consecutive exceptions. "
+                        f"Last error: {strategy_instance.last_exception_msg}"
+                    )
+                    strategy_instance.paused = True
+                
                 self.logger().error(
-                    f"Error ticking strategy '{strategy_instance.name}': {e}",
+                    f"Error ticking strategy '{strategy_instance.name}' (failure #{strategy_instance.exception_count}): {e}",
                     exc_info=True
                 )
 
@@ -1191,7 +1313,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def _get_strategy_instance(self, strategy_name: str) -> Optional[V1StrategyInstance]:
         """
-        Get strategy instance by name with validation.
+        Get strategy instance by name with validation (O(1) lookup).
 
         Args:
             strategy_name: The name of the strategy
@@ -1203,11 +1325,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             self.logger().error("Strategy name cannot be empty")
             return None
 
-        strategy_instance = next((s for s in self.strategies if s.name == strategy_name), None)
+        strategy_instance = self._strategy_by_name.get(strategy_name)
         if not strategy_instance:
             self.logger().error(
                 f"Strategy '{strategy_name}' not found. Available strategies: "
-                f"{[s.name for s in self.strategies]}"
+                f"{list(self._strategy_by_name.keys())}"
             )
             return None
 
@@ -1753,8 +1875,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Step 2: Collect market info before removal
         removed_markets = self._get_strategy_markets(strategy_instance)
 
-        # Step 3: Remove from in-memory list
+        # Step 3: Remove from in-memory list and index
         self.strategies = [s for s in self.strategies if s.name != strategy_name]
+        self._strategy_by_name.pop(strategy_name, None)  # Remove from index
         self.logger().info(f"Strategy '{strategy_name}' removed from memory")
 
         # Step 4: Update the config file

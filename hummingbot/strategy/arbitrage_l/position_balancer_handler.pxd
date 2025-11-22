@@ -64,6 +64,18 @@ cdef class PositionBalancerHandler:
     cdef void c_scan_and_mark_completion(self)
     cdef object c_find_best_buy_market(self, str asset)
     cdef object c_find_best_sell_market(self, str asset)
+    # Helper methods for cancellation logic
+    cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time)
+    cdef tuple c_get_orderbook_prices(self, object ob)
+    cdef double c_get_effective_reference_price(self, object ob, double top_price, double order_price, 
+                                                  double min_price_increment, bint is_buy)
+    cdef tuple c_check_immediate_frontrun(self, double current_top_price, double order_price, bint is_buy)
+    cdef tuple c_check_large_gap_immediate(self, double order_price, double expected_price, 
+                                            double min_price_increment, bint is_buy)
+    cdef double c_calculate_ideal_order_price(self, double effective_ref_price, double spread_pct, 
+                                               bint spread_is_min, double min_price_increment, bint is_buy)
+    cdef tuple c_check_price_divergence(self, double order_price, double ideal_price, bint spread_is_min, 
+                                         double min_price_increment, bint got_valid_second_level)
     cdef void c_cancel_stale_orders(self, str asset)
     cdef void _cancel_buy_order(self, str asset, str order_id, str reason)
     cdef void _cancel_sell_order(self, str asset, str order_id, str reason)
