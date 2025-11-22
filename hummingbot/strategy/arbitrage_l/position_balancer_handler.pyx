@@ -1053,11 +1053,14 @@ cdef class PositionBalancerHandler:
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
             if order_id:
-                # SAFETY NET: Detect stuck cancels using helper method
-                process_buy_order = not self.c_check_stuck_cancel(order_id, asset, True, current_time)
+                # Check if order is already in cancellation state
+                if order_id in self.strategy._timeout_cancelled_orders:
+                    # Check for stuck cancel (force cleanup if needed)
+                    self.c_check_stuck_cancel(order_id, asset, True, current_time)
+                    # Skip normal processing since it's already cancelling
+                    continue
 
-                if process_buy_order:
-                    # Normal processing - order not in cancellation state
+                # Normal processing - order not in cancellation state
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_buy_order_time.get(asset, 0.0)
                     should_cancel = False
@@ -1215,11 +1218,14 @@ cdef class PositionBalancerHandler:
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
             if order_id:
-                # SAFETY NET: Detect stuck cancels using helper method
-                process_sell_order = not self.c_check_stuck_cancel(order_id, asset, False, current_time)
+                # Check if order is already in cancellation state
+                if order_id in self.strategy._timeout_cancelled_orders:
+                    # Check for stuck cancel (force cleanup if needed)
+                    self.c_check_stuck_cancel(order_id, asset, False, current_time)
+                    # Skip normal processing since it's already cancelling
+                    continue
 
-                if process_sell_order:
-                    # Normal processing - order not in cancellation state
+                # Normal processing - order not in cancellation state
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_sell_order_time.get(asset, 0.0)
                     should_cancel = False
