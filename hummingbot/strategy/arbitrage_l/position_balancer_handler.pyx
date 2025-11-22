@@ -1054,13 +1054,14 @@ cdef class PositionBalancerHandler:
             order_id = self._active_buy_orders.get(asset)
             if order_id:
                 # Check if order is already in cancellation state
+                should_process = True
                 if order_id in self.strategy._timeout_cancelled_orders:
                     # Check for stuck cancel (force cleanup if needed)
                     self.c_check_stuck_cancel(order_id, asset, True, current_time)
-                    # Skip normal processing since it's already cancelling
-                    continue
+                    should_process = False
 
-                # Normal processing - order not in cancellation state
+                if should_process:
+                    # Normal processing - order not in cancellation state
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_buy_order_time.get(asset, 0.0)
                     should_cancel = False
@@ -1219,13 +1220,14 @@ cdef class PositionBalancerHandler:
             order_id = self._active_sell_orders.get(asset)
             if order_id:
                 # Check if order is already in cancellation state
+                should_process = True
                 if order_id in self.strategy._timeout_cancelled_orders:
                     # Check for stuck cancel (force cleanup if needed)
                     self.c_check_stuck_cancel(order_id, asset, False, current_time)
-                    # Skip normal processing since it's already cancelling
-                    continue
+                    should_process = False
 
-                # Normal processing - order not in cancellation state
+                if should_process:
+                    # Normal processing - order not in cancellation state
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_sell_order_time.get(asset, 0.0)
                     should_cancel = False
