@@ -1,5 +1,6 @@
 # distutils: language=c++
 from libcpp.pair cimport pair
+from hummingbot.core.data_type.order_book cimport OrderBook
 from hummingbot.strategy.arbitrage_l.arbitrage cimport ArbitrageLStrategy
 cdef class PositionBalancerHandler:
     """
