@@ -66,11 +66,11 @@ async def start(self):
         if sell_off_enabled is None:
             sell_off_enabled = False
         if sell_off_target_usd is None:
-            sell_off_target_usd = 1000.0
+            sell_off_target_usd = 3000.0
         if sell_off_spread_pct is None:
             sell_off_spread_pct = 0.1
         if position_balancer_refresh_interval is None:
-            position_balancer_refresh_interval = 10.0
+            position_balancer_refresh_interval = 60.0
         # Filled order timeout (defaults to 3600 seconds = 1 hour)
         filled_order_timeout_val = arbitrage_l_config_map.get("filled_order_timeout").value
         if filled_order_timeout_val is None:

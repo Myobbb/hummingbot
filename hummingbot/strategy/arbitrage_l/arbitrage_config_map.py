@@ -228,7 +228,7 @@ arbitrage_l_config_map = {
         key="sell_off_enabled",
         type_str="bool",
         prompt="Enable sell-off to reduce assets when above target? (Yes/No)",
-        prompt_on_new=False,
+        prompt_on_new=True,
         default=False,
         validator=lambda v: validate_bool(v),
     ),
@@ -254,7 +254,7 @@ arbitrage_l_config_map = {
     "position_balancer_refresh_interval": ConfigVar(
         key="position_balancer_refresh_interval",
         prompt="How often to cancel and replace limit orders (seconds) >>> ",
-        prompt_on_new=False,
+        prompt_on_new=True,
         default=Decimal("60"),
         validator=lambda v: validate_decimal(v, Decimal(1), inclusive=True),
         type_str="decimal",
@@ -309,7 +309,7 @@ arbitrage_l_config_map = {
     "filled_order_timeout": ConfigVar(
         key="filled_order_timeout",
         prompt="Timeout in seconds for limit orders that have received fills (default: 3600 = 1 hour) >>> ",
-        prompt_on_new=False,
+        prompt_on_new=True,
         default=Decimal("3600"),
         validator=lambda v: validate_decimal(v, Decimal(1), inclusive=True),
         type_str="decimal",
