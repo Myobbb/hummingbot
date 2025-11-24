@@ -2252,30 +2252,68 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 except Exception:
                     pass # Order book might not be ready yet
 
-            # Check 2: Low Balances (< $15 USD)
-            # Iterate over unique assets (base and quote) for each market
+            # Check 2: Prices and Balances
             checked_assets = set()
             for market_pair in strategy_instance.market_pairs:
                 connector = market_pair.market
+                pair = market_pair.trading_pair
                 base_asset = market_pair.base_asset
                 quote_asset = market_pair.quote_asset
+
+                # 2a. Check Market Price Availability
+                price = None
+                try:
+                    price = connector.get_price(pair, is_buy=False)
+                    if price is None or price <= 0:
+                         price = connector.get_mid_price(pair)
+                except Exception:
+                    pass
                 
-                for asset in [base_asset, quote_asset]:
-                    key = (connector.name, asset)
-                    if key in checked_assets:
-                        continue
-                    checked_assets.add(key)
-                    
+                if price is None or price <= 0:
+                    issues.append(f"{connector.name} {pair} (no price)")
+                    # Can't value base asset reliably without price, but we can still check quote asset
+                
+                # 2b. Check Base Asset Balance (using market price)
+                key_base = (connector.name, base_asset)
+                if key_base not in checked_assets:
+                    checked_assets.add(key_base)
                     try:
-                        balance = connector.get_available_balance(asset)
-                        # Convert to USD
-                        rate = RateOracle.get_instance().get_pair_rate(f"{asset}-USDT")
+                        balance = connector.get_available_balance(base_asset)
+                        if price is not None and price > 0:
+                            # Value in Quote Asset
+                            val_in_quote = float(balance) * float(price)
+                            # Convert Quote to USD
+                            quote_rate = RateOracle.get_instance().get_pair_rate(f"{quote_asset}-USDT")
+                            if quote_rate is not None:
+                                usd_value = val_in_quote * float(quote_rate)
+                                if usd_value < 15.0:
+                                    issues.append(f"{connector.name} (${usd_value:.0f})")
+                            else:
+                                issues.append(f"{connector.name} {quote_asset} (no rate)")
+                        else:
+                             # Fallback if no price: try direct Oracle conversion? 
+                             # User requested market price, so maybe just skip or warn?
+                             # We already warned about "no price" above.
+                             pass
+                    except Exception:
+                        pass
+
+                # 2c. Check Quote Asset Balance (direct Oracle)
+                key_quote = (connector.name, quote_asset)
+                if key_quote not in checked_assets:
+                    checked_assets.add(key_quote)
+                    try:
+                        balance = connector.get_available_balance(quote_asset)
+                        rate = RateOracle.get_instance().get_pair_rate(f"{quote_asset}-USDT")
                         if rate is not None:
                             usd_value = float(balance) * float(rate)
                             if usd_value < 15.0:
                                 issues.append(f"{connector.name} (${usd_value:.0f})")
+                        else:
+                            issues.append(f"{connector.name} {quote_asset} (no rate)")
                     except Exception:
-                        pass # RateOracle might not have rate or other error
+                        pass
+
 
         except Exception as e:
             self.logger().debug(f"Error checking market issues for {strategy_instance.name}: {e}")
