@@ -169,6 +169,7 @@ from hummingbot.strategy.arbitrage_m.arbitrage import ArbitrageMStrategy
 from hummingbot.strategy.arbitrage_m.arbitrage_market_pair import ArbitrageMMarketPair
 from hummingbot.strategy.arbitrage_l.arbitrage import ArbitrageLStrategy
 from hummingbot.strategy.arbitrage_l.arbitrage_market_pair import ArbitrageLMarketPair
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.script_strategy_base import ScriptConfigBase, ScriptStrategyBase
 from hummingbot.strategy.strategy_base import StrategyBase
@@ -346,7 +347,7 @@ def resume_all() -> None:
     Example:
         >>> resume_all()
     """
-    orchestrator = _get_orchestrator()
+    orchestrator = _get_get_orchestrator()
     orchestrator.resume_all_strategies()
 
 
@@ -693,7 +694,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if not hasattr(self.config, 'markets'):
             issues.append("Missing 'markets' section in config")
         elif not self.config.markets:
-            issues.append("'markets' section is empty")
+            issues.append("Removing 'markets' section is empty")
         
         # Validate individual strategies with enhanced checks
         if hasattr(self.config, 'arbitrage_m_strategies') and self.config.arbitrage_m_strategies:
@@ -2229,6 +2230,59 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info(f"Config file updated: {config_path}")
 
+    def _check_market_issues(self, strategy_instance: V1StrategyInstance) -> List[str]:
+        """
+        Check for market issues like low balance or not ready state.
+        Returns a list of warning messages.
+        """
+        issues = []
+        try:
+            # Check 1: Market Readiness (Connectors and Order Books)
+            for market_pair in strategy_instance.market_pairs:
+                connector = market_pair.market
+                if not (connector.ready and connector.network_status == NetworkStatus.CONNECTED):
+                    issues.append(f"{connector.name} not ready")
+                    continue
+                
+                # Check order book
+                try:
+                    ob = connector.get_order_book(market_pair.trading_pair)
+                    if not ob.snapshot or (len(ob.snapshot[0]) == 0 and len(ob.snapshot[1]) == 0):
+                         issues.append(f"{connector.name} empty order book")
+                except Exception:
+                    pass # Order book might not be ready yet
+
+            # Check 2: Low Balances (< $15 USD)
+            # Iterate over unique assets (base and quote) for each market
+            checked_assets = set()
+            for market_pair in strategy_instance.market_pairs:
+                connector = market_pair.market
+                base_asset = market_pair.base_asset
+                quote_asset = market_pair.quote_asset
+                
+                for asset in [base_asset, quote_asset]:
+                    key = (connector.name, asset)
+                    if key in checked_assets:
+                        continue
+                    checked_assets.add(key)
+                    
+                    try:
+                        balance = connector.get_available_balance(asset)
+                        # Convert to USD
+                        rate = RateOracle.get_instance().get_pair_rate(f"{asset}-USDT")
+                        if rate is not None:
+                            usd_value = float(balance) * float(rate)
+                            if usd_value < 15.0:
+                                issues.append(f"{connector.name} {asset} low balance (${usd_value:.2f})")
+                    except Exception:
+                        pass # RateOracle might not have rate or other error
+
+        except Exception as e:
+            self.logger().debug(f"Error checking market issues for {strategy_instance.name}: {e}")
+            
+        return issues
+
+
     def list_strategies(self) -> Dict[str, Dict[str, Any]]:
         """
         Get a summary of all strategies and their statuses.
@@ -2396,7 +2450,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 "markets": markets_str,
                 "min": f"min {min_prof_str}" if min_prof_str is not None else "",
                 "best": best_prof_str,
+                "issues": self._check_market_issues(strategy_instance)
             })
+
 
             if status_blob is not None:
                 bi_lines = self._extract_buyin_lines(status_blob)
@@ -2404,35 +2460,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     buyin_sections.append((strategy_name, bi_lines))
 
         if rows:
-            # Compute widths for pair and exchange columns to align neatly
-            def split_pair_ex(s: str) -> Tuple[str, str]:
-                try:
-                    pair, rest = s.split(" ", 1)
-                    return pair, rest
-                except Exception:
-                    return s, ""
-
-            pair_ex_rows: List[Tuple[str, str]] = [split_pair_ex(r["markets"]) for r in rows]
-            pair_w = max((len(p) for p, _ in pair_ex_rows), default=0)
-            ex_w = max((len(e) for _, e in pair_ex_rows), default=0)
-
-            # Width for the entire "min X%" field; rows without min will be padded with spaces
-            try:
-                min_w = max((len(r["min"]) for r in rows), default=0)
-            except Exception:
-                min_w = 0
-
-            for (pair_part, ex_part), r in zip(pair_ex_rows, rows):
-                if ex_w > 0:
-                    markets_fmt = f"{pair_part:<{pair_w}} {ex_part:<{ex_w}}"
-                else:
-                    markets_fmt = f"{pair_part:<{pair_w}}"
-
-                if min_w > 0:
-                    min_field = f"{r['min']:<{min_w}}" if r['min'] else (" " * min_w)
-                    lines.append(f"{markets_fmt} | {min_field} | best {r['best']}")
-                else:
-                    lines.append(f"{markets_fmt} | best {r['best']}")
+            # Calculate max widths
+            max_markets_len = max([len(r["markets"]) for r in rows]) if rows else 0
+            max_min_len = max([len(r["min"]) for r in rows]) if rows else 0
+            
+            for r in rows:
+                line = f"{r['markets']:<{max_markets_len}}  {r['min']:<{max_min_len}}  {r['best']}"
+                if r['issues']:
+                     line += f"  ⚠ {', '.join(r['issues'])}"
+                lines.append(line)
 
         if buyin_sections:
             lines.append("\nPosition Balancer active:")
