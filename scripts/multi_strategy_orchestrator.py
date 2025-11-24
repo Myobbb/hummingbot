@@ -2273,7 +2273,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         if rate is not None:
                             usd_value = float(balance) * float(rate)
                             if usd_value < 15.0:
-                                issues.append(f"{connector.name} {asset} low balance (${usd_value:.2f})")
+                                issues.append(f"{connector.name} (${usd_value:.0f})")
                     except Exception:
                         pass # RateOracle might not have rate or other error
 
