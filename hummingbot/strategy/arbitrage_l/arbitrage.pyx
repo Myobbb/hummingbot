@@ -1342,6 +1342,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         try:
             # Mark this order as completed (first fill counts as completed)
             self._completed_orders.insert(order_id_str)
+            
+            # Increment trade counter (only for this strategy's orders)
+            self._total_trades += 1
 
             # Clean fill marker since completion supersedes partials
             try:
@@ -1480,12 +1483,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
-        self._total_trades += 1
         self.c_handle_order_completion(buy_order_completed_event, True)
     
     cdef c_did_complete_sell_order(self, object sell_order_completed_event):
         """Handle sell order completion"""
-        self._total_trades += 1
         self.c_handle_order_completion(sell_order_completed_event, False)
 
     cdef c_did_fail_order(self, object order_failed_event):

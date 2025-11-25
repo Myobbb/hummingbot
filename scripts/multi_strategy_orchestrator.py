@@ -1666,10 +1666,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if hasattr(strategy_instance.strategy, 'min_profitability'):
                 strategy_instance.strategy.min_profitability = decimal_value
                 
-                # Also update the config object so status display reflects the change
-                if hasattr(strategy_instance.config, 'min_profitability'):
+                # Also update the config dict so status display reflects the change
+                if 'min_profitability' in strategy_instance.config:
                     # Convert float value to Decimal for the config model
-                    strategy_instance.config.min_profitability = Decimal(str(value))
+                    strategy_instance.config['min_profitability'] = Decimal(str(value))
                 
                 self.logger().info(f"Updated min_profitability for '{strategy_name}' to {value}%")
                 return True
