@@ -2558,8 +2558,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 except Exception as e:
                     self.logger().debug(f"Could not get strategy stats for '{strategy_instance.name}': {e}")
 
+            trade_count = 0
+            try:
+                if hasattr(strategy_instance.strategy, 'trades'):
+                    trade_count = len(strategy_instance.strategy.trades)
+            except Exception:
+                pass
+
             rows.append({
                 "markets": markets_str,
+                "trades": str(trade_count),
                 "min": f"min {min_prof_str}" if min_prof_str is not None else "",
                 "best": best_prof_str,
                 "issues": self._check_market_issues(strategy_instance)
@@ -2574,10 +2582,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if rows:
             # Calculate max widths
             max_markets_len = max([len(r["markets"]) for r in rows]) if rows else 0
+            max_trades_len = max([len(r["trades"]) for r in rows]) if rows else 0
             max_min_len = max([len(r["min"]) for r in rows]) if rows else 0
             
             for r in rows:
-                line = f"{r['markets']:<{max_markets_len}}  {r['min']:<{max_min_len}}  {r['best']}"
+                line = f"{r['markets']:<{max_markets_len}}  {r['trades']:<{max_trades_len}}  {r['min']:<{max_min_len}}  {r['best']}"
                 if r['issues']:
                      line += f"  ⚠ {', '.join(r['issues'])}"
                 lines.append(line)
