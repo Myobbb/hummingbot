@@ -85,6 +85,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode
+        
+        # Trade counter (strategy-specific, incremented on each completed order)
+        int64_t _total_trades
 
     # Core methods
     cdef void _validate_configuration(self)

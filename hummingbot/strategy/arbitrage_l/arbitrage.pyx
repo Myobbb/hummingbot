@@ -113,6 +113,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._last_rate_update = 0
         # Orchestrated mode flag (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = False
+        # Trade counter (strategy-specific, not affected by shared connectors)
+        self._total_trades = 0
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -303,6 +305,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
     @min_profitability.setter
     def min_profitability(self, value: Decimal):
         self._min_profitability = float(value)
+
+    @property
+    def total_trades(self) -> int:
+        return self._total_trades
 
     @property
     def tracked_limit_orders(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
@@ -1474,10 +1480,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
+        self._total_trades += 1
         self.c_handle_order_completion(buy_order_completed_event, True)
     
     cdef c_did_complete_sell_order(self, object sell_order_completed_event):
         """Handle sell order completion"""
+        self._total_trades += 1
         self.c_handle_order_completion(sell_order_completed_event, False)
 
     cdef c_did_fail_order(self, object order_failed_event):

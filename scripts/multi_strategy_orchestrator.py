@@ -2560,8 +2560,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
             trade_count = 0
             try:
-                if hasattr(strategy_instance.strategy, 'trades'):
-                    trade_count = len(strategy_instance.strategy.trades)
+                if hasattr(strategy_instance.strategy, 'total_trades'):
+                    trade_count = strategy_instance.strategy.total_trades
             except Exception:
                 pass
 
