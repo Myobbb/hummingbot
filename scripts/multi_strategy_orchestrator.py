@@ -1668,8 +1668,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 
                 # Also update the config dict so status display reflects the change
                 if 'min_profitability' in strategy_instance.config:
-                    # Convert float value to Decimal for the config model
                     strategy_instance.config['min_profitability'] = Decimal(str(value))
+                
+                # Persist to config file using the same pattern as _update_config_file
+                if self.config.config_file_path:
+                    try:
+                        config_path = Path(self.config.config_file_path)
+                        with open(config_path, 'r') as f:
+                            yaml_data = yaml.safe_load(f)
+                        
+                        # Find and update the strategy
+                        for strat_config in yaml_data.get('arbitrage_m_strategies', []):
+                            if strat_config.get('name') == strategy_name:
+                                strat_config['min_profitability'] = float(value)
+                                break
+                        
+                        # Write back
+                        with open(config_path, 'w') as f:
+                            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+                    except Exception as e:
+                        self.logger().warning(f"Failed to update config file: {e}")
                 
                 self.logger().info(f"Updated min_profitability for '{strategy_name}' to {value}%")
                 return True
