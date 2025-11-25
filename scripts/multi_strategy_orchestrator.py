@@ -181,6 +181,7 @@ logger = None
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
     'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff',
+    'set_min_profitability',
     'MultiStrategyOrchestrator'
 ]
 
@@ -313,6 +314,25 @@ def disable_selloff(identifier: str) -> bool:
     """
     orchestrator = _get_orchestrator()
     return orchestrator.disable_selloff_by_identifier(identifier)
+
+
+def set_min_profitability(identifier: str, value: float) -> bool:
+    """
+    Set minimum profitability for a strategy by name or token symbol.
+
+    Args:
+        identifier: Full strategy name or token symbol
+        value: New minimum profitability percentage (e.g., 1.5 for 1.5%)
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> set_min_profitability("arb_bsx_gate_bitmart", 1.5)
+        >>> set_min_profitability("BSX", 0.5)
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.set_min_profitability_by_identifier(identifier, value)
 
 
 def list_arb() -> Dict[str, Dict[str, Any]]:
@@ -671,7 +691,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("  control pause_all           # Pause all strategies")
         self.logger().info("  control resume_all          # Resume all strategies")
         self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
+        self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
         self.logger().info("  control add <file>          # Add strategy from conf/strategies/ (staged; starts on restart)")
+        self.logger().info("  set_min_profitability <token> <val> # Set min profitability % (e.g., 1.5)")
         self.logger().info("")
         self.logger().info(f"Loaded {len(self.strategies)} strateg{'y' if len(self.strategies) == 1 else 'ies'}")
         self.logger().info("=" * 70)
@@ -1605,6 +1627,52 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         position_balancer.disable_sell_off()
         return True
+
+    def set_min_profitability_by_identifier(self, identifier: str, value: float) -> bool:
+        """
+        Set minimum profitability for a strategy by full name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            value: New minimum profitability percentage (e.g., 1.5 for 1.5%)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_min_profitability(strategy_name, value) if strategy_name else False
+
+    def set_min_profitability(self, strategy_name: str, value: float) -> bool:
+        """
+        Set minimum profitability for a strategy.
+
+        Args:
+            strategy_name: The name of the strategy
+            value: New minimum profitability percentage (e.g., 1.5 for 1.5%)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+
+        try:
+            # Convert percentage to decimal (e.g. 1.5 -> 0.015)
+            decimal_value = Decimal(str(value)) / Decimal("100")
+            
+            # Update the strategy
+            # Note: This relies on the property setter we added to ArbitrageLStrategy
+            if hasattr(strategy_instance.strategy, 'min_profitability'):
+                strategy_instance.strategy.min_profitability = decimal_value
+                self.logger().info(f"Updated min_profitability for '{strategy_name}' to {value}%")
+                return True
+            else:
+                self.logger().error(f"Strategy '{strategy_name}' does not support dynamic min_profitability update")
+                return False
+        except Exception as e:
+            self.logger().error(f"Error setting min profitability for '{strategy_name}': {e}")
+            return False
 
     def set_buy_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
         """

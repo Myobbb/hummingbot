@@ -300,6 +300,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
     def min_profitability(self) -> Decimal:
         return Decimal(str(self._min_profitability))
 
+    @min_profitability.setter
+    def min_profitability(self, value: Decimal):
+        self._min_profitability = float(value)
+
     @property
     def tracked_limit_orders(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
         return self._sb_order_tracker.tracked_limit_orders

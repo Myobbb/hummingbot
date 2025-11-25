@@ -83,7 +83,7 @@ class HummingbotCompleter(Completer):
             "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set"
         ], ignore_case=True)
         self._control_set_completer = WordCompleter([
-            "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval"
+            "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval", "min_profitability"
         ], ignore_case=True)
         self._gateway_chains = GATEWAY_CHAINS
         self._gateway_networks = []

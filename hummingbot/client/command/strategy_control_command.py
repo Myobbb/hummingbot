@@ -36,7 +36,9 @@ class StrategyControlCommand:
             control set buy_spread <id> <value>         - Set buy spread (% or 'min')
             control set sell_spread <id> <value>        - Set sell spread (% or 'min')
             control set order_size <id> <value>         - Set order size in USD
+            control set order_size <id> <value>         - Set order size in USD
             control set refresh_interval <id> <value>   - Set limit order refresh interval in seconds
+            control set min_profitability <id> <value>  - Set minimum profitability percentage
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -216,7 +218,9 @@ class StrategyControlCommand:
             self.notify("  control set buy_spread <name> <value>            - Set buy spread (% or 'min')")
             self.notify("  control set sell_spread <name> <value>           - Set sell spread (% or 'min')")
             self.notify("  control set order_size <name> <value>            - Set order size (USD)")
+            self.notify("  control set order_size <name> <value>            - Set order size (USD)")
             self.notify("  control set refresh_interval <name> <value>      - Set refresh interval (seconds)")
+            self.notify("  control set min_profitability <name> <value>     - Set min profitability (%)")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -574,9 +578,30 @@ class StrategyControlCommand:
                     self.notify(f"\n✗ Failed to set refresh interval for: {strategy_id}")
                     self.notify("  Use 'control list' to see available strategies")
 
+            elif parameter == "min_profitability":
+                # Set min profitability
+                if not hasattr(strategy, 'set_min_profitability_by_identifier'):
+                    self.notify("The current strategy does not support runtime control.")
+                    return
+
+                try:
+                    value = float(value_str)
+                    # No negative check here as negative profitability might be valid for some strategies (though unlikely for arb)
+                    # But let's assume it should be reasonable.
+                except ValueError:
+                    self.notify(f"Error: Invalid value '{value_str}'. Must be a number.")
+                    return
+
+                success = strategy.set_min_profitability_by_identifier(strategy_id, value)
+                if success:
+                    self.notify(f"\n✓ Min profitability set to {value}% for {strategy_id}")
+                else:
+                    self.notify(f"\n✗ Failed to set min profitability for: {strategy_id}")
+                    self.notify("  Use 'control list' to see available strategies")
+
             else:
                 self.notify(f"Unknown parameter: {parameter}")
-                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval")
+                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval, min_profitability")
 
         except Exception as e:
             self.notify(f"Error setting parameter: {e}")
