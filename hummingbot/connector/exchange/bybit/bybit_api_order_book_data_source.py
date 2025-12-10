@@ -103,6 +103,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._reconnect_attempts: int = 0
         self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
         self._suppress_reconnect_logs: bool = False
+        # FIX: Track original trading pairs and temporarily disabled pairs (instead of permanent removal)
+        # This allows recovery on reconnection rather than permanent loss of subscriptions
+        self._original_trading_pairs: List[str] = list(trading_pairs)  # Immutable copy
+        self._temporarily_disabled_pairs: set = set()  # Pairs disabled due to repeated failures
 
     async def _cancel_task_safely(self, task: Optional[asyncio.Task]):
         if task is None:
@@ -513,6 +517,20 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param ws: the websocket assistant used to connect to the exchange
         """
         try:
+            # FIX: On reconnection, restore temporarily disabled pairs and reset failure counters
+            # This allows recovery after pause/resume or transient network issues
+            if self._temporarily_disabled_pairs:
+                restored_pairs = list(self._temporarily_disabled_pairs)
+                for pair in restored_pairs:
+                    if pair not in self._trading_pairs and pair in self._original_trading_pairs:
+                        self._trading_pairs.append(pair)
+                        self.logger().info(f"Restoring previously disabled trading pair: {pair}")
+                self._temporarily_disabled_pairs.clear()
+            
+            # Reset subscription failure counts on new connection attempt
+            # This gives pairs a fresh chance to subscribe successfully
+            self._subscription_failure_count.clear()
+            
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 # Pre-seed symbol -> trading pair cache to avoid per-message async lookups #
@@ -604,7 +622,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         self.logger().warning(
                             f"Bybit subscribe failure #{self._subscription_failure_count[topic_str]} for topic '{topic_str}': {data.get('ret_msg')}"
                         )
-                        # If we've hit max failures, drop only the affected pair/topic; otherwise retry subscribing with backoff
+                        # If we've hit max failures, TEMPORARILY disable the pair (will be restored on reconnection)
+                        # FIX: No longer permanently remove pairs - this allows recovery after pause/resume
                         if self._subscription_failure_count[topic_str] >= self._max_subscription_failures:
                             try:
                                 symbol = self._parse_symbol_from_topic(topic_str)
@@ -617,8 +636,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                         except Exception:
                                             trading_pair = None
                                 if trading_pair and trading_pair in self._trading_pairs:
+                                    # FIX: Temporarily disable instead of permanent removal
+                                    self._temporarily_disabled_pairs.add(trading_pair)
                                     self._trading_pairs.remove(trading_pair)
-                                    self.logger().error(f"Removing {trading_pair} from tracking after repeated subscription failures for {topic_str}")
+                                    self.logger().warning(
+                                        f"Temporarily disabling {trading_pair} after repeated subscription failures for {topic_str}. "
+                                        f"Will attempt to restore on next reconnection."
+                                    )
                                 else:
                                     self.logger().error(f"Max subscription failures reached for {topic_str}, not reconnecting entire WS")
                             except Exception:

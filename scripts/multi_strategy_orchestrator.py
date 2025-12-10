@@ -1475,24 +1475,93 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """
         Resume a paused arbitrage_m strategy by name.
 
+        Enhanced with comprehensive health checks:
+        - Order book existence check
+        - Order book freshness check (stale data detection)
+        - Subscription verification (ensure trading pairs are actively subscribed)
+
         Args:
             strategy_name: The name of the strategy to resume
 
         Returns:
             True if successful, False otherwise
         """
-        def _books_ready(si: V1StrategyInstance) -> Tuple[bool, List[str]]:
+        import time
+        STALE_THRESHOLD_SECONDS = 120.0  # Order book considered stale if no updates in 2 minutes
+        
+        def _books_healthy(si: V1StrategyInstance) -> Tuple[bool, List[str], List[str]]:
+            """
+            Check order book health comprehensively.
+            Returns: (all_healthy, missing_books, stale_books)
+            """
             missing: List[str] = []
+            stale: List[str] = []
+            now = time.perf_counter()
+            
             for mt in si.market_pairs:
                 try:
-                    mt.market.get_order_book(mt.trading_pair)
+                    ex_name = getattr(mt.market, "name", "?")
                 except Exception:
-                    try:
-                        ex_name = getattr(mt.market, "name", "?")
-                    except Exception:
-                        ex_name = "?"
+                    ex_name = "?"
+                
+                try:
+                    ob = mt.market.get_order_book(mt.trading_pair)
+                    
+                    # Check if order book is receiving updates (freshness check)
+                    last_diff = getattr(ob, 'last_applied_diff', -1000.0)
+                    if last_diff > 0 and (now - last_diff) > STALE_THRESHOLD_SECONDS:
+                        stale_secs = int(now - last_diff)
+                        stale.append(f"{ex_name}:{mt.trading_pair} (stale {stale_secs}s)")
+                    # Check if order book has any data (empty check)
+                    elif hasattr(ob, 'snapshot'):
+                        snapshot = ob.snapshot
+                        if snapshot and (len(snapshot[0]) == 0 and len(snapshot[1]) == 0):
+                            stale.append(f"{ex_name}:{mt.trading_pair} (empty)")
+                except Exception:
                     missing.append(f"{ex_name}:{mt.trading_pair}")
-            return (len(missing) == 0), missing
+            
+            all_healthy = (len(missing) == 0 and len(stale) == 0)
+            return all_healthy, missing, stale
+        
+        def _verify_subscriptions(si: V1StrategyInstance) -> Tuple[bool, List[str], List[str]]:
+            """
+            Verify trading pairs are in active subscriptions.
+            Returns: (all_subscribed, missing_subscriptions, restored_subscriptions)
+            """
+            missing_subs: List[str] = []
+            restored: List[str] = []
+            
+            for mt in si.market_pairs:
+                connector = mt.market
+                try:
+                    ex_name = getattr(connector, "name", "?")
+                except Exception:
+                    ex_name = "?"
+                
+                # Check if connector has order book tracker with data source
+                if hasattr(connector, 'order_book_tracker'):
+                    tracker = connector.order_book_tracker
+                    if hasattr(tracker, 'data_source'):
+                        data_source = tracker.data_source
+                        
+                        # Check if trading pair is in active subscriptions
+                        if hasattr(data_source, '_trading_pairs'):
+                            if mt.trading_pair not in data_source._trading_pairs:
+                                # Check if it was temporarily disabled (Bybit-specific)
+                                if hasattr(data_source, '_temporarily_disabled_pairs'):
+                                    if mt.trading_pair in data_source._temporarily_disabled_pairs:
+                                        # Try to restore it
+                                        if hasattr(data_source, '_original_trading_pairs'):
+                                            if mt.trading_pair in data_source._original_trading_pairs:
+                                                data_source._trading_pairs.append(mt.trading_pair)
+                                                data_source._temporarily_disabled_pairs.discard(mt.trading_pair)
+                                                restored.append(f"{ex_name}:{mt.trading_pair}")
+                                                self.logger().info(f"Restored subscription for {ex_name}:{mt.trading_pair}")
+                                                continue
+                                missing_subs.append(f"{ex_name}:{mt.trading_pair}")
+            
+            all_subscribed = (len(missing_subs) == 0)
+            return all_subscribed, missing_subs, restored
 
         strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
@@ -1503,15 +1572,42 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
         self.logger().info(f"Resuming strategy: {strategy_name}")
-        # Safety check: ensure order books exist before resuming to avoid runtime errors
-        ready, missing = _books_ready(strategy_instance)
-        if not ready:
+        
+        # Step 1: Verify subscriptions and restore if needed
+        subs_ok, missing_subs, restored = _verify_subscriptions(strategy_instance)
+        if restored:
+            self.logger().info(f"Restored {len(restored)} subscriptions: {', '.join(restored)}")
+        
+        if not subs_ok and missing_subs:
             self.logger().warning(
-                f"Cannot resume '{strategy_name}' yet. Missing order books: {', '.join(missing[:5])}"
+                f"Cannot resume '{strategy_name}' - missing subscriptions: {', '.join(missing_subs[:5])}"
+                f"{'...' if len(missing_subs) > 5 else ''}. "
+                f"Subscriptions may have been lost during pause. Will remain PAUSED."
+            )
+            return False
+        
+        # Step 2: Check order book health (existence and freshness)
+        healthy, missing, stale = _books_healthy(strategy_instance)
+        
+        if missing:
+            self.logger().warning(
+                f"Cannot resume '{strategy_name}' - missing order books: {', '.join(missing[:5])}"
                 f"{'...' if len(missing) > 5 else ''}. Will remain PAUSED."
             )
             return False
-
+        
+        if stale:
+            # Stale books are a warning but not blocking - WS should recover
+            self.logger().warning(
+                f"Resuming '{strategy_name}' with stale order books (will recover): {', '.join(stale[:3])}"
+                f"{'...' if len(stale) > 3 else ''}"
+            )
+        
+        # Reset exception tracking on resume
+        strategy_instance.exception_count = 0
+        strategy_instance.last_exception_time = None
+        strategy_instance.last_exception_msg = None
+        
         strategy_instance.paused = False
         self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
         return True
@@ -1543,6 +1639,210 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if self.resume_strategy(strategy_instance.name):
                     count += 1
         return count
+
+    # Subscription Verification and Restoration Methods
+
+    def verify_subscriptions(self) -> Dict[str, Dict]:
+        """
+        Verify websocket subscriptions for all connectors.
+        
+        Returns a diagnostic report of subscription health per connector.
+        Useful for debugging pause/resume issues.
+        
+        Returns:
+            Dict mapping connector names to subscription status:
+            {
+                "connector_name": {
+                    "total_pairs": int,
+                    "active_subscriptions": int,
+                    "disabled_pairs": List[str],
+                    "missing_pairs": List[str],
+                    "healthy": bool
+                }
+            }
+        """
+        report: Dict[str, Dict] = {}
+        
+        for connector_name, connector in self.connectors.items():
+            connector_report = {
+                "total_pairs": 0,
+                "active_subscriptions": 0,
+                "disabled_pairs": [],
+                "missing_pairs": [],
+                "healthy": True
+            }
+            
+            try:
+                # Get expected trading pairs from connector
+                expected_pairs = set()
+                if hasattr(connector, 'trading_pairs'):
+                    expected_pairs = set(connector.trading_pairs or [])
+                
+                connector_report["total_pairs"] = len(expected_pairs)
+                
+                # Get data source subscription info
+                if hasattr(connector, 'order_book_tracker'):
+                    tracker = connector.order_book_tracker
+                    if hasattr(tracker, 'data_source'):
+                        ds = tracker.data_source
+                        
+                        # Get active subscriptions
+                        if hasattr(ds, '_trading_pairs'):
+                            active_pairs = set(ds._trading_pairs)
+                            connector_report["active_subscriptions"] = len(active_pairs)
+                            
+                            # Check for missing pairs
+                            missing = expected_pairs - active_pairs
+                            connector_report["missing_pairs"] = list(missing)
+                        
+                        # Get temporarily disabled pairs (Bybit-specific)
+                        if hasattr(ds, '_temporarily_disabled_pairs'):
+                            connector_report["disabled_pairs"] = list(ds._temporarily_disabled_pairs)
+                
+                # Determine health
+                connector_report["healthy"] = (
+                    len(connector_report["missing_pairs"]) == 0 and
+                    len(connector_report["disabled_pairs"]) == 0
+                )
+                
+            except Exception as e:
+                connector_report["error"] = str(e)
+                connector_report["healthy"] = False
+            
+            report[connector_name] = connector_report
+        
+        # Log summary
+        healthy_count = sum(1 for r in report.values() if r.get("healthy", False))
+        self.logger().info(f"Subscription verification: {healthy_count}/{len(report)} connectors healthy")
+        
+        for name, r in report.items():
+            if not r.get("healthy", False):
+                self.logger().warning(
+                    f"  {name}: {r.get('active_subscriptions', '?')}/{r.get('total_pairs', '?')} active, "
+                    f"disabled={r.get('disabled_pairs', [])}, missing={r.get('missing_pairs', [])}"
+                )
+        
+        return report
+
+    def restore_all_subscriptions(self) -> Dict[str, List[str]]:
+        """
+        Attempt to restore all temporarily disabled subscriptions across all connectors.
+        
+        This is useful after pause/resume or network issues where some trading pairs
+        may have been disabled due to subscription failures.
+        
+        Returns:
+            Dict mapping connector names to lists of restored trading pairs
+        """
+        restored: Dict[str, List[str]] = {}
+        
+        for connector_name, connector in self.connectors.items():
+            connector_restored = []
+            
+            try:
+                if hasattr(connector, 'order_book_tracker'):
+                    tracker = connector.order_book_tracker
+                    if hasattr(tracker, 'data_source'):
+                        ds = tracker.data_source
+                        
+                        # Check for temporarily disabled pairs (Bybit-specific)
+                        if hasattr(ds, '_temporarily_disabled_pairs') and hasattr(ds, '_original_trading_pairs'):
+                            disabled = list(ds._temporarily_disabled_pairs)
+                            for pair in disabled:
+                                if pair in ds._original_trading_pairs and pair not in ds._trading_pairs:
+                                    ds._trading_pairs.append(pair)
+                                    ds._temporarily_disabled_pairs.discard(pair)
+                                    connector_restored.append(pair)
+                                    self.logger().info(f"Restored subscription for {connector_name}:{pair}")
+                            
+                            # Reset failure counters to give restored pairs a fresh chance
+                            if hasattr(ds, '_subscription_failure_count') and connector_restored:
+                                ds._subscription_failure_count.clear()
+                
+            except Exception as e:
+                self.logger().error(f"Error restoring subscriptions for {connector_name}: {e}")
+            
+            if connector_restored:
+                restored[connector_name] = connector_restored
+        
+        if restored:
+            total = sum(len(pairs) for pairs in restored.values())
+            self.logger().info(f"Restored {total} subscriptions across {len(restored)} connectors")
+        else:
+            self.logger().info("No subscriptions needed restoration")
+        
+        return restored
+
+    def get_order_book_health(self, identifier: Optional[str] = None) -> Dict[str, Dict]:
+        """
+        Get order book health status for strategies.
+        
+        Args:
+            identifier: Optional strategy name or token. If None, checks all strategies.
+            
+        Returns:
+            Dict mapping strategy names to order book health info
+        """
+        import time
+        STALE_THRESHOLD = 120.0
+        
+        health: Dict[str, Dict] = {}
+        now = time.perf_counter()
+        
+        strategies_to_check = []
+        if identifier:
+            name = self._resolve_identifier_to_name(identifier, log_token_match=False)
+            if name:
+                si = self._get_strategy_instance(name)
+                if si:
+                    strategies_to_check = [si]
+        else:
+            strategies_to_check = self.strategies
+        
+        for si in strategies_to_check:
+            strategy_health = {
+                "status": "PAUSED" if si.paused else "RUNNING",
+                "order_books": {},
+                "all_healthy": True
+            }
+            
+            for mt in si.market_pairs:
+                try:
+                    ex_name = getattr(mt.market, "name", "?")
+                except Exception:
+                    ex_name = "?"
+                
+                key = f"{ex_name}:{mt.trading_pair}"
+                ob_health = {"status": "unknown", "last_update": None, "stale_seconds": None}
+                
+                try:
+                    ob = mt.market.get_order_book(mt.trading_pair)
+                    last_diff = getattr(ob, 'last_applied_diff', -1000.0)
+                    
+                    if last_diff > 0:
+                        stale_secs = now - last_diff
+                        ob_health["last_update"] = int(stale_secs)
+                        ob_health["stale_seconds"] = int(stale_secs)
+                        
+                        if stale_secs > STALE_THRESHOLD:
+                            ob_health["status"] = "stale"
+                            strategy_health["all_healthy"] = False
+                        else:
+                            ob_health["status"] = "healthy"
+                    else:
+                        ob_health["status"] = "no_data"
+                        strategy_health["all_healthy"] = False
+                        
+                except Exception as e:
+                    ob_health["status"] = "missing"
+                    ob_health["error"] = str(e)
+                    strategy_health["all_healthy"] = False
+                
+                strategy_health["order_books"][key] = ob_health
+            
+            health[si.name] = strategy_health
+        
+        return health
 
     # Position Balancer Control Methods
 
