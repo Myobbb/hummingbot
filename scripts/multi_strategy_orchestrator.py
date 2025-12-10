@@ -367,7 +367,7 @@ def resume_all() -> None:
     Example:
         >>> resume_all()
     """
-    orchestrator = _get_get_orchestrator()
+    orchestrator = _get_orchestrator()
     orchestrator.resume_all_strategies()
 
 
@@ -666,6 +666,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Orchestrator-level readiness coordination (optimization for 40-50 strategies)
         self._markets_ready_notified: bool = False
+
+        # Connector readiness cache - refreshed once per tick for efficiency with 30+ strategies
+        # Maps connector_name -> is_ready (bool)
+        self._connector_ready_cache: Dict[str, bool] = {}
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -1057,11 +1061,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         CRITICAL FIX: ScriptStrategyBase.tick() only calls on_tick() when ALL connectors are ready,
         which breaks multi-exchange orchestrators. We need per-strategy readiness checking.
         """
-        # Check if ALL connectors are ready (for coordinated initialization only)
-        all_connectors_ready = all(
-            ex.ready and ex.network_status == NetworkStatus.CONNECTED
-            for ex in self.connectors.values()
-        )
+        # OPTIMIZATION: Refresh connector readiness cache ONCE per tick
+        # This avoids redundant connector.ready and network_status checks across 30+ strategies
+        self._refresh_connector_ready_cache()
+
+        # Check if ALL connectors are ready using cached values (for coordinated initialization only)
+        all_connectors_ready = all(self._connector_ready_cache.values()) if self._connector_ready_cache else False
 
         # Handle initial coordinated initialization
         if not self._markets_ready_notified and all_connectors_ready:
@@ -1081,8 +1086,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # CRITICAL: Don't use ScriptStrategyBase.tick() - it requires ALL connectors to be ready
         # Instead, implement per-strategy readiness checking that allows partial operation
         
-        # Update orchestrator-level ready_to_trade for status display
-        self.ready_to_trade = any(ex.ready for ex in self.connectors.values())
+        # Update orchestrator-level ready_to_trade for status display (using cached values)
+        self.ready_to_trade = any(self._connector_ready_cache.values()) if self._connector_ready_cache else False
         
         # Always call on_tick() - individual strategies will check their own connector readiness
         # This allows strategies with working connectors to continue during partial disconnections
@@ -1147,19 +1152,51 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """Get the unique set of connectors used by a strategy (cached)."""
         return strategy_instance.connectors
 
+    def _refresh_connector_ready_cache(self):
+        """
+        Build/refresh the connector readiness cache.
+        
+        Call once at the start of tick() to avoid redundant connector status checks
+        across 30+ strategies. The cache maps connector_name -> is_ready (bool).
+        """
+        self._connector_ready_cache = {
+            name: (c.ready and c.network_status == NetworkStatus.CONNECTED)
+            for name, c in self.connectors.items()
+        }
+
+    def _is_connector_ready_cached(self, connector_name: str) -> bool:
+        """
+        Check if a connector is ready using the cached value.
+        
+        Falls back to direct check if cache is empty (e.g., called outside tick cycle).
+        """
+        if self._connector_ready_cache:
+            return self._connector_ready_cache.get(connector_name, False)
+        # Fallback: direct check if cache not populated
+        connector = self.connectors.get(connector_name)
+        if connector is None:
+            return False
+        return connector.ready and connector.network_status == NetworkStatus.CONNECTED
+
     def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
         """
         Check if a strategy's specific connectors are ready.
         
+        Uses the connector readiness cache when available for efficiency.
         This enables partial disconnection handling - a strategy only pauses
         if ITS connectors are down, not if unrelated connectors disconnect.
         """
-        strategy_connectors = self._get_strategy_connectors(strategy_instance)
+        # Use cached readiness if available (populated at start of tick)
+        if self._connector_ready_cache:
+            for connector in strategy_instance.connectors:
+                if not self._connector_ready_cache.get(connector.name, False):
+                    return False
+            return True
         
-        # Strategy is ready if ALL of its connectors are ready and connected
+        # Fallback to direct check if cache not populated (e.g., called outside tick cycle)
         return all(
             connector.ready and connector.network_status == NetworkStatus.CONNECTED
-            for connector in strategy_connectors
+            for connector in strategy_instance.connectors
         )
 
     def on_tick(self):
@@ -1199,9 +1236,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     )
                 else:
                     # Transition: ready -> not ready (disconnection)
+                    # Use cached readiness to find affected connectors
                     affected_connectors = [
-                        c.name for c in self._get_strategy_connectors(strategy_instance)
-                        if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
+                        c.name for c in strategy_instance.connectors
+                        if not self._connector_ready_cache.get(c.name, False)
                     ]
                     self.logger().warning(
                         f"Strategy '{strategy_instance.name}' paused - connectors disconnected: "
@@ -2329,10 +2367,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """
         issues = []
         try:
-            # Check 1: Market Readiness (Connectors and Order Books)
+            # Check 1: Market Readiness (Connectors and Order Books) - use cached values
             for market_pair in strategy_instance.market_pairs:
                 connector = market_pair.market
-                if not (connector.ready and connector.network_status == NetworkStatus.CONNECTED):
+                if not self._connector_ready_cache.get(connector.name, False):
                     issues.append(f"{connector.name} not ready")
                     continue
                 
@@ -2453,32 +2491,29 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         Shows per-strategy status even during partial disconnections, since
         unaffected strategies may still be trading.
         """
+        # Refresh connector readiness cache for accurate status display
+        # (format_status may be called outside of tick cycle)
+        self._refresh_connector_ready_cache()
+
         # Check if we've completed initial startup
         if not self._markets_ready_notified:
             # Initial startup - still waiting for first coordinated initialization
-            not_ready = [name for name, c in self.connectors.items()
-                        if not (c.ready and c.network_status == NetworkStatus.CONNECTED)]
+            not_ready = [name for name, ready in self._connector_ready_cache.items() if not ready]
             if not_ready:
                 return "\n".join(["Waiting for connectors to initialize:"] + [f"  {n}" for n in not_ready])
             return "Market connectors are initializing..."
 
         lines = []
 
-        # Connector Status Summary (show which connectors are down during partial disconnection)
-        all_connectors_ready = all(
-            c.ready and c.network_status == NetworkStatus.CONNECTED
-            for c in self.connectors.values()
-        )
+        # Connector Status Summary using cached values
+        all_connectors_ready = all(self._connector_ready_cache.values()) if self._connector_ready_cache else False
 
         # Strategy Status Summary
         # During normal operation: simple count of non-paused strategies
         # During partial disconnection: show which connectors are down
         if not all_connectors_ready:
             # Partial disconnection - show detailed breakdown
-            not_ready = [
-                name for name, c in self.connectors.items()
-                if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
-            ]
+            not_ready = [name for name, ready in self._connector_ready_cache.items() if not ready]
             lines.append(f"\n⚠ Partial Disconnection - Connectors down: {', '.join(not_ready)}")
             lines.append(f"  (Unaffected strategies continue trading)")
 
@@ -2561,9 +2596,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 best_prof_str = "PAUSED"
             elif not all_connectors_ready and not self._is_strategy_ready(strategy_instance):
                 # Partial disconnection AND this strategy's connectors are down
+                # Use cached readiness to find affected connectors
                 affected_connectors = [
-                    c.name for c in self._get_strategy_connectors(strategy_instance)
-                    if not (c.ready and c.network_status == NetworkStatus.CONNECTED)
+                    c.name for c in strategy_instance.connectors
+                    if not self._connector_ready_cache.get(c.name, False)
                 ]
                 best_prof_str = f"PAUSED ({', '.join(affected_connectors)} down)"
             else:
@@ -2621,8 +2657,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             lines.append("\nPending Orders:")
             lines.extend([f"  {line}" for line in pending_orders_info])
 
-        # Only show connectors not ready; omit when all ready
-        not_ready = [name for name, c in self.connectors.items() if not getattr(c, 'ready', False)]
+        # Only show connectors not ready; omit when all ready (using cached values)
+        not_ready = [name for name, ready in self._connector_ready_cache.items() if not ready]
         if not_ready:
             lines.append("\nConnectors not ready:")
             for n in not_ready:
