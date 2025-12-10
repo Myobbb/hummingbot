@@ -80,11 +80,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Track last per-symbol update time (diff or snapshot) to detect staleness (Bybit symbol-specific)
         self._symbol_last_update_time: Dict[str, float] = {}
         # Minimum inactivity before a resnapshot is attempted (seconds)
-        # Tighten threshold to recover faster from silent stream stalls
-        self._per_pair_stale_threshold: float = 180.0
+        # Bybit spot L50 pushes every 20ms, so 60s of silence is definitely stale
+        # FIXED: Reduced from 180s to 60s for faster recovery
+        self._per_pair_stale_threshold: float = 60.0
         # Cooldown between topic resubscriptions per symbol (seconds)
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
-        self._per_pair_resubscribe_cooldown: float = 45.0
+        self._per_pair_resubscribe_cooldown: float = 30.0
         # Proactive reconnect window to avoid aged connections (seconds)
         self._max_connection_age_seconds: float = 60.0 * 60.0 * 12.0  #12 hours
         self._conn_start_time: Optional[float] = None
@@ -420,7 +421,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         if last_any and (now - last_any) > (2.5 * hb):
                             raise ConnectionError("Bybit public WS inactive (no frames incl. pongs); reconnecting.")
 
-                        # 3b) DATA IDLE (still getting pongs/acks) -> log + resnapshot, but stay connected
+                        # 3b) DATA IDLE (still getting pongs/acks) -> log warning
                         last_data = getattr(self, "_last_data_recv_ts", None)
                         data_idle_threshold = 10
                         if last_data and (now - last_data) > data_idle_threshold:
@@ -429,16 +430,21 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                 try:
                                     self.logger().info(
                                         f"Orderbook stream idle for {now - last_data:.1f}s (WS alive via pongs)"
-                                        #f"(WS alive via pongs). Running resnapshot checks."
                                     )
                                 except Exception:
                                     pass
                                 self._last_idle_log_ts = now
 
-                            await self._resnapshot_stale_pairs_if_any(
-                                ws=ws,
-                                snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
-                            )
+                        # CRITICAL FIX: Per-symbol staleness check runs EVERY ping tick
+                        # Previously this was inside the DATA IDLE block, which meant:
+                        # - If Symbol A is active, _last_data_recv_ts keeps updating
+                        # - Symbol B could go stale but _resnapshot_stale_pairs_if_any() never runs
+                        # - Symbol B stays stale indefinitely!
+                        # Now we check per-symbol staleness regardless of overall data flow
+                        await self._resnapshot_stale_pairs_if_any(
+                            ws=ws,
+                            snapshot_queue=self._message_queue[self._snapshot_messages_queue_key]
+                        )
 
                         if (self._conn_start_time is not None and
                             (now - self._conn_start_time) > self._max_connection_age_seconds):
@@ -775,6 +781,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except Exception:
                         pass
                     self._symbol_last_warn_time[symbol or trading_pair] = now
+            # Stage 1: Moderate staleness (60s-180s) - try topic re-subscribe
             if (now - last_ts) >= self._per_pair_stale_threshold and (now - last_ts) < 3 * self._per_pair_stale_threshold:
                 # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:
@@ -795,9 +802,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 except Exception:
                     self.logger().warning(f"Failed during re-subscribe attempt for {trading_pair}", exc_info=True)
 
-                # Escalate to full WS reconnect if extreme staleness persists
-                if (now - last_ts) >= (3 * self._per_pair_stale_threshold):
-                    raise ConnectionError(f"Persistent staleness for {trading_pair} ({int(now - last_ts)}s); reconnecting WS.")
+            # Stage 2: Extreme staleness (>= 180s) - force full WS reconnect
+            # FIXED: This was previously inside the Stage 1 block and could never trigger!
+            if (now - last_ts) >= (3 * self._per_pair_stale_threshold):
+                raise ConnectionError(f"Persistent staleness for {trading_pair} ({int(now - last_ts)}s); reconnecting WS.")
 
     async def _process_ob_snapshot(self, snapshot_queue: asyncio.Queue):
         message_queue = self._message_queue[self._snapshot_messages_queue_key]
@@ -812,6 +820,10 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if symbol is not None and isinstance(u, int):
                     self._last_applied_u_by_symbol[symbol] = u
                     self._latest_diff_by_symbol.pop(symbol, None)
+                    # CRITICAL FIX: Update staleness timer when snapshot is received
+                    # This ensures re-subscribe recovery is properly tracked
+                    self._symbol_last_update_time[symbol] = self._time()
+                    self._symbol_drop_count[symbol] = 0
 
                 trading_pair = json_msg.get("trading_pair")
                 if trading_pair is None:
