@@ -153,7 +153,8 @@ class BitmartExchange(ExchangePyBase):
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
-            use_depth_increase=CONSTANTS.USE_DEPTH_INCREASE)
+            use_depth_increase=CONSTANTS.USE_DEPTH_INCREASE,
+            seed_snapshot_via_request=True)  # Request snapshot immediately on connect for faster orderbook initialization
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return BitmartAPIUserStreamDataSource(

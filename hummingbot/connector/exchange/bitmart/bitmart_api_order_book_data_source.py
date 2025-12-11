@@ -25,8 +25,8 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
     _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
-    _DEPTH_STALENESS_SECONDS: float = 45.0  # per-symbol watchdog
-    _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 300.0  # Refresh snapshot every 5 minutes to prevent one-sided staleness
+    _DEPTH_STALENESS_SECONDS: float = 30.0  # per-symbol watchdog (reduced from 45s for faster recovery)
+    _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0  # Refresh snapshot every 3 minutes for fresher baseline
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -68,6 +68,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._active_ws: Optional[WSAssistant] = None
         self._ws_consumer_task: Optional[asyncio.Task] = None
         self._watchdog_check_interval: float = 5.0  # Check watchdogs every 5s
+        # Cache for symbol -> trading pair to avoid blocking async lookups in hot path
+        self._symbol_to_pair_cache: Dict[str, str] = {}
+        # Cache for trading pair -> symbol (for recovery operations)
+        self._pair_to_symbol_cache: Dict[str, str] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -153,7 +157,12 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         trade_updates = raw_message["data"]
 
         for trade_data in trade_updates:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=trade_data["symbol"])
+            symbol = trade_data["symbol"]
+            # Fast path: use cached symbol -> trading_pair mapping to avoid async lookup
+            trading_pair = self._symbol_to_pair_cache.get(symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                self._symbol_to_pair_cache[symbol] = trading_pair
             ms_ts = int(trade_data["ms_t"]) if "ms_t" in trade_data else int(trade_data["s_t"]) * 1000
             message_content = {
                 "trade_id": ms_ts,
@@ -188,7 +197,12 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             symbol = diff_data.get("symbol")
             if symbol is None or ms_t is None or version is None:
                 continue
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            # Fast path: use cached symbol -> trading_pair mapping to avoid async lookup
+            trading_pair = self._symbol_to_pair_cache.get(symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                # Cache for subsequent messages
+                self._symbol_to_pair_cache[symbol] = trading_pair
             
             # Track ANY message received for this pair (proves subscription is alive)
             current_time = time.time()
@@ -352,8 +366,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         for diff_data in diff_updates:
             timestamp: float = int(diff_data["ms_t"]) * 1e-3
             update_id: int = int(diff_data["ms_t"])
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                symbol=diff_data["symbol"])
+            symbol = diff_data["symbol"]
+            # Fast path: use cached symbol -> trading_pair mapping to avoid async lookup
+            trading_pair = self._symbol_to_pair_cache.get(symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                # Cache for subsequent messages
+                self._symbol_to_pair_cache[symbol] = trading_pair
 
             # Check for heartbeats with empty asks/bids
             bids_list = diff_data.get("bids", [])
@@ -507,8 +526,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
-            symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                       for trading_pair in self._trading_pairs]
+            symbols = []
+            for trading_pair in self._trading_pairs:
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                symbols.append(symbol)
+                # Pre-seed symbol caches to avoid async lookups in hot path
+                self._symbol_to_pair_cache[symbol] = trading_pair
+                self._pair_to_symbol_cache[trading_pair] = symbol
 
             # BitMart allows up to 20 topics per subscription message
             trade_topics = [f"{CONSTANTS.PUBLIC_TRADE_CHANNEL_NAME}:{symbol}" for symbol in symbols] if self._subscribe_trades else []
@@ -725,7 +749,11 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Try targeted recovery for individual stale pairs
             for trading_pair in stale_pairs:
                 try:
-                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    # Fast path: use cached trading_pair -> symbol mapping
+                    symbol = self._pair_to_symbol_cache.get(trading_pair)
+                    if symbol is None:
+                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                        self._pair_to_symbol_cache[trading_pair] = symbol
                     depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
                                      if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
                     topic = f"{depth_channel}:{symbol}"
@@ -769,7 +797,11 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if one_sided_stale_pairs:
             for trading_pair, stale_side in one_sided_stale_pairs:
                 try:
-                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    # Fast path: use cached trading_pair -> symbol mapping
+                    symbol = self._pair_to_symbol_cache.get(trading_pair)
+                    if symbol is None:
+                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                        self._pair_to_symbol_cache[trading_pair] = symbol
                     
                     last_bids_ts = self._last_bids_update_ts.get(trading_pair, 0)
                     last_asks_ts = self._last_asks_update_ts.get(trading_pair, 0)
@@ -795,7 +827,11 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             refresh_batch = periodic_refresh_pairs[:5]  # Max 5 per cycle
             for trading_pair in refresh_batch:
                 try:
-                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    # Fast path: use cached trading_pair -> symbol mapping
+                    symbol = self._pair_to_symbol_cache.get(trading_pair)
+                    if symbol is None:
+                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                        self._pair_to_symbol_cache[trading_pair] = symbol
                     
                     last_snapshot_ts = self._last_snapshot_refresh_ts.get(trading_pair, 0)
                     elapsed = int(now - last_snapshot_ts) if last_snapshot_ts > 0 else 0
