@@ -88,6 +88,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Trade counter (strategy-specific, incremented on each completed order)
         int64_t _total_trades
+        
+        # Optimization: Reusable vector to avoid heap allocation in hot loop
+        vector[ArbOpportunity] _reusable_arb_opps
 
     # Core methods
     cdef void _validate_configuration(self)

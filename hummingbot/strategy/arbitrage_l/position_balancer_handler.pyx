@@ -126,11 +126,15 @@ cdef class PositionBalancerHandler:
         self._last_buy_completion_time = {}   # asset -> timestamp when buy order completed
         self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
 
-        # Asset alias detection (for cross-exchange pairs with different token names)
-        # If base assets have 1:1 conversion (no oracle, conversion_rate=1.0), treat as aliases
-        self._asset_aliases = {}  # canonical_name -> [alias1, alias2, ...]
-        self._canonical_asset = {}  # alias -> canonical_name
+        # Asset alias support (for cross-exchange pairs with different token names)
+        # Dictionary mapping asset name to list of aliases (including itself)
+        self._asset_aliases = {}
+        # Dictionary mapping alias to canonical asset name
+        self._canonical_asset = {}
         self._build_asset_aliases()
+        
+        # Cache for invariant trading rules
+        self._min_price_increment_cache = {}
 
     @property
     def is_buy_active(self):
@@ -1092,11 +1096,17 @@ cdef class PositionBalancerHandler:
                                 # Get orderbook prices using helper
                                 current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
 
-                                # Get min_price_increment for gap detection
-                                trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
-                                min_price_increment = 0.0
-                                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                    min_price_increment = float(trading_rule.min_price_increment)
+
+                                # Get min_price_increment (cached)
+                                trading_pair = order_market_tuple.trading_pair
+                                if trading_pair in self._min_price_increment_cache:
+                                    min_price_increment = self._min_price_increment_cache[trading_pair]
+                                else:
+                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
+                                    min_price_increment = 0.0
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_price_increment = float(trading_rule.min_price_increment)
+                                    self._min_price_increment_cache[trading_pair] = min_price_increment
 
                                 # Calculate effective_bid (second level if top is our order) using helper
                                 effective_bid = self.c_get_effective_reference_price(
@@ -1149,10 +1159,16 @@ cdef class PositionBalancerHandler:
                                             current_ask = 0.0
 
                                         # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
-                                        trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                        min_price_increment = 0.0
-                                        if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                            min_price_increment = float(trading_rule.min_price_increment)
+                                        # Use cache instead of dict lookup
+                                        trading_pair = current_best_market.trading_pair
+                                        if trading_pair in self._min_price_increment_cache:
+                                            min_price_increment = self._min_price_increment_cache[trading_pair]
+                                        else:
+                                            trading_rule = current_best_market.market._trading_rules.get(trading_pair)
+                                            min_price_increment = 0.0
+                                            if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                min_price_increment = float(trading_rule.min_price_increment)
+                                            self._min_price_increment_cache[trading_pair] = min_price_increment
 
                                         # IMPORTANT: For 'min' mode gap detection, check if top bid is OUR order
                                         # Calculate effective_bid (second level if top is our order) using helper
@@ -1258,11 +1274,17 @@ cdef class PositionBalancerHandler:
                                 # Get orderbook prices using helper
                                 current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
 
-                                # Get min_price_increment for gap detection
-                                trading_rule = order_market_tuple.market._trading_rules.get(order_market_tuple.trading_pair)
-                                min_price_increment = 0.0
-                                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                    min_price_increment = float(trading_rule.min_price_increment)
+
+                                # Get min_price_increment (cached)
+                                trading_pair = order_market_tuple.trading_pair
+                                if trading_pair in self._min_price_increment_cache:
+                                    min_price_increment = self._min_price_increment_cache[trading_pair]
+                                else:
+                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
+                                    min_price_increment = 0.0
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_price_increment = float(trading_rule.min_price_increment)
+                                    self._min_price_increment_cache[trading_pair] = min_price_increment
 
                                 # Calculate effective_ask (second level if top is our order) using helper
                                 effective_ask = self.c_get_effective_reference_price(
@@ -1303,11 +1325,17 @@ cdef class PositionBalancerHandler:
                                             # Get orderbook prices using helper
                                             current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
 
-                                            # Get min_price_increment
-                                            trading_rule = current_best_market.market._trading_rules.get(current_best_market.trading_pair)
-                                            min_price_increment = 0.0
-                                            if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                min_price_increment = float(trading_rule.min_price_increment)
+
+                                            # Get min_price_increment (cached)
+                                            trading_pair = current_best_market.trading_pair
+                                            if trading_pair in self._min_price_increment_cache:
+                                                min_price_increment = self._min_price_increment_cache[trading_pair]
+                                            else:
+                                                trading_rule = current_best_market.market._trading_rules.get(trading_pair)
+                                                min_price_increment = 0.0
+                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                                    min_price_increment = float(trading_rule.min_price_increment)
+                                                self._min_price_increment_cache[trading_pair] = min_price_increment
 
                                             # Calculate effective_ask (second level if top is our order) using helper
                                             effective_ask = self.c_get_effective_reference_price(

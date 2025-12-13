@@ -243,6 +243,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
 
+        # Optimization: Reserve capacity to avoid reallocations
+        self._reusable_arb_opps.reserve(20)
+
         # Validate and add markets
         self._validate_configuration()
         
@@ -800,7 +803,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pair[int, double] gate_res
             OrderBook buy_ob
             OrderBook sell_ob
-            vector[ArbOpportunity] profitable_orders
+            # vector[ArbOpportunity] profitable_orders  <-- Removed: using self._reusable_arb_opps
             double max_base_amount
 
         # Early uniform gate: skip any Python balance calls if top-of-book fails
@@ -827,6 +830,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         buy_ob = buy_market.c_get_order_book(buy_market_tuple.trading_pair)
         sell_ob = sell_market.c_get_order_book(sell_market_tuple.trading_pair)
 
+        # Reset reusable vector
+        self._reusable_arb_opps.clear()
+
         # Get profitable orders (includes top-of-book check) with capacity-aware early-stop
         # Release GIL for scanning loop
         with nogil:
@@ -838,9 +844,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 conv_rate,
                 max_base_amount,
                 0.05,
-                &profitable_orders)
+                &self._reusable_arb_opps) # Pass address of reusable vector
         
-        if profitable_orders.size() == 0:
+        if self._reusable_arb_opps.empty():
             return (0.0, 0.0, 0.0, 0.0)
         
         # Aggregate profitable volume and track worst prices for limit orders
@@ -1206,42 +1212,68 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
         
         # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API
-        cdef object buy_price_decimal = Decimal(str(buy_price))
-        cdef object sell_price_decimal = Decimal(str(sell_price))
-        cdef object dec_safe_amount = Decimal(str(max(0.0, amount - QUANTIZATION_EPSILON)))
+        # OPTIMIZATION: Use Decimal.from_float() instead of Decimal(str()) to avoid expensive string formatting.
+        # This is safe because quantization handles small precision noise.
+        cdef object buy_price_decimal = Decimal.from_float(buy_price)
+        cdef object sell_price_decimal = Decimal.from_float(sell_price)
+        
+        # Calculate safe amount using float math first
+        cdef double safe_amount_float = max(0.0, amount - QUANTIZATION_EPSILON)
+        cdef object dec_safe_amount = Decimal.from_float(safe_amount_float)
+        
         quantized_buy = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, dec_safe_amount, buy_price_decimal)
         quantized_sell = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
         quantized_amount = min(quantized_buy, quantized_sell)
         
         # Safety cap: re-check sell venue's live available base and re-quantize to prevent oversold at submission time
         sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
+        
         # Only do extra work if available shrank below our planned amount
+        # OPTIMIZATION: Compare floats directly to avoid Decimal overhead
         if sell_available_now + 1e-15 < float(quantized_amount):
-            sell_cap_dec = Decimal(str(max(0.0, sell_available_now - QUANTIZATION_EPSILON)))
+            # Calculate cap using float math
+            # safe_cap = max(0.0, sell_available_now - QUANTIZATION_EPSILON)
+            # Use Decimal.from_float for speed
+            sell_cap_dec = Decimal.from_float(max(0.0, sell_available_now - QUANTIZATION_EPSILON))
+            
             quantized_sell_cap = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_cap_dec, sell_price_decimal)
-            # Re-quantize buy side to the capped amount using Decimal math (avoid float conversions)
-            buy_req = quantized_sell_cap
-            dec_eps = Decimal("1e-12")
-            if buy_req is None or buy_req <= Decimal("0"):
+            
+            # Re-quantize buy side to the capped amount
+            # OPTIMIZATION: Avoid Decimal arithmetic where possible
+            if quantized_sell_cap is None:
                 buy_req = Decimal("0")
             else:
-                buy_req = buy_req - dec_eps if buy_req > dec_eps else Decimal("0")
+                 buy_req = quantized_sell_cap
+            
+            # Ensure epsilon safety for buy side (using Decimal subtract only once)
+            dec_eps = Decimal("1e-12")
+            if buy_req > dec_eps:
+                buy_req = buy_req - dec_eps
+            else:
+                buy_req = Decimal("0")
+                
             quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
             quantized_amount = min(quantized_amount, quantized_sell_cap, quantized_buy_cap)
 
         # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability
         buy_quote_available_now = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
         buy_required_quote = float(quantized_amount) * buy_price
+        
         if buy_quote_available_now + 1e-15 < buy_required_quote:
             # Reduce to affordable base amount and re-quantize both sides accordingly
             affordable_base = 0.0
             if buy_price > 0.0:
                 affordable_base = max(0.0, buy_quote_available_now / buy_price)
-            affordable_dec = Decimal(str(max(0.0, affordable_base - QUANTIZATION_EPSILON)))
+            
+            # OPTIMIZATION: Use Decimal.from_float
+            affordable_dec = Decimal.from_float(max(0.0, affordable_base - QUANTIZATION_EPSILON))
+            
             q_buy2 = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, affordable_dec, buy_price_decimal)
+            
             # Align sell side to the reduced buy size
             sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
             q_sell2 = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_req2, sell_price_decimal)
+            
             # Handle potential None from quantization
             if q_buy2 is not None and q_sell2 is not None:
                 quantized_amount = min(quantized_amount, q_buy2, q_sell2)

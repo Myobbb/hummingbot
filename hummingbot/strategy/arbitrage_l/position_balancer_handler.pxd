@@ -44,6 +44,9 @@ cdef class PositionBalancerHandler:
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset
+        
+        # Cache for invariant trading rules
+        dict _min_price_increment_cache
 
     # Core methods
     cdef void _build_asset_aliases(self)
