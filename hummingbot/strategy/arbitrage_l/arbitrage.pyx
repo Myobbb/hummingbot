@@ -860,8 +860,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double avg_sell_price_orig, avg_buy_price, profitability
             ArbOpportunity opp
 
-        for i in range(profitable_orders.size()):
-            opp = profitable_orders[i]
+        for i in range(self._reusable_arb_opps.size()):
+            opp = self._reusable_arb_opps[i]
             bid_adj = opp.bid_price
             ask_adj = opp.ask_price
             orig_bid = opp.orig_bid_price
