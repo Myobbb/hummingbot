@@ -361,22 +361,27 @@ cdef class PositionBalancerHandler:
         """
         Aggregate base balance using the same source as status (balance_map).
         For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
+        OPTIMIZED: Fetches directly from markets to avoid DataFrame overhead.
         """
         cdef:
             double total = 0.0
-            list unique_tuples
-            object assets_df
-            dict balance_map
-            object t
             list aliases
-            str alias
+            set checked_keys = set()
+            object mp
+            object market_tuple
+            tuple key
+            
         try:
-            unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
-            # Get all aliases for this asset (includes asset itself)
             aliases = self._get_all_asset_aliases(asset)
-            for t in unique_tuples:
-                if t.base_asset in aliases:
-                    total += float(balance_map.get((t.market.name, t.base_asset), 0.0))
+            for mp in self.strategy._market_pairs:
+                for market_tuple in [mp.first, mp.second]:
+                    if market_tuple.base_asset in aliases:
+                        # Ensure we don't double count the same market+asset combo
+                        key = (market_tuple.market, market_tuple.base_asset)
+                        if key not in checked_keys:
+                            checked_keys.add(key)
+                            # Use get_available_balance to match original behavior (only free funds)
+                            total += float(market_tuple.market.get_available_balance(market_tuple.base_asset))
         except Exception:
             return 0.0
         return total
@@ -472,7 +477,9 @@ cdef class PositionBalancerHandler:
         last_bid = self.strategy.c_get_reference_bid_for_asset(canonical_asset)
 
         # Build balances
-        unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
+        # OPTIMIZATION: c_get_actual_base_balance now fetches directly from connectors
+        # We don't need to build the full DataFrame/balance_map here
+        # unique_tuples, assets_df, balance_map = self.strategy.c_build_unique_tuples_assets_and_balance_map()
 
         # Sum base balance across ALL aliases - USE ACTUAL BALANCE for target completion checking
         # Do NOT include pending orders here, only count what's actually filled
