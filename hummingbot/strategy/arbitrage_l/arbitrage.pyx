@@ -1632,6 +1632,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if order_id in self._position_balancer_orders:
                         continue
 
+                    # Skip orders that have partial fills - they are handled by c_check_filled_order_timeouts
+                    # using the existing framework tracking
+                    if order_id in self._order_fill_timestamps:
+                        continue
+
                     # Check if this order is already being cancelled to prevent duplicates
                     if self._sb_order_tracker.c_has_in_flight_cancel(order_id):
                         continue
@@ -1754,8 +1759,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Clean up tracking
             try:
                 order_id_str = self._to_cpp_str(order_id)
-                self._order_timestamps.erase(order_id_str)
-                self._completed_orders.erase(order_id_str)
+                # CRITICAL: Keep tombstone to prevent resurrection
+                # self._order_timestamps.erase(order_id_str)
+                # self._completed_orders.erase(order_id_str)
+                self._completed_orders.insert(order_id_str)
                 self._recent_order_market_pair[order_id] = market_tuple
             except Exception:
                 pass
@@ -1770,8 +1777,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Remove from pending orders tracking
             self.c_remove_pending_order(market_tuple, order_id, "filled_timeout")
 
-            # Clean up fill timestamp
+            # Clean up fill timestamp and set
             self._order_fill_timestamps.pop(order_id, None)
+            self._orders_with_fills.discard(order_id)
 
             # Do NOT enforce cooldown for filled order timeouts (they got fills, just didn't complete)
 
