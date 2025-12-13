@@ -968,7 +968,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if timestamp < cutoff:
                 to_remove.append(order_id_str)
         
-        # Remove old entries #from both tracking structures
+        # Remove old entries from both tracking structures
         for order_id_str in to_remove:
             self._order_timestamps.erase(order_id_str)
             # Also remove from completed orders set
@@ -977,8 +977,25 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Cleanup position balancer tracking (delegated to handler)
             try:
                 oid = order_id_str.decode('utf-8')
-                if self._position_balancer is not None and oid is not None:
+                
+                # CRITICAL FIX: Force cleanup of pending orders and order tracker
+                # This prevents "resurrection" of stuck orders where they are removed from timestamps
+                # but valid in tracker -> c_check_all_order_timeouts -> re-added to timestamps loop
+                
+                # 1. Attempt to find market pair for the order
+                market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(oid)
+                
+                # 2. Stop tracking in strategy base (prevents it from showing up in active orders)
+                if market_pair is not None:
+                    self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, oid)
+                    
+                # 3. Remove from local pending set (unblocks new orders)
+                self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
+                
+                if self._position_balancer is not None:
                     self._position_balancer.handle_old_order_cleanup(oid)
+                    
+                self.logger().warning(f"Force cleaned up stuck order {oid} (older than {self._order_timeout * 2}s)")
             except Exception:
                 pass
         
@@ -1424,7 +1441,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self.logger().info(f"{market_pair_tuple[0].name}: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
                 else:
                     self.logger().info(f"Unknown market: {order_type} order {order_id} completed in {time_elapsed:.2f}s")
-                self._order_timestamps.erase(order_id_str)
+                # CRITICAL: Do NOT erase timestamp here. Keep it as tombstone for garbage collection.
+                # self._order_timestamps.erase(order_id_str)
 
             if self._logging_options & self.OPTION_LOG_ORDER_COMPLETED:
                 self.log_with_clock(
@@ -1496,9 +1514,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # This prevents race condition where cancel arrives after completion
         was_already_completed = (self._completed_orders.find(order_id_str) != self._completed_orders.end())
 
-        # Full cleanup for cancelled orders
-        self._order_timestamps.erase(order_id_str)
-        self._completed_orders.erase(order_id_str)
+        # Full cleanup for cancelled orders calling logic
+        # CRITICAL: Do NOT erase timestamp. Keep it as tombstone.
+        # self._order_timestamps.erase(order_id_str)
+        # CRITICAL: Mark as completed (tombstone) to prevent resurrection
+        self._completed_orders.insert(order_id_str)
         # Clean up fill timestamp tracking
         try:
             self._order_fill_timestamps.pop(order_id, None)
@@ -1550,6 +1570,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef:
             str order_id = order_failed_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+        
+        # Always clean up tracking for failed orders to prevent stuck state
+        self._sb_order_tracker.c_stop_tracking_limit_order(market_pair_tuple, order_id)
+        self.c_remove_pending_order(market_pair_tuple, order_id, "failed")
+        
         if market_pair_tuple is None:
             return
 
@@ -1591,6 +1616,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
                 # Track new orders
                 if self._order_timestamps.find(order_id_str) == self._order_timestamps.end():
+                    # CRITICAL: Check if this is a zombie order (already completed/cancelled but resurrected by tracker)
+                    if self._completed_orders.find(order_id_str) != self._completed_orders.end():
+                        # Force stop tracking to kill zombie
+                        self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
+                        continue
+                        
                     self._order_timestamps[order_id_str] = self._current_timestamp
 
                 time_elapsed = self._current_timestamp - self._order_timestamps[order_id_str]
@@ -1626,8 +1657,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 continue
 
             # Clean up tracking
-            self._order_timestamps.erase(order_id_str)
-            self._completed_orders.erase(order_id_str)
+            # CRITICAL: Do NOT erase from timestamps/completed. Keep tombstones to prevent resurrection.
+            # self._order_timestamps.erase(order_id_str)
+            # self._completed_orders.erase(order_id_str)
+            self._completed_orders.insert(order_id_str)
 
             # CRITICAL: Stop tracking the order immediately to prevent re-processing
             # before the cancel event arrives (prevents repeated cancel attempts)
