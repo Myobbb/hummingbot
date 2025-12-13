@@ -411,8 +411,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 base_rate = self.c_get_conversion_rate(True)
                 base_conv = 1.0 / base_rate if base_rate != 0 else 0.0
             else:
-                base_conv = float(RateOracle.get_instance().get_pair_rate(
-                    f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
+                if self._use_oracle_conversion_rate:
+                    base_conv = float(RateOracle.get_instance().get_pair_rate(
+                        f"{sell_market_tuple.base_asset}-{buy_market_tuple.base_asset}"))
+                else:
+                    base_conv = self._fixed_base_rate
 
         # Quote asset conversion (sell quote -> buy quote)
         if buy_market_tuple.quote_asset != sell_market_tuple.quote_asset:
@@ -424,8 +427,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 quote_rate = self.c_get_conversion_rate(False)
                 quote_conv = 1.0 / quote_rate if quote_rate != 0 else 0.0
             else:
-                quote_conv = float(RateOracle.get_instance().get_pair_rate(
-                    f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
+                if self._use_oracle_conversion_rate:
+                    quote_conv = float(RateOracle.get_instance().get_pair_rate(
+                        f"{sell_market_tuple.quote_asset}-{buy_market_tuple.quote_asset}"))
+                else:
+                    quote_conv = self._fixed_quote_rate
 
         return quote_conv / base_conv if base_conv != 0 else 0.0
     
