@@ -43,6 +43,7 @@ from hummingbot.strategy.arbitrage_l.position_balancer_handler cimport PositionB
 # Constants - Now configurable via init_params
 cdef:
     double DEFAULT_MIN_ORDER_USD = 15.0
+    double DEFAULT_MAX_ORDER_USD = 1000.0
     double DEFAULT_RATE_CACHE_DURATION = 10.0
 
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
@@ -81,6 +82,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._filled_order_timeout = 3600.0  # Default 1 hour
 
         self._min_order_usd = 10.0  # Default minimum order size
+        self._max_order_usd = 1000.0  # Default maximum order size
         self._rate_cache_duration = 10.0  # Default rate cache duration
         self._max_tracked_orders = 1000  # Default max tracked orders
         self._use_oracle_conversion_rate = False  # Default no oracle
@@ -129,6 +131,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     secondary_to_primary_quote_conversion_rate: Decimal = Decimal("1"),
                     hb_app_notification: bool = False,
                     min_order_usd: float = DEFAULT_MIN_ORDER_USD,
+                    max_order_usd: float = DEFAULT_MAX_ORDER_USD,
                     rate_cache_duration: float = DEFAULT_RATE_CACHE_DURATION,
 
                     max_tracked_orders: int = DEFAULT_MAX_TRACKED_ORDERS,
@@ -163,6 +166,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Thresholds
         self._min_order_usd = min_order_usd
+        self._max_order_usd = max_order_usd
         self._rate_cache_duration = rate_cache_duration
         self._max_tracked_orders = max_tracked_orders
         
@@ -931,8 +935,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             approx_ask = 0.0
         
         # Apply quote balance constraint
-        if approx_ask > 0 and buy_quote_balance > 0:
-            capacity = min(capacity, buy_quote_balance / approx_ask)
+        if approx_ask > 0:
+            if buy_quote_balance > 0:
+                capacity = min(capacity, buy_quote_balance / approx_ask)
+            
+            # Apply max trade size constraint (no overhead: simple division using existing approx_ask)
+            if self._max_order_usd > 0:
+                capacity = min(capacity, self._max_order_usd / approx_ask)
         
         # Apply sell-side quantization
         quantized = sell_market_tuple.market.quantize_order_amount(

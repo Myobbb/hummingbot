@@ -40,6 +40,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Thresholds
         double _min_order_usd
+        double _max_order_usd
         double _rate_cache_duration
         size_t _max_tracked_orders
         
