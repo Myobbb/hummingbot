@@ -39,6 +39,8 @@ class StrategyControlCommand:
             control set order_size <id> <value>         - Set order size in USD
             control set refresh_interval <id> <value>   - Set limit order refresh interval in seconds
             control set min_profitability <id> <value>  - Set minimum profitability percentage
+            control add_market <id> <exchange:PAIR>     - Add market to strategy (e.g., 'mexc:BSX-USDT')
+            control remove_market <id> <exchange:PAIR>  - Remove market from strategy
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -155,10 +157,35 @@ class StrategyControlCommand:
             # Join the list into a single string
             value_str = " ".join(value) if isinstance(value, list) else str(value)
             safe_ensure_future(self._control_set(identifier, value_str), loop=self.ev_loop)
+        elif action == "add_market":
+            if identifier is None or value is None or len(value) == 0:
+                self.notify("Error: Missing strategy identifier or market specification")
+                self.notify("Usage: control add_market <strategy_name_or_token> <exchange:PAIR>")
+                self.notify("Example: control add_market BSX mexc:BSX-USDT")
+                return
+            # Check if add_market capability exists
+            if not hasattr(strategy, 'add_market_by_identifier'):
+                self.notify("The current strategy does not support adding markets.")
+                return
+            market_spec = value[0] if isinstance(value, list) else str(value)
+            safe_ensure_future(self._control_add_market(identifier, market_spec), loop=self.ev_loop)
+        elif action == "remove_market":
+            if identifier is None or value is None or len(value) == 0:
+                self.notify("Error: Missing strategy identifier or market specification")
+                self.notify("Usage: control remove_market <strategy_name_or_token> <exchange:PAIR>")
+                self.notify("Example: control remove_market BSX mexc:BSX-USDT")
+                return
+            # Check if remove_market capability exists
+            if not hasattr(strategy, 'remove_market_by_identifier'):
+                self.notify("The current strategy does not support removing markets.")
+                return
+            market_spec = value[0] if isinstance(value, list) else str(value)
+            safe_ensure_future(self._control_remove_market(identifier, market_spec), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
             self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
-                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set")
+                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set, "
+                       "add_market, remove_market")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -221,6 +248,8 @@ class StrategyControlCommand:
             self.notify("  control set order_size <name> <value>            - Set order size (USD)")
             self.notify("  control set refresh_interval <name> <value>      - Set refresh interval (seconds)")
             self.notify("  control set min_profitability <name> <value>     - Set min profitability (%)")
+            self.notify("  control add_market <name_or_token> <exchange:PAIR> - Add market to strategy")
+            self.notify("  control remove_market <name_or_token> <exchange:PAIR> - Remove market from strategy")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -606,3 +635,43 @@ class StrategyControlCommand:
         except Exception as e:
             self.notify(f"Error setting parameter: {e}")
             self.logger().error(f"Error in control set: {e}", exc_info=True)
+
+    async def _control_add_market(self,  # type: HummingbotApplication
+                                  identifier: str,
+                                  market_spec: str):
+        """Add a market to a strategy's additional_markets."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.add_market_by_identifier(identifier, market_spec)
+
+            if success:
+                self.notify(f"\n✓ Market '{market_spec}' added successfully to {identifier}")
+                self.notify("  New arbitrage pairs created; trading will include the new market")
+            else:
+                self.notify(f"\n✗ Failed to add market '{market_spec}' to: {identifier}")
+                self.notify("  Check logs for details. Use 'control list' to see strategies")
+
+        except Exception as e:
+            self.notify(f"Error adding market: {e}")
+            self.logger().error(f"Error in control add_market: {e}", exc_info=True)
+
+    async def _control_remove_market(self,  # type: HummingbotApplication
+                                     identifier: str,
+                                     market_spec: str):
+        """Remove a market from a strategy's additional_markets."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.remove_market_by_identifier(identifier, market_spec)
+
+            if success:
+                self.notify(f"\n✓ Market '{market_spec}' removed successfully from {identifier}")
+                self.notify("  Arbitrage pairs updated; trading will exclude the removed market")
+            else:
+                self.notify(f"\n✗ Failed to remove market '{market_spec}' from: {identifier}")
+                self.notify("  Possible reasons: market not found, or need at least 2 markets remaining")
+                self.notify("  Primary/secondary removal requires additional_markets for promotion")
+                self.notify("  Use 'control list' to see strategies")
+
+        except Exception as e:
+            self.notify(f"Error removing market: {e}")
+            self.logger().error(f"Error in control remove_market: {e}", exc_info=True)

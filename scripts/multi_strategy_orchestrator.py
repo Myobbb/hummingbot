@@ -181,7 +181,7 @@ logger = None
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
     'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff',
-    'set_min_profitability',
+    'set_min_profitability', 'add_market', 'remove_market',
     'MultiStrategyOrchestrator'
 ]
 
@@ -398,6 +398,46 @@ def remove(identifier: str) -> bool:
     """
     orchestrator = _get_orchestrator()
     return orchestrator.remove_strategy_by_identifier(identifier)
+
+
+def add_market(identifier: str, market_spec: str) -> bool:
+    """
+    Add a market to a strategy's additional_markets (runtime + config file).
+
+    Args:
+        identifier: Full strategy name or token symbol
+        market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> add_market("arb_bsx_gate_bitmart", "mexc:BSX-USDT")
+        >>> add_market("BSX", "htx:BSX-USDT")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.add_market_by_identifier(identifier, market_spec)
+
+
+def remove_market(identifier: str, market_spec: str) -> bool:
+    """
+    Remove a market from a strategy's additional_markets (runtime + config file).
+
+    Note: Cannot remove primary or secondary markets, only additional_markets.
+
+    Args:
+        identifier: Full strategy name or token symbol
+        market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> remove_market("arb_bsx_gate_bitmart", "mexc:BSX-USDT")
+        >>> remove_market("BSX", "htx:BSX-USDT")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.remove_market_by_identifier(identifier, market_spec)
 
 
 @dataclass
@@ -695,8 +735,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("  control pause_all           # Pause all strategies")
         self.logger().info("  control resume_all          # Resume all strategies")
         self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
-        self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
         self.logger().info("  control add <file>          # Add strategy from conf/strategies/ (staged; starts on restart)")
+        self.logger().info("  control add_market <token> <exchange:PAIR>   # Add market to strategy")
+        self.logger().info("  control remove_market <token> <exchange:PAIR> # Remove market from strategy")
         self.logger().info("  set_min_profitability <token> <val> # Set min profitability % (e.g., 1.5)")
         self.logger().info("")
         self.logger().info(f"Loaded {len(self.strategies)} strateg{'y' if len(self.strategies) == 1 else 'ies'}")
@@ -2427,6 +2468,497 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             self.logger().info(
                                 f"Removed pairs from '{exchange}': {unused_pairs}"
                             )
+
+        # Write updated config back to file
+        with open(config_path, 'w') as f:
+            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+    # ====================================================================================
+    # MARKET MANIPULATION (add/remove markets from strategies at runtime)
+    # ====================================================================================
+
+    def add_market_by_identifier(self, identifier: str, market_spec: str) -> bool:
+        """
+        Add a market to a strategy's additional_markets by name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        if not strategy_name:
+            self.logger().error(f"Could not resolve identifier '{identifier}' to a strategy name")
+            return False
+        return self.add_market_to_strategy(strategy_name, market_spec)
+
+    def add_market_to_strategy(self, strategy_name: str, market_spec: str) -> bool:
+        """
+        Add a market to a strategy's additional_markets (runtime + config file).
+
+        The new market will be:
+        1. Added to the strategy's active market pairs (creates new arbitrage permutations)
+        2. Added to the strategy's additional_markets config
+        3. Added to the config file's markets section (if not already present)
+
+        Args:
+            strategy_name: Full strategy name
+            market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not strategy_name:
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        # Validate market_spec format
+        if ':' not in market_spec:
+            self.logger().error(f"Invalid market spec '{market_spec}'. Expected format: 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')")
+            return False
+
+        exchange, pair = market_spec.split(':', 1)
+        exchange = exchange.lower()
+
+        if '-' not in pair:
+            self.logger().error(f"Invalid trading pair '{pair}'. Expected format: 'BASE-QUOTE' (e.g., 'BSX-USDT')")
+            return False
+
+        # Check if exchange exists in connector pool
+        if exchange not in self.connectors:
+            self.logger().error(f"Exchange '{exchange}' not in connector pool. Available: {list(self.connectors.keys())}")
+            return False
+
+        # Get strategy instance
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            self.logger().error(f"Strategy '{strategy_name}' not found")
+            return False
+
+        # Check if market already exists
+        existing_spec = f"{exchange}:{pair}"
+        for mt in strategy_instance.market_pairs:
+            mt_spec = f"{mt.market.name}:{mt.trading_pair}".lower()
+            if mt_spec == existing_spec.lower():
+                self.logger().warning(f"Market '{market_spec}' already exists in strategy '{strategy_name}'")
+                return False
+
+        # Build new market tuple
+        base, quote = pair.split('-', 1)
+        new_tuple = MarketTradingPairTuple(
+            market=self.connectors[exchange],
+            trading_pair=pair,
+            base_asset=base,
+            quote_asset=quote
+        )
+
+        # Add to strategy's market_pairs list
+        strategy_instance.market_pairs.append(new_tuple)
+
+        # Invalidate cached connectors set (will be recomputed on next access)
+        strategy_instance._connectors = None
+
+        # Rebuild strategy's internal _market_pairs (ArbitrageLMarketPair permutations)
+        self._rebuild_strategy_market_pairs(strategy_instance)
+
+        self.logger().info(f"Added market '{market_spec}' to strategy '{strategy_name}' (runtime)")
+
+        # Update config file
+        if self.config.config_file_path:
+            try:
+                self._add_market_to_config(strategy_name, market_spec)
+                self.logger().info(f"Config file updated: added '{market_spec}' to '{strategy_name}'")
+            except Exception as e:
+                self.logger().error(f"Failed to update config file: {e}", exc_info=True)
+                return False
+        else:
+            self.logger().warning("Config file path not set, skipping file update")
+
+        return True
+
+    def remove_market_by_identifier(self, identifier: str, market_spec: str) -> bool:
+        """
+        Remove a market from a strategy's additional_markets by name or token symbol.
+
+        Args:
+            identifier: Full strategy name or token symbol
+            market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        if not strategy_name:
+            self.logger().error(f"Could not resolve identifier '{identifier}' to a strategy name")
+            return False
+        return self.remove_market_from_strategy(strategy_name, market_spec)
+
+    def remove_market_from_strategy(self, strategy_name: str, market_spec: str) -> bool:
+        """
+        Remove a market from a strategy's additional_markets (runtime + config file).
+
+        Note: Cannot remove primary or secondary markets, only additional_markets.
+
+        Args:
+            strategy_name: Full strategy name
+            market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not strategy_name:
+            self.logger().error("Strategy name cannot be empty")
+            return False
+
+        # Validate market_spec format
+        if ':' not in market_spec:
+            self.logger().error(f"Invalid market spec '{market_spec}'. Expected format: 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')")
+            return False
+
+        exchange, pair = market_spec.split(':', 1)
+        exchange = exchange.lower()
+
+        # Get strategy instance
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            self.logger().error(f"Strategy '{strategy_name}' not found")
+            return False
+
+        # Check if this is a primary or secondary market
+        config = strategy_instance.config
+        primary_spec = f"{config.get('primary_market', '')}:{config.get('primary_trading_pair', '')}".lower()
+        secondary_spec = f"{config.get('secondary_market', '')}:{config.get('secondary_trading_pair', '')}".lower()
+        target_spec = f"{exchange}:{pair}".lower()
+
+        # Track if we need promotion (removing primary or secondary)
+        is_removing_primary = (target_spec == primary_spec)
+        is_removing_secondary = (target_spec == secondary_spec)
+        promotion_info = None  # Will hold promotion details if needed
+
+        if is_removing_primary or is_removing_secondary:
+            # Need to promote another market to fill the gap
+            additional_markets = config.get('additional_markets', [])
+
+            if is_removing_primary:
+                # Removing primary: need at least secondary + 1 additional (to become new secondary)
+                if len(additional_markets) < 1 and len(strategy_instance.market_pairs) <= 3:
+                    # If no additional markets and only 2 markets total, cannot promote
+                    if len(strategy_instance.market_pairs) <= 2:
+                        self.logger().error(
+                            f"Cannot remove primary market '{market_spec}': no additional_markets to promote. "
+                            f"Add another market first with 'control add_market'."
+                        )
+                        return False
+                # Secondary becomes new primary, first additional becomes new secondary
+                promotion_info = {
+                    'type': 'primary_removed',
+                    'new_primary_market': config.get('secondary_market'),
+                    'new_primary_pair': config.get('secondary_trading_pair'),
+                    'new_secondary_from_additional': additional_markets[0] if additional_markets else None
+                }
+                self.logger().info(
+                    f"Removing primary market '{market_spec}' - promoting secondary to primary"
+                )
+            else:  # is_removing_secondary
+                # Removing secondary: need at least 1 additional to promote
+                if not additional_markets:
+                    self.logger().error(
+                        f"Cannot remove secondary market '{market_spec}': no additional_markets to promote. "
+                        f"Add another market first with 'control add_market'."
+                    )
+                    return False
+                # First additional becomes new secondary
+                promotion_info = {
+                    'type': 'secondary_removed',
+                    'new_secondary_from_additional': additional_markets[0]
+                }
+                self.logger().info(
+                    f"Removing secondary market '{market_spec}' - promoting from additional_markets"
+                )
+
+        # Find and remove the market tuple
+        found = False
+        new_market_pairs = []
+        for mt in strategy_instance.market_pairs:
+            mt_spec = f"{mt.market.name}:{mt.trading_pair}".lower()
+            if mt_spec == target_spec:
+                found = True
+                # Skip this one (effectively removing it)
+            else:
+                new_market_pairs.append(mt)
+
+        if not found:
+            self.logger().error(f"Market '{market_spec}' not found in strategy '{strategy_name}'")
+            return False
+
+        # Check minimum markets requirement (need at least 2 for arbitrage)
+        if len(new_market_pairs) < 2:
+            self.logger().error(
+                f"Cannot remove market '{market_spec}': strategy requires at least 2 markets for arbitrage. "
+                f"Current market count: {len(strategy_instance.market_pairs)}"
+            )
+            return False
+
+        # Apply promotion if needed (update runtime config dict)
+        if promotion_info:
+            if promotion_info['type'] == 'primary_removed':
+                # Secondary becomes primary
+                config['primary_market'] = config['secondary_market']
+                config['primary_trading_pair'] = config['secondary_trading_pair']
+                # First additional becomes secondary
+                if promotion_info.get('new_secondary_from_additional'):
+                    new_sec_spec = promotion_info['new_secondary_from_additional']
+                    if ':' in new_sec_spec:
+                        new_sec_exchange, new_sec_pair = new_sec_spec.split(':', 1)
+                        config['secondary_market'] = new_sec_exchange.lower()
+                        config['secondary_trading_pair'] = new_sec_pair
+                        # Remove from additional_markets
+                        config['additional_markets'] = [
+                            m for m in config.get('additional_markets', [])
+                            if m.lower() != new_sec_spec.lower()
+                        ]
+            elif promotion_info['type'] == 'secondary_removed':
+                # First additional becomes secondary
+                new_sec_spec = promotion_info['new_secondary_from_additional']
+                if ':' in new_sec_spec:
+                    new_sec_exchange, new_sec_pair = new_sec_spec.split(':', 1)
+                    config['secondary_market'] = new_sec_exchange.lower()
+                    config['secondary_trading_pair'] = new_sec_pair
+                    # Remove from additional_markets
+                    config['additional_markets'] = [
+                        m for m in config.get('additional_markets', [])
+                        if m.lower() != new_sec_spec.lower()
+                    ]
+
+        # Update strategy's market_pairs list
+        strategy_instance.market_pairs = new_market_pairs
+
+        # Invalidate cached connectors set (will be recomputed on next access)
+        strategy_instance._connectors = None
+
+        # Rebuild strategy's internal _market_pairs (ArbitrageLMarketPair permutations)
+        self._rebuild_strategy_market_pairs(strategy_instance)
+
+        self.logger().info(f"Removed market '{market_spec}' from strategy '{strategy_name}' (runtime)")
+
+        # Update config file
+        if self.config.config_file_path:
+            try:
+                self._remove_market_from_config(strategy_name, market_spec, promotion_info)
+                self.logger().info(f"Config file updated: removed '{market_spec}' from '{strategy_name}'")
+            except Exception as e:
+                self.logger().error(f"Failed to update config file: {e}", exc_info=True)
+                return False
+        else:
+            self.logger().warning("Config file path not set, skipping file update")
+
+        return True
+
+    def _rebuild_strategy_market_pairs(self, strategy_instance: V1StrategyInstance):
+        """
+        Rebuild a strategy's internal _market_pairs from its market tuple list.
+
+        This creates all permutations (i != j) of ArbitrageLMarketPair.
+        """
+        strategy = strategy_instance.strategy
+        market_tuples = strategy_instance.market_pairs
+
+        # Determine market pair class from strategy type
+        config = strategy_instance.config
+        strategy_type = config.get('strategy_type', 'arbitrage_l')
+
+        if strategy_type == 'arbitrage_l':
+            MarketPairClass = ArbitrageLMarketPair
+        else:
+            MarketPairClass = ArbitrageMMarketPair
+
+        # Build all permutations
+        new_market_pairs = []
+        for i in range(len(market_tuples)):
+            for j in range(len(market_tuples)):
+                if i != j:
+                    new_market_pairs.append(MarketPairClass(
+                        first=market_tuples[i],
+                        second=market_tuples[j]
+                    ))
+
+        # Update strategy's internal _market_pairs directly
+        strategy._market_pairs = new_market_pairs
+
+        self.logger().debug(
+            f"Rebuilt market pairs for '{strategy_instance.name}': "
+            f"{len(market_tuples)} markets -> {len(new_market_pairs)} pairs"
+        )
+
+    def _add_market_to_config(self, strategy_name: str, market_spec: str):
+        """
+        Add a market to the config file's strategy and markets sections.
+        """
+        config_path = Path(self.config.config_file_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        # Read current config
+        with open(config_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
+
+        if not yaml_data:
+            raise ValueError("Config file is empty or invalid")
+
+        exchange, pair = market_spec.split(':', 1)
+        exchange = exchange.lower()
+
+        # 1. Add to strategy's additional_markets
+        if 'arbitrage_m_strategies' in yaml_data:
+            for strategy_config in yaml_data['arbitrage_m_strategies']:
+                if strategy_config.get('name') == strategy_name:
+                    if 'additional_markets' not in strategy_config:
+                        strategy_config['additional_markets'] = []
+                    # Case-insensitive check for duplicates
+                    existing_lower = [m.lower() for m in strategy_config['additional_markets']]
+                    if market_spec.lower() not in existing_lower:
+                        strategy_config['additional_markets'].append(market_spec)
+                    break
+
+        # 2. Add to global markets section if needed
+        if 'markets' not in yaml_data:
+            yaml_data['markets'] = {}
+
+        if exchange not in yaml_data['markets']:
+            yaml_data['markets'][exchange] = []
+
+        if isinstance(yaml_data['markets'][exchange], list):
+            # Case-insensitive check for duplicates
+            existing_pairs_lower = [p.lower() for p in yaml_data['markets'][exchange]]
+            if pair.lower() not in existing_pairs_lower:
+                yaml_data['markets'][exchange].append(pair)
+
+        # Write updated config back to file
+        with open(config_path, 'w') as f:
+            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+    def _remove_market_from_config(self, strategy_name: str, market_spec: str, promotion_info: dict = None):
+        """
+        Remove a market from the config file's strategy additional_markets.
+        If promotion_info is provided, also updates primary_market/secondary_market fields.
+        Also removes from global markets section if no longer used by any strategy.
+        """
+        config_path = Path(self.config.config_file_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        # Read current config
+        with open(config_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
+
+        if not yaml_data:
+            raise ValueError("Config file is empty or invalid")
+
+        exchange, pair = market_spec.split(':', 1)
+        exchange = exchange.lower()
+
+        # Find the strategy config entry
+        target_strategy_config = None
+        if 'arbitrage_m_strategies' in yaml_data:
+            for strategy_config in yaml_data['arbitrage_m_strategies']:
+                if strategy_config.get('name') == strategy_name:
+                    target_strategy_config = strategy_config
+                    break
+
+        if target_strategy_config:
+            # Handle promotion if needed
+            if promotion_info:
+                if promotion_info['type'] == 'primary_removed':
+                    # Secondary becomes primary
+                    target_strategy_config['primary_market'] = target_strategy_config['secondary_market']
+                    target_strategy_config['primary_trading_pair'] = target_strategy_config['secondary_trading_pair']
+
+                    # First additional becomes secondary
+                    new_sec_spec = promotion_info.get('new_secondary_from_additional')
+                    if new_sec_spec and ':' in new_sec_spec:
+                        new_sec_exchange, new_sec_pair = new_sec_spec.split(':', 1)
+                        target_strategy_config['secondary_market'] = new_sec_exchange.lower()
+                        target_strategy_config['secondary_trading_pair'] = new_sec_pair
+                        # Remove promoted market from additional_markets
+                        if 'additional_markets' in target_strategy_config:
+                            target_strategy_config['additional_markets'] = [
+                                m for m in target_strategy_config['additional_markets']
+                                if m.lower() != new_sec_spec.lower()
+                            ]
+                            if not target_strategy_config['additional_markets']:
+                                del target_strategy_config['additional_markets']
+
+                    self.logger().info(
+                        f"Config: promoted secondary to primary, "
+                        f"new secondary: {new_sec_spec or 'none'}"
+                    )
+
+                elif promotion_info['type'] == 'secondary_removed':
+                    # First additional becomes secondary
+                    new_sec_spec = promotion_info.get('new_secondary_from_additional')
+                    if new_sec_spec and ':' in new_sec_spec:
+                        new_sec_exchange, new_sec_pair = new_sec_spec.split(':', 1)
+                        target_strategy_config['secondary_market'] = new_sec_exchange.lower()
+                        target_strategy_config['secondary_trading_pair'] = new_sec_pair
+                        # Remove promoted market from additional_markets
+                        if 'additional_markets' in target_strategy_config:
+                            target_strategy_config['additional_markets'] = [
+                                m for m in target_strategy_config['additional_markets']
+                                if m.lower() != new_sec_spec.lower()
+                            ]
+                            if not target_strategy_config['additional_markets']:
+                                del target_strategy_config['additional_markets']
+
+                    self.logger().info(f"Config: promoted {new_sec_spec} to secondary")
+
+            else:
+                # No promotion - just remove from additional_markets
+                if 'additional_markets' in target_strategy_config:
+                    # Remove matching market spec (case-insensitive comparison)
+                    target_strategy_config['additional_markets'] = [
+                        m for m in target_strategy_config['additional_markets']
+                        if m.lower() != market_spec.lower()
+                    ]
+                    # Remove empty list
+                    if not target_strategy_config['additional_markets']:
+                        del target_strategy_config['additional_markets']
+
+        # Check if pair is still used by any strategy
+        pair_still_used = False
+        for strategy_config in yaml_data.get('arbitrage_m_strategies', []):
+            # Check primary/secondary
+            if (strategy_config.get('primary_market', '').lower() == exchange and
+                strategy_config.get('primary_trading_pair', '').lower() == pair.lower()):
+                pair_still_used = True
+                break
+            if (strategy_config.get('secondary_market', '').lower() == exchange and
+                strategy_config.get('secondary_trading_pair', '').lower() == pair.lower()):
+                pair_still_used = True
+                break
+            # Check additional_markets
+            for am in strategy_config.get('additional_markets', []):
+                if am.lower() == market_spec.lower():
+                    pair_still_used = True
+                    break
+            if pair_still_used:
+                break
+
+        # Remove from global markets section if no longer used
+        if not pair_still_used and 'markets' in yaml_data:
+            if exchange in yaml_data['markets']:
+                if isinstance(yaml_data['markets'][exchange], list):
+                    yaml_data['markets'][exchange] = [
+                        p for p in yaml_data['markets'][exchange]
+                        if p.lower() != pair.lower()
+                    ]
+                    # Remove exchange if no pairs left
+                    if not yaml_data['markets'][exchange]:
+                        del yaml_data['markets'][exchange]
+                        self.logger().info(f"Removed exchange '{exchange}' from markets (no pairs remaining)")
 
         # Write updated config back to file
         with open(config_path, 'w') as f:
