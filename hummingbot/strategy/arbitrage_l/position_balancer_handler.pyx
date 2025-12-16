@@ -1692,11 +1692,20 @@ cdef class PositionBalancerHandler:
             if shortfall_or_excess > 0:
                 # Check if already have pending buy order for ANY alias
                 # Only place new order if no aliases have active orders
+                # EXCEPTION: If the active order has a pending cancel, we can place a new one
                 has_active_order = False
                 for alias in asset_aliases:
                     if alias in self._active_buy_orders:
-                        has_active_order = True
-                        break
+                        existing_order_id = self._active_buy_orders[alias]
+                        # Check if this order has a pending cancel
+                        if existing_order_id in self.strategy._timeout_cancelled_orders:
+                            # Order is being cancelled - force clear tracking to allow replacement
+                            self.strategy.logger().info(
+                                f"Position balancer: Active buy order {existing_order_id} has pending cancel - clearing for replacement")
+                            self.handle_order_cancellation(existing_order_id)
+                        else:
+                            has_active_order = True
+                            break
 
                 if not has_active_order:
                     # Check 2-second cooldown after order completion
