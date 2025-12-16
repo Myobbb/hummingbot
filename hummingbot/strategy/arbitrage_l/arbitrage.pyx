@@ -51,8 +51,7 @@ cdef:
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
-
- 
+    # NOTE: AGGRESSIVE_REFRESH_INTERVAL is defined in position_balancer_handler.pyx (5.0s default)
 
 cdef class ArbitrageLStrategy(StrategyBase):
     """
@@ -240,7 +239,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 sell_off_target_usd,
                 sell_off_spread_pct,
                 position_balancer_refresh_interval,
-                position_balancer_order_size_usd)
+                position_balancer_order_size_usd)  # aggressive_refresh uses default from position_balancer_handler.pyx
         else:
             self._position_balancer = None
 

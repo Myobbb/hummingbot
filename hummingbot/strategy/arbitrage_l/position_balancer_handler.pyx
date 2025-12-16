@@ -29,12 +29,31 @@ s_decimal_nan = Decimal("NaN")
 EPSILON = 1e-9
 QUANTIZATION_EPSILON = 1e-9
 
-# Cancellation threshold constants
-cdef double TICK_TOLERANCE = 0.9  # Tolerance for detecting if order matches top of book (90% of tick)
-cdef double HALF_TICK_TOLERANCE = 0.5  # Half-tick tolerance for price matching
-cdef double LARGE_GAP_THRESHOLD = 1.9  # Multi-tick gap threshold for immediate cancellation (2 ticks)
-cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection timeout
+# =============================================================================
+# POSITION BALANCER TIMING & THRESHOLD CONSTANTS
+# All timing and threshold values are consolidated here for easy tweaking
+# =============================================================================
+
+# --- Order Hanging Intervals (seconds) ---
+# How long orders hang before being refreshed (cancelled and replaced)
+cdef double DEFAULT_LIMIT_REFRESH_INTERVAL = 60.0       # Default refresh for min/set_spread modes
+cdef double DEFAULT_AGGRESSIVE_REFRESH_INTERVAL = 5.0   # Refresh for aggressive (0%) mode with partial fills
+cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
+
+# --- Stuck Cancel Detection ---
+cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
+
+# --- Price Threshold Constants ---
+cdef double TICK_TOLERANCE = 0.9            # Tolerance for detecting if order matches top of book (90% of tick)
+cdef double HALF_TICK_TOLERANCE = 0.5       # Half-tick tolerance for price matching
+cdef double LARGE_GAP_THRESHOLD = 1.9       # Multi-tick gap threshold for immediate cancellation (2 ticks)
 cdef double AGGRESSIVE_MODE_TOLERANCE = 0.999  # Price tolerance for aggressive mode (0.1%)
+cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
+
+# --- Better Market Switch ---
+# Tolerance for triggering immediate market switch (price difference as ratio)
+# e.g., 0.0001 = 0.01% = switch if other market is 0.01% better
+cdef double BETTER_MARKET_SWITCH_TOLERANCE = 0.0001  # 0.01% - switch immediately if another market is better
 
 
 cdef class PositionBalancerHandler:
@@ -57,7 +76,8 @@ cdef class PositionBalancerHandler:
                  double sell_target_usd,
                  object sell_spread_pct,  # float or 'min'
                  double limit_refresh_interval,
-                 double order_size_usd=100.0):
+                 double order_size_usd=100.0,
+                 double aggressive_refresh_interval=5.0):
         """
         Initialize position balancer handler.
 
@@ -115,6 +135,7 @@ cdef class PositionBalancerHandler:
 
         # Limit order refresh
         self._limit_refresh_interval = limit_refresh_interval
+        self._aggressive_refresh_interval = aggressive_refresh_interval
         self._last_buy_order_time = {}    # asset -> timestamp
         self._last_sell_order_time = {}   # asset -> timestamp
         self._active_buy_orders = {}      # asset -> order_id
@@ -1019,6 +1040,171 @@ cdef class PositionBalancerHandler:
         
         return (should_cancel, cancel_reason)
 
+    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy):
+        """
+        UNIFIED immediate check for all conditions that require instant response.
+        
+        This combines:
+        1. Better market available (ALL MODES)
+        2. Frontrun/undercut detection (min/% modes only)
+        3. Large gap detection (min mode only)
+        
+        All checks use the SAME orderbook snapshot to avoid race conditions
+        and prevent duplicate fetches.
+        
+        Returns: (should_cancel, cancel_reason) tuple
+        """
+        cdef:
+            bint should_cancel = False
+            str cancel_reason = ""
+            object current_best_market = None
+            object order_market_tuple = None
+            double order_price = 0.0
+            double best_market_price = 0.0
+            double order_market_price = 0.0
+            double current_bid = 0.0
+            double current_ask = 0.0
+            double effective_ref_price = 0.0
+            double expected_price = 0.0
+            double min_price_increment = 0.0
+            double gap_amount = 0.0
+            tuple order_details
+            OrderBook order_ob
+            OrderBook best_ob
+            str trading_pair
+            bint spread_is_min
+            double spread_pct
+            bint is_maker_mode
+        
+        try:
+            # Get order details
+            if is_buy:
+                order_details = self._active_buy_order_details.get(asset)
+                spread_is_min = self._buy_spread_is_min
+                spread_pct = self._buy_spread_pct
+            else:
+                order_details = self._active_sell_order_details.get(asset)
+                spread_is_min = self._sell_spread_is_min
+                spread_pct = self._sell_spread_pct
+            
+            if order_details is None:
+                return (False, "")
+            
+            order_market_tuple, order_price = order_details
+            is_maker_mode = spread_is_min or spread_pct > 0.0
+            
+            # Find current best market
+            if is_buy:
+                current_best_market = self.c_find_best_buy_market(asset)
+            else:
+                current_best_market = self.c_find_best_sell_market(asset)
+            
+            if current_best_market is None:
+                return (False, "")
+            
+            # Fetch current order's market orderbook ONCE
+            order_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
+            
+            # Get prices from order's market
+            if order_ob._bid_book.size() > 0:
+                current_bid = float(deref(order_ob._bid_book.rbegin()).getPrice())
+            if order_ob._ask_book.size() > 0:
+                current_ask = float(deref(order_ob._ask_book.begin()).getPrice())
+            
+            # Get min_price_increment (cached)
+            trading_pair = order_market_tuple.trading_pair
+            if trading_pair in self._min_price_increment_cache:
+                min_price_increment = self._min_price_increment_cache[trading_pair]
+            else:
+                trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
+                min_price_increment = 0.0
+                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                    min_price_increment = float(trading_rule.min_price_increment)
+                self._min_price_increment_cache[trading_pair] = min_price_increment
+            
+            # ================================================================
+            # CHECK 1: Better market available (ALL MODES)
+            # ================================================================
+            if current_best_market.market.name != order_market_tuple.market.name:
+                # Different market is now best - compare prices
+                best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                
+                if is_buy:
+                    if not is_maker_mode:
+                        # Aggressive mode: compare asks (taker)
+                        if best_ob._ask_book.size() > 0 and current_ask > 0:
+                            best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
+                            if best_market_price < current_ask * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} < {order_market_tuple.market.name} ask {current_ask:.8f}"
+                    else:
+                        # Maker mode: compare bids (we place above)
+                        if best_ob._bid_book.size() > 0 and current_bid > 0:
+                            best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
+                            if best_market_price < current_bid * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} < {order_market_tuple.market.name} bid {current_bid:.8f}"
+                else:  # SELL
+                    if not is_maker_mode:
+                        # Aggressive mode: compare bids (taker)
+                        if best_ob._bid_book.size() > 0 and current_bid > 0:
+                            best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
+                            if best_market_price > current_bid * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} > {order_market_tuple.market.name} bid {current_bid:.8f}"
+                    else:
+                        # Maker mode: compare asks (we place below)
+                        if best_ob._ask_book.size() > 0 and current_ask > 0:
+                            best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
+                            if best_market_price > current_ask * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} > {order_market_tuple.market.name} ask {current_ask:.8f}"
+            
+            # ================================================================
+            # CHECK 2 & 3: Frontrun + Large Gap (MAKER MODES ONLY)
+            # Skip for aggressive mode (0%) - they don't compete for position
+            # ================================================================
+            if not should_cancel and is_maker_mode:
+                if is_buy:
+                    # CHECK 2: Frontrun - someone placed HIGHER bid than our order
+                    if current_bid > order_price:
+                        should_cancel = True
+                        cancel_reason = f"frontrun (top bid {current_bid:.8f} > our {order_price:.8f})"
+                    
+                    # CHECK 3: Large gap detection (min mode only)
+                    if not should_cancel and spread_is_min and min_price_increment > 0:
+                        # Our order should be 1 tick above effective bid
+                        effective_ref_price = self.c_get_effective_reference_price(
+                            order_ob, current_bid, order_price, min_price_increment, True)
+                        expected_price = effective_ref_price + min_price_increment
+                        gap_amount = abs(order_price - expected_price)
+                        if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
+                            should_cancel = True
+                            cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
+                else:  # SELL
+                    # CHECK 2: Undercut - someone placed LOWER ask than our order
+                    if current_ask < order_price:
+                        should_cancel = True
+                        cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
+                    
+                    # CHECK 3: Large gap detection (min mode only)
+                    if not should_cancel and spread_is_min and min_price_increment > 0:
+                        # Our order should be 1 tick below effective ask
+                        effective_ref_price = self.c_get_effective_reference_price(
+                            order_ob, current_ask, order_price, min_price_increment, False)
+                        expected_price = effective_ref_price - min_price_increment
+                        gap_amount = abs(order_price - expected_price)
+                        if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
+                            should_cancel = True
+                            cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
+        
+        except Exception as e:
+            self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
+        
+        return (should_cancel, cancel_reason)
+
+
+
     cdef void c_cancel_stale_orders(self, str asset):
         """
         Cancel stale buy/sell limit orders for refresh.
@@ -1083,49 +1269,27 @@ cdef class PositionBalancerHandler:
                         should_cancel = True
                         cancel_reason = "mode disabled"
 
-                    # IMMEDIATE CHECK: Critical market conditions (don't wait for refresh interval)
-                    # Detects frontrun and large gaps that require immediate response
-                    if not should_cancel and (self._buy_spread_is_min or self._buy_spread_pct > 0.0):
-                        try:
-                            # Get current market state (query once, use for all checks)
-                            order_details = self._active_buy_order_details.get(asset)
-                            if order_details is not None:
-                                order_market_tuple, order_price = order_details
-                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
-                                
-                                # Get orderbook prices using helper
-                                current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
-
-
-                                # Get min_price_increment (cached)
-                                trading_pair = order_market_tuple.trading_pair
-                                if trading_pair in self._min_price_increment_cache:
-                                    min_price_increment = self._min_price_increment_cache[trading_pair]
-                                else:
-                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
-                                    min_price_increment = 0.0
-                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                        min_price_increment = float(trading_rule.min_price_increment)
-                                    self._min_price_increment_cache[trading_pair] = min_price_increment
-
-                                # Calculate effective_bid (second level if top is our order) using helper
-                                effective_bid = self.c_get_effective_reference_price(
-                                    current_ob, current_bid, order_price, min_price_increment, True)
-
-                                # IMMEDIATE CONDITION 1: Simple frontrun check using helper
-                                should_cancel, cancel_reason = self.c_check_immediate_frontrun(current_bid, order_price, True)
-
-                                # IMMEDIATE CONDITION 2: Large gap detection using helper
-                                if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
-                                    expected_price = effective_bid + min_price_increment
-                                    should_cancel, cancel_reason = self.c_check_large_gap_immediate(
-                                        order_price, expected_price, min_price_increment, True)
-                        except Exception as e:
-                            self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
-                            pass  # If check fails, continue to regular interval-based checks
+                    # UNIFIED IMMEDIATE CHECK: Better market + Frontrun + Gap detection
+                    # All checks use same orderbook snapshot to avoid race conditions
+                    if not should_cancel:
+                        should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, True)
 
                     # Check if refresh interval passed AND conditions changed
-                    if not should_cancel and current_time - last_time > self._limit_refresh_interval:
+                    # Determine effective refresh interval (shorter for aggressive partial fills)
+                    effective_interval = self._limit_refresh_interval
+                    
+                    # Aggressive mode (0% spread) and partial fill -> use aggressive interval
+                    if (not self._buy_spread_is_min and self._buy_spread_pct == 0.0):
+                        if order_id in self._pending_buy_orders:
+                            # Unpack correctly: (asset_key, total, filled)
+                            try:
+                                _, _, filled_amt = self._pending_buy_orders[order_id]
+                                if filled_amt > EPSILON:
+                                    effective_interval = self._aggressive_refresh_interval
+                            except Exception:
+                                pass
+
+                    if not should_cancel and current_time - last_time > effective_interval:
                         # Smart cancellation: only cancel if market/price changed
                         current_best_market = None
                         try:
@@ -1261,49 +1425,27 @@ cdef class PositionBalancerHandler:
                         should_cancel = True
                         cancel_reason = "mode disabled"
 
-                    # IMMEDIATE CHECK: Critical market conditions (don't wait for refresh interval)
-                    # Detects undercut and large gaps that require immediate response
-                    if not should_cancel and (self._sell_spread_is_min or self._sell_spread_pct > 0.0):
-                        try:
-                            # Get current market state (query once, use for all checks)
-                            order_details = self._active_sell_order_details.get(asset)
-                            if order_details is not None:
-                                order_market_tuple, order_price = order_details
-                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
-                                
-                                # Get orderbook prices using helper
-                                current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
-
-
-                                # Get min_price_increment (cached)
-                                trading_pair = order_market_tuple.trading_pair
-                                if trading_pair in self._min_price_increment_cache:
-                                    min_price_increment = self._min_price_increment_cache[trading_pair]
-                                else:
-                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
-                                    min_price_increment = 0.0
-                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                        min_price_increment = float(trading_rule.min_price_increment)
-                                    self._min_price_increment_cache[trading_pair] = min_price_increment
-
-                                # Calculate effective_ask (second level if top is our order) using helper
-                                effective_ask = self.c_get_effective_reference_price(
-                                    current_ob, current_ask, order_price, min_price_increment, False)
-
-                                # IMMEDIATE CONDITION 1: Simple undercut check using helper
-                                should_cancel, cancel_reason = self.c_check_immediate_frontrun(current_ask, order_price, False)
-
-                                # IMMEDIATE CONDITION 2: Large gap detection using helper
-                                if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
-                                    expected_price = effective_ask - min_price_increment
-                                    should_cancel, cancel_reason = self.c_check_large_gap_immediate(
-                                        order_price, expected_price, min_price_increment, False)
-                        except Exception as e:
-                            self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
-                            pass  # If check fails, continue to regular interval-based checks
+                    # UNIFIED IMMEDIATE CHECK: Better market + Undercut + Gap detection
+                    # All checks use same orderbook snapshot to avoid race conditions
+                    if not should_cancel:
+                        should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, False)
 
                     # Check if refresh interval passed AND conditions changed
-                    if not should_cancel and current_time - last_time > self._limit_refresh_interval:
+                    # Determine effective refresh interval (shorter for aggressive partial fills)
+                    effective_interval = self._limit_refresh_interval
+                    
+                    # Aggressive mode (0% spread) and partial fill -> use aggressive interval
+                    if (not self._sell_spread_is_min and self._sell_spread_pct == 0.0):
+                        if order_id in self._pending_sell_orders:
+                            # Unpack correctly: (asset_key, total, filled)
+                            try:
+                                _, _, filled_amt = self._pending_sell_orders[order_id]
+                                if filled_amt > EPSILON:
+                                    effective_interval = self._aggressive_refresh_interval
+                            except Exception:
+                                pass
+
+                    if not should_cancel and current_time - last_time > effective_interval:
                         # Smart cancellation: only cancel if market/price changed
                         try:
                             # Find current best market
@@ -1318,6 +1460,7 @@ cdef class PositionBalancerHandler:
                                     if current_best_market.market.name != order_market_tuple.market.name:
                                         should_cancel = True
                                         cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
+                                    else:
                                         # Same market - evaluate if conditions changed
                                         try:
                                             current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
@@ -1558,7 +1701,7 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Check 2-second cooldown after order completion
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion < 2.0:
+                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
                         return False
 
                     # For completion check, use ACTUAL balance (not adjusted)
@@ -1593,7 +1736,7 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Check 2-second cooldown after order completion
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion < 2.0:
+                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
                         return False
 
                     # For completion check, use ACTUAL balance (not adjusted)
@@ -2259,3 +2402,16 @@ cdef class PositionBalancerHandler:
         self.strategy.log_with_clock(
             logging.INFO,
             f"Limit order refresh interval updated: {old_interval:.0f} -> {refresh_interval:.0f} seconds")
+
+    def set_aggressive_refresh_interval(self, double refresh_interval):
+        """
+        Set the aggressive refresh interval in seconds.
+
+        Args:
+            refresh_interval: Refresh interval for aggressive partial fills (seconds)
+        """
+        old_interval = self._aggressive_refresh_interval
+        self._aggressive_refresh_interval = refresh_interval
+        self.strategy.log_with_clock(
+            logging.INFO,
+            f"Aggressive refresh interval updated: {old_interval:.0f} -> {refresh_interval:.0f} seconds")
