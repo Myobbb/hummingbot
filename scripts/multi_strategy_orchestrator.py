@@ -181,7 +181,7 @@ logger = None
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
     'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff',
-    'set_min_profitability', 'add_market', 'remove_market',
+    'set_min_profitability', 'add_market', 'remove_market', 'create',
     'MultiStrategyOrchestrator'
 ]
 
@@ -439,6 +439,38 @@ def remove_market(identifier: str, market_spec: str) -> bool:
     orchestrator = _get_orchestrator()
     return orchestrator.remove_market_by_identifier(identifier, market_spec)
 
+
+def create(name: str, primary_spec: str, secondary_spec: str,
+           min_profitability: float = 1.5, start_running: bool = False,
+           additional_markets: str = None) -> bool:
+    """
+    Create a new arbitrage strategy at runtime (starts paused by default).
+
+    Args:
+        name: Unique name for the strategy (e.g., 'arb_bsx_new')
+        primary_spec: Primary market as 'exchange:PAIR' (e.g., 'gate:BSX-USDT')
+        secondary_spec: Secondary market as 'exchange:PAIR' (e.g., 'kucoin:BSX-USDT')
+        min_profitability: Minimum profitability percentage (default: 1.5%)
+        start_running: Whether to start running immediately (default: False = paused)
+        additional_markets: Optional comma-separated list of additional markets
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> create("arb_bsx_new", "gate:BSX-USDT", "kucoin:BSX-USDT")
+        >>> create("arb_bsx_new", "gate:BSX-USDT", "kucoin:BSX-USDT", min_profitability=2.0)
+        >>> create("arb_bsx_3way", "gate:BSX-USDT", "kucoin:BSX-USDT", additional_markets="mexc:BSX-USDT")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.create_strategy(
+        name=name,
+        primary_spec=primary_spec,
+        secondary_spec=secondary_spec,
+        min_profitability=min_profitability,
+        paused=not start_running,
+        additional_markets=additional_markets
+    )
 
 @dataclass
 class V1StrategyInstance:
@@ -735,7 +767,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("  control pause_all           # Pause all strategies")
         self.logger().info("  control resume_all          # Resume all strategies")
         self.logger().info("  control remove <token>      # Remove strategy (edits config file)")
-        self.logger().info("  control add <file>          # Add strategy from conf/strategies/ (staged; starts on restart)")
+        self.logger().info("  control add <file>          # Add strategy from conf/strategies/ (staged)")
+        self.logger().info("  control create <name> <primary> <secondary>  # Create new strategy (paused)")
         self.logger().info("  control add_market <token> <exchange:PAIR>   # Add market to strategy")
         self.logger().info("  control remove_market <token> <exchange:PAIR> # Remove market from strategy")
         self.logger().info("  set_min_profitability <token> <val> # Set min profitability % (e.g., 1.5)")
@@ -2839,6 +2872,183 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Write updated config back to file
         with open(config_path, 'w') as f:
             yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+    # ====================================================================================
+    # RUNTIME STRATEGY CREATION
+    # ====================================================================================
+
+    def create_strategy(self, name: str, primary_spec: str, secondary_spec: str,
+                        min_profitability: float = 1.5, paused: bool = True,
+                        additional_markets: str = None) -> bool:
+        """
+        Create a new arbitrage strategy at runtime.
+
+        Args:
+            name: Unique name for the strategy
+            primary_spec: Primary market as 'exchange:PAIR' (e.g., 'gate:BSX-USDT')
+            secondary_spec: Secondary market as 'exchange:PAIR' (e.g., 'kucoin:BSX-USDT')
+            min_profitability: Minimum profitability percentage (default: 1.5)
+            paused: Whether to start paused (default: True)
+            additional_markets: Optional comma-separated additional markets
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Validate name uniqueness
+            if name in self._strategy_by_name:
+                self.logger().error(f"Strategy name '{name}' already exists")
+                return False
+
+            # Validate and parse primary market spec
+            if ':' not in primary_spec:
+                self.logger().error(f"Invalid primary market spec '{primary_spec}'. Expected format: 'exchange:PAIR'")
+                return False
+            primary_exchange, primary_pair = primary_spec.split(':', 1)
+            primary_exchange = primary_exchange.lower()
+
+            if '-' not in primary_pair:
+                self.logger().error(f"Invalid primary trading pair '{primary_pair}'. Expected format: 'BASE-QUOTE'")
+                return False
+
+            # Validate and parse secondary market spec
+            if ':' not in secondary_spec:
+                self.logger().error(f"Invalid secondary market spec '{secondary_spec}'. Expected format: 'exchange:PAIR'")
+                return False
+            secondary_exchange, secondary_pair = secondary_spec.split(':', 1)
+            secondary_exchange = secondary_exchange.lower()
+
+            if '-' not in secondary_pair:
+                self.logger().error(f"Invalid secondary trading pair '{secondary_pair}'. Expected format: 'BASE-QUOTE'")
+                return False
+
+            # Check exchanges are available
+            missing = []
+            if primary_exchange not in self.connectors:
+                missing.append(primary_exchange)
+            if secondary_exchange not in self.connectors:
+                missing.append(secondary_exchange)
+            if missing:
+                self.logger().error(f"Missing connectors: {', '.join(missing)}. Available: {list(self.connectors.keys())}")
+                return False
+
+            # Parse additional_markets
+            additional_list = []
+            if additional_markets:
+                for am in additional_markets.split(','):
+                    am = am.strip()
+                    if am and ':' in am:
+                        additional_list.append(am)
+
+            # Create config using ArbitrageMInstanceConfig
+            config = ArbitrageMInstanceConfig(
+                name=name,
+                primary_market=primary_exchange,
+                secondary_market=secondary_exchange,
+                primary_trading_pair=primary_pair,
+                secondary_trading_pair=secondary_pair,
+                min_profitability=Decimal(str(min_profitability)),
+                additional_markets=additional_list
+            )
+
+            # Create the strategy using existing infrastructure
+            self._add_arbitrage_m_strategy(config, paused=paused)
+
+            state = "paused" if paused else "running"
+            self.logger().info(f"Created strategy '{name}' ({state}): {primary_spec} <-> {secondary_spec}")
+
+            # Persist to config file
+            if self.config.config_file_path:
+                try:
+                    self._add_strategy_to_config(config)
+                    self.logger().info(f"Config file updated: added strategy '{name}'")
+                except Exception as e:
+                    self.logger().error(f"Failed to update config file: {e}", exc_info=True)
+                    # Strategy is still running in memory, just warn about config
+                    self.logger().warning("Strategy created but NOT persisted to config file")
+
+            return True
+
+        except Exception as e:
+            self.logger().error(f"Failed to create strategy '{name}': {e}", exc_info=True)
+            return False
+
+    def _add_strategy_to_config(self, config: ArbitrageMInstanceConfig):
+        """
+        Add a strategy to the config file's arbitrage_m_strategies list and update markets section.
+        """
+        config_path = Path(self.config.config_file_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        # Read current config
+        with open(config_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
+
+        if not yaml_data:
+            raise ValueError("Config file is empty or invalid")
+
+        # 1. Add strategy to arbitrage_m_strategies list
+        if 'arbitrage_m_strategies' not in yaml_data:
+            yaml_data['arbitrage_m_strategies'] = []
+
+        # Build strategy dict (only include non-default values for cleaner YAML)
+        strategy_dict = {
+            'name': config.name,
+            'primary_market': config.primary_market,
+            'secondary_market': config.secondary_market,
+            'primary_trading_pair': config.primary_trading_pair,
+            'secondary_trading_pair': config.secondary_trading_pair,
+        }
+
+        # Only add min_profitability if different from default
+        if config.min_profitability != Decimal("1.5"):
+            strategy_dict['min_profitability'] = float(config.min_profitability)
+
+        # Add additional_markets if any
+        if config.additional_markets:
+            strategy_dict['additional_markets'] = config.additional_markets
+
+        yaml_data['arbitrage_m_strategies'].append(strategy_dict)
+
+        # 2. Add markets to global markets section
+        if 'markets' not in yaml_data:
+            yaml_data['markets'] = {}
+
+        # Add primary market pair
+        if config.primary_market not in yaml_data['markets']:
+            yaml_data['markets'][config.primary_market] = []
+        if isinstance(yaml_data['markets'][config.primary_market], list):
+            existing_lower = [p.lower() for p in yaml_data['markets'][config.primary_market]]
+            if config.primary_trading_pair.lower() not in existing_lower:
+                yaml_data['markets'][config.primary_market].append(config.primary_trading_pair)
+
+        # Add secondary market pair
+        if config.secondary_market not in yaml_data['markets']:
+            yaml_data['markets'][config.secondary_market] = []
+        if isinstance(yaml_data['markets'][config.secondary_market], list):
+            existing_lower = [p.lower() for p in yaml_data['markets'][config.secondary_market]]
+            if config.secondary_trading_pair.lower() not in existing_lower:
+                yaml_data['markets'][config.secondary_market].append(config.secondary_trading_pair)
+
+        # Add additional markets
+        for am in config.additional_markets:
+            if ':' in am:
+                exchange, pair = am.split(':', 1)
+                exchange = exchange.lower()
+                if exchange not in yaml_data['markets']:
+                    yaml_data['markets'][exchange] = []
+                if isinstance(yaml_data['markets'][exchange], list):
+                    existing_lower = [p.lower() for p in yaml_data['markets'][exchange]]
+                    if pair.lower() not in existing_lower:
+                        yaml_data['markets'][exchange].append(pair)
+
+        # Write updated config back to file
+        with open(config_path, 'w') as f:
+            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+
+        self.logger().info(f"Strategy '{config.name}' added to config file")
 
     def _remove_market_from_config(self, strategy_name: str, market_spec: str, promotion_info: dict = None):
         """

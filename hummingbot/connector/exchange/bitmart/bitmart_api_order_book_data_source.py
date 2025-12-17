@@ -240,8 +240,8 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             elif bids_list and not asks_list:
                 update_type = "bids-only"
             
-            # If explicitly waiting for snapshot (only happens on initial connect or manual refresh)
-            # Note: With optimistic gap handling, we don't enter this state on version gaps anymore
+            # Check if we are waiting for initial snapshot
+            # Only strictly block if we are in the initial connection phase (~10s)
             if self._waiting_for_snapshot.get(trading_pair, False):
                 wait_start = self._waiting_for_snapshot_since.get(trading_pair, 0)
                 wait_duration = time.time() - wait_start if wait_start > 0 else 0
@@ -249,92 +249,54 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # OPTIMISTIC: Much shorter timeout (10s) since we only block on initial connect
                 # After 10s, accept ANY update to keep orderbook moving
                 if wait_duration >= 10.0:  # Reduced from 30s
-                    # Timeout exceeded - force recovery by accepting this update as new baseline
-                    #self.logger().warning(
-                    #    f"BitMart {trading_pair}: Snapshot wait timeout ({int(wait_duration)}s). "
-                    #    f"Forcing recovery: accepting {update_type} v{new_ver} as new baseline"
-                    #)
+                    # Timeout exceeded - forced start
                     self._waiting_for_snapshot[trading_pair] = False
                     self._waiting_for_snapshot_since.pop(trading_pair, None)
                     self._last_depth_version[trading_pair] = new_ver
                     # Continue processing this update below
                 else:
                     # Still waiting (only in first 10s after connect)
-                    self.logger().debug(
-                        f"BitMart {trading_pair}: Waiting for initial snapshot "
-                        f"({int(wait_duration)}s elapsed, will accept updates after 10s) - dropping {update_type} v{new_ver}"
-                    )
+                    # Dropping updates here is correct because we have NO baseline yet
                     continue
             
             # Version validation and gap detection
             # CORE PRINCIPLE: Prefer orderbook updates over perfect version tracking
-            # Better to have slightly gappy data than NO data
+            # Better to have slightly gappy data than NO data (frozen orderbook)
             skip_version_checks = False
             
             if last_ver is None:
-                # No baseline version - this can happen after:
-                # 1. Initial connection (haven't received first snapshot yet)
-                # 2. REST snapshot fallback (REST snapshots don't have versions)
-                # 
-                # OPTIMISTIC STRATEGY: Accept ANY update as baseline after reasonable timeout
-                last_snapshot_ts = self._last_snapshot_refresh_ts.get(trading_pair, 0)
-                time_since_init = current_time - last_snapshot_ts if last_snapshot_ts > 0 else 999999
+                # No baseline version - establish it now
+                # This mirrors the reference implementation's optimistic initialization
+                self._last_depth_version[trading_pair] = new_ver
+                skip_version_checks = True
                 
-                # If we have ANY recent snapshot OR have been waiting >10s, accept this as baseline
-                # 10s gives time for initial snapshot, but doesn't block updates forever
-                should_establish_baseline = (
-                    time_since_init < 30.0  # Recent snapshot (within 30s)
-                    or time_since_init > 999998  # Never had snapshot (first update ever)
-                    or (current_time - self._last_any_message_ts.get(trading_pair, 0)) > 10.0  # Been receiving messages >10s
-                )
-                
-                if should_establish_baseline:
-                    # Establish this update as baseline - ALWAYS prefer data over blocking
-                    elapsed_msg = f" {int(time_since_init)}s after snapshot" if time_since_init < 1000 else " (first update)"
-                    self.logger().info(
-                        f"BitMart {trading_pair}: Establishing version baseline v{new_ver}{elapsed_msg} "
-                        f"({update_type} update)"
-                    )
-                    self._last_depth_version[trading_pair] = new_ver
-                    skip_version_checks = True  # Skip remaining version checks for this update
-                    # Trigger background snapshot request for proper baseline, but don't wait for it
-                    if not self._waiting_for_snapshot.get(trading_pair, False):
-                        asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-                else:
-                    # Only block if we literally just started (<10s) and haven't received any messages
-                    self.logger().debug(
-                        f"BitMart {trading_pair}: No baseline version, requesting snapshot for {update_type} update (v{new_ver})"
-                    )
-                    self._waiting_for_snapshot[trading_pair] = True
-                    self._waiting_for_snapshot_since[trading_pair] = current_time
-                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
-                    continue
+                # Request snapshot in background to ensure full book is correct, but don't block
+                # Only request if we're not already waiting for one
+                if not self._waiting_for_snapshot.get(trading_pair, False):
+                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
             
-            if not skip_version_checks and new_ver <= last_ver:
-                # Old or duplicate - this is CORRECT to skip
-                self.logger().debug(f"BitMart {trading_pair}: Skipping old/duplicate {update_type} update v{new_ver} (current v{last_ver})")
+            elif new_ver <= last_ver:
+                # Old or duplicate - skip
                 continue
             
-            if not skip_version_checks and new_ver != last_ver + 1:
-                # Version gap detected - could be transient network issue, exchange rate limiting, etc.
-                # OPTIMISTIC STRATEGY: Apply the update anyway, request snapshot in background for correction
+            elif new_ver != last_ver + 1 and not skip_version_checks:
+                # Version gap detected - OPTIMISTIC HANDLING
+                # Apply the update anyway to keep the book moving
                 gap_size = new_ver - last_ver - 1
-                self.logger().debug(
+                
+                # Log at debug level to avoid spam, unless gap is huge
+                log_level = self.logger().warning if gap_size > 10 else self.logger().debug
+                log_level(
                     f"BitMart {trading_pair}: Version gap detected in {update_type} update! "
                     f"Expected v{last_ver + 1}, got v{new_ver} (gap of {gap_size}). "
                     f"Applying update anyway, requesting snapshot for correction."
                 )
                 
-                # Request snapshot in background to correct any gaps, but DON'T wait for it
-                # Only request if we're not already waiting for one
-                if not self._waiting_for_snapshot.get(trading_pair, False):
-                    # Fire-and-forget snapshot request (background task)
-                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-                
-                # CRITICAL: Still apply this update to keep orderbook moving
-                # The snapshot will correct any accumulated errors when it arrives
+                # Request snapshot in background to correct specific levels
+                # Fire-and-forget, do NOT set _waiting_for_snapshot (which would block updates)
+                asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
             
-            # Build and emit DIFF for actual updates (includes one-sided updates)
+            # Build and emit DIFF for actual updates
             timestamp: float = int(ms_t) * 1e-3
             update_id: int = int(ms_t)
             order_book_message_content = {
@@ -348,16 +310,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 order_book_message_content,
                 timestamp)
             
-            # Log one-sided updates for debugging
-            if update_type != "two-sided":
-                self.logger().debug(
-                    f"BitMart {trading_pair}: Applying {update_type} diff v{last_ver}→v{new_ver} "
-                    f"({len(bids_list)} bids, {len(asks_list)} asks)"
-                )
-            
             # Advance version (skip if already set during baseline establishment)
             if not skip_version_checks:
                 self._last_depth_version[trading_pair] = new_ver
+                
             message_queue.put_nowait(diff_message)
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
@@ -689,16 +645,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Detect symbols whose depth stream has stalled and take corrective action.
         Called periodically from main loop's watchdog check.
-        
-        This method detects three types of staleness:
-        1. Complete staleness: No messages at all (original behavior)
-        2. One-sided staleness: Only bids OR asks updating (new detection)
-        3. Periodic refresh: Refresh snapshot every N minutes (preventive maintenance)
         """
         now = time.time()
         stale_pairs = []
-        one_sided_stale_pairs = []
-        periodic_refresh_pairs = []
         
         # Check all trading pairs for staleness
         for trading_pair in list(self._trading_pairs):
@@ -708,45 +657,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Check 1: Complete staleness (no messages at all)
             if last_any_ts > 0 and (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
                 stale_pairs.append(trading_pair)
-                continue  # Handle complete staleness first
-            
-            # Check 2: One-sided staleness (only for Depth-Increase with incremental updates)
-            if self._use_depth_increase and last_any_ts > 0:
-                last_bids_ts = float(self._last_bids_update_ts.get(trading_pair, 0.0) or 0.0)
-                last_asks_ts = float(self._last_asks_update_ts.get(trading_pair, 0.0) or 0.0)
-                
-                # If one side hasn't updated in 2x the staleness threshold while the other side is updating
-                if last_bids_ts > 0 and last_asks_ts > 0:
-                    bids_stale_duration = now - last_bids_ts
-                    asks_stale_duration = now - last_asks_ts
-                    
-                    # One side is stale while the other is fresh (received updates recently)
-                    if (asks_stale_duration >= self._DEPTH_STALENESS_SECONDS * 2 and 
-                        bids_stale_duration < self._DEPTH_STALENESS_SECONDS):
-                        one_sided_stale_pairs.append((trading_pair, "asks"))
-                        continue
-                    elif (bids_stale_duration >= self._DEPTH_STALENESS_SECONDS * 2 and 
-                          asks_stale_duration < self._DEPTH_STALENESS_SECONDS):
-                        one_sided_stale_pairs.append((trading_pair, "bids"))
-                        continue
-            
-            # Check 3: Periodic refresh (preventive maintenance for incremental depth)
-            if self._use_depth_increase:
-                last_snapshot_ts = float(self._last_snapshot_refresh_ts.get(trading_pair, 0.0) or 0.0)
-                if last_snapshot_ts > 0 and (now - last_snapshot_ts) >= self._PERIODIC_SNAPSHOT_REFRESH_SECONDS:
-                    periodic_refresh_pairs.append(trading_pair)
         
-        # Handle complete staleness (most critical)
-        if stale_pairs:
-            # If more than 50% of pairs are stale, it's a systematic issue - force full reconnect
-            if len(stale_pairs) > len(self._trading_pairs) // 2:
-                self.logger().warning(
-                    f"BitMart depth watchdog: {len(stale_pairs)}/{len(self._trading_pairs)} pairs stale "
-                    f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), forcing full reconnect"
-                )
-                raise ConnectionError("BitMart orderbook data stale for multiple pairs; forcing reconnect")
-            
-            # Try targeted recovery for individual stale pairs
+        # Handle complete staleness (only if not excessive)
+        # If >50% pairs are stale, let the main watchdog handle it as a broken connection
+        if stale_pairs and len(stale_pairs) <= len(self._trading_pairs) // 2:
             for trading_pair in stale_pairs:
                 try:
                     # Fast path: use cached trading_pair -> symbol mapping
@@ -754,101 +668,27 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     if symbol is None:
                         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                         self._pair_to_symbol_cache[trading_pair] = symbol
-                    depth_channel = (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
-                                     if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME)
-                    topic = f"{depth_channel}:{symbol}"
                     
                     last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
                     stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
+                    
+                    # Log warning but ONLY request snapshot (non-disruptive)
                     self.logger().warning(
                         f"BitMart {trading_pair}: No messages for {stale_duration}s "
-                        f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), attempting recovery"
+                        f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), requesting snapshot to provoke exchange"
                     )
                     
-                    # Unsubscribe (best-effort) then subscribe
-                    try:
-                        unsub = WSJSONRequest(payload={"op": "unsubscribe", "args": [topic]})
-                        async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                            await ws.send(unsub)
-                    except Exception:
-                        pass
-                    
-                    sub = WSJSONRequest(payload={"op": "subscribe", "args": [topic]})
-                    async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
-                        await ws.send(sub)
-                    
-                    # Mark that we're waiting for snapshot (diffs will be dropped until it arrives)
-                    self._waiting_for_snapshot[trading_pair] = True
-                    self._waiting_for_snapshot_since[trading_pair] = now
-                    
-                    # Refresh snapshot using WS request (Depth-Increase) or REST fallback
+                    # Do NOT set _waiting_for_snapshot (would filter updates)
+                    # Just fire the request; the response (snapshot) will update timestamps and clear staleness
                     await self._refresh_snapshot_for_pair(trading_pair, symbol)
                     
-                    # Reset staleness timer to avoid repeated attempts every check cycle
-                    # The snapshot response will update _last_any_message_ts when received
+                    # Reset staleness timer temporarily to avoid spamming requests
+                    # If real data comes in, it will overwrite this
                     self._last_any_message_ts[trading_pair] = now
                     
                 except Exception as e:
                     self.logger().warning(f"BitMart depth watchdog: failed to recover {trading_pair}: {e}")
-                    # If we can't send resubscribe (e.g., WS disconnected), force full reconnect
-                    raise ConnectionError(f"BitMart depth watchdog recovery failed; forcing reconnect")
-        
-        # Handle one-sided staleness (asks or bids stale while other side updates)
-        if one_sided_stale_pairs:
-            for trading_pair, stale_side in one_sided_stale_pairs:
-                try:
-                    # Fast path: use cached trading_pair -> symbol mapping
-                    symbol = self._pair_to_symbol_cache.get(trading_pair)
-                    if symbol is None:
-                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                        self._pair_to_symbol_cache[trading_pair] = symbol
-                    
-                    last_bids_ts = self._last_bids_update_ts.get(trading_pair, 0)
-                    last_asks_ts = self._last_asks_update_ts.get(trading_pair, 0)
-                    stale_duration = int(now - (last_asks_ts if stale_side == "asks" else last_bids_ts))
-                    
-                    #self.logger().warning(
-                    #    f"BitMart {trading_pair}: One-sided staleness detected - {stale_side} stale for {stale_duration}s "
-                    #    f"while {'bids' if stale_side == 'asks' else 'asks'} updating. Requesting snapshot (non-blocking)."
-                    #)
-                    
-                    # Don't need to resubscribe, just refresh snapshot to get both sides fresh
-                    # IMPORTANT: Don't block updates - request snapshot in background
-                    # The snapshot will fix any staleness when it arrives, but updates keep flowing
-                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-                    
-                except Exception as e:
-                    self.logger().warning(f"BitMart {trading_pair}: Failed to refresh snapshot for one-sided staleness: {e}")
-        
-        # Handle periodic refresh (preventive maintenance - defensive, not required by protocol)
-        # This is completely non-blocking: fire-and-forget background requests
-        if periodic_refresh_pairs:
-            # Limit number of refreshes per cycle to avoid bursts
-            refresh_batch = periodic_refresh_pairs[:5]  # Max 5 per cycle
-            for trading_pair in refresh_batch:
-                try:
-                    # Fast path: use cached trading_pair -> symbol mapping
-                    symbol = self._pair_to_symbol_cache.get(trading_pair)
-                    if symbol is None:
-                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                        self._pair_to_symbol_cache[trading_pair] = symbol
-                    
-                    last_snapshot_ts = self._last_snapshot_refresh_ts.get(trading_pair, 0)
-                    elapsed = int(now - last_snapshot_ts) if last_snapshot_ts > 0 else 0
-                    
-                    # DEBUG only - no need to spam logs for routine maintenance
-                    self.logger().debug(
-                        f"BitMart {trading_pair}: Periodic snapshot refresh ({elapsed}s since last refresh)"
-                    )
-                    
-                    # CRITICAL: Don't set _waiting_for_snapshot - this would block updates!
-                    # Just fire-and-forget the snapshot request in background
-                    # The snapshot will arrive and update the orderbook without blocking live updates
-                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-                    
-                except Exception as e:
-                    # Silence errors - periodic refresh is optional defensive measure
-                    pass
+
 
     async def listen_for_subscriptions(self):
         """

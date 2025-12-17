@@ -27,7 +27,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     """
     cdef:
         # Core configuration
-        list _market_pairs
+        public list _market_pairs
         double _min_profitability
         int64_t _logging_options
         

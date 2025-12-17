@@ -81,7 +81,7 @@ class HummingbotCompleter(Completer):
         self._control_completer = WordCompleter([
             "list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
             "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set",
-            "add_market", "remove_market"
+            "add_market", "remove_market", "create"
         ], ignore_case=True)
         self._control_set_completer = WordCompleter([
             "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval", "min_profitability"

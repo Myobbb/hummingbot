@@ -181,11 +181,33 @@ class StrategyControlCommand:
                 return
             market_spec = value[0] if isinstance(value, list) else str(value)
             safe_ensure_future(self._control_remove_market(identifier, market_spec), loop=self.ev_loop)
+        elif action == "create":
+            # Format: control create <name> <primary_exchange:pair> <secondary_exchange:pair> [options]
+            # identifier = name, value = [primary_spec, secondary_spec, ...]
+            if identifier is None or value is None or len(value) < 2:
+                self.notify("Error: Missing required arguments for create")
+                self.notify("Usage: control create <name> <primary_exchange:PAIR> <secondary_exchange:PAIR>")
+                self.notify("Example: control create arb_bsx_new gate:BSX-USDT kucoin:BSX-USDT")
+                return
+            # Check if create capability exists
+            if not hasattr(strategy, 'create_strategy'):
+                self.notify("The current strategy does not support runtime strategy creation.")
+                return
+            primary_spec = value[0]
+            secondary_spec = value[1]
+            # Parse optional min_profitability if provided (e.g., "2.0" as third arg)
+            min_profitability = 1.5
+            if len(value) > 2:
+                try:
+                    min_profitability = float(value[2])
+                except ValueError:
+                    pass  # Keep default
+            safe_ensure_future(self._control_create(identifier, primary_spec, secondary_spec, min_profitability), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
             self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
                        "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set, "
-                       "add_market, remove_market")
+                       "add_market, remove_market, create")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -675,3 +697,35 @@ class StrategyControlCommand:
         except Exception as e:
             self.notify(f"Error removing market: {e}")
             self.logger().error(f"Error in control remove_market: {e}", exc_info=True)
+
+    async def _control_create(self,  # type: HummingbotApplication
+                              name: str,
+                              primary_spec: str,
+                              secondary_spec: str,
+                              min_profitability: float = 1.5):
+        """Create a new arbitrage strategy at runtime."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.create_strategy(
+                name=name,
+                primary_spec=primary_spec,
+                secondary_spec=secondary_spec,
+                min_profitability=min_profitability,
+                paused=True  # Always start paused for safety
+            )
+
+            if success:
+                self.notify(f"\n✓ Strategy '{name}' created successfully (PAUSED)")
+                self.notify(f"  Primary: {primary_spec}, Secondary: {secondary_spec}")
+                self.notify(f"  Min profitability: {min_profitability}%")
+                self.notify("  Use 'control resume <name>' to start trading")
+            else:
+                self.notify(f"\n✗ Failed to create strategy '{name}'")
+                self.notify("  Check logs for details. Possible issues:")
+                self.notify("  - Strategy name already exists")
+                self.notify("  - Exchange not available in connector pool")
+                self.notify("  - Invalid exchange:PAIR format")
+
+        except Exception as e:
+            self.notify(f"Error creating strategy: {e}")
+            self.logger().error(f"Error in control create: {e}", exc_info=True)
