@@ -81,9 +81,9 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Track last per-symbol update time (diff or snapshot) to detect staleness (Bybit symbol-specific)
         self._symbol_last_update_time: Dict[str, float] = {}
         # Minimum inactivity before a resnapshot is attempted (seconds)
-        # Bybit spot L50 pushes every 20ms, so 60s of silence is definitely stale
-        # FIXED: Reduced from 180s to 60s for faster recovery
-        self._per_pair_stale_threshold: float = 60.0
+        # Bybit spot L50 pushes every 20ms, so prolonged silence indicates staleness
+        # Set to 5 minutes - re-subscribe and reconnect logic is robust
+        self._per_pair_stale_threshold: float = 300.0
         # Cooldown between topic resubscriptions per symbol (seconds)
         self._symbol_last_resubscribe_time: Dict[str, float] = {}
         self._per_pair_resubscribe_cooldown: float = 30.0
@@ -774,7 +774,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             # Throttled warning if pair has had no orderbook updates for a while
             idle = now - last_ts
-            if idle >= 60.0:  # warn after 60s of silence
+            if idle >= 180.0:  # warn after 3 mins of silence (before staleness threshold)
                 last_warn = self._symbol_last_warn_time.get(symbol or trading_pair, 0)
                 if (now - last_warn) >= 60.0:
                     try:
@@ -782,7 +782,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except Exception:
                         pass
                     self._symbol_last_warn_time[symbol or trading_pair] = now
-            # Stage 1: Moderate staleness (60s-180s) - try topic re-subscribe
+            # Stage 1: Moderate staleness (5-15 min) - try topic re-subscribe
             if (now - last_ts) >= self._per_pair_stale_threshold and (now - last_ts) < 3 * self._per_pair_stale_threshold:
                 # Always attempt topic re-subscribe first (favor WS stream continuity)
                 try:
