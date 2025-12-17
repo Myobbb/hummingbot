@@ -11,6 +11,7 @@ from hummingbot.connector.exchange.bybit.bybit_order_book import BybitOrderBook
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
+from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -830,7 +831,51 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # Fallback lookup (infrequent path)
                     trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                         symbol=data["s"])
-                # Prefer engine time (cts) when present on WS snapshot; fall back to frame ts
+
+                # CRITICAL: u=1 indicates Bybit service restart (per API docs)
+                # "Occasionally, you'll receive u=1, which is a snapshot data due to the restart
+                # of the service. So please overwrite your local orderbook."
+                #
+                # Problem: The tracker's restore_from_snapshot_and_diffs() replays buffered diffs
+                # after applying snapshot. With u=1, those old diffs are from the previous sequence
+                # and would corrupt the new book.
+                #
+                # Solution: Apply snapshot directly to OrderBook, bypassing the tracker's diff replay.
+                if u == 1:
+                    try:
+                        order_books = getattr(self._connector, 'order_books', None)
+                        if order_books and trading_pair in order_books:
+                            order_book = order_books[trading_pair]
+                            # Convert Bybit format [[price, qty], ...] to OrderBookRow
+                            bids = [
+                                OrderBookRow(float(entry[0]), float(entry[1]), u)
+                                for entry in (data.get("b") or [])
+                            ]
+                            asks = [
+                                OrderBookRow(float(entry[0]), float(entry[1]), u)
+                                for entry in (data.get("a") or [])
+                            ]
+                            # Apply directly - bypasses tracker's restore_from_snapshot_and_diffs
+                            order_book.apply_snapshot(bids, asks, u)
+                            self.logger().warning(
+                                f"Bybit service restart detected (u=1) for {trading_pair} ({symbol}). "
+                                f"Applied snapshot directly with {len(bids)} bids, {len(asks)} asks."
+                            )
+                            count += 1
+                            continue  # Skip putting in snapshot_queue
+                        else:
+                            # OrderBook not yet initialized, fall through to normal flow
+                            self.logger().warning(
+                                f"Bybit u=1 snapshot for {trading_pair} but OrderBook not ready, using normal flow"
+                            )
+                    except Exception as e:
+                        # If direct apply fails, fall through to normal flow
+                        self.logger().warning(
+                            f"Failed to directly apply u=1 snapshot for {trading_pair}: {e}, using normal flow"
+                        )
+
+                # Normal snapshot handling - goes through tracker's restore_from_snapshot_and_diffs
+                # This is fine for initial snapshots (no stale diffs in buffer) and regular snapshots
                 ts_ms_ws = data.get("cts") or json_msg.get("ts") or data.get("ts")
                 order_book_message: OrderBookMessage = BybitOrderBook.snapshot_message_from_exchange_websocket(
                     data, (float(ts_ms_ws) * 1e-3) if ts_ms_ws is not None else self._time(), {"trading_pair": trading_pair})
