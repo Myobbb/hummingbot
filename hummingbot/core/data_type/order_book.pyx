@@ -194,6 +194,27 @@ cdef class OrderBook(PubSub):
             cpp_asks.push_back(OrderBookEntry(row.price, row.amount, row.update_id))
         self.c_apply_diffs(cpp_bids, cpp_asks, update_id)
 
+    def apply_diffs_raw(self, bids: list, asks: list, update_id: int):
+        """
+        Optimized diff application that accepts raw bid/ask tuples directly from WS messages.
+        Bypasses OrderBookRow creation for significantly reduced allocation overhead.
+        Each bid/ask should be a tuple/list of (price, amount, ...) where price/amount are strings or numbers.
+        """
+        cdef:
+            vector[OrderBookEntry] cpp_bids
+            vector[OrderBookEntry] cpp_asks
+            double price
+            double amount
+        for item in bids:
+            price = float(item[0])
+            amount = float(item[1])
+            cpp_bids.push_back(OrderBookEntry(price, amount, update_id))
+        for item in asks:
+            price = float(item[0])
+            amount = float(item[1])
+            cpp_asks.push_back(OrderBookEntry(price, amount, update_id))
+        self.c_apply_diffs(cpp_bids, cpp_asks, update_id)
+
     def apply_snapshot(self, bids: List[OrderBookRow], asks: List[OrderBookRow], update_id: int):
         cdef:
             vector[OrderBookEntry] cpp_bids
@@ -202,6 +223,26 @@ cdef class OrderBook(PubSub):
             cpp_bids.push_back(OrderBookEntry(row.price, row.amount, row.update_id))
         for row in asks:
             cpp_asks.push_back(OrderBookEntry(row.price, row.amount, row.update_id))
+        self.c_apply_snapshot(cpp_bids, cpp_asks, update_id)
+
+    def apply_snapshot_raw(self, bids: list, asks: list, update_id: int):
+        """
+        Optimized snapshot application that accepts raw bid/ask tuples directly.
+        Bypasses OrderBookRow creation for significantly reduced allocation overhead.
+        """
+        cdef:
+            vector[OrderBookEntry] cpp_bids
+            vector[OrderBookEntry] cpp_asks
+            double price
+            double amount
+        for item in bids:
+            price = float(item[0])
+            amount = float(item[1])
+            cpp_bids.push_back(OrderBookEntry(price, amount, update_id))
+        for item in asks:
+            price = float(item[0])
+            amount = float(item[1])
+            cpp_asks.push_back(OrderBookEntry(price, amount, update_id))
         self.c_apply_snapshot(cpp_bids, cpp_asks, update_id)
 
     def apply_trade(self, trade: OrderBookTradeEvent):

@@ -330,7 +330,13 @@ class OrderBookTracker:
                     message = await message_queue.get()
 
                 if message.type is OrderBookMessageType.DIFF:
-                    order_book.apply_diffs(message.bids, message.asks, message.update_id)
+                    # Use optimized raw method if available (bypasses OrderBookRow allocation)
+                    raw_bids = message.content.get("bids")
+                    raw_asks = message.content.get("asks")
+                    if raw_bids is not None and raw_asks is not None and hasattr(order_book, 'apply_diffs_raw'):
+                        order_book.apply_diffs_raw(raw_bids, raw_asks, message.update_id)
+                    else:
+                        order_book.apply_diffs(message.bids, message.asks, message.update_id)
                     past_diffs_window.append(message)
                     diff_messages_accepted += 1
 
