@@ -61,7 +61,11 @@ async def main():
     ping_count = 0
     pong_count = 0
     
-    async with aiohttp.ClientSession() as session:
+    # Use SOCKS5 proxy on port 1080 for proper WebSocket tunnel support
+    from aiohttp_socks import ProxyConnector
+    connector = ProxyConnector.from_url('socks5://127.0.0.1:1080')
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         # EXACT parameters from WSConnection.connect() when ping_timeout=None
         async with session.ws_connect(
             WSS_PUBLIC_URL,

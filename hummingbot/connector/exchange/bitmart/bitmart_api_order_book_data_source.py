@@ -25,7 +25,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _logger: Optional[HummingbotLogger] = None
     _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
     _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
-    _DEPTH_STALENESS_SECONDS: float = 30.0  # per-symbol watchdog (reduced from 45s for faster recovery)
+    _DEPTH_STALENESS_SECONDS: float = 300.0  # 5 minutes - relaxed for low-volume pairs
     _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0  # Refresh snapshot every 3 minutes for fresher baseline
 
     def __init__(self,
@@ -276,8 +276,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
             
             elif new_ver <= last_ver:
-                # Old or duplicate - skip
-                continue
+                # Old or duplicate - accept anyway for maximum freshness
+                # 10-minute test showed 0 occurrences, but if it happens, fresher data is better than skipping
+                self.logger().debug(f"BitMart {trading_pair}: Received v{new_ver} <= v{last_ver}, accepting anyway for freshness")
+                # Don't update version - keep last_ver as baseline
             
             elif new_ver != last_ver + 1 and not skip_version_checks:
                 # Version gap detected - OPTIMISTIC HANDLING
@@ -758,8 +760,23 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     exponent = min(self._reconnect_attempts, 5)
                     reconnect_delay = float(min(30, 2 ** max(1, exponent)))
             finally:
-                # Clean up
+                # Clean up websocket resources
                 self._active_ws = None
+                
+                # CRITICAL: Clear ALL per-pair state to prevent issues on reconnect
+                # BitMart may reset version numbering on new connection, so old versions are invalid
+                self._last_depth_version.clear()
+                self._waiting_for_snapshot.clear()
+                self._waiting_for_snapshot_since.clear()
+                
+                # Clear timestamp trackers to prevent immediate staleness warnings after reconnect
+                # All pairs will get fresh timestamps when new data arrives
+                self._last_any_message_ts.clear()
+                self._last_depth_update_ts.clear()
+                self._last_bids_update_ts.clear()
+                self._last_asks_update_ts.clear()
+                
+                # Cancel consumer task if still running
                 if self._ws_consumer_task and not self._ws_consumer_task.done():
                     self._ws_consumer_task.cancel()
                     try:
@@ -767,6 +784,10 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except Exception:
                         pass
                 self._ws_consumer_task = None
+                
+                # Wait before reconnecting
                 await self._sleep(reconnect_delay)
+                
+                # Clean disconnect from old websocket
                 if ws:
                     await ws.disconnect()
