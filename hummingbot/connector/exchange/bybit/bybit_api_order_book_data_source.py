@@ -206,11 +206,11 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
         symbol = raw_message.get("data", {}).get("s")
         u = raw_message.get("data", {}).get("u")
+        # OPTIMISTIC APPROACH: Accept all WS diffs, no sequence-based rejection
+        # Bybit's WS stream is authoritative - trust it to send correct updates
+        # We only track sequence for staleness detection, not for rejection
         if symbol is not None and isinstance(u, int):
-            last_u = self._last_applied_u_by_symbol.get(symbol, -1)
-            if u <= last_u:
-                return  # stale/duplicate; drop silently
-        
+            # Track latest u for staleness monitoring only (not for rejection)
             self._last_applied_u_by_symbol[symbol] = u
             self._symbol_last_update_time[symbol] = self._time()
             self._symbol_drop_count[symbol] = 0
@@ -300,16 +300,12 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except asyncio.QueueEmpty:
                         break
 
-                # 3) process batch; skip only if not newer than flushed
+                # 3) process batch - OPTIMISTIC: process all messages, no sequence-based rejection
                 processed = 0
                 slice_start = self._time()
                 for diff_event in batch:
-                    data = diff_event.get("data") or {}
-                    sym = data.get("s")
-                    if sym in flushed_symbols:
-                        u = data.get("u")
-                        if isinstance(u, int) and u <= flushed_u_by_symbol.get(sym, 0):
-                            continue  # older-or-equal than what we just applied
+                    # OPTIMISTIC: Process all diffs without sequence filtering
+                    # Trust Bybit's WS stream to send correct updates
                     await self._parse_order_book_diff_message(raw_message=diff_event, message_queue=output)
                     processed += 1
                     # cooperative yield during large batch processing

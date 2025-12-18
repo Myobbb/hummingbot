@@ -266,9 +266,13 @@ class OrderBookTracker:
                 # Check the order book's initial update ID. If it's larger, don't bother.
                 order_book: OrderBook = self._order_books[trading_pair]
 
+                # OPTIMISTIC: Route message even if sequence seems stale
+                # Hard rejection caused orderbook freezes when sequences got misaligned
+                # Trust the exchange WS stream and apply updates optimistically
                 if order_book.snapshot_uid > ob_message.update_id:
                     messages_rejected += 1
-                    continue
+                    # Still route the message - let OrderBook handle it
+                    # The exchange stream is authoritative
                 await message_queue.put(ob_message)
                 messages_accepted += 1
 
