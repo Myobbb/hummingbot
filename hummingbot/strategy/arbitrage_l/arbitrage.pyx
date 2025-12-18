@@ -51,6 +51,7 @@ cdef:
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
+    double PARTIAL_FILL_COOLOFF = 5.0  # Cooldown for orders with partial fills
     # NOTE: AGGRESSIVE_REFRESH_INTERVAL is defined in position_balancer_handler.pyx (5.0s default)
 
 cdef class ArbitrageLStrategy(StrategyBase):
@@ -1088,26 +1089,37 @@ cdef class ArbitrageLStrategy(StrategyBase):
         buy_market_tuple = market_tuples[0]
         sell_market_tuple = market_tuples[1]
 
-        # Check buy market: block only if it has pending BUY orders without fills
-        # OPTIMIZATION: Removed redundant len() > 0 check - truthiness is sufficient
+        # Check buy market: block if it has pending BUY orders that are either:
+        # 1. Unfilled
+        # 2. Partially filled within the PARTIAL_FILL_COOLOFF window
         try:
             pending_buys = self._pending_buy_orders_by_market.get(buy_market_tuple)
             if pending_buys:
-                # Check if ANY pending buy lacks fills (fast rejection)
                 for order_id in pending_buys:
                     if order_id not in self._orders_with_fills:
-                        return False  # Block: buy market has unfilled buy order
+                        return False  # Block: unfilled order
+                    
+                    # Partially filled order: check cooldown
+                    fill_timestamp = self._order_fill_timestamps.get(order_id, 0.0)
+                    if self._current_timestamp - fill_timestamp < PARTIAL_FILL_COOLOFF:
+                        return False  # Block: recently partial-filled order
         except Exception:
             pass
 
-        # Check sell market: block only if it has pending SELL orders without fills
+        # Check sell market: block if it has pending SELL orders that are either:
+        # 1. Unfilled
+        # 2. Partially filled within the PARTIAL_FILL_COOLOFF window
         try:
             pending_sells = self._pending_sell_orders_by_market.get(sell_market_tuple)
             if pending_sells:
-                # Check if ANY pending sell lacks fills (fast rejection)
                 for order_id in pending_sells:
                     if order_id not in self._orders_with_fills:
-                        return False  # Block: sell market has unfilled sell order
+                        return False  # Block: unfilled order
+
+                    # Partially filled order: check cooldown
+                    fill_timestamp = self._order_fill_timestamps.get(order_id, 0.0)
+                    if self._current_timestamp - fill_timestamp < PARTIAL_FILL_COOLOFF:
+                        return False  # Block: recently partial-filled order
         except Exception:
             pass
 
