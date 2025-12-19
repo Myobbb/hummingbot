@@ -433,7 +433,7 @@ class MexcExchange(ExchangePyBase):
         client_order_id = str(order_status["d"].get("c", ""))
         order_update = OrderUpdate(
             trading_pair=order.trading_pair,
-            update_timestamp=int(order_status["t"] * 1e-3),
+            update_timestamp=order_status["t"] * 1e-3,
             new_state=CONSTANTS.WS_ORDER_STATE[order_status["d"]["s"]],
             client_order_id=client_order_id,
             exchange_order_id=str(order_status["d"]["i"]),

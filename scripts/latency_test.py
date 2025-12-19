@@ -13,6 +13,7 @@ Usage:
 """
 
 import csv
+import math
 import os
 import time
 from decimal import Decimal
@@ -325,6 +326,24 @@ class LatencyTest(ScriptStrategyBase):
             exchange_ts_ms = event.creation_timestamp * 1000
             one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
             
+            # VALIDATION: Detect second-precision timestamps (lack of millisecond precision)
+            # If fractional milliseconds are < 1, the exchange timestamp was likely in seconds-only
+            fractional_ms = exchange_ts_ms % 1000
+            has_ms_precision = fractional_ms >= 1  # True if there's actual ms precision
+            
+            if not has_ms_precision:
+                # Log warning once per exchange about low-precision timestamps
+                if not hasattr(self, '_low_precision_warned'):
+                    self._low_precision_warned = set()
+                if exchange not in self._low_precision_warned:
+                    self.logger().warning(
+                        f"{exchange}: Low-precision timestamp detected (seconds only). "
+                        f"One-way latency may be unreliable."
+                    )
+                    self._low_precision_warned.add(exchange)
+                # Mark as approximate with special value (use NaN for unreliable)
+                one_way_ms = float('nan')  # Indicates unreliable measurement
+            
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
             if exchange not in self.current_batch_one_way:
@@ -350,7 +369,11 @@ class LatencyTest(ScriptStrategyBase):
         summary_parts = []
         for ex, lat in sorted_latencies:
             one_way = self.current_batch_one_way.get(ex, 0)
-            summary_parts.append(f"{ex}:{lat}ms({one_way:.0f})")
+            # Handle NaN (unreliable) one-way measurements
+            if isinstance(one_way, float) and math.isnan(one_way):
+                summary_parts.append(f"{ex}:{lat}ms(N/A)")
+            else:
+                summary_parts.append(f"{ex}:{lat}ms({one_way:.0f})")
             
         summary = " | ".join(summary_parts)
         

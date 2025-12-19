@@ -421,7 +421,7 @@ class GateIoExchange(ExchangePyBase):
 
         order_update = OrderUpdate(
             trading_pair=order.trading_pair,
-            update_timestamp=int(order_status["update_time"]),
+            update_timestamp=order_status.get("update_time_ms", int(order_status["update_time"]) * 1000) * 1e-3,
             new_state=state,
             client_order_id=client_order_id,
             exchange_order_id=str(order_status["id"]),

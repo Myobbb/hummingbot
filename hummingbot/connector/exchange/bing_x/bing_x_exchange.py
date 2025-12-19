@@ -347,7 +347,7 @@ class BingXExchange(ExchangePyBase):
                             if new_state == OrderState.FILLED and tracked_order.current_state == OrderState.PENDING_CREATE:
                                 order_update = OrderUpdate(
                                     trading_pair=tracked_order.trading_pair,
-                                    update_timestamp=int(data["E"]) * 1e-3,
+                                    update_timestamp=data["E"] * 1e-3,
                                     new_state=OrderState.OPEN,
                                     client_order_id=tracked_order.client_order_id,
                                     exchange_order_id=str(data["i"]),
@@ -369,7 +369,7 @@ class BingXExchange(ExchangePyBase):
                                 fill_base_amount=Decimal(str(data["l"])),
                                 fill_quote_amount=Decimal(str(data["l"])) * Decimal(str(data["L"])),
                                 fill_price=Decimal(str(data["L"])),
-                                fill_timestamp=int(data["E"]) * 1e-3,
+                                fill_timestamp=data["E"] * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
 
@@ -382,7 +382,7 @@ class BingXExchange(ExchangePyBase):
 
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
-                            update_timestamp=int(data["E"]) * 1e-3,
+                            update_timestamp=data["E"] * 1e-3,
                             new_state=new_state,
                             client_order_id=tracked_order.client_order_id,
                             exchange_order_id=str(data["i"]),
@@ -464,7 +464,7 @@ class BingXExchange(ExchangePyBase):
                 client_order_id=tracked_order.client_order_id,
                 exchange_order_id=str(updated_order_data["data"]["orderId"]),
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=int(updated_order_data["data"]["updateTime"]) * 1e-3,
+                update_timestamp=updated_order_data["data"]["updateTime"] * 1e-3,
                 new_state=OrderState.OPEN,
             )
             # noinspection PyProtectedMember
@@ -474,7 +474,7 @@ class BingXExchange(ExchangePyBase):
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(updated_order_data["data"]["orderId"]),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=int(updated_order_data["data"]["updateTime"]) * 1e-3,
+            update_timestamp=updated_order_data["data"]["updateTime"] * 1e-3,
             new_state=new_state,
         )
 

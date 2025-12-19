@@ -289,13 +289,17 @@ class HtxExchange(ExchangePyBase):
         )
 
         if updated_order_data["status"] == "ok":
-            new_state = CONSTANTS.ORDER_STATE[updated_order_data["data"]["state"]]
+            order_data = updated_order_data["data"]
+            new_state = CONSTANTS.ORDER_STATE[order_data["state"]]
+            # Use exchange-provided timestamps (in ms): finished-at or created-at
+            exchange_ts_ms = order_data.get("finished-at") or order_data.get("created-at")
+            update_ts = exchange_ts_ms * 1e-3 if exchange_ts_ms else self.current_timestamp
 
             order_update = OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=self.current_timestamp,
+                update_timestamp=update_ts,
                 new_state=new_state,
             )
 
@@ -351,9 +355,12 @@ class HtxExchange(ExchangePyBase):
         order_status = msg.get("orderStatus")
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
+            # Use exchange-provided timestamps (in ms): lastActTime, orderCreateTime, or tradeTime
+            exchange_ts_ms = msg.get("lastActTime") or msg.get("orderCreateTime") or msg.get("tradeTime")
+            update_ts = exchange_ts_ms * 1e-3 if exchange_ts_ms else self.current_timestamp
             order_update = OrderUpdate(
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=self.current_timestamp,
+                update_timestamp=update_ts,
                 new_state=CONSTANTS.ORDER_STATE[order_status],
                 client_order_id=client_order_id,
             )
