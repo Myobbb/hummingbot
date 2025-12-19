@@ -144,6 +144,7 @@ class LatencyTest(ScriptStrategyBase):
         """Places test orders on all configured exchanges."""
         self.batch_count += 1
         self.current_batch_latencies = {}
+        self.current_batch_one_way = {}
         
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
@@ -219,10 +220,22 @@ class LatencyTest(ScriptStrategyBase):
             # 4. Network Response (RTT)
             latency_ms = created_ts - order_info["pre_send_ts"]
             
+            # One-Way Latency (Approximate due to Clock Skew)
+            # = Exchange TS - Local Send TS
+            exchange_ts = event.creation_timestamp * 1e3 # Convert to ms if needed, check format
+            # Note: hummingbot event timestamps are usually floats in seconds. 
+            # Scripts usually use ms for logging.
+            # event.creation_timestamp comes from connector which did * 1e-3. So it is strictly seconds.
+            # self.timestamp_now is milliseconds.
+            # So:
+            exchange_ts_ms = event.creation_timestamp * 1000
+            one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
+            
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
+            self.current_batch_one_way[exchange] = one_way_ms
             
-            self.save_to_csv(exchange, created_ts, event.order_id, OrderState.CREATED.name)
+            self.save_to_csv(exchange, created_ts, event.order_id, OrderState.CREATED.name, exchange_ts_ms)
             
             # Check if all orders for this batch have been confirmed
             if len(self.current_batch_latencies) == len(self.connectors):
@@ -236,8 +249,12 @@ class LatencyTest(ScriptStrategyBase):
         # Sort by latency (fastest first)
         sorted_latencies = sorted(self.current_batch_latencies.items(), key=lambda x: x[1])
         
-        # Format as: "exchange:XXms"
-        summary_parts = [f"{ex}:{lat}ms" for ex, lat in sorted_latencies]
+        # Format as: "exchange:RTT(OneWay)"
+        summary_parts = []
+        for ex, lat in sorted_latencies:
+            one_way = self.current_batch_one_way.get(ex, 0)
+            summary_parts.append(f"{ex}:{lat}ms({one_way:.0f})")
+            
         summary = " | ".join(summary_parts)
         
         # Calculate stats
@@ -247,7 +264,7 @@ class LatencyTest(ScriptStrategyBase):
         max_latency = max(latencies)
         
         self.logger().info(f"{'='*60}")
-        self.logger().info(f"BATCH #{self.batch_count} RESULTS (sorted by speed):")
+        self.logger().info(f"BATCH #{self.batch_count} RESULTS (RTT | One-Way):")
         self.logger().info(f"  {summary}")
         self.logger().info(f"  Min: {min_latency}ms | Avg: {avg_latency:.0f}ms | Max: {max_latency}ms")
         self.logger().info(f"{'='*60}")
@@ -266,15 +283,20 @@ class LatencyTest(ScriptStrategyBase):
             self.save_to_csv(exchange, canceled_ts, event.order_id, OrderState.CANCELED.name)
             del self.pending_orders[event.order_id]
     
-    def save_to_csv(self, exchange, timestamp, order_id, status):
+    def save_to_csv(self, exchange, timestamp, order_id, status, exchange_timestamp=0):
         """Appends the provided data to the CSV file."""
         filename = self.get_filename(exchange)
         file_exists = os.path.exists(filename)
         
         with open(filename, 'a', newline='') as csvfile:
-            fieldnames = ['Timestamp', 'Order_ID', 'Status']
+            fieldnames = ['Timestamp', 'Order_ID', 'Status', 'Exchange_Timestamp']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if not file_exists:
                 writer.writeheader()
             
-            writer.writerow({'Timestamp': timestamp, 'Order_ID': order_id, 'Status': status})
+            writer.writerow({
+                'Timestamp': timestamp, 
+                'Order_ID': order_id, 
+                'Status': status,
+                'Exchange_Timestamp': exchange_timestamp
+            })
