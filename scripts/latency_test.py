@@ -8,8 +8,7 @@ Inspired by: https://github.com/supervik/crypto-exchanges-latencies-test
 
 Usage:
     1. Configure API keys for target exchanges in Hummingbot
-    2. Comment out exchanges you don't have configured in the markets dict
-    3. Run: start --script latency_test.py
+    2. Run: start --script latency_test.py --conf conf/latency_test.yml
 """
 
 import csv
@@ -18,7 +17,7 @@ import os
 import time
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 
 from pydantic import Field
 
@@ -33,6 +32,10 @@ from hummingbot.core.event.events import (
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
+# Type alias for markets dict (same as orchestrator)
+MarketDict = Dict[str, Set[str]]
+
+
 class OrderState(Enum):
     PENDING_CREATE = 0
     CREATED = 1
@@ -41,19 +44,22 @@ class OrderState(Enum):
 
 
 class LatencyTestConfig(BaseClientModel):
-    """Configuration for latency test - uses config-based init_markets pattern"""
-    script_file_name: str = os.path.basename(__file__)
-    trading_pair: str = Field(default="BTC-USDT", description="Trading pair to test")
+    """Configuration for latency test"""
+    script_file_name: str = "latency_test.py"
+    
+    # Markets to test - same format as orchestrator
+    markets: MarketDict = Field(
+        default_factory=dict,
+        description="Markets to test: {'bybit': {'BTC-USDT'}, 'mexc': {'BTC-USDT'}}"
+    )
+    
+    # Order parameters
     order_price: Decimal = Field(default=Decimal("69420"), description="Unfillable order price")
-    order_amount: Decimal = Field(default=Decimal("0.0004"), description="Order amount")
+    order_amount: Decimal = Field(default=Decimal("0.0004"), description="Order amount in base")
+    
+    # Timing configuration
     create_interval: int = Field(default=60, description="Interval between test cycles (seconds)")
     delay: int = Field(default=5, description="Delay before canceling orders (seconds)")
-    
-    # Exchanges to test - all enabled by default, comment out in config YAML to disable
-    exchanges: str = Field(
-        default="bybit,kucoin,gate_io,mexc,htx,bitmart,bing_x,okx,bitget",
-        description="Comma-separated list of exchanges to test"
-    )
 
 
 class LatencyTest(ScriptStrategyBase):
@@ -68,17 +74,15 @@ class LatencyTest(ScriptStrategyBase):
     
     @classmethod
     def init_markets(cls, config: LatencyTestConfig):
-        """Initialize markets from config - ensures proper connector initialization"""
-        markets: Dict[str, Set[str]] = {}
-        for exchange in config.exchanges.split(","):
-            exchange = exchange.strip()
-            if exchange:
-                markets[exchange] = {config.trading_pair}
-        cls.markets = markets
+        """Initialize markets from config - same pattern as orchestrator"""
+        cls.markets = config.markets
     
     def __init__(self, connectors: Dict[str, ConnectorBase], config: LatencyTestConfig):
         super().__init__(connectors, config)
         self.config = config
+        
+        # Extract trading pair from first market (all should be same pair)
+        self.trading_pair = next(iter(next(iter(config.markets.values()))))
         
         # Runtime state
         self.create_timestamp: float = 0
@@ -90,6 +94,8 @@ class LatencyTest(ScriptStrategyBase):
         self.batch_count: int = 0
         
         self.csv_file_id: str = "latency_test"
+        
+        self.logger().info(f"LatencyTest initialized with markets: {list(config.markets.keys())}")
     
     @property
     def timestamp_now(self):
@@ -150,8 +156,8 @@ class LatencyTest(ScriptStrategyBase):
         connector = self.connectors[connector_name]
         
         # Quantize amount to exchange's requirements
-        amount = connector.quantize_order_amount(self.config.trading_pair, self.config.order_amount)
-        price = connector.quantize_order_price(self.config.trading_pair, self.config.order_price)
+        amount = connector.quantize_order_amount(self.trading_pair, self.config.order_amount)
+        price = connector.quantize_order_price(self.trading_pair, self.config.order_price)
         
         if amount <= 0:
             self.logger().warning(f"{connector_name}: Order amount too small after quantization")
@@ -161,7 +167,7 @@ class LatencyTest(ScriptStrategyBase):
         time_before_order_sent = self.timestamp_now
         
         # Place limit buy order
-        order_id = self.buy(connector_name, self.config.trading_pair, amount, OrderType.LIMIT, price)
+        order_id = self.buy(connector_name, self.trading_pair, amount, OrderType.LIMIT, price)
         
         # Track the order
         self.pending_orders[order_id] = {
