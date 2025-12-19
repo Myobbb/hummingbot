@@ -40,6 +40,9 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ws_manager = MexcWebsocketSubscriptionManager(api_factory, domain)
         self._ws_manager.set_connector(connector)
         self._active_connections: List[WSConnectionInfo] = []
+        
+        # Symbol cache for hot path optimization (avoid async lookups per message)
+        self._symbol_to_pair_cache: Dict[str, str] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -76,6 +79,11 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         The ws parameter is ignored since we manage our own connections.
         """
         try:
+            # Pre-populate symbol cache for hot path optimization
+            for trading_pair in self._trading_pairs:
+                ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                self._symbol_to_pair_cache[ex_symbol] = trading_pair
+            
             # Use the subscription manager to handle multiple connections
             self._active_connections = await self._ws_manager.subscribe_to_pairs(self._trading_pairs)
             
@@ -206,7 +214,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if isinstance(raw_message, dict) and "code" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message.get("s", ""))
+            ex_symbol = raw_message.get("s", "")
+            # Use cache for O(1) lookup, fallback to async if not cached
+            trading_pair = self._symbol_to_pair_cache.get(ex_symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+                self._symbol_to_pair_cache[ex_symbol] = trading_pair
             for single_msg in raw_message.get('d', {}).get('deals', []):
                 trade_message = MexcOrderBook.trade_message_from_exchange(
                     single_msg, timestamp=raw_message.get('t'), metadata={"trading_pair": trading_pair})
@@ -214,7 +227,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if isinstance(raw_message, dict) and "code" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message.get("s", ""))
+            ex_symbol = raw_message.get("s", "")
+            # Use cache for O(1) lookup, fallback to async if not cached
+            trading_pair = self._symbol_to_pair_cache.get(ex_symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+                self._symbol_to_pair_cache[ex_symbol] = trading_pair
             order_book_message: OrderBookMessage = MexcOrderBook.diff_message_from_exchange(
                 raw_message, raw_message.get('t'), {"trading_pair": trading_pair})
             message_queue.put_nowait(order_book_message)

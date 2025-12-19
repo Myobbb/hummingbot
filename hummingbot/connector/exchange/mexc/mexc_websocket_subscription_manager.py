@@ -162,7 +162,7 @@ class MexcWebsocketSubscriptionManager:
         
         # Create subscription strings
         trade_subscription = f"spot@public.aggre.deals.v3.api.pb@10ms@{symbol}"
-        depth_subscription = f"spot@public.aggre.depth.v3.api.pb@100ms@{symbol}"
+        depth_subscription = f"spot@public.aggre.depth.v3.api.pb@10ms@{symbol}"
         
         # Add to connection
         connection.trade_subscriptions.append(trade_subscription)
