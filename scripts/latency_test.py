@@ -148,11 +148,19 @@ class LatencyTest(ScriptStrategyBase):
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
         
+        # Log start of dispatch
+        dispatch_start = time.perf_counter()
+        
         for connector_name in self.connectors:
             try:
                 self.place_order(connector_name)
             except Exception as e:
                 self.logger().error(f"Error placing order on {connector_name}: {e}")
+        
+        # Log end of dispatch to prove parallel scheduling
+        dispatch_duration = (time.perf_counter() - dispatch_start) * 1000
+        self.logger().info(f"Batch dispatched to {len(self.connectors)} exchanges in {dispatch_duration:.2f}ms")
+        self.logger().info(f"(Orders are executed asynchronously/parallel - dispatch time is purely local scheduling overhead)")
     
     def place_order(self, connector_name):
         """Places a single test order on an exchange."""
@@ -178,9 +186,11 @@ class LatencyTest(ScriptStrategyBase):
             return
         
         # Record pre-send timestamp
+        # Metric: End-to-End Latency (Bot Decision -> Exchange ACK -> Bot Confirmation)
         time_before_order_sent = self.timestamp_now
         
         # Place limit buy order
+        # Note: self.buy() is non-blocking (returns immediately after scheduling task)
         order_id = self.buy(connector_name, trading_pair, amount, OrderType.LIMIT, price)
         
         # Track the order
@@ -194,11 +204,19 @@ class LatencyTest(ScriptStrategyBase):
     
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         """Logs the post-transmission timestamp when a buy order is created."""
+        # Capture time immediately upon receiving event (Exchange ACK)
         created_ts = self.timestamp_now
         
         if event.order_id in self.pending_orders:
             order_info = self.pending_orders[event.order_id]
             exchange = order_info["exchange"]
+            
+            # Latency = (Time Event Received) - (Time Order Sent)
+            # This captures:
+            # 1. Internal Scheduling
+            # 2. Network Request (RTT)
+            # 3. Exchange Processing
+            # 4. Network Response (RTT)
             latency_ms = created_ts - order_info["pre_send_ts"]
             
             # Track for batch summary
