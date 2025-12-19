@@ -376,7 +376,7 @@ class OrderBookTracker:
                     if int(now / 60.0) > int(last_message_timestamp / 60.0):
                         # Check queue depth only during periodic logging (not every message)
                         queue_size = message_queue.qsize()
-                        if queue_size > 10 and now - last_queue_warning_ts > 60.0:
+                        if queue_size > 5 and now - last_queue_warning_ts > 60.0:
                             self.logger().warning(
                                 f"Orderbook queue for {trading_pair} backed up: {queue_size} pending"
                             )

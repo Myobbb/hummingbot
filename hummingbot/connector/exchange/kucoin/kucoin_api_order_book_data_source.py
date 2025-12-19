@@ -31,6 +31,9 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._last_ws_message_sent_timestamp = 0
         self._ping_interval = 0
+        
+        # Symbol cache for hot path optimization (avoid async lookups per message)
+        self._symbol_to_pair_cache: Dict[str, str] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -80,7 +83,14 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         trade_data: Dict[str, Any] = raw_message["data"]
         timestamp: float = int(trade_data["time"]) * 1e-9
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=trade_data["symbol"])
+        
+        # Use cache for O(1) lookup, fallback to async if not cached
+        ex_symbol = trade_data["symbol"]
+        trading_pair = self._symbol_to_pair_cache.get(ex_symbol)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+            self._symbol_to_pair_cache[ex_symbol] = trading_pair
+        
         message_content = {
             "trade_id": trade_data["tradeId"],
             "update_id": trade_data["sequence"],
@@ -98,11 +108,17 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        diff_data: [str, Any] = raw_message["data"]
-        timestamp: float = self._time()
+        diff_data: Dict[str, Any] = raw_message["data"]
+        # Use exchange timestamp (milliseconds) for accurate latency tracking
+        timestamp: float = float(diff_data.get("time", self._time() * 1000)) * 1e-3
         update_id: int = diff_data["sequenceEnd"]
 
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=diff_data["symbol"])
+        # Use cache for O(1) lookup, fallback to async if not cached
+        ex_symbol = diff_data["symbol"]
+        trading_pair = self._symbol_to_pair_cache.get(ex_symbol)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+            self._symbol_to_pair_cache[ex_symbol] = trading_pair
 
         order_book_message_content = {
             "trading_pair": trading_pair,
@@ -120,8 +136,14 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
-            symbols = ",".join([await self._connector.exchange_symbol_associated_to_pair(trading_pair=pair)
-                                for pair in self._trading_pairs])
+            # Pre-populate symbol cache for hot path optimization
+            symbol_list = []
+            for trading_pair in self._trading_pairs:
+                ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                self._symbol_to_pair_cache[ex_symbol] = trading_pair
+                symbol_list.append(ex_symbol)
+            
+            symbols = ",".join(symbol_list)
 
             trades_payload = {
                 "id": web_utils.next_message_id(),
@@ -145,7 +167,7 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await ws.send(subscribe_orderbook_request)
 
             self._last_ws_message_sent_timestamp = self._time()
-            self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().info(f"Subscribed to public order book and trade channels (cached {len(self._symbol_to_pair_cache)} symbols)")
         except asyncio.CancelledError:
             raise
         except Exception:
