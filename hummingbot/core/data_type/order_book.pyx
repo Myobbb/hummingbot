@@ -524,8 +524,22 @@ cdef class OrderBook(PubSub):
         return self.c_get_quote_volume_for_price(is_buy, price)
 
     def restore_from_snapshot_and_diffs(self, snapshot: OrderBookMessage, diffs: List[OrderBookMessage]):
+        """
+        Restore orderbook from a snapshot and replay any subsequent diffs.
+        
+        OPTIMIZED: Uses apply_snapshot_raw and apply_diffs_raw to avoid 
+        OrderBookRow object creation, significantly reducing allocation overhead.
+        """
         replay_position = bisect.bisect_right(diffs, snapshot)
-        replay_diffs = diffs[replay_position:]
-        self.apply_snapshot(snapshot.bids, snapshot.asks, snapshot.update_id)
-        for diff in replay_diffs:
-            self.apply_diffs(diff.bids, diff.asks, diff.update_id)
+        
+        # Use raw snapshot content directly (avoids OrderBookRow creation in .bids/.asks properties)
+        snapshot_bids = snapshot.content.get("bids", [])
+        snapshot_asks = snapshot.content.get("asks", [])
+        self.apply_snapshot_raw(snapshot_bids, snapshot_asks, snapshot.update_id)
+        
+        # Replay diffs using raw method
+        for i in range(replay_position, len(diffs)):
+            diff = diffs[i]
+            diff_bids = diff.content.get("bids", [])
+            diff_asks = diff.content.get("asks", [])
+            self.apply_diffs_raw(diff_bids, diff_asks, diff.update_id)

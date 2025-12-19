@@ -316,11 +316,18 @@ class OrderBookTracker:
                 await asyncio.sleep(5.0)
 
     async def _track_single_book(self, trading_pair: str):
+        """
+        Process orderbook messages for a single trading pair.
+        
+        IMPORTANT: ALL diff messages must be processed in order - skipping diffs
+        would corrupt the orderbook since diffs are incremental (not idempotent).
+        """
         past_diffs_window = self._past_diffs_windows[trading_pair]
-
         message_queue: asyncio.Queue = self._tracking_message_queues[trading_pair]
         order_book: OrderBook = self._order_books[trading_pair]
+        
         last_message_timestamp: float = time.time()
+        last_queue_warning_ts: float = 0.0
         diff_messages_accepted: int = 0
 
         while True:
@@ -333,6 +340,7 @@ class OrderBookTracker:
                 else:
                     message = await message_queue.get()
 
+                # Process the message
                 if message.type is OrderBookMessageType.DIFF:
                     # Use optimized raw method if available (bypasses OrderBookRow allocation)
                     raw_bids = message.content.get("bids")
@@ -344,15 +352,42 @@ class OrderBookTracker:
                     past_diffs_window.append(message)
                     diff_messages_accepted += 1
 
-                    # Output some statistics periodically.
-                    now: float = time.time()
+                    # Batch processing: drain queue without await to reduce loop overhead
+                    while not message_queue.empty():
+                        try:
+                            batch_msg = message_queue.get_nowait()
+                            if batch_msg.type is OrderBookMessageType.DIFF:
+                                raw_bids = batch_msg.content.get("bids")
+                                raw_asks = batch_msg.content.get("asks")
+                                if raw_bids is not None and raw_asks is not None and hasattr(order_book, 'apply_diffs_raw'):
+                                    order_book.apply_diffs_raw(raw_bids, raw_asks, batch_msg.update_id)
+                                else:
+                                    order_book.apply_diffs(batch_msg.bids, batch_msg.asks, batch_msg.update_id)
+                                past_diffs_window.append(batch_msg)
+                                diff_messages_accepted += 1
+                            elif batch_msg.type is OrderBookMessageType.SNAPSHOT:
+                                order_book.restore_from_snapshot_and_diffs(batch_msg, list(past_diffs_window))
+                                break
+                        except asyncio.QueueEmpty:
+                            break
+
+                    # Periodic logging (once per minute)
+                    now = time.time()
                     if int(now / 60.0) > int(last_message_timestamp / 60.0):
+                        # Check queue depth only during periodic logging (not every message)
+                        queue_size = message_queue.qsize()
+                        if queue_size > 10 and now - last_queue_warning_ts > 60.0:
+                            self.logger().warning(
+                                f"Orderbook queue for {trading_pair} backed up: {queue_size} pending"
+                            )
+                            last_queue_warning_ts = now
                         self.logger().debug(f"Processed {diff_messages_accepted} order book diffs for {trading_pair}.")
                         diff_messages_accepted = 0
                     last_message_timestamp = now
+
                 elif message.type is OrderBookMessageType.SNAPSHOT:
-                    past_diffs: List[OrderBookMessage] = list(past_diffs_window)
-                    order_book.restore_from_snapshot_and_diffs(message, past_diffs)
+                    order_book.restore_from_snapshot_and_diffs(message, list(past_diffs_window))
+
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -362,6 +397,7 @@ class OrderBookTracker:
                     app_warning_msg="Unexpected error tracking order book. Retrying after 5 seconds."
                 )
                 await asyncio.sleep(5.0)
+
 
     async def _emit_trade_event_loop(self):
         last_message_timestamp: float = time.time()
