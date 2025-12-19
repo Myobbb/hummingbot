@@ -86,6 +86,11 @@ class LatencyTest(ScriptStrategyBase):
     def __init__(self, connectors):
         super().__init__(connectors)
         
+        # Force MEXC symbol map initialization immediately
+        if "mexc" in connectors:
+            import asyncio
+            asyncio.get_event_loop().create_task(self._init_mexc_symbol_map())
+        
         # Runtime state
         self.create_timestamp = 0
         self.delay_timestamp = 0
@@ -98,6 +103,15 @@ class LatencyTest(ScriptStrategyBase):
         self.csv_file_id = "latency_test"
         
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
+    
+    async def _init_mexc_symbol_map(self):
+        """Pre-initialize MEXC symbol map to avoid race condition"""
+        try:
+            mexc = self.connectors.get("mexc")
+            if mexc:
+                await mexc.trading_pair_symbol_map()
+        except Exception as e:
+            self.logger().debug(f"MEXC symbol map init: {e}")
     
     @property
     def timestamp_now(self):
