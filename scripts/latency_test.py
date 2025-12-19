@@ -86,10 +86,9 @@ class LatencyTest(ScriptStrategyBase):
     def __init__(self, connectors):
         super().__init__(connectors)
         
-        # Force MEXC symbol map initialization immediately
+        # Inject MEXC symbol map directly to avoid initialization race
         if "mexc" in connectors:
-            import asyncio
-            asyncio.get_event_loop().create_task(self._init_mexc_symbol_map())
+            self._inject_mexc_symbol_map(connectors["mexc"])
         
         # Runtime state
         self.create_timestamp = 0
@@ -104,14 +103,18 @@ class LatencyTest(ScriptStrategyBase):
         
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
     
-    async def _init_mexc_symbol_map(self):
-        """Pre-initialize MEXC symbol map to avoid race condition"""
-        try:
-            mexc = self.connectors.get("mexc")
-            if mexc:
-                await mexc.trading_pair_symbol_map()
-        except Exception as e:
-            self.logger().debug(f"MEXC symbol map init: {e}")
+    def _inject_mexc_symbol_map(self, mexc_connector):
+        """Inject symbol mapping directly into MEXC connector"""
+        from bidict import bidict
+        
+        # MEXC uses symbols without hyphen: BTC-USDT -> BTCUSDT
+        symbol_map = bidict({
+            "BTCUSDT": "BTC-USDT",
+        })
+        
+        # Inject directly into the connector
+        mexc_connector._set_trading_pair_symbol_map(symbol_map)
+        self.logger().info("MEXC symbol map injected")
     
     @property
     def timestamp_now(self):
