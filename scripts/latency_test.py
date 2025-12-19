@@ -104,8 +104,10 @@ class LatencyTest(ScriptStrategyBase):
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
     
     def _inject_mexc_symbol_map(self, mexc_connector):
-        """Inject symbol mapping and patch setter to preserve it"""
+        """Inject symbol mapping, trading rules, and patch setter to preserve it"""
         from bidict import bidict
+        from decimal import Decimal
+        from hummingbot.core.data_type.common import TradingRule
         
         # MEXC uses symbols without hyphen: BTC-USDT -> BTCUSDT
         required_symbols = {"BTCUSDT": "BTC-USDT"}
@@ -128,7 +130,17 @@ class LatencyTest(ScriptStrategyBase):
         
         # Set initial map with our required symbols
         mexc_connector._set_trading_pair_symbol_map(bidict(required_symbols))
-        self.logger().info("MEXC symbol map patched with BTC-USDT")
+        
+        # Also inject trading rules for BTC-USDT
+        mexc_connector._trading_rules["BTC-USDT"] = TradingRule(
+            trading_pair="BTC-USDT",
+            min_order_size=Decimal("0.00001"),
+            min_price_increment=Decimal("0.01"),
+            min_base_amount_increment=Decimal("0.000001"),
+            min_notional_size=Decimal("5"),
+        )
+        
+        self.logger().info("MEXC symbol map and trading rules patched for BTC-USDT")
     
     @property
     def timestamp_now(self):
