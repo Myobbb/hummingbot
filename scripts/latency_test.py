@@ -231,6 +231,10 @@ class LatencyTest(ScriptStrategyBase):
             exchange_ts_ms = event.creation_timestamp * 1000
             one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
             
+            # Debug log for first order of batch to understand timestamps
+            if len(self.current_batch_latencies) == 0:
+                self.logger().info(f"DEBUG {exchange}: Send={order_info['pre_send_ts']} Exch={exchange_ts_ms:.0f} Rcv={created_ts} OneWay={one_way_ms:.0f}")
+
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
             self.current_batch_one_way[exchange] = one_way_ms
