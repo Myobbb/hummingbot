@@ -107,7 +107,7 @@ class LatencyTest(ScriptStrategyBase):
         """Inject symbol mapping, trading rules, and patch setter to preserve it"""
         from bidict import bidict
         from decimal import Decimal
-        from hummingbot.core.data_type.common import TradingRule
+        from hummingbot.connector.trading_rule import TradingRule
         
         # MEXC uses symbols without hyphen: BTC-USDT -> BTCUSDT
         required_symbols = {"BTCUSDT": "BTC-USDT"}
