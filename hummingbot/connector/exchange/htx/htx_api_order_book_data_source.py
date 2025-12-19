@@ -230,7 +230,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Do not proactively ping; rely on server ping/pong for v1 market WS.
                 # Only monitor inactivity and recycle the connection if needed.
                 now = time.time()
-                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 180:
+                if self._last_pong_timestamp and (now - self._last_pong_timestamp) > 60:
                     self.logger().warning("Inactivity threshold exceeded, disconnecting")
                     await ws.disconnect()
                     break

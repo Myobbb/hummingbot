@@ -204,13 +204,10 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 except Exception:
                     pass
                 try:
-                    if self._last_frame_ts and (now - self._last_frame_ts) > 120:
-                        if (now - self._last_inactivity_warn_ts) > 60:
-                            self._last_inactivity_warn_ts = now
-                            self.logger().warning("No private WS frames received recently", extra={"idle_seconds": int(now - self._last_frame_ts)})
-                        if (now - self._last_frame_ts) > 180:
-                            await websocket_assistant.disconnect()
-                            break
+                    if self._last_frame_ts and (now - self._last_frame_ts) > 60:
+                        self.logger().warning("No private WS frames received for 60s, disconnecting")
+                        await websocket_assistant.disconnect()
+                        break
                 except Exception:
                     pass
                 # Fallback health check based on underlying connection recv time
