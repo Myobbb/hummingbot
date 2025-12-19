@@ -18,7 +18,12 @@ import os
 import time
 from decimal import Decimal
 from enum import Enum
+from typing import Dict, Set
 
+from pydantic import Field
+
+from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
@@ -35,6 +40,22 @@ class OrderState(Enum):
     CANCELED = 3
 
 
+class LatencyTestConfig(BaseClientModel):
+    """Configuration for latency test - uses config-based init_markets pattern"""
+    script_file_name: str = os.path.basename(__file__)
+    trading_pair: str = Field(default="BTC-USDT", description="Trading pair to test")
+    order_price: Decimal = Field(default=Decimal("69420"), description="Unfillable order price")
+    order_amount: Decimal = Field(default=Decimal("0.0004"), description="Order amount")
+    create_interval: int = Field(default=60, description="Interval between test cycles (seconds)")
+    delay: int = Field(default=5, description="Delay before canceling orders (seconds)")
+    
+    # Exchanges to test - all enabled by default, comment out in config YAML to disable
+    exchanges: str = Field(
+        default="bybit,kucoin,gate_io,mexc,htx,bitmart,bing_x,okx,bitget",
+        description="Comma-separated list of exchanges to test"
+    )
+
+
 class LatencyTest(ScriptStrategyBase):
     """
     Multi-exchange latency test script.
@@ -45,35 +66,30 @@ class LatencyTest(ScriptStrategyBase):
     Results are saved to CSV files for analysis.
     """
     
-    # Configuration - class-level variables
-    trading_pair: str = "BTC-USDT"
-    order_price: Decimal = Decimal("69420")  # Unfillable price (way below market)
-    order_amount: Decimal = Decimal("0.0004")  # ~$25 worth at ~$100k BTC
-    create_interval: int = 60  # Time interval (in seconds) between test cycles
-    delay: int = 5  # Time delay (in seconds) before canceling orders
-    csv_file_id: str = "latency_test"  # Identifier for CSV filenames
+    @classmethod
+    def init_markets(cls, config: LatencyTestConfig):
+        """Initialize markets from config - ensures proper connector initialization"""
+        markets: Dict[str, Set[str]] = {}
+        for exchange in config.exchanges.split(","):
+            exchange = exchange.strip()
+            if exchange:
+                markets[exchange] = {config.trading_pair}
+        cls.markets = markets
     
-    # Exchanges to test - comment out any you don't have configured
-    markets = {
-        "bybit": {trading_pair},
-        "kucoin": {trading_pair},
-        "gate_io": {trading_pair},
-        "mexc": {trading_pair},
-        "htx": {trading_pair},
-        "bitmart": {trading_pair},
-        "bing_x": {trading_pair},
-        "okx": {trading_pair},
-        "bitget": {trading_pair},
-    }
-    
-    # Runtime state
-    create_timestamp: float = 0
-    delay_timestamp: float = 0
-    pending_orders: dict = {}  # order_id -> {exchange, pre_send_ts}
-    
-    # Batch latency tracking
-    current_batch_latencies: dict = {}  # exchange -> latency_ms
-    batch_count: int = 0
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: LatencyTestConfig):
+        super().__init__(connectors, config)
+        self.config = config
+        
+        # Runtime state
+        self.create_timestamp: float = 0
+        self.delay_timestamp: float = 0
+        self.pending_orders: dict = {}  # order_id -> {exchange, pre_send_ts}
+        
+        # Batch latency tracking
+        self.current_batch_latencies: dict = {}  # exchange -> latency_ms
+        self.batch_count: int = 0
+        
+        self.csv_file_id: str = "latency_test"
     
     @property
     def timestamp_now(self):
@@ -100,13 +116,13 @@ class LatencyTest(ScriptStrategyBase):
                 self.cancel_all_orders(connector_name)
         
         if has_active:
-            self.delay_timestamp = self.current_timestamp + self.delay
+            self.delay_timestamp = self.current_timestamp + self.config.delay
             return
         
         # Place limit orders if conditions are met
         if self.current_timestamp > self.create_timestamp:
-            self.delay_timestamp = self.current_timestamp + self.delay
-            self.create_timestamp = self.current_timestamp + self.create_interval
+            self.delay_timestamp = self.current_timestamp + self.config.delay
+            self.create_timestamp = self.current_timestamp + self.config.create_interval
             self.place_orders_all_exchanges()
     
     def cancel_all_orders(self, connector_name):
@@ -134,8 +150,8 @@ class LatencyTest(ScriptStrategyBase):
         connector = self.connectors[connector_name]
         
         # Quantize amount to exchange's requirements
-        amount = connector.quantize_order_amount(self.trading_pair, self.order_amount)
-        price = connector.quantize_order_price(self.trading_pair, self.order_price)
+        amount = connector.quantize_order_amount(self.config.trading_pair, self.config.order_amount)
+        price = connector.quantize_order_price(self.config.trading_pair, self.config.order_price)
         
         if amount <= 0:
             self.logger().warning(f"{connector_name}: Order amount too small after quantization")
@@ -145,7 +161,7 @@ class LatencyTest(ScriptStrategyBase):
         time_before_order_sent = self.timestamp_now
         
         # Place limit buy order
-        order_id = self.buy(connector_name, self.trading_pair, amount, OrderType.LIMIT, price)
+        order_id = self.buy(connector_name, self.config.trading_pair, amount, OrderType.LIMIT, price)
         
         # Track the order
         self.pending_orders[order_id] = {
