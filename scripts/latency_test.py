@@ -112,6 +112,11 @@ class LatencyTest(ScriptStrategyBase):
     
     def on_tick(self):
         """Called regularly to check for order creation and cancellation conditions."""
+        # Inject WS hooks if not active
+        if not getattr(self, "hooks_injected", False):
+            self.inject_hooks()
+            self.hooks_injected = True
+
         # Prevent further actions if within the delay period
         if self.current_timestamp < self.delay_timestamp:
             return
@@ -133,6 +138,63 @@ class LatencyTest(ScriptStrategyBase):
             self.delay_timestamp = self.current_timestamp + self.delay
             self.create_timestamp = self.current_timestamp + self.create_interval
             self.place_orders_all_exchanges()
+
+    def inject_hooks(self):
+        """Monkey-patches the ClientOrderTracker to intercept WS updates before they are filtered."""
+        for connector_name, connector in self.connectors.items():
+            tracker = connector._client_order_tracker
+            
+            # Avoid double wrapping if possible (wrapper name usually 'wrapper' or 'make_wrapper')
+            if getattr(tracker.process_order_update, "__name__", "") == "wrapper":
+                continue 
+                
+            original_method = tracker.process_order_update
+            
+            def make_wrapper(orig, name):
+                def wrapper(order_update):
+                    # Intercept WS update
+                    try:
+                        self.process_ws_update(name, order_update)
+                    except Exception as e:
+                        self.logger().error(f"Error in WS hook: {e}")
+                    return orig(order_update)
+                return wrapper
+            
+            tracker.process_order_update = make_wrapper(original_method, connector_name)
+            self.logger().info(f"Injected WS hook for {connector_name}")
+
+    def process_ws_update(self, connector_name, order_update):
+        client_order_id = order_update.client_order_id
+        if not client_order_id:
+            # Sometimes updates only have exchange_order_id, need to find mapping
+            # But for simplicity, we focus on updates that carry client_id or are matched
+            return
+            
+        if not hasattr(self, 'pending_orders') or client_order_id not in self.pending_orders:
+            return
+            
+        # We found a WS update for a pending/active order!
+        new_ts = order_update.update_timestamp
+        
+        if not hasattr(self, 'ws_updates_found'):
+             self.ws_updates_found = set()
+             
+        if client_order_id in self.ws_updates_found:
+            return
+
+        order_info = self.pending_orders[client_order_id]
+        pre_send_ts = order_info["pre_send_ts"]
+        
+        ws_ts_ms = new_ts * 1000
+        one_way = ws_ts_ms - pre_send_ts
+        
+        if not hasattr(self, 'current_batch_one_way'):
+            self.current_batch_one_way = {}
+            
+        self.current_batch_one_way[connector_name] = one_way
+        self.ws_updates_found.add(client_order_id)
+        
+        self.logger().info(f"WS UPDATE {connector_name}: Captured Timestamp! One-Way: {one_way:.0f}ms (TS={new_ts:.3f})")
     
     def cancel_all_orders(self, connector_name):
         """Cancels all active orders on an exchange."""
@@ -145,6 +207,7 @@ class LatencyTest(ScriptStrategyBase):
         self.batch_count += 1
         self.current_batch_latencies = {}
         self.current_batch_one_way = {}
+        self.ws_updates_found = set()
         
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
@@ -231,10 +294,6 @@ class LatencyTest(ScriptStrategyBase):
             exchange_ts_ms = event.creation_timestamp * 1000
             one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
             
-            # Debug log for first order of batch to understand timestamps
-            if len(self.current_batch_latencies) == 0:
-                self.logger().info(f"DEBUG {exchange}: Send={order_info['pre_send_ts']} Exch={exchange_ts_ms:.0f} Rcv={created_ts} OneWay={one_way_ms:.0f}")
-
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
             self.current_batch_one_way[exchange] = one_way_ms
