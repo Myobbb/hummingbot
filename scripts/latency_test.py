@@ -71,11 +71,12 @@ class LatencyTest(ScriptStrategyBase):
     # ========== END CONFIGURATION ==========
     
     # Build markets dict from exchanges list
+    # Note: MEXC uses SOL-USDT because BTC-USDT has isSpotTradingAllowed=False in their API
     markets = {
         "bybit": {"BTC-USDT"},
         "kucoin": {"BTC-USDT"},
         "gate_io": {"BTC-USDT"},
-        "mexc": {"BTC-USDT"},
+        "mexc": {"SOL-USDT"},
         "htx": {"BTC-USDT"},
         "bitmart": {"BTC-USDT"},
         "bing_x": {"BTC-USDT"},
@@ -85,10 +86,6 @@ class LatencyTest(ScriptStrategyBase):
     
     def __init__(self, connectors):
         super().__init__(connectors)
-        
-        # Inject MEXC symbol map directly to avoid initialization race
-        if "mexc" in connectors:
-            self._inject_mexc_symbol_map(connectors["mexc"])
         
         # Runtime state
         self.create_timestamp = 0
@@ -102,45 +99,6 @@ class LatencyTest(ScriptStrategyBase):
         self.csv_file_id = "latency_test"
         
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
-    
-    def _inject_mexc_symbol_map(self, mexc_connector):
-        """Inject symbol mapping, trading rules, and patch setter to preserve it"""
-        from bidict import bidict
-        from decimal import Decimal
-        from hummingbot.connector.trading_rule import TradingRule
-        
-        # MEXC uses symbols without hyphen: BTC-USDT -> BTCUSDT
-        required_symbols = {"BTCUSDT": "BTC-USDT"}
-        
-        # Patch the setter to always include our required symbols
-        original_setter = mexc_connector._set_trading_pair_symbol_map
-        
-        def patched_setter(new_map):
-            if new_map is None:
-                new_map = bidict()
-            else:
-                new_map = bidict(new_map)
-            # Always ensure our required symbols are in the map
-            for ex_symbol, hb_pair in required_symbols.items():
-                if ex_symbol not in new_map:
-                    new_map[ex_symbol] = hb_pair
-            original_setter(new_map)
-        
-        mexc_connector._set_trading_pair_symbol_map = patched_setter
-        
-        # Set initial map with our required symbols
-        mexc_connector._set_trading_pair_symbol_map(bidict(required_symbols))
-        
-        # Also inject trading rules for BTC-USDT
-        mexc_connector._trading_rules["BTC-USDT"] = TradingRule(
-            trading_pair="BTC-USDT",
-            min_order_size=Decimal("0.00001"),
-            min_price_increment=Decimal("0.01"),
-            min_base_amount_increment=Decimal("0.000001"),
-            min_notional_size=Decimal("5"),
-        )
-        
-        self.logger().info("MEXC symbol map and trading rules patched for BTC-USDT")
     
     @property
     def timestamp_now(self):
@@ -200,9 +158,20 @@ class LatencyTest(ScriptStrategyBase):
         """Places a single test order on an exchange."""
         connector = self.connectors[connector_name]
         
+        # Get the trading pair for this exchange
+        trading_pair = list(self.markets.get(connector_name, {self.trading_pair}))[0]
+        
+        # Get appropriate price for the pair
+        if trading_pair == "SOL-USDT":
+            order_price = Decimal("100")  # Unfillable low price for SOL
+            order_amount = Decimal("0.1")  # ~$20 worth
+        else:
+            order_price = self.order_price
+            order_amount = self.order_amount
+        
         # Quantize amount to exchange's requirements
-        amount = connector.quantize_order_amount(self.trading_pair, self.order_amount)
-        price = connector.quantize_order_price(self.trading_pair, self.order_price)
+        amount = connector.quantize_order_amount(trading_pair, order_amount)
+        price = connector.quantize_order_price(trading_pair, order_price)
         
         if amount <= 0:
             self.logger().warning(f"{connector_name}: Order amount too small after quantization")
@@ -212,7 +181,7 @@ class LatencyTest(ScriptStrategyBase):
         time_before_order_sent = self.timestamp_now
         
         # Place limit buy order
-        order_id = self.buy(connector_name, self.trading_pair, amount, OrderType.LIMIT, price)
+        order_id = self.buy(connector_name, trading_pair, amount, OrderType.LIMIT, price)
         
         # Track the order
         self.pending_orders[order_id] = {
