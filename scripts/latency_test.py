@@ -56,7 +56,7 @@ class LatencyTest(ScriptStrategyBase):
     # Timing
     create_interval = 60  # seconds between test cycles
     delay = 5  # seconds before canceling orders
-    ws_wait_timeout = 1.0  # seconds to wait for late WS updates (for BingX etc)
+    ws_wait_timeout = 2.0  # seconds to wait for late WS updates (BingX can take 5+ seconds)
     
     # Exchanges to test - comment out any you don't have configured
     EXCHANGES = [
@@ -164,9 +164,10 @@ class LatencyTest(ScriptStrategyBase):
         
         # Place limit orders if conditions are met
         if self.current_timestamp > self.create_timestamp:
-            self.delay_timestamp = self.current_timestamp + self.delay
-            self.create_timestamp = self.current_timestamp + self.create_interval
-            self.place_orders_all_exchanges()
+            now = self.current_timestamp  # Capture once for consistency
+            self.delay_timestamp = now + self.delay
+            self.create_timestamp = now + self.create_interval
+            self.place_orders_all_exchanges(now)
 
     def inject_hooks(self):
         """Monkey-patches the ClientOrderTracker to intercept WS updates before they are filtered."""
@@ -259,7 +260,7 @@ class LatencyTest(ScriptStrategyBase):
             self.save_to_csv(connector_name, self.timestamp_now, order.client_order_id, OrderState.PENDING_CANCEL.name)
             self.cancel(connector_name, order.trading_pair, order.client_order_id)
     
-    def place_orders_all_exchanges(self):
+    def place_orders_all_exchanges(self, batch_start_ts):
         """Places test orders on all configured exchanges."""
         self.batch_count += 1
         self.current_batch_latencies = {}
@@ -272,7 +273,7 @@ class LatencyTest(ScriptStrategyBase):
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
         
         # Track when batch started for WS timeout calculation
-        self.batch_start_timestamp = self.current_timestamp
+        self.batch_start_timestamp = batch_start_ts
         
         # Log start of dispatch
         dispatch_start = time.perf_counter()
@@ -347,32 +348,9 @@ class LatencyTest(ScriptStrategyBase):
             
             # One-Way Latency (Approximate due to Clock Skew)
             # = Exchange TS - Local Send TS
-            exchange_ts = event.creation_timestamp * 1e3 # Convert to ms if needed, check format
-            # Note: hummingbot event timestamps are usually floats in seconds. 
-            # Scripts usually use ms for logging.
-            # event.creation_timestamp comes from connector which did * 1e-3. So it is strictly seconds.
-            # self.timestamp_now is milliseconds.
-            # So:
+            # Note: This is from the HTTP response, not WS. WS timestamps are more reliable.
             exchange_ts_ms = event.creation_timestamp * 1000
             one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
-            
-            # VALIDATION: Detect second-precision timestamps (lack of millisecond precision)
-            # If fractional milliseconds are < 1, the exchange timestamp was likely in seconds-only
-            fractional_ms = exchange_ts_ms % 1000
-            has_ms_precision = fractional_ms >= 1  # True if there's actual ms precision
-            
-            if not has_ms_precision:
-                # Log warning once per exchange about low-precision timestamps
-                if not hasattr(self, '_low_precision_warned'):
-                    self._low_precision_warned = set()
-                if exchange not in self._low_precision_warned:
-                    self.logger().warning(
-                        f"{exchange}: Low-precision timestamp detected (seconds only). "
-                        f"One-way latency may be unreliable."
-                    )
-                    self._low_precision_warned.add(exchange)
-                # Mark as approximate with special value (use NaN for unreliable)
-                one_way_ms = float('nan')  # Indicates unreliable measurement
             
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
@@ -398,9 +376,9 @@ class LatencyTest(ScriptStrategyBase):
         # Format as: "exchange:RTT(OneWay)"
         summary_parts = []
         for ex, lat in sorted_latencies:
-            one_way = self.current_batch_one_way.get(ex, 0)
-            # Handle NaN (unreliable) one-way measurements
-            if isinstance(one_way, float) and math.isnan(one_way):
+            one_way = self.current_batch_one_way.get(ex)
+            # Handle missing, NaN, or 0 one-way measurements
+            if one_way is None or (isinstance(one_way, float) and (math.isnan(one_way) or one_way == 0)):
                 summary_parts.append(f"{ex}:{lat}ms(N/A)")
             else:
                 summary_parts.append(f"{ex}:{lat}ms({one_way:.0f})")
