@@ -61,7 +61,7 @@ class LatencyTest(ScriptStrategyBase):
         "bybit",
         "kucoin",
         "gate_io",
-        "mexc",
+      #  "mexc",
         "htx",
         "bitmart",
         "bing_x",
