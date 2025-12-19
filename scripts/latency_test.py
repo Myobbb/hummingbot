@@ -75,7 +75,7 @@ class LatencyTest(ScriptStrategyBase):
         "bybit": {"BTC-USDT"},
         "kucoin": {"BTC-USDT"},
         "gate_io": {"BTC-USDT"},
-        "mexc": {"BTC-USDT"},
+        "mexc": {"BTCUSDT"},
         "htx": {"BTC-USDT"},
         "bitmart": {"BTC-USDT"},
         "bing_x": {"BTC-USDT"},
