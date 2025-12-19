@@ -218,7 +218,7 @@ class BingXExchange(ExchangePyBase):
         )
 
         o_id = str(order_result["data"]["orderId"])
-        transact_time = int(order_result["data"]["transactTime"]) * 1e-3
+        transact_time = order_result["data"]["transactTime"] * 1e-3
         return (o_id, transact_time)
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
