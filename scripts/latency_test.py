@@ -104,17 +104,31 @@ class LatencyTest(ScriptStrategyBase):
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
     
     def _inject_mexc_symbol_map(self, mexc_connector):
-        """Inject symbol mapping directly into MEXC connector"""
+        """Inject symbol mapping and patch setter to preserve it"""
         from bidict import bidict
         
         # MEXC uses symbols without hyphen: BTC-USDT -> BTCUSDT
-        symbol_map = bidict({
-            "BTCUSDT": "BTC-USDT",
-        })
+        required_symbols = {"BTCUSDT": "BTC-USDT"}
         
-        # Inject directly into the connector
-        mexc_connector._set_trading_pair_symbol_map(symbol_map)
-        self.logger().info("MEXC symbol map injected")
+        # Patch the setter to always include our required symbols
+        original_setter = mexc_connector._set_trading_pair_symbol_map
+        
+        def patched_setter(new_map):
+            if new_map is None:
+                new_map = bidict()
+            else:
+                new_map = bidict(new_map)
+            # Always ensure our required symbols are in the map
+            for ex_symbol, hb_pair in required_symbols.items():
+                if ex_symbol not in new_map:
+                    new_map[ex_symbol] = hb_pair
+            original_setter(new_map)
+        
+        mexc_connector._set_trading_pair_symbol_map = patched_setter
+        
+        # Set initial map with our required symbols
+        mexc_connector._set_trading_pair_symbol_map(bidict(required_symbols))
+        self.logger().info("MEXC symbol map patched with BTC-USDT")
     
     @property
     def timestamp_now(self):
