@@ -71,7 +71,17 @@ class LatencyTest(ScriptStrategyBase):
     # ========== END CONFIGURATION ==========
     
     # Build markets dict from exchanges list
-    markets = {ex: {trading_pair} for ex in EXCHANGES}
+    markets = {
+        "bybit": {"BTC-USDT"},
+        "kucoin": {"BTC-USDT"},
+        "gate_io": {"BTC-USDT"},
+        "mexc": {"BTC-USDT"},
+        "htx": {"BTC-USDT"},
+        "bitmart": {"BTC-USDT"},
+        "bing_x": {"BTC-USDT"},
+        "okx": {"BTC-USDT"},
+        "bitget": {"BTC-USDT"},
+    }
     
     def __init__(self, connectors):
         super().__init__(connectors)
