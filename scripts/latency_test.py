@@ -243,11 +243,18 @@ class LatencyTest(ScriptStrategyBase):
             if order.client_order_id in self.pending_orders:
                 info = self.pending_orders[order.client_order_id]
                 if "created_ts" in info:
-                    # Use pre_send_ts (Seconds) for Timestamp column to allow (Exchange - Send) calculation
-                    ts_to_write = info["pre_send_ts"]
-                    # Use exchange_ts (Seconds)
-                    exchange_ts = info.get("exchange_ts", 0)
-                    self.save_to_csv(connector_name, ts_to_write, order.client_order_id, OrderState.CREATED.name, exchange_ts)
+                    pre_send_ts = info["pre_send_ts"]  # ms
+                    created_ts = info["created_ts"]  # ms (local time when event received)
+                    exchange_ts = info.get("exchange_ts", 0)  # ms
+                    
+                    # Calculate latencies
+                    rtt_ms = created_ts - pre_send_ts if created_ts else 0
+                    one_way_ms = exchange_ts - pre_send_ts if exchange_ts else 0
+                    
+                    self.save_to_csv(
+                        connector_name, pre_send_ts, order.client_order_id, 
+                        OrderState.CREATED.name, exchange_ts, rtt_ms, one_way_ms
+                    )
 
             self.save_to_csv(connector_name, self.timestamp_now, order.client_order_id, OrderState.PENDING_CANCEL.name)
             self.cancel(connector_name, order.trading_pair, order.client_order_id)
@@ -426,13 +433,13 @@ class LatencyTest(ScriptStrategyBase):
             self.save_to_csv(exchange, canceled_ts, event.order_id, OrderState.CANCELED.name)
             del self.pending_orders[event.order_id]
     
-    def save_to_csv(self, exchange, timestamp, order_id, status, exchange_timestamp=0):
+    def save_to_csv(self, exchange, timestamp, order_id, status, exchange_timestamp=0, rtt_latency=0, one_way_latency=0):
         """Appends the provided data to the CSV file."""
         filename = self.get_filename(exchange)
         file_exists = os.path.exists(filename)
         
         with open(filename, 'a', newline='') as csvfile:
-            fieldnames = ['Timestamp', 'Order_ID', 'Status', 'Exchange_Timestamp']
+            fieldnames = ['Timestamp', 'Order_ID', 'Status', 'Exchange_Timestamp', 'RTT_Latency', 'One_Way_Latency']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if not file_exists:
                 writer.writeheader()
@@ -441,5 +448,7 @@ class LatencyTest(ScriptStrategyBase):
                 'Timestamp': timestamp, 
                 'Order_ID': order_id, 
                 'Status': status,
-                'Exchange_Timestamp': exchange_timestamp
+                'Exchange_Timestamp': exchange_timestamp,
+                'RTT_Latency': rtt_latency,
+                'One_Way_Latency': one_way_latency,
             })

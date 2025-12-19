@@ -40,9 +40,23 @@ def analyze_latency_results():
                 for row in reader:
                     order_id = row['Order_ID']
                     status = row['Status']
-                    timestamp = float(row['Timestamp']) # Changed to float to handle potential decimals
+                    timestamp = float(row['Timestamp'])
                     
-                    # Handle Exchange Timestamp if present
+                    # Handle new direct latency columns (preferred)
+                    rtt_direct = None
+                    one_way_direct = None
+                    if 'RTT_Latency' in row and row['RTT_Latency']:
+                        try:
+                            rtt_direct = float(row['RTT_Latency'])
+                        except ValueError:
+                            pass
+                    if 'One_Way_Latency' in row and row['One_Way_Latency']:
+                        try:
+                            one_way_direct = float(row['One_Way_Latency'])
+                        except ValueError:
+                            pass
+                    
+                    # Handle Exchange Timestamp for backward compatibility
                     exchange_ts = 0.0
                     if 'Exchange_Timestamp' in row and row['Exchange_Timestamp']:
                         try:
@@ -56,24 +70,35 @@ def analyze_latency_results():
                         orders[order_id]['end'] = timestamp
                         if exchange_ts > 0:
                             orders[order_id]['exchange_ts'] = exchange_ts
+                        # Store direct values from CSV (preferred)
+                        if rtt_direct is not None and rtt_direct > 0:
+                            orders[order_id]['rtt_direct'] = rtt_direct
+                        if one_way_direct is not None:
+                            orders[order_id]['one_way_direct'] = one_way_direct
             
             # Calculate latencies
             for order_id, times in orders.items():
-                if 'start' in times and 'end' in times:
+                # Prefer direct RTT from CSV, otherwise calculate
+                if 'rtt_direct' in times:
+                    latency = times['rtt_direct']
+                elif 'start' in times and 'end' in times:
                     latency = times['end'] - times['start']
-                    
+                else:
+                    continue
+                
+                # Prefer direct one-way from CSV, otherwise calculate
+                if 'one_way_direct' in times:
+                    one_way = times['one_way_direct']
+                elif 'exchange_ts' in times and 'start' in times:
+                    one_way = times['exchange_ts'] - times['start']
+                else:
                     one_way = None
-                    if 'exchange_ts' in times:
-                        one_way = times['exchange_ts'] - times['start']
-                    
-                    # Filter out obviously bad data (e.g. negative latency)
-                    if latency >= 0:
-                        latencies.append(latency)
-                        if one_way is not None:
-                            # Keep one-way even if negative (due to clock skew), 
-                            # but filtering huge negative outliers might be good.
-                            # For now, let's keep it raw to see the skew.
-                            one_way_latencies.append(one_way)
+                
+                # Filter out obviously bad data (e.g. negative latency)
+                if latency >= 0:
+                    latencies.append(latency)
+                    if one_way is not None:
+                        one_way_latencies.append(one_way)
             
             if not latencies:
                 print(f"Warning: No completed orders found for {exchange_name}")
@@ -83,6 +108,10 @@ def analyze_latency_results():
             # P50 (Median): The "typical" latency. 50% of orders were faster than this.
             # P90: The "slow" tail. 90% of orders were faster than this. Good for identifying lag spikes.
             # P99: The "worst case". 99% of orders were faster than this. Only 1 in 100 was slower.
+            
+            # Filter out NaN and extreme negative one-way values (likely clock skew artifacts)
+            valid_one_way = [x for x in one_way_latencies if x is not None and x > -1000 and x < 10000]
+            
             stats = {
                 "Exchange": exchange_name,
                 "Count": len(latencies),
@@ -91,7 +120,9 @@ def analyze_latency_results():
                 "Avg": statistics.mean(latencies),
                 "P50": statistics.median(latencies),
                 "P90": statistics.quantiles(latencies, n=10)[8] if len(latencies) >= 10 else max(latencies), # Approx P90
-                "Avg One-Way": statistics.mean(one_way_latencies) if one_way_latencies else "N/A"
+                "Avg One-Way": statistics.mean(valid_one_way) if valid_one_way else "N/A",
+                "P50 One-Way": statistics.median(valid_one_way) if valid_one_way else "N/A",
+                "One-Way Count": len(valid_one_way),
             }
             exchange_stats.append(stats)
             
@@ -102,30 +133,48 @@ def analyze_latency_results():
         print("No valid statistics could be calculated.")
         return
 
-    # Sort results by Average Latency
-    exchange_stats.sort(key=lambda x: x["Avg"])
+    # Sort results by One-Way Latency (fastest first), falling back to RTT if no one-way data
+    exchange_stats.sort(key=lambda x: x["Avg One-Way"] if isinstance(x["Avg One-Way"], (int, float)) else 9999)
     
-    # Print Table
-    headers = ["Exchange", "Count", "Min (ms)", "Avg (ms)", "P50 (ms)", "P90 (ms)", "Max (ms)", "One-Way(Avg)"]
-    row_format = "{:<15} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<12}"
+    # Print unified table - user-friendly format
+    print("\n" + "=" * 90)
+    print("EXCHANGE LATENCY ANALYSIS")
+    print("One-Way = time from bot decision to order on exchange book")
+    print("RTT = round-trip time (full order creation cycle)")
+    print("=" * 90)
     
-    print("-" * 95)
-    print(row_format.format(*headers))
-    print("-" * 95)
+    # Header
+    print(f"\n{'Exchange':<12} {'Avg One-Way':<14} {'P50 One-Way':<14} {'Samples':<10} {'Notes':<25}")
+    print("-" * 85)
     
     for s in exchange_stats:
-        one_way_str = f"{s['Avg One-Way']:.2f}" if isinstance(s['Avg One-Way'], (int, float)) else "N/A"
-        print(row_format.format(
-            s["Exchange"],
-            s["Count"],
-            f"{s['Min']:.1f}",
-            f"{s['Avg']:.1f}",
-            f"{s['P50']:.1f}",
-            f"{s['P90']:.1f}",
-            f"{s['Max']:.1f}",
-            one_way_str
-        ))
-    print("-" * 95)
+        # Format one-way with RTT in parentheses
+        if isinstance(s['Avg One-Way'], (int, float)):
+            avg_str = f"{s['Avg One-Way']:.0f}ms ({s['Avg']:.0f}ms RTT)"
+        else:
+            avg_str = f"N/A ({s['Avg']:.0f}ms RTT)"
+        
+        if isinstance(s['P50 One-Way'], (int, float)):
+            p50_str = f"{s['P50 One-Way']:.0f}ms ({s['P50']:.0f}ms RTT)"
+        else:
+            p50_str = f"N/A ({s['P50']:.0f}ms RTT)"
+        
+        # Sample count with filtering note
+        samples_str = f"{s['One-Way Count']}/{s['Count']}"
+        
+        # Notes for issues
+        notes = ""
+        if s["One-Way Count"] == 0:
+            notes = "No valid timestamps"
+        elif s["One-Way Count"] < s["Count"]:
+            filtered = s['Count'] - s['One-Way Count']
+            notes = f"{filtered} filtered (clock skew)"
+        
+        print(f"{s['Exchange']:<12} {avg_str:<14} {p50_str:<14} {samples_str:<10} {notes:<25}")
+    
+    print("-" * 85)
+    print(f"\nTotal orders analyzed: {sum(s['Count'] for s in exchange_stats)}")
+    print(f"Exchanges: {len(exchange_stats)}")
 
 if __name__ == "__main__":
     analyze_latency_results()
