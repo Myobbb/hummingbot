@@ -120,7 +120,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                                              object sell_market_tuple,
                                                              double min_profitability)
     cdef pair[double, double] c_calculate_profitability(self, object market_pair)
-    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple)
+    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple, tuple precomputed_result=*)
     cdef tuple c_find_best_profitable_amount(self, object buy_market_tuple, object sell_market_tuple)
     cdef double _calculate_capacity_limit(self,
                                           object buy_market_tuple,

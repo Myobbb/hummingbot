@@ -597,7 +597,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                   (timestamp >= self._status_debounce_until))
             object best_buy = None
             object best_sell = None
-            tuple best_result
+            tuple best_result = None
+            tuple current_result
             double best_profitability = 0.0
 
         try:
@@ -632,16 +633,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # Cheap non-throwing readiness check for direction (buy asks, sell bids)
                 if not self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                     continue
-                best_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
-                if best_result[0] <= 0:
+                current_result = self.c_find_best_profitable_amount(market_pair.first, market_pair.second)
+                if current_result[0] <= 0:
                     continue
 
-                if best_result[1] > best_profitability:
-                    best_profitability = <double>best_result[1]
+                if current_result[1] > best_profitability:
+                    best_profitability = <double>current_result[1]
                     best_buy = market_pair.first
                     best_sell = market_pair.second
+                    best_result = current_result  # Store result for later use
                     
             # Execute only the globally best profitable opportunity
+            # OPTIMIZATION: Pass best_result to avoid duplicate orderbook scan in c_execute_arbitrage
             if best_buy is not None and best_sell is not None and best_profitability >= self._min_profitability:
                 if self._position_balancer is not None and self._position_balancer.is_active:
                     # Try position balancing first (buy-in or sell-off)
@@ -649,9 +652,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         # Position balancing executed; skip regular arbitrage this tick
                         pass
                     else:
-                        self.c_execute_arbitrage(best_buy, best_sell)
+                        self.c_execute_arbitrage(best_buy, best_sell, best_result)
                 else:
-                    self.c_execute_arbitrage(best_buy, best_sell)
+                    self.c_execute_arbitrage(best_buy, best_sell, best_result)
             elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is not None and best_sell is not None:
                 # Not enough edge for normal arbitrage. Still try position balancing.
                 # Attempt with current best direction (respect pending/cool-off)
@@ -1197,10 +1200,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         return pair[double, double](prof1, prof2)
 
-    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple):
+    cdef c_execute_arbitrage(self, object buy_market_tuple, object sell_market_tuple, tuple precomputed_result=None):
         """
         Execute arbitrage trade
-
+        
+        OPTIMIZATION: If precomputed_result is provided (from c_tick), use it directly
+        to avoid duplicate orderbook scanning via c_find_best_profitable_amount.
         """
         # CRITICAL SAFEGUARD: Prevent double execution at the same timestamp
         # This protects against multiple strategy instances or rapid tick cycles
@@ -1215,11 +1220,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._last_global_trade_timestamp = self._current_timestamp
 
         cdef:
-            tuple result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
-            double amount = <double>result[0]
-            double profitability = <double>result[1]
-            double sell_price = <double>result[2]
-            double buy_price = <double>result[3]
+            tuple result
+            double amount
+            double profitability
+            double sell_price
+            double buy_price
             double volume_usd
             ExchangeBase buy_market = buy_market_tuple.market
             ExchangeBase sell_market = sell_market_tuple.market
@@ -1242,11 +1247,38 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object q_buy2
             object q_sell2
             object sell_req2
-            
+        
+        # OPTIMIZATION: Use precomputed result if available (skips entire orderbook rescan)
+        if precomputed_result is not None:
+            result = precomputed_result
+        else:
+            result = self.c_find_best_profitable_amount(buy_market_tuple, sell_market_tuple)
+        
+        amount = <double>result[0]
+        profitability = <double>result[1]
+        sell_price = <double>result[2]
+        buy_price = <double>result[3]
+
         if amount <= 0:
             if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
                 self.logger().info("Insufficient balance or no profitable amount found")
             return
+        
+        # PRICE TICK ADJUSTMENT: Make orders more aggressive for better fills
+        # Adjusts float prices BEFORE balance checks so calculations are correct
+        # Buy orders: increase price by 2 ticks (bid higher to fill faster)
+        # Sell orders: decrease price by 2 ticks (ask lower to fill faster)
+        # NOTE: _trading_rules is an in-memory dict (O(1) lookup, no network call)
+        cdef object buy_tr = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
+        cdef object sell_tr = sell_market._trading_rules.get(sell_market_tuple.trading_pair)
+        cdef double buy_tick = 0.0
+        cdef double sell_tick = 0.0
+        if buy_tr is not None and buy_tr.min_price_increment is not None:
+            buy_tick = float(buy_tr.min_price_increment)
+            buy_price = buy_price + (buy_tick * 2.0)
+        if sell_tr is not None and sell_tr.min_price_increment is not None:
+            sell_tick = float(sell_tr.min_price_increment)
+            sell_price = sell_price - (sell_tick * 2.0)
         
         # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API
         # OPTIMIZATION: Use Decimal.from_float() instead of Decimal(str()) to avoid expensive string formatting.
