@@ -25,6 +25,9 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         super().__init__(trading_pairs)
         self._connector = connector
         self._api_factory = api_factory
+        
+        # Symbol cache for hot path optimization (avoid async lookups per message)
+        self._symbol_to_pair_cache: Dict[str, str] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -77,7 +80,12 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return data
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["arg"]["instId"])
+        inst_id = raw_message["arg"]["instId"]
+        # Use cache for O(1) lookup, fallback to async if not cached
+        trading_pair = self._symbol_to_pair_cache.get(inst_id)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=inst_id)
+            self._symbol_to_pair_cache[inst_id] = trading_pair
         snapshot_data = raw_message["data"][0]
         snapshot_timestamp: float = int(snapshot_data["ts"]) * 1e-3
         update_id: int = int(snapshot_timestamp)
@@ -99,7 +107,12 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         trade_updates = raw_message["data"]
 
         for trade_data in trade_updates:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=trade_data["instId"])
+            inst_id = trade_data["instId"]
+            # Use cache for O(1) lookup, fallback to async if not cached
+            trading_pair = self._symbol_to_pair_cache.get(inst_id)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=inst_id)
+                self._symbol_to_pair_cache[inst_id] = trading_pair
             message_content = {
                 "trade_id": trade_data["tradeId"],
                 "trading_pair": trading_pair,
@@ -117,12 +130,16 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         diff_updates: Dict[str, Any] = raw_message["data"]
+        inst_id = raw_message["arg"]["instId"]
+        # Use cache for O(1) lookup, fallback to async if not cached
+        trading_pair = self._symbol_to_pair_cache.get(inst_id)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=inst_id)
+            self._symbol_to_pair_cache[inst_id] = trading_pair
 
         for diff_data in diff_updates:
             timestamp: float = int(diff_data["ts"]) * 1e-3
             update_id: int = int(timestamp)
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                symbol=raw_message["arg"]["instId"])
 
             order_book_message_content = {
                 "trading_pair": trading_pair,
@@ -141,6 +158,8 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                # Pre-populate symbol cache for hot path optimization
+                self._symbol_to_pair_cache[symbol] = trading_pair
 
                 payload = {
                     "op": "subscribe",
@@ -168,7 +187,7 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIPTION_LIMIT_ID):
                     await ws.send(subscribe_orderbook_request)
 
-            self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().info(f"Subscribed to public order book and trade channels (cached {len(self._symbol_to_pair_cache)} symbols)")
         except asyncio.CancelledError:
             raise
         except Exception:

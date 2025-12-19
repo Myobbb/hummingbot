@@ -29,6 +29,9 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._connector: 'BitgetExchange' = connector
         self._api_factory: WebAssistantsFactory = api_factory
         self._ping_task: Optional[asyncio.Task] = None
+        
+        # Symbol cache for hot path optimization (avoid async lookups per message)
+        self._symbol_to_pair_cache: Dict[str, str] = {}
 
     async def get_last_traded_prices(
         self,
@@ -92,7 +95,11 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         :return: The parsed order book message.
         """
-        trading_pair: str = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+        # Use cache for O(1) lookup, fallback to async if not cached
+        trading_pair = self._symbol_to_pair_cache.get(symbol)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+            self._symbol_to_pair_cache[symbol] = trading_pair
         update_id: int = int(data["ts"])
         timestamp: float = update_id * 1e-3
 
@@ -150,7 +157,11 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
     ) -> None:
         data: List[Dict[str, Any]] = raw_message["data"]
         symbol: str = raw_message["arg"]["instId"]
-        trading_pair: str = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+        # Use cache for O(1) lookup, fallback to async if not cached
+        trading_pair = self._symbol_to_pair_cache.get(symbol)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+            self._symbol_to_pair_cache[symbol] = trading_pair
 
         for trade_data in data:
             trade_type: float = float(TradeType.BUY.value) \
@@ -187,6 +198,9 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol: str = await self._connector.exchange_symbol_associated_to_pair(
                     trading_pair
                 )
+                # Pre-populate symbol cache for hot path optimization
+                self._symbol_to_pair_cache[symbol] = trading_pair
+                
                 for channel in [CONSTANTS.PUBLIC_WS_BOOKS, CONSTANTS.PUBLIC_WS_TRADE]:
                     subscription_topics.append({
                         "instType": "SPOT",
@@ -201,7 +215,7 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 })
             )
 
-            self.logger().info("Subscribed to public channels...")
+            self.logger().info(f"Subscribed to public channels (cached {len(self._symbol_to_pair_cache)} symbols)")
         except asyncio.CancelledError:
             raise
         except Exception:

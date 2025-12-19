@@ -11,7 +11,8 @@ MAX_CLIENT_ORDER_ID_LENGTH = 64
 
 # Use AWS-hosted endpoints for improved stability
 REST_URL = "https://api-aws.huobi.pro"
-WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"
+WS_PUBLIC_URL = "wss://api-aws.huobi.pro/ws"  # For trade.detail
+WS_MBP_URL = "wss://api-aws.huobi.pro/feed"   # For MBP (Market By Price) incremental updates
 WS_PRIVATE_URL = "wss://api-aws.huobi.pro/ws/v2"
 
 
@@ -19,7 +20,14 @@ WS_HEARTBEAT_TIME_INTERVAL = 20  # seconds
 
 # Websocket event types
 TRADE_CHANNEL_SUFFIX = "trade.detail"
-ORDERBOOK_CHANNEL_SUFFIX = "depth.step0"
+ORDERBOOK_CHANNEL_SUFFIX = "mbp"  # MBP for orderbook updates
+
+# Hybrid MBP orderbook configuration for maximum freshness:
+# - mbp.5: tick-by-tick incremental updates for top 5 levels (ALL symbols, fastest)
+# - mbp.refresh.20: 100ms full snapshots with 20 levels (ALL symbols, fills deeper depth)
+# Both share same sequence space. Use mbp.5 for real-time, mbp.refresh.20 for sync/recovery.
+MBP_INCREMENTAL_DEPTH = 5   # Tick-by-tick incremental (DIFF messages)
+MBP_REFRESH_DEPTH = 20      # 100ms full snapshots (fills levels 6-20)
 
 TRADE_INFO_URL = "/v1/settings/common/market-symbols"
 DEPTH_URL = "/market/depth"

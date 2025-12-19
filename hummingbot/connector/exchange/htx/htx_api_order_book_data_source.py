@@ -47,6 +47,19 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         # Track transient disconnects to emit a single concise INFO after successful resubscribe
         self._pending_reconnect_notice: Optional[Dict[str, Any]] = None
+        
+        # Symbol cache for hot path optimization (avoid async lookups per message)
+        self._symbol_to_pair_cache: Dict[str, str] = {}
+        
+        # MBP sequence tracking per symbol for gap detection
+        # Key: exchange symbol (lowercase), Value: last received seqNum
+        self._last_seq_num: Dict[str, int] = {}
+        
+        # Track symbols needing snapshot refresh (due to sequence gaps)
+        self._symbols_needing_refresh: set = set()
+        
+        # Track active WebSocket for snapshot requests
+        self._active_ws: Optional[WSAssistant] = None
 
     def _extract_close_code(self, exc: Exception) -> Optional[str]:
         try:
@@ -84,8 +97,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         throttler = getattr(self._api_factory, "throttler", None)
         
-        # IMPORTANT: Disable protocol-level ping; HTX uses JSON ping/pong
-        ws_url = CONSTANTS.WS_PUBLIC_URL
+        # IMPORTANT: Use /feed endpoint for MBP incremental updates (not /ws)
+        # MBP provides 100ms incremental updates vs 1s snapshots from depth.step0
+        ws_url = CONSTANTS.WS_MBP_URL
         connection_params = {
             "ws_url": ws_url,
             "ping_timeout": None,  # Disable protocol ping, use JSON ping instead
@@ -297,31 +311,59 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
-        Subscribe to orderbook and trade channels with proper rate limiting.
+        Subscribe to MBP orderbook (incremental) and trade channels with proper rate limiting.
+        MBP = Market By Price incremental updates (100ms for mbp.150)
         """
         try:
+            # Store reference to active WS for snapshot requests
+            self._active_ws = ws
+            
+            # Reset sequence tracking on new connection
+            self._last_seq_num.clear()
+            self._symbols_needing_refresh.clear()
+            
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                # Pre-populate symbol cache for hot path optimization (HTX uses lowercase)
+                self._symbol_to_pair_cache[exchange_symbol.lower()] = trading_pair
                 # HTX WS expects lowercase symbols in channel names
                 exchange_symbol = exchange_symbol.lower()
                 
-                # Subscribe to orderbook
-                subscribe_orderbook_request: WSJSONRequest = WSJSONRequest({
-                    "sub": f"market.{exchange_symbol}.depth.step0",
+                # Subscribe to MBP incremental orderbook (tick-by-tick for top levels)
+                mbp_incremental_channel = f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_INCREMENTAL_DEPTH}"
+                subscribe_incremental_request: WSJSONRequest = WSJSONRequest({
+                    "sub": mbp_incremental_channel,
                     "id": str(uuid.uuid4())
                 })
                 
                 if not self._suppress_reconnect_logs:
-                    self.logger().debug(f"Subscribing to orderbook: market.{exchange_symbol}.depth.step0")
+                    self.logger().debug(f"Subscribing to MBP incremental: {mbp_incremental_channel}")
                 
                 throttler = getattr(self._api_factory, "throttler", None)
                 if throttler is not None:
                     async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
-                        await ws.send(subscribe_orderbook_request)
+                        await ws.send(subscribe_incremental_request)
                 else:
-                    await ws.send(subscribe_orderbook_request)
+                    await ws.send(subscribe_incremental_request)
 
-                # Subscribe to trades
+                # Subscribe to MBP refresh (100ms full snapshots with deeper levels)
+                mbp_refresh_channel = f"market.{exchange_symbol}.mbp.refresh.{CONSTANTS.MBP_REFRESH_DEPTH}"
+                subscribe_refresh_request: WSJSONRequest = WSJSONRequest({
+                    "sub": mbp_refresh_channel,
+                    "id": str(uuid.uuid4())
+                })
+                
+                if not self._suppress_reconnect_logs:
+                    self.logger().debug(f"Subscribing to MBP refresh: {mbp_refresh_channel}")
+                
+                if throttler is not None:
+                    async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                        await ws.send(subscribe_refresh_request)
+                else:
+                    await ws.send(subscribe_refresh_request)
+
+                # Subscribe to trades (still uses the old /ws endpoint implicitly, 
+                # but /feed also supports trade.detail)
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.trade.detail",
                     "id": str(uuid.uuid4())
@@ -335,6 +377,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         await ws.send(subscribe_trade_request)
                 else:
                     await ws.send(subscribe_trade_request)
+                
+                # No need for explicit snapshot request - mbp.refresh provides them continuously
                 
 
             if self._pending_reconnect_notice is not None:
@@ -361,14 +405,32 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             raise
 
+    async def _request_mbp_snapshot(self, ws: WSAssistant, exchange_symbol: str):
+        """
+        Request a full MBP snapshot for a symbol (used for initial sync and gap recovery).
+        """
+        mbp_channel = f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_DEPTH}"
+        snapshot_request: WSJSONRequest = WSJSONRequest({
+            "req": mbp_channel,
+            "id": str(uuid.uuid4())
+        })
+        throttler = getattr(self._api_factory, "throttler", None)
+        if throttler is not None:
+            async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
+                await ws.send(snapshot_request)
+        else:
+            await ws.send(snapshot_request)
+        self.logger().debug(f"Requested MBP snapshot for {exchange_symbol}")
+
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         """
         Identify which channel a message belongs to based on the channel name.
         """
-        channel = event_message.get("ch", "")
+        # Check both "ch" (incremental) and "rep" (snapshot response)
+        channel = event_message.get("ch", "") or event_message.get("rep", "")
         
-        # HTX uses "depth.step0" for orderbook and "trade.detail" for trades
-        if "depth.step0" in channel:
+        # MBP incremental updates and snapshot responses: market.{symbol}.mbp.{depth}
+        if ".mbp." in channel:
             return self._diff_messages_queue_key
         elif "trade.detail" in channel:
             return self._trade_messages_queue_key
@@ -381,7 +443,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Called by the base class with messages from the queue.
         """
         ex_symbol = raw_message["ch"].split(".")[1]
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+        # Use cache for O(1) lookup, fallback to async if not cached
+        trading_pair = self._symbol_to_pair_cache.get(ex_symbol)
+        if trading_pair is None:
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=ex_symbol)
+            self._symbol_to_pair_cache[ex_symbol] = trading_pair
         
         for data in raw_message["tick"]["data"]:
             trade_message: OrderBookMessage = self.trade_message_from_exchange(
@@ -392,18 +458,138 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         """
-        Parse orderbook snapshot messages.
-        HTX sends snapshots through the depth channel, not diffs.
+        Parse MBP orderbook messages. Handles three types:
+        1. mbp.refresh.X: 100ms full snapshots (20 levels)
+        2. mbp.X: tick-by-tick incremental updates (5 levels)
+        3. req response: snapshot from explicit request
+        
+        Format:
+        - Refresh:     {"ch":"market.btcusdt.mbp.refresh.20", "tick":{"seqNum":X, "bids":[...], "asks":[...]}}
+        - Incremental: {"ch":"market.btcusdt.mbp.5", "tick":{"seqNum":X, "prevSeqNum":Y, "bids":[...], "asks":[...]}}
+        - Snapshot:    {"rep":"market.btcusdt.mbp.5", "data":{"seqNum":X, "bids":[...], "asks":[...]}}
         """
-        msg_channel = raw_message["ch"]
-        order_book_symbol = msg_channel.split(".")[1]
-        snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
-            msg=raw_message,
-            metadata={
-                "trading_pair": await self._connector.trading_pair_associated_to_exchange_symbol(order_book_symbol)
+        # Check if this is a snapshot response (from req) or a channel update (from sub)
+        is_req_response = "rep" in raw_message
+        
+        if is_req_response:
+            # Snapshot response from "req"
+            msg_channel = raw_message.get("rep", "")
+            parts = msg_channel.split(".")
+            if len(parts) >= 2:
+                order_book_symbol = parts[1]
+            else:
+                return
+            
+            data = raw_message.get("data", {})
+            seq_num = data.get("seqNum", 0)
+            
+            # Update sequence tracking
+            self._last_seq_num[order_book_symbol] = seq_num
+            if order_book_symbol in self._symbols_needing_refresh:
+                self._symbols_needing_refresh.discard(order_book_symbol)
+            
+            # Use cache for O(1) lookup
+            trading_pair = self._symbol_to_pair_cache.get(order_book_symbol)
+            if trading_pair is None:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(order_book_symbol)
+                self._symbol_to_pair_cache[order_book_symbol] = trading_pair
+            
+            # Create snapshot message
+            msg_ts = raw_message.get("ts", time.time() * 1000) * 1e-3
+            content = {
+                "trading_pair": trading_pair,
+                "update_id": seq_num,
+                "bids": data.get("bids", []),
+                "asks": data.get("asks", [])
             }
-        )
-        message_queue.put_nowait(snapshot_msg)
+            snapshot_msg = OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
+            message_queue.put_nowait(snapshot_msg)
+            
+        else:
+            # Channel update from "sub" - either mbp.refresh.X or mbp.X
+            msg_channel = raw_message.get("ch", "")
+            parts = msg_channel.split(".")
+            if len(parts) >= 2:
+                order_book_symbol = parts[1]
+            else:
+                return
+            
+            tick = raw_message.get("tick", {})
+            seq_num = tick.get("seqNum", 0)
+            
+            # Check if this is a refresh (snapshot) or incremental
+            is_refresh = ".mbp.refresh." in msg_channel
+            
+            if is_refresh:
+                # mbp.refresh.X - full snapshot at 100ms intervals
+                # Always update sequence tracking from refresh
+                self._last_seq_num[order_book_symbol] = seq_num
+                if order_book_symbol in self._symbols_needing_refresh:
+                    self._symbols_needing_refresh.discard(order_book_symbol)
+                
+                trading_pair = self._symbol_to_pair_cache.get(order_book_symbol)
+                if trading_pair is None:
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(order_book_symbol)
+                    self._symbol_to_pair_cache[order_book_symbol] = trading_pair
+                
+                msg_ts = raw_message.get("ts", time.time() * 1000) * 1e-3
+                content = {
+                    "trading_pair": trading_pair,
+                    "update_id": seq_num,
+                    "bids": tick.get("bids", []),
+                    "asks": tick.get("asks", [])
+                }
+                snapshot_msg = OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
+                message_queue.put_nowait(snapshot_msg)
+                
+            else:
+                # mbp.X - tick-by-tick incremental update
+                prev_seq_num = tick.get("prevSeqNum", 0)
+                
+                # Check if we have received a snapshot yet for this symbol
+                last_seq = self._last_seq_num.get(order_book_symbol)
+                
+                if last_seq is None:
+                    # No snapshot received yet - mbp.refresh will provide initial sync
+                    return
+                
+                # Optimistic processing: apply incrementals if they're moving forward
+                # The next refresh snapshot (within 100ms) will correct any inconsistencies
+                # This allows us to get real-time top-5 updates while refresh handles sync
+                
+                if seq_num <= last_seq:
+                    # Old/duplicate message - skip
+                    return
+                
+                # Forward-looking message - apply it optimistically
+                # Track the sequence for logging but don't block on gaps
+                if prev_seq_num != last_seq and order_book_symbol not in self._symbols_needing_refresh:
+                    # Log gap at debug level since refresh will auto-correct within 100ms
+                    self.logger().debug(
+                        f"MBP incremental gap for {order_book_symbol}: had seq={last_seq}, got prevSeq={prev_seq_num}, seqNum={seq_num}"
+                    )
+                    # Mark for clarity but don't skip - apply optimistically
+                    self._symbols_needing_refresh.add(order_book_symbol)
+                
+                # Update sequence tracking
+                self._last_seq_num[order_book_symbol] = seq_num
+                
+                # Use cache for O(1) lookup
+                trading_pair = self._symbol_to_pair_cache.get(order_book_symbol)
+                if trading_pair is None:
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(order_book_symbol)
+                    self._symbol_to_pair_cache[order_book_symbol] = trading_pair
+                
+                # Create diff message (incremental update)
+                msg_ts = raw_message.get("ts", time.time() * 1000) * 1e-3
+                content = {
+                    "trading_pair": trading_pair,
+                    "update_id": seq_num,
+                    "bids": tick.get("bids", []),
+                    "asks": tick.get("asks", [])
+                }
+                diff_msg = OrderBookMessage(OrderBookMessageType.DIFF, content, timestamp=msg_ts)
+                message_queue.put_nowait(diff_msg)
 
     async def _process_message_for_unknown_channel(self, event_message: Dict[str, Any], websocket_assistant: WSAssistant):
         # Server may send ping - respond immediately
