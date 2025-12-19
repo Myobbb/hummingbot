@@ -54,11 +54,12 @@ class LatencyTest(ScriptStrategyBase):
     csv_file_id: str = "latency_test"  # Identifier for CSV filenames
     
     # Exchanges to test - comment out any you don't have configured
+    # NOTE: MEXC has symbol format issues (uses BTCUSDT not BTC-USDT), disabled
     markets = {
         "bybit": {trading_pair},
         "kucoin": {trading_pair},
         "gate_io": {trading_pair},
-        "mexc": {trading_pair},
+        # "mexc": {trading_pair},  # Symbol mapping issue
         "htx": {trading_pair},
         "bitmart": {trading_pair},
         "bing_x": {trading_pair},
