@@ -214,7 +214,7 @@ class LatencyTest(ScriptStrategyBase):
         
         self.ws_updates_found.add(client_order_id)
         
-        self.logger().info(f"WS UPDATE {connector_name}: Captured Timestamp! One-Way: {one_way:.0f}ms (TS={new_ts:.3f})")
+        self.logger().info(f"WS UPDATE {connector_name}: Captured! P={one_way:.0f}ms (Exch={new_ts:.3f} - Send={pre_send_ts/1000:.3f})")
     
     def cancel_all_orders(self, connector_name):
         """Cancels all active orders on an exchange."""
