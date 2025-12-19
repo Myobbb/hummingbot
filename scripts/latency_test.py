@@ -56,6 +56,7 @@ class LatencyTest(ScriptStrategyBase):
     # Timing
     create_interval = 60  # seconds between test cycles
     delay = 5  # seconds before canceling orders
+    ws_wait_timeout = 1.0  # seconds to wait for late WS updates (for BingX etc)
     
     # Exchanges to test - comment out any you don't have configured
     EXCHANGES = [
@@ -130,10 +131,28 @@ class LatencyTest(ScriptStrategyBase):
         if any(active_counts.values()):
             has_active = True
             
+            # Wait for all WS updates before logging summary
+            # Check if we have WS updates for all exchanges, or timeout has passed
+            ws_received_count = len(getattr(self, 'current_batch_one_way', {}))
+            all_ws_received = ws_received_count >= len(self.connectors)
+            
+            # Check if ws_wait_timeout has passed since batch started
+            batch_start = getattr(self, 'batch_start_timestamp', 0)
+            ws_timeout_passed = (self.current_timestamp - batch_start) >= (self.delay + self.ws_wait_timeout)
+            
             # Log batch summary (with all collected WS updates) before cancelling
             if not getattr(self, "summary_logged", False):
-                self._log_batch_summary()
-                self.summary_logged = True
+                if all_ws_received or ws_timeout_passed:
+                    self._log_batch_summary()
+                    self.summary_logged = True
+                else:
+                    # Still waiting for WS updates - log which ones are pending
+                    ws_received = set(getattr(self, 'current_batch_one_way', {}).keys())
+                    ws_pending = set(self.connectors.keys()) - ws_received
+                    if not getattr(self, '_ws_wait_logged', False):
+                        self.logger().info(f"Waiting for WS updates from: {', '.join(sorted(ws_pending))}")
+                        self._ws_wait_logged = True
+                    return
             
             for connector_name in self.connectors:
                 if active_counts[connector_name] > 0:
@@ -240,9 +259,13 @@ class LatencyTest(ScriptStrategyBase):
         self.current_batch_one_way = {}
         self.ws_updates_found = set()
         self.summary_logged = False
+        self._ws_wait_logged = False
         
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
+        
+        # Track when batch started for WS timeout calculation
+        self.batch_start_timestamp = self.current_timestamp
         
         # Log start of dispatch
         dispatch_start = time.perf_counter()
