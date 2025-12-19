@@ -142,7 +142,13 @@ class LatencyTest(ScriptStrategyBase):
     def inject_hooks(self):
         """Monkey-patches the ClientOrderTracker to intercept WS updates before they are filtered."""
         for connector_name, connector in self.connectors.items():
-            tracker = connector._client_order_tracker
+            tracker = getattr(connector, "_client_order_tracker", None)
+            if not tracker:
+                tracker = getattr(connector, "_order_tracker", None)
+                
+            if not tracker:
+                self.logger().warning(f"Could not find order tracker for {connector_name} - skipping WS hooks")
+                continue
             
             # Avoid double wrapping if possible (wrapper name usually 'wrapper' or 'make_wrapper')
             if getattr(tracker.process_order_update, "__name__", "") == "wrapper":
