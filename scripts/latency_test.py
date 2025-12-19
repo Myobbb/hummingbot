@@ -201,15 +201,16 @@ class LatencyTest(ScriptStrategyBase):
         pre_send_ts = order_info["pre_send_ts"]
         
         ws_ts_ms = new_ts * 1000
-        one_way = ws_ts_ms - (pre_send_ts * 1000)
+        # Calculate One-Way (MS - MS)
+        one_way = ws_ts_ms - pre_send_ts
         
         if not hasattr(self, 'current_batch_one_way'):
             self.current_batch_one_way = {}
             
         self.current_batch_one_way[connector_name] = one_way
         
-        # Update for CSV (Store as Seconds to match analyzer expectation)
-        order_info["exchange_ts"] = new_ts
+        # Update for CSV (Store as MS)
+        order_info["exchange_ts"] = ws_ts_ms
         
         self.ws_updates_found.add(client_order_id)
         
@@ -334,8 +335,8 @@ class LatencyTest(ScriptStrategyBase):
                 self.pending_orders[event.order_id]["created_ts"] = created_ts
                 # Only set exchange_ts if not already set by WS (rare race condition)
                 if "exchange_ts" not in self.pending_orders[event.order_id]:
-                    # Store as Seconds
-                    self.pending_orders[event.order_id]["exchange_ts"] = event.creation_timestamp
+                    # Store as MS
+                    self.pending_orders[event.order_id]["exchange_ts"] = event.creation_timestamp * 1000
     
     def _log_batch_summary(self):
         """Log a one-line summary of all latencies sorted by speed."""
