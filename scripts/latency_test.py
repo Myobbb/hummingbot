@@ -123,11 +123,20 @@ class LatencyTest(ScriptStrategyBase):
         
         # Cancel any active orders after the delay has passed
         has_active = False
-        for connector_name in self.connectors:
-            active_orders = self.get_active_orders(connector_name)
-            if active_orders:
-                has_active = True
-                self.cancel_all_orders(connector_name)
+        # Check if we have active orders to cancel
+        active_counts = {c: len(self.get_active_orders(c)) for c in self.connectors}
+        
+        if any(active_counts.values()):
+            has_active = True
+            
+            # Log batch summary (with all collected WS updates) before cancelling
+            if not getattr(self, "summary_logged", False):
+                self._log_batch_summary()
+                self.summary_logged = True
+            
+            for connector_name in self.connectors:
+                if active_counts[connector_name] > 0:
+                     self.cancel_all_orders(connector_name)
         
         if has_active:
             self.delay_timestamp = self.current_timestamp + self.delay
@@ -192,12 +201,16 @@ class LatencyTest(ScriptStrategyBase):
         pre_send_ts = order_info["pre_send_ts"]
         
         ws_ts_ms = new_ts * 1000
-        one_way = ws_ts_ms - pre_send_ts
+        one_way = ws_ts_ms - (pre_send_ts * 1000)
         
         if not hasattr(self, 'current_batch_one_way'):
             self.current_batch_one_way = {}
             
         self.current_batch_one_way[connector_name] = one_way
+        
+        # Update for CSV (Store as Seconds to match analyzer expectation)
+        order_info["exchange_ts"] = new_ts
+        
         self.ws_updates_found.add(client_order_id)
         
         self.logger().info(f"WS UPDATE {connector_name}: Captured Timestamp! One-Way: {one_way:.0f}ms (TS={new_ts:.3f})")
@@ -205,6 +218,16 @@ class LatencyTest(ScriptStrategyBase):
     def cancel_all_orders(self, connector_name):
         """Cancels all active orders on an exchange."""
         for order in self.get_active_orders(connector_name):
+            # Save the deferred "CREATED" row now (with best timestamp)
+            if order.client_order_id in self.pending_orders:
+                info = self.pending_orders[order.client_order_id]
+                if "created_ts" in info:
+                    # Use pre_send_ts (Seconds) for Timestamp column to allow (Exchange - Send) calculation
+                    ts_to_write = info["pre_send_ts"]
+                    # Use exchange_ts (Seconds)
+                    exchange_ts = info.get("exchange_ts", 0)
+                    self.save_to_csv(connector_name, ts_to_write, order.client_order_id, OrderState.CREATED.name, exchange_ts)
+
             self.save_to_csv(connector_name, self.timestamp_now, order.client_order_id, OrderState.PENDING_CANCEL.name)
             self.cancel(connector_name, order.trading_pair, order.client_order_id)
     
@@ -214,6 +237,7 @@ class LatencyTest(ScriptStrategyBase):
         self.current_batch_latencies = {}
         self.current_batch_one_way = {}
         self.ws_updates_found = set()
+        self.summary_logged = False
         
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
@@ -302,13 +326,16 @@ class LatencyTest(ScriptStrategyBase):
             
             # Track for batch summary
             self.current_batch_latencies[exchange] = latency_ms
-            self.current_batch_one_way[exchange] = one_way_ms
+            if exchange not in self.current_batch_one_way:
+                self.current_batch_one_way[exchange] = one_way_ms
             
-            self.save_to_csv(exchange, created_ts, event.order_id, OrderState.CREATED.name, exchange_ts_ms)
-            
-            # Check if all orders for this batch have been confirmed
-            if len(self.current_batch_latencies) == len(self.connectors):
-                self._log_batch_summary()
+            # Store timestamps for delayed CSV writing (allows capturing better WS timestamps)
+            if event.order_id in self.pending_orders:
+                self.pending_orders[event.order_id]["created_ts"] = created_ts
+                # Only set exchange_ts if not already set by WS (rare race condition)
+                if "exchange_ts" not in self.pending_orders[event.order_id]:
+                    # Store as Seconds
+                    self.pending_orders[event.order_id]["exchange_ts"] = event.creation_timestamp
     
     def _log_batch_summary(self):
         """Log a one-line summary of all latencies sorted by speed."""
