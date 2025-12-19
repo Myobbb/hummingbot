@@ -487,8 +487,14 @@ class MexcExchange(ExchangePyBase):
             tasks = []
             trading_pairs = self.trading_pairs
             for trading_pair in trading_pairs:
+                try:
+                    symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                except KeyError:
+                    # Symbol map not initialized yet, skip this polling cycle
+                    self.logger().debug(f"Symbol map not ready for {trading_pair}, skipping trade poll")
+                    continue
                 params = {
-                    "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    "symbol": symbol
                 }
                 if self._last_poll_timestamp > 0:
                     params["startTime"] = query_time

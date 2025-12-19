@@ -105,6 +105,23 @@ class MexcWebsocketSubscriptionManager:
         if not self._connector:
             raise RuntimeError("Connector must be set before subscribing")
 
+        # Wait for the symbol map to be initialized (exchange info fetched)
+        # This handles the race condition where data source starts before exchange info is ready
+        max_wait = 30  # Maximum 30 seconds
+        wait_interval = 0.5
+        waited = 0
+        while waited < max_wait:
+            try:
+                # Test if symbol map is ready by trying to convert first trading pair
+                await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pairs[0])
+                break  # Symbol map is ready
+            except KeyError:
+                self.logger().debug(f"Waiting for MEXC symbol map to initialize... ({waited:.1f}s)")
+                await asyncio.sleep(wait_interval)
+                waited += wait_interval
+        else:
+            raise RuntimeError(f"MEXC symbol map not initialized after {max_wait}s")
+
         used_connections = []
         current_connection = None
 

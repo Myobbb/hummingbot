@@ -54,12 +54,11 @@ class LatencyTest(ScriptStrategyBase):
     csv_file_id: str = "latency_test"  # Identifier for CSV filenames
     
     # Exchanges to test - comment out any you don't have configured
-    # NOTE: MEXC has symbol format issues (uses BTCUSDT not BTC-USDT), disabled
     markets = {
         "bybit": {trading_pair},
         "kucoin": {trading_pair},
         "gate_io": {trading_pair},
-        # "mexc": {trading_pair},  # Symbol mapping issue
+        "mexc": {trading_pair},
         "htx": {trading_pair},
         "bitmart": {trading_pair},
         "bing_x": {trading_pair},
@@ -71,6 +70,10 @@ class LatencyTest(ScriptStrategyBase):
     create_timestamp: float = 0
     delay_timestamp: float = 0
     pending_orders: dict = {}  # order_id -> {exchange, pre_send_ts}
+    
+    # Batch latency tracking
+    current_batch_latencies: dict = {}  # exchange -> latency_ms
+    batch_count: int = 0
     
     @property
     def timestamp_now(self):
@@ -114,8 +117,11 @@ class LatencyTest(ScriptStrategyBase):
     
     def place_orders_all_exchanges(self):
         """Places test orders on all configured exchanges."""
-        self.logger().info("=" * 50)
-        self.logger().info("Starting latency test cycle")
+        self.batch_count += 1
+        self.current_batch_latencies = {}  # Reset for new batch
+        
+        self.logger().info(f"{'='*60}")
+        self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
         
         for connector_name in self.connectors:
             try:
@@ -149,7 +155,6 @@ class LatencyTest(ScriptStrategyBase):
         
         # Log to CSV
         self.save_to_csv(connector_name, time_before_order_sent, order_id, OrderState.PENDING_CREATE.name)
-        self.logger().info(f"{connector_name}: Placed test order {order_id}")
     
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         """Logs the post-transmission timestamp when a buy order is created."""
@@ -160,8 +165,39 @@ class LatencyTest(ScriptStrategyBase):
             exchange = order_info["exchange"]
             latency_ms = created_ts - order_info["pre_send_ts"]
             
+            # Track for batch summary
+            self.current_batch_latencies[exchange] = latency_ms
+            
             self.save_to_csv(exchange, created_ts, event.order_id, OrderState.CREATED.name)
-            self.logger().info(f"{exchange}: Order {event.order_id} CREATED in {latency_ms}ms")
+            
+            # Check if all orders for this batch have been confirmed
+            expected_count = len(self.connectors)
+            if len(self.current_batch_latencies) == expected_count:
+                self._log_batch_summary()
+    
+    def _log_batch_summary(self):
+        """Log a one-line summary of all latencies sorted by speed."""
+        if not self.current_batch_latencies:
+            return
+        
+        # Sort by latency (fastest first)
+        sorted_latencies = sorted(self.current_batch_latencies.items(), key=lambda x: x[1])
+        
+        # Format as: "exchange:XXms"
+        summary_parts = [f"{ex}:{lat}ms" for ex, lat in sorted_latencies]
+        summary = " | ".join(summary_parts)
+        
+        # Calculate stats
+        latencies = list(self.current_batch_latencies.values())
+        avg_latency = sum(latencies) / len(latencies)
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        
+        self.logger().info(f"{'='*60}")
+        self.logger().info(f"BATCH #{self.batch_count} RESULTS (sorted by speed):")
+        self.logger().info(f"  {summary}")
+        self.logger().info(f"  Min: {min_latency}ms | Avg: {avg_latency:.0f}ms | Max: {max_latency}ms")
+        self.logger().info(f"{'='*60}")
     
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
         """Logs the post-transmission timestamp when a sell order is created."""
@@ -176,7 +212,6 @@ class LatencyTest(ScriptStrategyBase):
             exchange = order_info["exchange"]
             
             self.save_to_csv(exchange, canceled_ts, event.order_id, OrderState.CANCELED.name)
-            self.logger().info(f"{exchange}: Order {event.order_id} CANCELED")
             
             # Clean up
             del self.pending_orders[event.order_id]
