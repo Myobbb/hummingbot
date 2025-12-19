@@ -8,22 +8,17 @@ Inspired by: https://github.com/supervik/crypto-exchanges-latencies-test
 
 Usage:
     1. Configure API keys for target exchanges in Hummingbot
-    2. Run: start --script latency_test.py --conf latency_test.yml
+    2. Comment out exchanges you don't have configured in EXCHANGES below
+    3. Run: start --script latency_test.py
 """
 
 import csv
-import logging
 import os
 import time
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, Optional, Set
 
-from pydantic import Field
-
-from hummingbot.client.config.config_data_types import BaseClientModel
-from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType
 from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
     OrderCancelledEvent,
@@ -39,28 +34,6 @@ class OrderState(Enum):
     CANCELED = 3
 
 
-class LatencyTestConfig(BaseClientModel):
-    """Configuration for latency test"""
-    script_file_name: str = "latency_test.py"
-    
-    # Trading pair for all exchanges
-    trading_pair: str = Field(default="BTC-USDT", description="Trading pair to test")
-    
-    # Exchanges as comma-separated string
-    exchanges: str = Field(
-        default="bybit,kucoin,gate_io,mexc,htx,bitmart,bing_x,okx,bitget",
-        description="Comma-separated list of exchanges to test"
-    )
-    
-    # Order parameters
-    order_price: Decimal = Field(default=Decimal("69420"), description="Unfillable order price")
-    order_amount: Decimal = Field(default=Decimal("0.0004"), description="Order amount in base")
-    
-    # Timing configuration
-    create_interval: int = Field(default=60, description="Interval between test cycles (seconds)")
-    delay: int = Field(default=5, description="Delay before canceling orders (seconds)")
-
-
 class LatencyTest(ScriptStrategyBase):
     """
     Multi-exchange latency test script.
@@ -71,30 +44,48 @@ class LatencyTest(ScriptStrategyBase):
     Results are saved to CSV files for analysis.
     """
     
-    @classmethod
-    def init_markets(cls, config: LatencyTestConfig):
-        """Initialize markets from config - builds markets dict from exchanges string"""
-        markets: Dict[str, Set[str]] = {}
-        for exchange in config.exchanges.split(","):
-            exchange = exchange.strip()
-            if exchange:
-                markets[exchange] = {config.trading_pair}
-        cls.markets = markets
+    # ========== CONFIGURATION ==========
+    # Trading pair (must be available on all exchanges)
+    trading_pair = "BTC-USDT"
     
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: LatencyTestConfig):
-        super().__init__(connectors, config)
-        self.config = config
+    # Order parameters - unfillable buy price
+    order_price = Decimal("69420")
+    order_amount = Decimal("0.0004")  # ~$25 at ~$100k BTC
+    
+    # Timing
+    create_interval = 60  # seconds between test cycles
+    delay = 5  # seconds before canceling orders
+    
+    # Exchanges to test - comment out any you don't have configured
+    EXCHANGES = [
+        "bybit",
+        "kucoin",
+        "gate_io",
+        "mexc",
+        "htx",
+        "bitmart",
+        "bing_x",
+        "okx",
+        "bitget",
+    ]
+    # ========== END CONFIGURATION ==========
+    
+    # Build markets dict from exchanges list
+    markets = {ex: {trading_pair} for ex in EXCHANGES}
+    
+    def __init__(self, connectors):
+        super().__init__(connectors)
         
         # Runtime state
-        self.create_timestamp: float = 0
-        self.delay_timestamp: float = 0
-        self.pending_orders: dict = {}  # order_id -> {exchange, pre_send_ts}
+        self.create_timestamp = 0
+        self.delay_timestamp = 0
+        self.pending_orders = {}  # order_id -> {exchange, pre_send_ts}
         
         # Batch latency tracking
-        self.current_batch_latencies: dict = {}  # exchange -> latency_ms
-        self.batch_count: int = 0
+        self.current_batch_latencies = {}  # exchange -> latency_ms
+        self.batch_count = 0
         
-        self.csv_file_id: str = "latency_test"
+        self.csv_file_id = "latency_test"
         
         self.logger().info(f"LatencyTest initialized with {len(connectors)} exchanges")
     
@@ -123,17 +114,17 @@ class LatencyTest(ScriptStrategyBase):
                 self.cancel_all_orders(connector_name)
         
         if has_active:
-            self.delay_timestamp = self.current_timestamp + self.config.delay
+            self.delay_timestamp = self.current_timestamp + self.delay
             return
         
         # Place limit orders if conditions are met
         if self.current_timestamp > self.create_timestamp:
-            self.delay_timestamp = self.current_timestamp + self.config.delay
-            self.create_timestamp = self.current_timestamp + self.config.create_interval
+            self.delay_timestamp = self.current_timestamp + self.delay
+            self.create_timestamp = self.current_timestamp + self.create_interval
             self.place_orders_all_exchanges()
     
     def cancel_all_orders(self, connector_name):
-        """Cancels all active orders on an exchange and logs the pre-transmission timestamp."""
+        """Cancels all active orders on an exchange."""
         for order in self.get_active_orders(connector_name):
             self.save_to_csv(connector_name, self.timestamp_now, order.client_order_id, OrderState.PENDING_CANCEL.name)
             self.cancel(connector_name, order.trading_pair, order.client_order_id)
@@ -141,7 +132,7 @@ class LatencyTest(ScriptStrategyBase):
     def place_orders_all_exchanges(self):
         """Places test orders on all configured exchanges."""
         self.batch_count += 1
-        self.current_batch_latencies = {}  # Reset for new batch
+        self.current_batch_latencies = {}
         
         self.logger().info(f"{'='*60}")
         self.logger().info(f"BATCH #{self.batch_count} - Starting latency test")
@@ -157,8 +148,8 @@ class LatencyTest(ScriptStrategyBase):
         connector = self.connectors[connector_name]
         
         # Quantize amount to exchange's requirements
-        amount = connector.quantize_order_amount(self.config.trading_pair, self.config.order_amount)
-        price = connector.quantize_order_price(self.config.trading_pair, self.config.order_price)
+        amount = connector.quantize_order_amount(self.trading_pair, self.order_amount)
+        price = connector.quantize_order_price(self.trading_pair, self.order_price)
         
         if amount <= 0:
             self.logger().warning(f"{connector_name}: Order amount too small after quantization")
@@ -168,7 +159,7 @@ class LatencyTest(ScriptStrategyBase):
         time_before_order_sent = self.timestamp_now
         
         # Place limit buy order
-        order_id = self.buy(connector_name, self.config.trading_pair, amount, OrderType.LIMIT, price)
+        order_id = self.buy(connector_name, self.trading_pair, amount, OrderType.LIMIT, price)
         
         # Track the order
         self.pending_orders[order_id] = {
@@ -194,8 +185,7 @@ class LatencyTest(ScriptStrategyBase):
             self.save_to_csv(exchange, created_ts, event.order_id, OrderState.CREATED.name)
             
             # Check if all orders for this batch have been confirmed
-            expected_count = len(self.connectors)
-            if len(self.current_batch_latencies) == expected_count:
+            if len(self.current_batch_latencies) == len(self.connectors):
                 self._log_batch_summary()
     
     def _log_batch_summary(self):
@@ -223,7 +213,6 @@ class LatencyTest(ScriptStrategyBase):
         self.logger().info(f"{'='*60}")
     
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
-        """Logs the post-transmission timestamp when a sell order is created."""
         pass
     
     def did_cancel_order(self, event: OrderCancelledEvent):
@@ -235,12 +224,10 @@ class LatencyTest(ScriptStrategyBase):
             exchange = order_info["exchange"]
             
             self.save_to_csv(exchange, canceled_ts, event.order_id, OrderState.CANCELED.name)
-            
-            # Clean up
             del self.pending_orders[event.order_id]
     
     def save_to_csv(self, exchange, timestamp, order_id, status):
-        """Appends the provided data to the CSV file. If the file doesn't exist, it creates one."""
+        """Appends the provided data to the CSV file."""
         filename = self.get_filename(exchange)
         file_exists = os.path.exists(filename)
         
