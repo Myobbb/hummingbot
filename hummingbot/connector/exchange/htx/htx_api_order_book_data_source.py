@@ -236,6 +236,64 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         pass
 
+    def snapshot_message_from_exchange(self,
+                                       msg: Dict[str, Any],
+                                       metadata: Optional[Dict] = None) -> OrderBookMessage:
+        """
+        Creates a snapshot message with the order book snapshot message
+        """
+        if metadata:
+            msg.update(metadata)
+        msg_ts = msg["tick"]["ts"] * 1e-3
+        content = {
+            "trading_pair": msg["trading_pair"],
+            "update_id": msg["tick"]["ts"],
+            "bids": msg["tick"].get("bids", []),
+            "asks": msg["tick"].get("asks", [])
+        }
+        return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
+
+    def trade_message_from_exchange(self,
+                                    msg: Dict[str, Any],
+                                    metadata: Dict[str, Any] = None) -> OrderBookMessage:
+        """
+        Creates a trade message with the information from the trade event
+        """
+        if metadata:
+            msg.update(metadata)
+
+        msg_ts = msg["ts"] * 1e-3
+        content = {
+            "trading_pair": msg["trading_pair"],
+            "trade_type": float(TradeType.BUY.value) if msg["direction"] == "buy" else float(TradeType.SELL.value),
+            "trade_id": msg["id"],
+            "update_id": msg["ts"],
+            "amount": msg["amount"],
+            "price": msg["price"]
+        }
+        return OrderBookMessage(OrderBookMessageType.TRADE, content, timestamp=msg_ts)
+
+    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        rest_assistant = await self._api_factory.get_rest_assistant()
+        url = public_rest_url(CONSTANTS.DEPTH_URL)
+        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        params: Dict = {"symbol": exchange_symbol, "type": "step0"}
+        snapshot_data = await rest_assistant.execute_request(
+            url=url,
+            params=params,
+            method=RESTMethod.GET,
+            throttler_limit_id=CONSTANTS.DEPTH_URL,
+        )
+        return snapshot_data
+
+    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
+        snapshot_msg: OrderBookMessage = self.snapshot_message_from_exchange(
+            msg=snapshot,
+            metadata={"trading_pair": trading_pair},
+        )
+        return snapshot_msg
+
     async def _subscribe_mbp(self, ws: WSAssistant):
         """Subscribe to MBP Incremental (5) and Refresh (20) channels"""
         try:
