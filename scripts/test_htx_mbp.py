@@ -31,6 +31,9 @@ class OrderBookState:
     last_refresh_time: float = 0
     last_incremental_time: float = 0
     initialized: bool = False
+    # Track previous best for change logging
+    prev_best_bid: Optional[Tuple[float, float]] = None
+    prev_best_ask: Optional[Tuple[float, float]] = None
 
 
 @dataclass 
@@ -66,6 +69,45 @@ class HTXMBPTester:
         self.start_time: float = 0
         self.last_any_message_time: float = 0
         self.global_pings: int = 0
+
+    def _get_best(self, d: Dict[float, float], reverse: bool) -> Optional[Tuple[float, float]]:
+        if not d:
+            return None
+        # bids (reverse=True): max price
+        # asks (reverse=False): min price
+        best_price = max(d.keys()) if reverse else min(d.keys())
+        return (best_price, d[best_price])
+
+    def _check_and_log_change(self, symbol: str, source: str):
+        ob = self.orderbooks[symbol]
+        
+        curr_bid = self._get_best(ob.bids, True)
+        curr_ask = self._get_best(ob.asks, False)
+        
+        changed = False
+        msg_parts = []
+        
+        # Check Bid Change
+        if curr_bid != ob.prev_best_bid:
+            old_p = ob.prev_best_bid[0] if ob.prev_best_bid else None
+            new_p = curr_bid[0] if curr_bid else None
+            # Only log if price changed or if it appeared/disappeared
+            # If only size changed, you might want to log it too, user said "best bid/ask", usually implies price+size
+            msg_parts.append(f"Bid: {old_p} -> {new_p}")
+            ob.prev_best_bid = curr_bid
+            changed = True
+            
+        # Check Ask Change
+        if curr_ask != ob.prev_best_ask:
+            old_p = ob.prev_best_ask[0] if ob.prev_best_ask else None
+            new_p = curr_ask[0] if curr_ask else None
+            msg_parts.append(f"Ask: {old_p} -> {new_p}")
+            ob.prev_best_ask = curr_ask
+            changed = True
+            
+        if changed:
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            print(f"[{ts}] [{source}] {symbol}: " + ", ".join(msg_parts))
     
     def apply_snapshot(self, symbol: str, bids: List, asks: List, seq_num: int, ts: float):
         ob = self.orderbooks[symbol]
@@ -86,6 +128,8 @@ class HTXMBPTester:
         ob.last_refresh_time = ts
         ob.initialized = True
         stats.refresh_count += 1
+        
+        self._check_and_log_change(symbol, "REFRESH")
     
     def apply_incremental(self, symbol: str, bids: List, asks: List, 
                           seq_num: int, prev_seq_num: int, ts: float) -> bool:
@@ -135,6 +179,9 @@ class HTXMBPTester:
         ob.last_incremental_seq = seq_num
         ob.last_incremental_time = ts
         stats.incremental_applied += 1
+        
+        self._check_and_log_change(symbol, "INCR")
+        
         return True
     
     def get_orderbook_summary(self, symbol: str) -> dict:
