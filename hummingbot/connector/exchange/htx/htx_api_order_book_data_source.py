@@ -34,8 +34,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         
         # Keep-alive tracking for stable connections
-        self._last_ping_timestamp = 0
-        self._last_pong_timestamp = 0
+        # Key: connection name ("MBP", "Trade"), Value: last activity timestamp
+        self._last_activity_timestamps: Dict[str, float] = {}
         self._ping_interval = 30  # Rely on server pings; only monitor liveness
         self._pong_timeout = 10
 
