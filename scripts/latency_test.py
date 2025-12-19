@@ -55,8 +55,8 @@ class LatencyTest(ScriptStrategyBase):
     
     # Timing
     create_interval = 60  # seconds between test cycles
-    delay = 5  # seconds before canceling orders
-    ws_wait_timeout = 2.0  # seconds to wait for late WS updates (BingX can take 5+ seconds)
+    delay = 5  # seconds before starting to check for WS updates
+    ws_wait_timeout = 55.0  # wait up to 60 seconds total for ALL WS updates (including slow BingX)
     
     # Exchanges to test - comment out any you don't have configured
     EXCHANGES = [
@@ -93,6 +93,7 @@ class LatencyTest(ScriptStrategyBase):
         self.create_timestamp = 0
         self.delay_timestamp = 0
         self.pending_orders = {}  # order_id -> {exchange, pre_send_ts}
+        self.batch_start_timestamp = 0  # Track when current batch started
         
         # Batch latency tracking
         self.current_batch_latencies = {}  # exchange -> latency_ms
@@ -138,11 +139,17 @@ class LatencyTest(ScriptStrategyBase):
             
             # Check if ws_wait_timeout has passed since batch started
             batch_start = getattr(self, 'batch_start_timestamp', 0)
-            ws_timeout_passed = (self.current_timestamp - batch_start) >= (self.delay + self.ws_wait_timeout)
+            elapsed = self.current_timestamp - batch_start
+            total_wait = self.delay + self.ws_wait_timeout
+            ws_timeout_passed = elapsed >= total_wait
             
             # Log batch summary (with all collected WS updates) before cancelling
             if not getattr(self, "summary_logged", False):
                 if all_ws_received or ws_timeout_passed:
+                    # Debug: log why we're printing summary
+                    if not all_ws_received:
+                        missing = len(self.connectors) - ws_received_count
+                        self.logger().info(f"WS timeout: elapsed={elapsed:.1f}s >= {total_wait}s, missing {missing} exchanges")
                     self._log_batch_summary()
                     self.summary_logged = True
                 else:
@@ -150,7 +157,7 @@ class LatencyTest(ScriptStrategyBase):
                     ws_received = set(getattr(self, 'current_batch_one_way', {}).keys())
                     ws_pending = set(self.connectors.keys()) - ws_received
                     if not getattr(self, '_ws_wait_logged', False):
-                        self.logger().info(f"Waiting for WS updates from: {', '.join(sorted(ws_pending))}")
+                        self.logger().info(f"Waiting for WS updates from: {', '.join(sorted(ws_pending))} (elapsed={elapsed:.1f}s, need={total_wait}s)")
                         self._ws_wait_logged = True
                     return
             
@@ -345,25 +352,17 @@ class LatencyTest(ScriptStrategyBase):
             # 3. Exchange Processing
             # 4. Network Response (RTT)
             latency_ms = created_ts - order_info["pre_send_ts"]
-            
-            # One-Way Latency (Approximate due to Clock Skew)
-            # = Exchange TS - Local Send TS
-            # Note: This is from the HTTP response, not WS. WS timestamps are more reliable.
-            exchange_ts_ms = event.creation_timestamp * 1000
-            one_way_ms = exchange_ts_ms - order_info["pre_send_ts"]
-            
-            # Track for batch summary
+            # Track RTT for batch summary (from HTTP response)
             self.current_batch_latencies[exchange] = latency_ms
-            if exchange not in self.current_batch_one_way:
-                self.current_batch_one_way[exchange] = one_way_ms
+            # Note: One-way latency is set from WS updates in process_ws_update(), not here.
+            # HTTP response timestamps often have lower precision (100ms granularity)
+            # which causes misleading -1ms/-2ms values.
             
             # Store timestamps for delayed CSV writing (allows capturing better WS timestamps)
             if event.order_id in self.pending_orders:
                 self.pending_orders[event.order_id]["created_ts"] = created_ts
-                # Only set exchange_ts if not already set by WS (rare race condition)
-                if "exchange_ts" not in self.pending_orders[event.order_id]:
-                    # Store as MS
-                    self.pending_orders[event.order_id]["exchange_ts"] = event.creation_timestamp * 1000
+                # Store exchange timestamp from HTTP response as fallback for CSV (in ms)
+                self.pending_orders[event.order_id]["exchange_ts"] = event.creation_timestamp * 1000
     
     def _log_batch_summary(self):
         """Log a one-line summary of all latencies sorted by speed."""
