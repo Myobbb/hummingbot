@@ -226,6 +226,16 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().error(f"Error in {name} keep-alive loop: {e}")
                 break
 
+    async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
+        return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
+
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        HTX provides snapshots through the depth channel, not separate REST calls.
+        The base class expects this method but we don't need to implement it.
+        """
+        pass
+
     async def _subscribe_mbp(self, ws: WSAssistant):
         """Subscribe to MBP Incremental (5) and Refresh (20) channels"""
         try:
