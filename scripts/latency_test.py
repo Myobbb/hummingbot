@@ -16,6 +16,7 @@ import csv
 import logging
 import os
 import time
+from decimal import Decimal
 from enum import Enum
 
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -24,7 +25,7 @@ from hummingbot.core.event.events import (
     OrderCancelledEvent,
     SellOrderCreatedEvent,
 )
-from hummingbot.strategy.script_strategy_base import Decimal, ScriptStrategyBase
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
 class OrderState(Enum):
@@ -44,31 +45,31 @@ class LatencyTest(ScriptStrategyBase):
     Results are saved to CSV files for analysis.
     """
     
-    # Configuration parameters
-    trading_pair = "BTC-USDT"
-    order_price = Decimal("69420")  # Unfillable price (way below market)
-    order_amount = Decimal("0.0004")  # ~$25 worth at ~$100k BTC
-    create_interval = 60  # Time interval (in seconds) between test cycles
-    delay = 5  # Time delay (in seconds) before canceling orders
-    csv_file_id = "latency_test"  # Identifier for CSV filenames
+    # Configuration - class-level variables
+    trading_pair: str = "BTC-USDT"
+    order_price: Decimal = Decimal("69420")  # Unfillable price (way below market)
+    order_amount: Decimal = Decimal("0.0004")  # ~$25 worth at ~$100k BTC
+    create_interval: int = 60  # Time interval (in seconds) between test cycles
+    delay: int = 5  # Time delay (in seconds) before canceling orders
+    csv_file_id: str = "latency_test"  # Identifier for CSV filenames
     
     # Exchanges to test - comment out any you don't have configured
     markets = {
-        "bybit": {"BTC-USDT"},
-        "kucoin": {"BTC-USDT"},
-        "gate_io": {"BTC-USDT"},
-        "mexc": {"BTC-USDT"},
-        "htx": {"BTC-USDT"},
-        "bitmart": {"BTC-USDT"},
-        "bing_x": {"BTC-USDT"},
-        "okx": {"BTC-USDT"},
-        "bitget": {"BTC-USDT"},
+        "bybit": {trading_pair},
+        "kucoin": {trading_pair},
+        "gate_io": {trading_pair},
+        "mexc": {trading_pair},
+        "htx": {trading_pair},
+        "bitmart": {trading_pair},
+        "bing_x": {trading_pair},
+        "okx": {trading_pair},
+        "bitget": {trading_pair},
     }
     
     # Runtime state
-    create_timestamp = 0
-    delay_timestamp = 0
-    pending_orders = {}  # order_id -> {exchange, pre_send_ts}
+    create_timestamp: float = 0
+    delay_timestamp: float = 0
+    pending_orders: dict = {}  # order_id -> {exchange, pre_send_ts}
     
     @property
     def timestamp_now(self):
@@ -163,7 +164,7 @@ class LatencyTest(ScriptStrategyBase):
     
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
         """Logs the post-transmission timestamp when a sell order is created."""
-        self.save_to_csv("unknown", self.timestamp_now, event.order_id, OrderState.CREATED.name)
+        pass
     
     def did_cancel_order(self, event: OrderCancelledEvent):
         """Logs the post-transmission timestamp when an order is cancelled."""
