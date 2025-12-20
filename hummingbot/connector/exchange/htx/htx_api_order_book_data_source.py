@@ -345,7 +345,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Request a full MBP snapshot for a symbol (used for initial sync and gap recovery).
         """
-        mbp_channel = f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_DEPTH}"
+        mbp_channel = f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_REFRESH_DEPTH}"
         snapshot_request: WSJSONRequest = WSJSONRequest({
             "req": mbp_channel,
             "id": str(uuid.uuid4())
