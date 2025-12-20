@@ -964,10 +964,19 @@ cdef class ArbitrageLStrategy(StrategyBase):
  
 
     cdef void c_cleanup_old_orders(self):
-        """Clean up old order tracking data"""
+        """
+        Clean up old order tracking data.
+        
+        Uses separate expiry for each tracking structure:
+        - _order_timestamps: expires based on order CREATION time
+        - _completed_orders: expires based on order COMPLETION time (tombstone lifetime)
+        
+        This ensures tombstones live long enough from when they were actually needed.
+        """
         cdef:
             double cutoff = self._current_timestamp - (self._order_timeout * 2)
-            list to_remove = []
+            list timestamps_to_remove = []
+            list tombstones_to_remove = []
             string order_id_str
             double timestamp
             
@@ -975,41 +984,45 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
             return
             
-        # Find old entries in order timestamps
+        # Phase 1: Find old entries in order timestamps (based on creation time)
         for order_id_str, timestamp in self._order_timestamps:
             if timestamp < cutoff:
-                to_remove.append(order_id_str)
+                timestamps_to_remove.append(order_id_str)
         
-        # Remove old entries from both tracking structures
-        for order_id_str in to_remove:
+        # Phase 2: Find old entries in completed orders / tombstones (based on completion time)
+        for order_id_str, timestamp in self._completed_orders:
+            if timestamp < cutoff:
+                tombstones_to_remove.append(order_id_str)
+        
+        # Phase 3: Clean up old order timestamps and check for stuck orders
+        for order_id_str in timestamps_to_remove:
             self._order_timestamps.erase(order_id_str)
-            # Also remove from completed orders set
-            self._completed_orders.erase(order_id_str)
 
-            # Cleanup position balancer tracking (delegated to handler)
+            # Check for and cleanup stuck orders (still in tracker when they shouldn't be)
             try:
                 oid = order_id_str.decode('utf-8')
                 
-                # CRITICAL FIX: Force cleanup of pending orders and order tracker
-                # This prevents "resurrection" of stuck orders where they are removed from timestamps
-                # but valid in tracker -> c_check_all_order_timeouts -> re-added to timestamps loop
-                
-                # 1. Attempt to find market pair for the order
+                # Attempt to find market pair for the order
                 market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(oid)
                 
-                # 2. Stop tracking in strategy base (prevents it from showing up in active orders)
+                # Only log warning and cleanup if order was ACTUALLY stuck (still in tracker)
                 if market_pair is not None:
                     self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, oid)
-                    
-                # 3. Remove from local pending set (unblocks new orders)
-                self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
+                    self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
+                    if self._position_balancer is not None:
+                        self._position_balancer.handle_old_order_cleanup(oid)
+                    self.logger().warning(f"Force cleaned up stuck order {oid} (older than {self._order_timeout * 2}s)")
                 
-                if self._position_balancer is not None:
-                    self._position_balancer.handle_old_order_cleanup(oid)
-                    
-                self.logger().warning(f"Force cleaned up stuck order {oid} (older than {self._order_timeout * 2}s)")
+                # Clean up auxiliary tracking
+                self._recent_order_market_pair.pop(oid, None)
+                self._timeout_cancelled_orders.discard(oid)
+                self._order_fill_timestamps.pop(oid, None)
             except Exception:
                 pass
+        
+        # Phase 4: Clean up expired tombstones (independent of order timestamps)
+        for order_id_str in tombstones_to_remove:
+            self._completed_orders.erase(order_id_str)
         
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
@@ -1023,21 +1036,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     keys_to_drop.append(mp_tuple)
             for k in keys_to_drop:
                 self._last_failure_timestamps.pop(k, None)
-        except Exception:
-            pass
-
-        # Cleanup stale recent order mappings for orders that were just cleaned
-        try:
-            for order_id_str in to_remove:
-                try:
-                    oid = order_id_str.decode('utf-8')
-                    self._recent_order_market_pair.pop(oid, None)
-                    # Also clean up timeout cancelled orders set
-                    self._timeout_cancelled_orders.discard(oid)
-                    # Also clean up fill timestamps
-                    self._order_fill_timestamps.pop(oid, None)
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -1465,8 +1463,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
             
         try:
-            # Mark this order as completed (first fill counts as completed)
-            self._completed_orders.insert(order_id_str)
+            # Mark this order as completed with timestamp (for expiry-based tombstone cleanup)
+            self._completed_orders[order_id_str] = self._current_timestamp
             
             # Increment trade counter (only for this strategy's orders)
             self._total_trades += 1
@@ -1566,11 +1564,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # This prevents race condition where cancel arrives after completion
         was_already_completed = (self._completed_orders.find(order_id_str) != self._completed_orders.end())
 
-        # Full cleanup for cancelled orders calling logic
-        # CRITICAL: Do NOT erase timestamp. Keep it as tombstone.
-        # self._order_timestamps.erase(order_id_str)
-        # CRITICAL: Mark as completed (tombstone) to prevent resurrection
-        self._completed_orders.insert(order_id_str)
+        # Mark as completed/tombstone with timestamp (prevents resurrection, enables expiry)
+        self._completed_orders[order_id_str] = self._current_timestamp
         # Clean up fill timestamp tracking
         try:
             self._order_fill_timestamps.pop(order_id, None)
@@ -1713,11 +1708,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._timeout_cancelled_orders.discard(order_id)
                 continue
 
-            # Clean up tracking
-            # CRITICAL: Do NOT erase from timestamps/completed. Keep tombstones to prevent resurrection.
-            # self._order_timestamps.erase(order_id_str)
-            # self._completed_orders.erase(order_id_str)
-            self._completed_orders.insert(order_id_str)
+            # Mark as tombstone with timestamp (prevents resurrection, enables expiry)
+            self._completed_orders[order_id_str] = self._current_timestamp
 
             # CRITICAL: Stop tracking the order immediately to prevent re-processing
             # before the cancel event arrives (prevents repeated cancel attempts)
@@ -1808,13 +1800,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._timeout_cancelled_orders.discard(order_id)
                 continue
 
-            # Clean up tracking
+            # Mark as tombstone with timestamp (prevents resurrection, enables expiry)
             try:
                 order_id_str = self._to_cpp_str(order_id)
-                # CRITICAL: Keep tombstone to prevent resurrection
-                # self._order_timestamps.erase(order_id_str)
-                # self._completed_orders.erase(order_id_str)
-                self._completed_orders.insert(order_id_str)
+                self._completed_orders[order_id_str] = self._current_timestamp
                 self._recent_order_market_pair[order_id] = market_tuple
             except Exception:
                 pass

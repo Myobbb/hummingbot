@@ -68,8 +68,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Order tracking - single unified map
         unordered_map[string, double] _order_timestamps
-        # Track completed orders to avoid duplicate completion logging
-        cpp_set[string] _completed_orders
+        # Tombstone map: completed/cancelled order_id -> completion timestamp (for expiry-based cleanup)
+        unordered_map[string, double] _completed_orders
         # Track orders that have received at least one fill (Python set of order_ids)
         set _orders_with_fills
         # Track when orders first received fills (for filled order timeout cleanup)
