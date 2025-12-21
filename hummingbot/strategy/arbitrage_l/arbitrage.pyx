@@ -820,7 +820,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         conv_rate = gate_res.second
 
         # Fetch balances only after passing the gate
-        buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
+        # SAFETY BUFFER: Subtract 25 quote units to account for 2-tick buy price increase applied later.
+        # This prevents overshooting available balance when buy_price += 2 * min_price_increment.
+        buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset)) - 25.0
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
