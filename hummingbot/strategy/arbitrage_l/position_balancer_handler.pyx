@@ -838,10 +838,18 @@ cdef class PositionBalancerHandler:
                                     trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
                                     if trading_rule is not None and trading_rule.min_price_increment is not None:
                                         min_tick = float(trading_rule.min_price_increment)
+                                    
                                     if min_tick > 0:
                                         current_price = current_ask - min_tick  # Effective sell price
                                     else:
+                                        # WARNING: min_tick lookup failed - using raw ask (may cause wrong market selection)
+                                        self.strategy.logger().warning(
+                                            f"Position balancer: min_tick=0 for {market_tuple.market.name}:{market_tuple.trading_pair} - "
+                                            f"falling back to raw ask. Check trading_rules!")
                                         current_price = current_ask  # Fallback to raw ask
+                                    
+                                    # DIRECT PRINT: This MUST show in console if code is running
+                                    print(f"[PB SELL] {market_tuple.market.name}: ask={current_ask:.10f} tick={min_tick:.10f} eff={current_price:.10f} best={best_price:.10f}")
                                 else:
                                     continue
                             else:
@@ -858,6 +866,12 @@ cdef class PositionBalancerHandler:
                             continue
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset} (aliases: {asset_aliases}): {e}")
+
+        # DEBUG: Log final selection
+        if best_market is not None and use_effective_price:
+            self.strategy.logger().info(
+                f"Position balancer SELL: Selected {best_market.market.name}:{best_market.trading_pair} "
+                f"with effective_price={best_price:.10f}")
 
         return best_market
 
