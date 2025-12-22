@@ -868,12 +868,6 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset} (aliases: {asset_aliases}): {e}")
 
-        # DEBUG: Log final selection
-        if best_market is not None and use_effective_price:
-            self.strategy.logger().info(
-                f"Position balancer SELL: Selected {best_market.market.name}:{best_market.trading_pair} "
-                f"with effective_price={best_price:.10f}")
-
         return best_market
 
     # ========================================================================
