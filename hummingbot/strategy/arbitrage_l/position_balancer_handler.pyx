@@ -757,17 +757,26 @@ cdef class PositionBalancerHandler:
                                 else:
                                     continue
                             elif use_effective_price:
-                                # 'min' mode: calculate effective frontrun price (bid + min_tick)
-                                # This accounts for different min_price_increment across markets
-                                if ob._bid_book.size() > 0:
+                                # 'min' mode: calculate BEST ACHIEVABLE price on this market
+                                # If spread is wide: use (bid + tick) as maker
+                                # If spread is tight: use ask as taker
+                                # Then compare across all markets to find best overall (lowest for buy)
+                                if ob._bid_book.size() > 0 and ob._ask_book.size() > 0:
                                     current_bid = float(deref(ob._bid_book.rbegin()).getPrice())
+                                    current_ask = float(deref(ob._ask_book.begin()).getPrice())
                                     # Get min_price_increment for this market
                                     min_tick = 0.0
                                     trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
                                     if trading_rule is not None and trading_rule.min_price_increment is not None:
                                         min_tick = float(trading_rule.min_price_increment)
+                                    
                                     if min_tick > 0:
-                                        current_price = current_bid + min_tick  # Effective buy price
+                                        maker_price = current_bid + min_tick  # Price if we place as maker
+                                        # Choose best achievable: maker if viable, else taker
+                                        if maker_price < current_ask:
+                                            current_price = maker_price  # Maker order is viable
+                                        else:
+                                            current_price = current_ask  # Spread too tight, would be taker
                                     else:
                                         current_price = current_bid  # Fallback to raw bid
                                 else:
@@ -833,10 +842,13 @@ cdef class PositionBalancerHandler:
                                 else:
                                     continue
                             elif use_effective_price:
-                                # 'min' mode: calculate effective frontrun price (ask - min_tick)
-                                # This accounts for different min_price_increment across markets
-                                if ob._ask_book.size() > 0:
+                                # 'min' mode: calculate BEST ACHIEVABLE price on this market
+                                # If spread is wide: use (ask - tick) as maker
+                                # If spread is tight: use bid as taker
+                                # Then compare across all markets to find best overall
+                                if ob._ask_book.size() > 0 and ob._bid_book.size() > 0:
                                     current_ask = float(deref(ob._ask_book.begin()).getPrice())
+                                    current_bid = float(deref(ob._bid_book.rbegin()).getPrice())
                                     # Get min_price_increment for this market
                                     min_tick = 0.0
                                     trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
@@ -844,13 +856,18 @@ cdef class PositionBalancerHandler:
                                         min_tick = float(trading_rule.min_price_increment)
                                     
                                     if min_tick > 0:
-                                        current_price = current_ask - min_tick  # Effective sell price
+                                        maker_price = current_ask - min_tick  # Price if we place as maker
+                                        # Choose best achievable: maker if viable, else taker
+                                        if maker_price > current_bid:
+                                            current_price = maker_price  # Maker order is viable
+                                        else:
+                                            current_price = current_bid  # Spread too tight, would be taker
                                     else:
-                                        # WARNING: min_tick lookup failed - using raw ask (may cause wrong market selection)
+                                        # WARNING: min_tick lookup failed - using raw ask
                                         self.strategy.logger().warning(
                                             f"Position balancer: min_tick=0 for {market_tuple.market.name}:{market_tuple.trading_pair} - "
                                             f"falling back to raw ask. Check trading_rules!")
-                                        current_price = current_ask  # Fallback to raw ask
+                                        current_price = current_ask
                                 else:
                                     continue
                             else:
