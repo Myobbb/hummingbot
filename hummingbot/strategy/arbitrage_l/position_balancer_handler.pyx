@@ -717,17 +717,22 @@ cdef class PositionBalancerHandler:
 
         - Aggressive (0%): Select market with LOWEST ASK (taker)
         - Percentage (>0%): Select market with LOWEST BID (maker above bid)
-        - 'min' mode: Select market with LOWEST BID (maker above bid + min_tick)
+        - 'min' mode: Select market with LOWEST EFFECTIVE BUY PRICE (bid + min_tick)
+          This accounts for different min_price_increment across markets.
         """
         cdef:
             object best_market = None
             double best_price = 1e100  # Start with very high number
             double current_price
+            double current_bid
+            double min_tick
             OrderBook ob
             object mp
             object market_tuple
             list asset_aliases
             bint use_ask_price = (not self._buy_spread_is_min and self._buy_spread_pct == 0.0)
+            bint use_effective_price = self._buy_spread_is_min  # 'min' mode needs effective price
+            object trading_rule
 
         # Get all aliases for this asset (includes asset itself)
         asset_aliases = self._get_all_asset_aliases(asset)
@@ -747,8 +752,24 @@ cdef class PositionBalancerHandler:
                                     current_price = float(deref(ob._ask_book.begin()).getPrice())
                                 else:
                                     continue
+                            elif use_effective_price:
+                                # 'min' mode: calculate effective frontrun price (bid + min_tick)
+                                # This accounts for different min_price_increment across markets
+                                if ob._bid_book.size() > 0:
+                                    current_bid = float(deref(ob._bid_book.rbegin()).getPrice())
+                                    # Get min_price_increment for this market
+                                    min_tick = 0.0
+                                    trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_tick = float(trading_rule.min_price_increment)
+                                    if min_tick > 0:
+                                        current_price = current_bid + min_tick  # Effective buy price
+                                    else:
+                                        current_price = current_bid  # Fallback to raw bid
+                                else:
+                                    continue
                             else:
-                                # Percentage or 'min' mode: select market with LOWEST BID (maker)
+                                # Percentage mode (>0%): select market with LOWEST BID (maker)
                                 if ob._bid_book.size() > 0:
                                     current_price = float(deref(ob._bid_book.rbegin()).getPrice())
                                 else:
@@ -772,17 +793,22 @@ cdef class PositionBalancerHandler:
 
         - Aggressive (0%): Select market with HIGHEST BID (taker)
         - Percentage (>0%): Select market with HIGHEST ASK (maker below ask)
-        - 'min' mode: Select market with HIGHEST ASK (maker below ask - min_tick)
+        - 'min' mode: Select market with HIGHEST EFFECTIVE SELL PRICE (ask - min_tick)
+          This accounts for different min_price_increment across markets.
         """
         cdef:
             object best_market = None
             double best_price = 0.0
             double current_price
+            double current_ask
+            double min_tick
             OrderBook ob
             object mp
             object market_tuple
             list asset_aliases
             bint use_bid_price = (not self._sell_spread_is_min and self._sell_spread_pct == 0.0)
+            bint use_effective_price = self._sell_spread_is_min  # 'min' mode needs effective price
+            object trading_rule
 
         # Get all aliases for this asset (includes asset itself)
         asset_aliases = self._get_all_asset_aliases(asset)
@@ -802,8 +828,24 @@ cdef class PositionBalancerHandler:
                                     current_price = float(deref(ob._bid_book.rbegin()).getPrice())
                                 else:
                                     continue
+                            elif use_effective_price:
+                                # 'min' mode: calculate effective frontrun price (ask - min_tick)
+                                # This accounts for different min_price_increment across markets
+                                if ob._ask_book.size() > 0:
+                                    current_ask = float(deref(ob._ask_book.begin()).getPrice())
+                                    # Get min_price_increment for this market
+                                    min_tick = 0.0
+                                    trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_tick = float(trading_rule.min_price_increment)
+                                    if min_tick > 0:
+                                        current_price = current_ask - min_tick  # Effective sell price
+                                    else:
+                                        current_price = current_ask  # Fallback to raw ask
+                                else:
+                                    continue
                             else:
-                                # Percentage or 'min' mode: select market with HIGHEST ASK (maker)
+                                # Percentage mode (>0%): select market with HIGHEST ASK (maker)
                                 if ob._ask_book.size() > 0:
                                     current_price = float(deref(ob._ask_book.begin()).getPrice())
                                 else:
@@ -1127,38 +1169,44 @@ cdef class PositionBalancerHandler:
             # ================================================================
             if current_best_market.market.name != order_market_tuple.market.name:
                 # Different market is now best - compare prices
-                best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                
-                if is_buy:
-                    if not is_maker_mode:
-                        # Aggressive mode: compare asks (taker)
-                        if best_ob._ask_book.size() > 0 and current_ask > 0:
-                            best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
-                            if best_market_price < current_ask * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
-                                should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} < {order_market_tuple.market.name} ask {current_ask:.8f}"
-                    else:
-                        # Maker mode: compare bids (we place above)
-                        if best_ob._bid_book.size() > 0 and current_bid > 0:
-                            best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
-                            if best_market_price < current_bid * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
-                                should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} < {order_market_tuple.market.name} bid {current_bid:.8f}"
-                else:  # SELL
-                    if not is_maker_mode:
-                        # Aggressive mode: compare bids (taker)
-                        if best_ob._bid_book.size() > 0 and current_bid > 0:
-                            best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
-                            if best_market_price > current_bid * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
-                                should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} > {order_market_tuple.market.name} bid {current_bid:.8f}"
-                    else:
-                        # Maker mode: compare asks (we place below)
-                        if best_ob._ask_book.size() > 0 and current_ask > 0:
-                            best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
-                            if best_market_price > current_ask * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
-                                should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} > {order_market_tuple.market.name} ask {current_ask:.8f}"
+                # For 'min' mode: c_find_best_*_market() already uses effective frontrun prices
+                # so if it returns a different market, we trust that decision immediately
+                if spread_is_min:
+                    should_cancel = True
+                    cancel_reason = f"better market - {current_best_market.market.name} (effective frontrun price better than {order_market_tuple.market.name})"
+                else:
+                    best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                    
+                    if is_buy:
+                        if not is_maker_mode:
+                            # Aggressive mode: compare asks (taker)
+                            if best_ob._ask_book.size() > 0 and current_ask > 0:
+                                best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
+                                if best_market_price < current_ask * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
+                                    should_cancel = True
+                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} < {order_market_tuple.market.name} ask {current_ask:.8f}"
+                        else:
+                            # Percentage maker mode: compare bids (we place above)
+                            if best_ob._bid_book.size() > 0 and current_bid > 0:
+                                best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
+                                if best_market_price < current_bid * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
+                                    should_cancel = True
+                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} < {order_market_tuple.market.name} bid {current_bid:.8f}"
+                    else:  # SELL
+                        if not is_maker_mode:
+                            # Aggressive mode: compare bids (taker)
+                            if best_ob._bid_book.size() > 0 and current_bid > 0:
+                                best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
+                                if best_market_price > current_bid * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
+                                    should_cancel = True
+                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} > {order_market_tuple.market.name} bid {current_bid:.8f}"
+                        else:
+                            # Percentage maker mode: compare asks (we place below)
+                            if best_ob._ask_book.size() > 0 and current_ask > 0:
+                                best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
+                                if best_market_price > current_ask * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
+                                    should_cancel = True
+                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} > {order_market_tuple.market.name} ask {current_ask:.8f}"
             
             # ================================================================
             # CHECK 2 & 3: Frontrun + Large Gap (MAKER MODES ONLY)
