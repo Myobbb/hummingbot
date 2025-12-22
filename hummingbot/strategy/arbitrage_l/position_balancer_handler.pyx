@@ -861,8 +861,16 @@ cdef class PositionBalancerHandler:
                                     continue
 
                             if current_price > best_price:
+                                # DEBUG: Log when a new best is found
+                                if use_effective_price:
+                                    self.strategy.logger().debug(
+                                        f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.10f} > prev_best={best_price:.10f}, now best")
                                 best_price = current_price
                                 best_market = market_tuple
+                            elif use_effective_price:
+                                # Log when market is NOT selected
+                                self.strategy.logger().debug(
+                                    f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.10f} <= best={best_price:.10f}, skipped")
                         except Exception:
                             continue
         except Exception as e:
@@ -1390,8 +1398,32 @@ cdef class PositionBalancerHandler:
 
                                 # CONDITION 1: Check if different market became better
                                 if current_best_market.market.name != order_market_tuple.market.name:
-                                    should_cancel = True
-                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
+                                    # For min mode: apply hysteresis - only switch if significantly better
+                                    if self._buy_spread_is_min:
+                                        # Get effective price of new best market
+                                        best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                                        best_min_tick = 0.0
+                                        best_tp = current_best_market.trading_pair
+                                        if best_tp in self._min_price_increment_cache:
+                                            best_min_tick = self._min_price_increment_cache[best_tp]
+                                        else:
+                                            best_tr = current_best_market.market._trading_rules.get(best_tp)
+                                            if best_tr is not None and best_tr.min_price_increment is not None:
+                                                best_min_tick = float(best_tr.min_price_increment)
+                                            self._min_price_increment_cache[best_tp] = best_min_tick
+                                        
+                                        if best_ob._bid_book.size() > 0 and best_min_tick > 0:
+                                            best_effective = float(deref(best_ob._bid_book.rbegin()).getPrice()) + best_min_tick
+                                            current_effective = order_price
+                                            # For BUY: lower effective price is better
+                                            improvement = (current_effective - best_effective) / current_effective if current_effective > 0 else 0
+                                            if improvement > MIN_MODE_SWITCH_HYSTERESIS:
+                                                should_cancel = True
+                                                cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name}, {improvement*100:.2f}% better)"
+                                        # If improvement <= threshold, don't cancel - stay on current market
+                                    else:
+                                        should_cancel = True
+                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                 else:
                                     # Same market - evaluate if conditions changed
                                     try:
@@ -1543,8 +1575,32 @@ cdef class PositionBalancerHandler:
 
                                     # CONDITION 1: Check if different market became better
                                     if current_best_market.market.name != order_market_tuple.market.name:
-                                        should_cancel = True
-                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
+                                        # For min mode: apply hysteresis - only switch if significantly better
+                                        if self._sell_spread_is_min:
+                                            # Get effective price of new best market
+                                            best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                                            best_min_tick = 0.0
+                                            best_tp = current_best_market.trading_pair
+                                            if best_tp in self._min_price_increment_cache:
+                                                best_min_tick = self._min_price_increment_cache[best_tp]
+                                            else:
+                                                best_tr = current_best_market.market._trading_rules.get(best_tp)
+                                                if best_tr is not None and best_tr.min_price_increment is not None:
+                                                    best_min_tick = float(best_tr.min_price_increment)
+                                                self._min_price_increment_cache[best_tp] = best_min_tick
+                                            
+                                            if best_ob._ask_book.size() > 0 and best_min_tick > 0:
+                                                best_effective = float(deref(best_ob._ask_book.begin()).getPrice()) - best_min_tick
+                                                current_effective = order_price
+                                                # For SELL: higher effective price is better
+                                                improvement = (best_effective - current_effective) / current_effective if current_effective > 0 else 0
+                                                if improvement > MIN_MODE_SWITCH_HYSTERESIS:
+                                                    should_cancel = True
+                                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name}, {improvement*100:.2f}% better)"
+                                            # If improvement <= threshold, don't cancel - stay on current market
+                                        else:
+                                            should_cancel = True
+                                            cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
                                     else:
                                         # Same market - evaluate if conditions changed
                                         try:
