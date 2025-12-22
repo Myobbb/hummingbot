@@ -55,6 +55,10 @@ cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage
 # e.g., 0.0001 = 0.01% = switch if other market is 0.01% better
 cdef double BETTER_MARKET_SWITCH_TOLERANCE = 0.0001  # 0.01% - switch immediately if another market is better
 
+# Min mode hysteresis: only switch if new market is at least 0.1% better
+# This prevents flip-flopping between markets with nearly identical effective prices
+cdef double MIN_MODE_SWITCH_HYSTERESIS = 0.001  # 0.1% - require meaningful improvement before switching
+
 
 cdef class PositionBalancerHandler:
     """
@@ -847,9 +851,6 @@ cdef class PositionBalancerHandler:
                                             f"Position balancer: min_tick=0 for {market_tuple.market.name}:{market_tuple.trading_pair} - "
                                             f"falling back to raw ask. Check trading_rules!")
                                         current_price = current_ask  # Fallback to raw ask
-                                    
-                                    # DIRECT PRINT: This MUST show in console if code is running
-                                    print(f"[PB SELL] {market_tuple.market.name}: ask={current_ask:.10f} tick={min_tick:.10f} eff={current_price:.10f} best={best_price:.10f}")
                                 else:
                                     continue
                             else:
@@ -1183,11 +1184,39 @@ cdef class PositionBalancerHandler:
             # ================================================================
             if current_best_market.market.name != order_market_tuple.market.name:
                 # Different market is now best - compare prices
-                # For 'min' mode: c_find_best_*_market() already uses effective frontrun prices
-                # so if it returns a different market, we trust that decision immediately
+                # For 'min' mode: compare effective frontrun prices with hysteresis
+                # Only switch if new market is significantly better (0.1%) to prevent flip-flopping
                 if spread_is_min:
-                    should_cancel = True
-                    cancel_reason = f"better market - {current_best_market.market.name} (effective frontrun price better than {order_market_tuple.market.name})"
+                    # Get effective price of new best market
+                    best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
+                    best_min_tick = 0.0
+                    best_trading_pair = current_best_market.trading_pair
+                    if best_trading_pair in self._min_price_increment_cache:
+                        best_min_tick = self._min_price_increment_cache[best_trading_pair]
+                    else:
+                        best_trading_rule = current_best_market.market._trading_rules.get(best_trading_pair)
+                        if best_trading_rule is not None and best_trading_rule.min_price_increment is not None:
+                            best_min_tick = float(best_trading_rule.min_price_increment)
+                        self._min_price_increment_cache[best_trading_pair] = best_min_tick
+                    
+                    if is_buy:
+                        if best_ob._bid_book.size() > 0 and best_min_tick > 0:
+                            best_effective = float(deref(best_ob._bid_book.rbegin()).getPrice()) + best_min_tick
+                            current_effective = order_price  # Our current order price IS our effective price
+                            # For BUY: lower effective price is better
+                            improvement = (current_effective - best_effective) / current_effective if current_effective > 0 else 0
+                            if improvement > MIN_MODE_SWITCH_HYSTERESIS:
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8f} vs current={current_effective:.8f} ({improvement*100:.2f}% better)"
+                    else:
+                        if best_ob._ask_book.size() > 0 and best_min_tick > 0:
+                            best_effective = float(deref(best_ob._ask_book.begin()).getPrice()) - best_min_tick
+                            current_effective = order_price  # Our current order price IS our effective price
+                            # For SELL: higher effective price is better
+                            improvement = (best_effective - current_effective) / current_effective if current_effective > 0 else 0
+                            if improvement > MIN_MODE_SWITCH_HYSTERESIS:
+                                should_cancel = True
+                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8f} vs current={current_effective:.8f} ({improvement*100:.2f}% better)"
                 else:
                     best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
                     
