@@ -78,7 +78,7 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.settings import AllConnectorSettings
@@ -110,27 +110,49 @@ class AmmArbV2Config(BaseClientModel):
     a DEX via Gateway (using market/swap orders).
     
     Configuration is loaded from YAML files in conf/scripts/
+    
+    Note: extra="ignore" allows trading_core to inject config_file_path
+    without causing validation errors.
     """
+    # Allow extra fields (trading_core injects config_file_path)
+    model_config = ConfigDict(extra="ignore")
+    
     script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
     
     # CEX Configuration (maker side - limit orders)
+    # Prompt contains "exchange name" to trigger connector autocomplete
     cex_connector: str = Field(
         "binance",
-        json_schema_extra={"prompt": "CEX connector name (e.g., binance, okx)", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "Enter CEX exchange name (e.g., binance, okx, gate_io)",
+            "prompt_on_new": True
+        }
     )
+    # Prompt contains "trading pair" to trigger trading pair autocomplete
     cex_trading_pair: str = Field(
         "ETH-USDT",
-        json_schema_extra={"prompt": "CEX trading pair (e.g., ETH-USDT)", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "Enter CEX trading pair (e.g., ETH-USDT)",
+            "prompt_on_new": True
+        }
     )
     
     # DEX Configuration (taker side - market/swap orders)
+    # Prompt contains "exchange name" for connector autocomplete (includes Gateway)
     dex_connector: str = Field(
         "uniswap/amm",
-        json_schema_extra={"prompt": "DEX connector in gateway format (e.g., uniswap/amm, pancakeswap/amm)", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "Enter DEX exchange name (Exchange/AMM) (e.g., uniswap/amm, pancakeswap/router)",
+            "prompt_on_new": True
+        }
     )
+    # Prompt contains "trading pair" to trigger trading pair autocomplete
     dex_trading_pair: str = Field(
         "WETH-USDC",
-        json_schema_extra={"prompt": "DEX trading pair (e.g., WETH-USDC)", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "Enter DEX trading pair (e.g., WETH-USDC, WBNB-USDT)",
+            "prompt_on_new": True
+        }
     )
     
     # Order Configuration
@@ -146,11 +168,11 @@ class AmmArbV2Config(BaseClientModel):
     # Slippage Configuration
     cex_slippage_buffer: Decimal = Field(
         Decimal("0.1"),
-        json_schema_extra={"prompt": "CEX slippage buffer percentage (e.g., 0.1 for 0.1%)", "prompt_on_new": False}
+        json_schema_extra={"prompt": "CEX slippage buffer percentage", "prompt_on_new": False}
     )
     dex_slippage_buffer: Decimal = Field(
         Decimal("1.0"),
-        json_schema_extra={"prompt": "DEX slippage buffer percentage (e.g., 1.0 for 1%)", "prompt_on_new": False}
+        json_schema_extra={"prompt": "DEX slippage buffer percentage", "prompt_on_new": False}
     )
     
     # Timing Configuration
@@ -170,11 +192,20 @@ class AmmArbV2Config(BaseClientModel):
     # Conversion Rate Configuration
     use_oracle_conversion_rate: bool = Field(
         True,
-        json_schema_extra={"prompt": "Use oracle for cross-asset conversion rates?", "prompt_on_new": False}
+        json_schema_extra={"prompt": "Use oracle for cross-asset conversion rates? (True/False)", "prompt_on_new": False}
     )
     quote_conversion_rate: Decimal = Field(
         Decimal("1.0"),
         json_schema_extra={"prompt": "Fixed quote conversion rate (if not using oracle)", "prompt_on_new": False}
+    )
+    
+    # DEX Pool Configuration (optional - for explicit pool targeting)
+    dex_pool_address: Optional[str] = Field(
+        None,
+        json_schema_extra={
+            "prompt": "DEX pool address (optional, leave empty for auto-discovery)",
+            "prompt_on_new": False
+        }
     )
     
 
@@ -418,16 +449,21 @@ class AmmArbV2(ScriptStrategyBase):
             else:
                 # Gateway connectors: async quote with amount consideration
                 # This accounts for price impact based on trade size
+                # If dex_pool_address is specified, use that specific pool
+                pool_address = self.config.dex_pool_address if self.config.dex_pool_address else None
+                
                 buy_quote = await dex_connector.get_quote_price(
                     self.config.dex_trading_pair,
                     is_buy=True,
-                    amount=self.config.order_amount
+                    amount=self.config.order_amount,
+                    pool_address=pool_address
                 )
                 
                 sell_quote = await dex_connector.get_quote_price(
                     self.config.dex_trading_pair,
                     is_buy=False,
-                    amount=self.config.order_amount
+                    amount=self.config.order_amount,
+                    pool_address=pool_address
                 )
             
             if buy_quote is not None and sell_quote is not None:
