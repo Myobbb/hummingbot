@@ -470,11 +470,32 @@ class AmmArbV2(ScriptStrategyBase):
                 self._dex_buy_price = Decimal(str(buy_quote))
                 self._dex_sell_price = Decimal(str(sell_quote))
                 self._last_quote_fetch = self.current_timestamp
-                self.logger().debug(
-                    f"DEX quotes updated: Buy={self._dex_buy_price:.6f}, Sell={self._dex_sell_price:.6f}"
+                
+                # Enhanced logging for debugging
+                self.logger().info(
+                    f"DEX quotes for {self.config.dex_trading_pair}: "
+                    f"Buy={self._dex_buy_price} {self.dex_quote}/{self.dex_base}, "
+                    f"Sell={self._dex_sell_price} {self.dex_quote}/{self.dex_base}"
                 )
+                
+                # Sanity check: if one price is 0 or prices are inverted/abnormal, log warning
+                if self._dex_buy_price <= 0 or self._dex_sell_price <= 0:
+                    self.logger().warning(
+                        f"DEX quote has zero/negative price! Buy={self._dex_buy_price}, Sell={self._dex_sell_price}"
+                    )
+                
+                # Check for abnormally large spreads (could indicate inverted quotes)
+                if self._dex_buy_price > 0 and self._dex_sell_price > 0:
+                    spread_pct = abs((self._dex_buy_price - self._dex_sell_price) / self._dex_sell_price * 100)
+                    if spread_pct > 50:
+                        self.logger().warning(
+                            f"DEX quote has abnormal spread ({spread_pct:.1f}%)! "
+                            f"This may indicate inverted prices or low liquidity."
+                        )
             else:
-                self.logger().debug("Failed to get DEX quotes (None returned)")
+                self.logger().warning(
+                    f"Failed to get DEX quotes: buy={buy_quote}, sell={sell_quote}"
+                )
                 
         except Exception as e:
             self.logger().error(f"Error fetching DEX quotes: {e}", exc_info=True)
@@ -1022,52 +1043,106 @@ class AmmArbV2(ScriptStrategyBase):
         for line in balance_df.to_string(index=False).split("\n"):
             lines.append(f"  {line}")
         
-        # Current Prices
+        # Current Prices - use dynamic formatting for micro-priced tokens
         lines.append("")
         lines.append("Current Prices:")
         
         cex_connector = self.connectors.get(self.config.cex_connector)
+        cex_bid = None
+        cex_ask = None
         if cex_connector:
             cex_bid = cex_connector.get_price(self.config.cex_trading_pair, is_buy=False)
             cex_ask = cex_connector.get_price(self.config.cex_trading_pair, is_buy=True)
             if cex_bid and cex_ask:
-                lines.append(f"  CEX: Bid={cex_bid:.6f}  Ask={cex_ask:.6f}")
+                # Use dynamic formatting for very small prices
+                lines.append(f"  CEX: Bid={self._format_price(cex_bid)}  Ask={self._format_price(cex_ask)}")
+            else:
+                lines.append(f"  CEX: Prices not available (bid={cex_bid}, ask={cex_ask})")
         
         if self._dex_buy_price and self._dex_sell_price:
-            lines.append(f"  DEX: Buy={self._dex_buy_price:.6f}  Sell={self._dex_sell_price:.6f}")
+            lines.append(f"  DEX (raw {self.dex_quote}):")
+            lines.append(f"       Buy={self._format_price(self._dex_buy_price)}  Sell={self._format_price(self._dex_sell_price)}")
             quote_age = self.current_timestamp - self._last_quote_fetch
             lines.append(f"       (Quote age: {quote_age:.1f}s)")
+            
+            # Show converted prices if quote currencies differ
+            if self.cex_quote != self.dex_quote:
+                dex_buy_converted = self._convert_dex_price(self._dex_buy_price)
+                dex_sell_converted = self._convert_dex_price(self._dex_sell_price)
+                lines.append(f"  DEX (converted to {self.cex_quote}):")
+                lines.append(f"       Buy={self._format_price(dex_buy_converted)}  Sell={self._format_price(dex_sell_converted)}")
         else:
             lines.append("  DEX: Fetching quotes...")
+        
+        # Oracle/Conversion Rates
+        lines.append("")
+        lines.append("Conversion Rates:")
+        if self.cex_quote == self.dex_quote:
+            lines.append(f"  Same quote currency ({self.cex_quote}) - no conversion needed")
+        else:
+            if self._rate_source:
+                rate_pair = f"{self.dex_quote}-{self.cex_quote}"
+                rate = self._rate_source.get_pair_rate(rate_pair)
+                if rate:
+                    lines.append(f"  Oracle {rate_pair}: {self._format_price(rate)}")
+                else:
+                    lines.append(f"  Oracle {rate_pair}: NOT AVAILABLE ⚠️")
+                    lines.append(f"  Using fixed rate: {self.config.quote_conversion_rate}")
+            else:
+                lines.append(f"  Oracle disabled, using fixed rate: {self.config.quote_conversion_rate}")
         
         # Gas estimate
         gas_cost = self._get_estimated_gas_cost()
         if gas_cost > Decimal("0"):
-            lines.append(f"  Gas Est: {gas_cost:.6f} {self.cex_quote}")
+            lines.append(f"  Gas Est: {self._format_price(gas_cost)} {self.cex_quote}")
         
         # Profitability Analysis
         lines.append("")
         lines.append("Profitability Analysis:")
-        opportunity = self._find_arbitrage_opportunity()
-        if opportunity:
-            lines.append(f"  Direction: {opportunity.direction.value}")
-            lines.append(f"  Raw Profit: {opportunity.profitability_pct:.4f}%")
-            lines.append(f"  CEX Fee: {opportunity.cex_fee_pct:.3f}%")
-            lines.append(f"  Min Required: {self.config.min_profitability}%")
-            
-            if opportunity.profitability_pct >= self.config.min_profitability:
-                lines.append("  Status: ✅ PROFITABLE - Will execute")
+        
+        # Only analyze if we have valid prices
+        if cex_bid and cex_ask and self._dex_buy_price and self._dex_sell_price:
+            opportunity = self._find_arbitrage_opportunity()
+            if opportunity:
+                lines.append(f"  Direction: {opportunity.direction.value}")
+                lines.append(f"  Raw Profit: {opportunity.profitability_pct:.4f}%")
+                lines.append(f"  CEX Fee: {opportunity.cex_fee_pct:.3f}%")
+                lines.append(f"  Gas Cost: {self._format_price(opportunity.estimated_gas_cost)} {self.cex_quote}")
+                lines.append(f"  Min Required: {self.config.min_profitability}%")
+                
+                if opportunity.profitability_pct >= self.config.min_profitability:
+                    lines.append("  Status: ✅ PROFITABLE - Will execute")
+                else:
+                    lines.append("  Status: ⏳ Below threshold")
             else:
-                lines.append("  Status: ⏳ Below threshold")
+                # Show why no opportunity (detailed analysis)
+                cex_bid_d = Decimal(str(cex_bid))
+                cex_ask_d = Decimal(str(cex_ask))
+                dex_buy_conv = self._convert_dex_price(self._dex_buy_price)
+                dex_sell_conv = self._convert_dex_price(self._dex_sell_price)
+                
+                # Calculate raw spreads
+                if cex_ask_d > 0:
+                    spread1 = ((dex_sell_conv / cex_ask_d) - 1) * 100
+                    lines.append(f"  Buy CEX→Sell DEX: {spread1:.4f}%")
+                if dex_buy_conv > 0:
+                    spread2 = ((cex_bid_d / dex_buy_conv) - 1) * 100
+                    lines.append(f"  Buy DEX→Sell CEX: {spread2:.4f}%")
+                
+                lines.append("  Status: No profitable opportunity")
         else:
-            lines.append("  No profitable opportunity")
+            lines.append("  Waiting for complete price data...")
+            if not cex_bid or not cex_ask:
+                lines.append("    - CEX prices missing")
+            if not self._dex_buy_price or not self._dex_sell_price:
+                lines.append("    - DEX quotes missing")
         
         # Statistics
         lines.append("")
         lines.append("Statistics:")
         lines.append(f"  Opportunities Found: {self._arb_opportunities_found}")
         lines.append(f"  Trades Executed: {self._trades_executed}")
-        lines.append(f"  Total P&L: {self._total_profit:.6f} {self.cex_quote}")
+        lines.append(f"  Total P&L: {self._format_price(self._total_profit)} {self.cex_quote}")
         
         # Pending Trade
         if self._pending_trade:
@@ -1083,3 +1158,54 @@ class AmmArbV2(ScriptStrategyBase):
             lines.append(f"  Age: {age:.0f}s")
         
         return "\n".join(lines)
+    
+    def _format_price(self, price: Decimal) -> str:
+        """
+        Format price for display, handling both very small and very large values.
+        
+        For micro-priced tokens like WKC (0.00000007), standard formatting
+        would show 0.000000 which is not useful.
+        """
+        if price is None:
+            return "N/A"
+        
+        price = Decimal(str(price))
+        
+        if price == 0:
+            return "0"
+        
+        abs_price = abs(price)
+        
+        # Very small prices (< 0.0001) - use scientific or more decimals
+        if abs_price < Decimal("0.0001"):
+            # Count leading zeros to determine precision
+            price_str = f"{abs_price:.18f}".rstrip('0')
+            # Find first non-zero digit position
+            decimal_pos = price_str.find('.')
+            first_sig = -1
+            for i, c in enumerate(price_str[decimal_pos+1:]):
+                if c != '0':
+                    first_sig = i
+                    break
+            
+            if first_sig >= 0:
+                # Show 4 significant figures after first non-zero
+                precision = first_sig + 5
+                if precision > 18:
+                    precision = 18
+                formatted = f"{price:.{precision}f}"
+                return formatted.rstrip('0').rstrip('.')
+            return f"{price:.8e}"  # Fallback to scientific
+        
+        # Normal prices (0.0001 to 1000) - use 6 decimals
+        elif abs_price < Decimal("1000"):
+            formatted = f"{price:.6f}"
+            return formatted.rstrip('0').rstrip('.')
+        
+        # Large prices (> 1000) - use 2 decimals
+        elif abs_price < Decimal("1000000000"):
+            return f"{price:,.2f}"
+        
+        # Very large prices - use scientific notation
+        else:
+            return f"{price:.4e}"
