@@ -467,31 +467,54 @@ class AmmArbV2(ScriptStrategyBase):
                 )
             
             if buy_quote is not None and sell_quote is not None:
-                self._dex_buy_price = Decimal(str(buy_quote))
-                self._dex_sell_price = Decimal(str(sell_quote))
+                buy_price = Decimal(str(buy_quote))
+                sell_price = Decimal(str(sell_quote))
+                
+                # CRITICAL: Detect and correct inverted quotes
+                # Gateway sometimes returns "how many base tokens per quote token" 
+                # instead of "quote tokens per base token" for BUY side
+                # 
+                # Detection: if buy_price / sell_price > 1000, the buy is likely inverted
+                # Example: WKC-WBNB
+                #   Correct: buy=0.00000000077 (WBNB per WKC), sell=0.00000000076
+                #   Inverted: buy=12999970041 (WKC per WBNB), sell=0.00000000076
+                
+                if buy_price > 0 and sell_price > 0:
+                    price_ratio = buy_price / sell_price
+                    
+                    if price_ratio > Decimal("100"):
+                        # Buy quote is likely inverted - it's returning WKC/WBNB instead of WBNB/WKC
+                        self.logger().warning(
+                            f"DEX buy quote appears inverted (ratio={price_ratio:.2f}). "
+                            f"Correcting: 1/{buy_price} = {1/buy_price}"
+                        )
+                        buy_price = Decimal("1") / buy_price
+                    
+                    elif price_ratio < Decimal("0.01"):
+                        # Sell quote might be inverted
+                        self.logger().warning(
+                            f"DEX sell quote appears inverted (ratio={price_ratio:.6f}). "
+                            f"Correcting: 1/{sell_price} = {1/sell_price}"
+                        )
+                        sell_price = Decimal("1") / sell_price
+                
+                self._dex_buy_price = buy_price
+                self._dex_sell_price = sell_price
                 self._last_quote_fetch = self.current_timestamp
                 
-                # Enhanced logging for debugging
+                # Log the corrected prices
                 self.logger().info(
                     f"DEX quotes for {self.config.dex_trading_pair}: "
                     f"Buy={self._dex_buy_price} {self.dex_quote}/{self.dex_base}, "
                     f"Sell={self._dex_sell_price} {self.dex_quote}/{self.dex_base}"
                 )
                 
-                # Sanity check: if one price is 0 or prices are inverted/abnormal, log warning
+                # Final sanity check
                 if self._dex_buy_price <= 0 or self._dex_sell_price <= 0:
                     self.logger().warning(
                         f"DEX quote has zero/negative price! Buy={self._dex_buy_price}, Sell={self._dex_sell_price}"
                     )
                 
-                # Check for abnormally large spreads (could indicate inverted quotes)
-                if self._dex_buy_price > 0 and self._dex_sell_price > 0:
-                    spread_pct = abs((self._dex_buy_price - self._dex_sell_price) / self._dex_sell_price * 100)
-                    if spread_pct > 50:
-                        self.logger().warning(
-                            f"DEX quote has abnormal spread ({spread_pct:.1f}%)! "
-                            f"This may indicate inverted prices or low liquidity."
-                        )
             else:
                 self.logger().warning(
                     f"Failed to get DEX quotes: buy={buy_quote}, sell={sell_quote}"
@@ -837,18 +860,100 @@ class AmmArbV2(ScriptStrategyBase):
         Uses RateOracle like arbitrage_l for cross-asset conversion.
         Examples:
         - CEX: ETH-USDT, DEX: WETH-USDC -> Convert USDC to USDT
-        - CEX: SOL-USDT, DEX: SOL-USDC -> Convert USDC to USDT
+        - CEX: WKC-USDT, DEX: WKC-WBNB -> Convert WBNB to USDT
+        
+        Handles wrapped token symbols (WBNB->BNB, WETH->ETH) since
+        oracle typically uses unwrapped symbols.
         """
         if self.cex_quote == self.dex_quote:
             return dex_price
         
         if self._rate_source is not None:
-            rate = self._rate_source.get_pair_rate(f"{self.dex_quote}-{self.cex_quote}")
-            if rate is not None:
-                return dex_price * Decimal(str(rate))
+            rate = self._get_conversion_rate(self.dex_quote, self.cex_quote)
+            if rate is not None and rate > 0:
+                return dex_price * rate
         
         # Use fixed rate as fallback
         return dex_price * self.config.quote_conversion_rate
+    
+    def _get_conversion_rate(self, from_token: str, to_token: str) -> Optional[Decimal]:
+        """
+        Get conversion rate between two tokens using RateOracle.
+        
+        Tries multiple pair variants to handle wrapped tokens:
+        - Direct: WBNB-USDT
+        - Unwrapped: BNB-USDT
+        - Via intermediary: WBNB-BNB-USDT
+        """
+        if self._rate_source is None:
+            return None
+        
+        # Unwrap token symbols (WBNB->BNB, WETH->ETH)
+        from_unwrapped = self._unwrap_token(from_token)
+        to_unwrapped = self._unwrap_token(to_token)
+        
+        # Try different pair variants
+        pairs_to_try = [
+            f"{from_token}-{to_token}",           # WBNB-USDT
+            f"{from_unwrapped}-{to_token}",       # BNB-USDT  
+            f"{from_token}-{to_unwrapped}",       # WBNB-USD
+            f"{from_unwrapped}-{to_unwrapped}",   # BNB-USD
+        ]
+        
+        for pair in pairs_to_try:
+            rate = self._rate_source.get_pair_rate(pair)
+            if rate is not None and rate > 0:
+                self.logger().debug(f"Found oracle rate for {pair}: {rate}")
+                return Decimal(str(rate))
+        
+        # If from_token is wrapped, try assuming 1:1 with unwrapped
+        if from_token != from_unwrapped:
+            # WBNB = BNB, so try BNB-USDT
+            rate = self._rate_source.get_pair_rate(f"{from_unwrapped}-{to_token}")
+            if rate is not None and rate > 0:
+                self.logger().debug(f"Using {from_unwrapped}-{to_token} rate for {from_token}: {rate}")
+                return Decimal(str(rate))
+        
+        self.logger().warning(
+            f"Could not find oracle rate for {from_token}->{to_token}. "
+            f"Tried: {pairs_to_try}"
+        )
+        return None
+    
+    def _unwrap_token(self, token: str) -> str:
+        """
+        Unwrap token symbol for oracle lookup.
+        
+        Examples:
+        - WBNB -> BNB
+        - WETH -> ETH  
+        - WBTC -> BTC
+        - WMATIC -> MATIC
+        - USDT -> USDT (unchanged)
+        """
+        # Common wrapped token patterns
+        wrapped_mapping = {
+            'WBNB': 'BNB',
+            'WETH': 'ETH',
+            'WBTC': 'BTC',
+            'WMATIC': 'MATIC',
+            'WAVAX': 'AVAX',
+            'WSOL': 'SOL',
+            'WFTM': 'FTM',
+            'WPOL': 'POL',
+        }
+        
+        if token in wrapped_mapping:
+            return wrapped_mapping[token]
+        
+        # Generic W-prefix pattern for other tokens
+        if token.startswith('W') and len(token) > 1:
+            # Check if removing W gives a valid-looking symbol (at least 2 chars)
+            potential = token[1:]
+            if len(potential) >= 2 and potential.isupper():
+                return potential
+        
+        return token
     
     def _get_cex_fee_percent(self) -> Decimal:
         """
@@ -1081,12 +1186,17 @@ class AmmArbV2(ScriptStrategyBase):
             lines.append(f"  Same quote currency ({self.cex_quote}) - no conversion needed")
         else:
             if self._rate_source:
-                rate_pair = f"{self.dex_quote}-{self.cex_quote}"
-                rate = self._rate_source.get_pair_rate(rate_pair)
+                # Use the new conversion method that handles wrapped tokens
+                rate = self._get_conversion_rate(self.dex_quote, self.cex_quote)
+                unwrapped = self._unwrap_token(self.dex_quote)
                 if rate:
-                    lines.append(f"  Oracle {rate_pair}: {self._format_price(rate)}")
+                    if unwrapped != self.dex_quote:
+                        lines.append(f"  Oracle {unwrapped}-{self.cex_quote}: {self._format_price(rate)} (via {self.dex_quote})")
+                    else:
+                        lines.append(f"  Oracle {self.dex_quote}-{self.cex_quote}: {self._format_price(rate)}")
                 else:
-                    lines.append(f"  Oracle {rate_pair}: NOT AVAILABLE ⚠️")
+                    lines.append(f"  Oracle {self.dex_quote}-{self.cex_quote}: NOT AVAILABLE ⚠️")
+                    lines.append(f"  Tried unwrapped: {unwrapped}-{self.cex_quote}")
                     lines.append(f"  Using fixed rate: {self.config.quote_conversion_rate}")
             else:
                 lines.append(f"  Oracle disabled, using fixed rate: {self.config.quote_conversion_rate}")
