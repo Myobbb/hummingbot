@@ -209,18 +209,11 @@ class AmmArbV2Config(BaseClientModel):
         }
     )
     
-    # Quote Robustness Configuration
+    # Quote Retry Configuration
     max_quote_retries: int = Field(
         2,
         json_schema_extra={
             "prompt": "Maximum retries for failed DEX quotes",
-            "prompt_on_new": False
-        }
-    )
-    validate_pool_on_start: bool = Field(
-        True,
-        json_schema_extra={
-            "prompt": "Validate DEX pool existence on startup",
             "prompt_on_new": False
         }
     )
@@ -387,24 +380,17 @@ class AmmArbV2(ScriptStrategyBase):
         if config.use_oracle_conversion_rate:
             self._rate_source = RateOracle.get_instance()
         
-        # Pool validation state (to prevent repeated errors)
-        self._pool_validated: bool = False
-        self._pool_validation_error: Optional[str] = None
+        # Quote failure tracking (to prevent log spam on repeated failures)
         self._consecutive_quote_failures: int = 0
         self._max_consecutive_failures: int = 5  # Pause quotes after this many failures
         self._quote_pause_until: float = 0  # Timestamp when to resume quote fetching
-        
-        # Schedule pool validation if enabled
-        if config.validate_pool_on_start:
-            safe_ensure_future(self._validate_dex_pool())
         
         self.logger().info(
             f"AmmArbV2 initialized:\n"
             f"  CEX: {config.cex_connector}/{config.cex_trading_pair}\n"
             f"  DEX: {config.dex_connector}/{config.dex_trading_pair} (Gateway={self._is_dex_gateway})\n"
             f"  Order Amount: {config.order_amount}\n"
-            f"  Min Profitability: {config.min_profitability}%\n"
-            f"  Pool Validation: {'Enabled' if config.validate_pool_on_start else 'Disabled'}"
+            f"  Min Profitability: {config.min_profitability}%"
         )
     
     # ========================================================================
@@ -456,99 +442,15 @@ class AmmArbV2(ScriptStrategyBase):
                 self.logger().info(f"Profitable opportunity found: {opportunity}")
                 safe_ensure_future(self._execute_arbitrage(opportunity))
     
-    async def _validate_dex_pool(self):
-        """
-        Validate that the DEX pool exists and can provide quotes.
-        
-        This is called on startup to catch configuration issues early,
-        rather than failing repeatedly during runtime.
-        
-        Common issues caught:
-        - Pool doesn't exist for the trading pair
-        - Token symbols not recognized by Gateway
-        - Network connectivity issues to Gateway
-        - Insufficient liquidity for order size
-        """
-        self.logger().info(f"Validating DEX pool for {self.config.dex_trading_pair}...")
-        
-        try:
-            dex_connector = self.connectors.get(self.config.dex_connector)
-            if dex_connector is None:
-                self._pool_validation_error = f"DEX connector {self.config.dex_connector} not found"
-                self.logger().error(self._pool_validation_error)
-                return
-            
-            if not hasattr(dex_connector, 'get_quote_price'):
-                # Non-Gateway connector, skip validation
-                self._pool_validated = True
-                return
-            
-            # Try to get a small quote to validate pool existence
-            pool_address = self.config.dex_pool_address if self.config.dex_pool_address else None
-            
-            # Use a tiny amount for validation to minimize chance of liquidity issues
-            test_amount = self.config.order_amount * Decimal("0.01")
-            
-            test_quote = await dex_connector.get_quote_price(
-                self.config.dex_trading_pair,
-                is_buy=True,
-                amount=test_amount,
-                pool_address=pool_address
-            )
-            
-            if test_quote is not None and test_quote > 0:
-                self._pool_validated = True
-                self.logger().info(
-                    f"✅ DEX pool validated: {self.config.dex_trading_pair} "
-                    f"(test quote: {test_quote:.8f})"
-                )
-            else:
-                # Validation returned None, but this isn't fatal
-                # Some pools return None for small amounts but work for full amounts
-                self._pool_validated = True  # Still try quotes
-                self._pool_validation_error = (
-                    f"Pool validation returned None for {self.config.dex_trading_pair}. "
-                    f"Will still attempt quotes with full amount."
-                )
-                self.logger().warning(self._pool_validation_error)
-                
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            # Always mark as validated to allow quote attempts
-            # Validation is advisory only - actual quote fetching may still work
-            self._pool_validated = True
-            
-            # Classify the error for informational purposes
-            if "no routes found" in error_str or "pool not found" in error_str:
-                self._pool_validation_error = (
-                    f"⚠️ Pool may not exist for {self.config.dex_trading_pair} on {self.config.dex_connector}. "
-                    f"Will still attempt quotes."
-                )
-            elif "token not found" in error_str:
-                self._pool_validation_error = (
-                    f"⚠️ Token may not be in Gateway's list: {self.config.dex_trading_pair}. "
-                    f"Will still attempt quotes."
-                )
-            elif "insufficient" in error_str or "revert" in error_str:
-                self._pool_validation_error = (
-                    f"Pool exists but validation quote reverted (common with router connectors): {e}"
-                )
-            else:
-                self._pool_validation_error = f"Pool validation issue: {e}"
-            
-            self.logger().warning(self._pool_validation_error)
-    
     async def _fetch_dex_quotes(self):
         """
-        Fetch buy and sell quotes from DEX via Gateway with robust error handling.
+        Fetch buy and sell quotes from DEX via Gateway.
         
-        Key improvements:
-        1. Checks for pool validation status before attempting quotes
+        This method:
+        1. Calls GatewaySwap.get_quote_price() for buy and sell
         2. Implements retry logic with smaller amounts if quotes fail
         3. Tracks consecutive failures and pauses to prevent log spam
-        4. Classifies errors to distinguish recoverable vs fatal issues
-        5. Automatically resumes after pause period
+        4. Detects and corrects inverted quotes (Gateway quirk)
         
         The quotes are cached for quote_refresh_interval seconds.
         """
@@ -1369,25 +1271,18 @@ class AmmArbV2(ScriptStrategyBase):
         for line in balance_df.to_string(index=False).split("\n"):
             lines.append(f"  {line}")
         
-        # Pool Status (new section for debugging quote issues)
+        # Quote Status (for debugging quote issues)
         lines.append("")
-        lines.append("DEX Pool Status:")
-        if self._pool_validated:
-            if self._pool_validation_error:
-                # Validated but had a warning
-                lines.append(f"  Pool: ⚠️ {self._pool_validation_error[:60]}...")
-            else:
-                lines.append("  Pool: ✅ Validated")
-        else:
-            lines.append("  Pool: ⏳ Validation pending...")
-        
+        lines.append("DEX Quote Status:")
         if self._consecutive_quote_failures > 0:
-            lines.append(f"  Quote Failures: {self._consecutive_quote_failures} consecutive")
+            lines.append(f"  Consecutive Failures: {self._consecutive_quote_failures}")
             if self._quote_pause_until > self.current_timestamp:
                 remaining = self._quote_pause_until - self.current_timestamp
-                lines.append(f"  Status: ⏸️ Paused for {remaining:.0f}s")
+                lines.append(f"  Status: ⏸️ Paused for {remaining:.0f}s (too many failures)")
+            else:
+                lines.append("  Status: ⚠️ Retrying...")
         else:
-            lines.append("  Quote Status: ✅ Working")
+            lines.append("  Status: ✅ Working")
         
         # Current Prices - use dynamic formatting for micro-priced tokens
         lines.append("")
