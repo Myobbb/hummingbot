@@ -503,36 +503,41 @@ class AmmArbV2(ScriptStrategyBase):
                     f"(test quote: {test_quote:.8f})"
                 )
             else:
+                # Validation returned None, but this isn't fatal
+                # Some pools return None for small amounts but work for full amounts
+                self._pool_validated = True  # Still try quotes
                 self._pool_validation_error = (
-                    f"Pool validation failed: No quote returned for {self.config.dex_trading_pair}. "
-                    f"Check that the pool exists and has liquidity."
+                    f"Pool validation returned None for {self.config.dex_trading_pair}. "
+                    f"Will still attempt quotes with full amount."
                 )
                 self.logger().warning(self._pool_validation_error)
                 
         except Exception as e:
             error_str = str(e).lower()
             
-            # Classify the error for better user feedback
+            # Always mark as validated to allow quote attempts
+            # Validation is advisory only - actual quote fetching may still work
+            self._pool_validated = True
+            
+            # Classify the error for informational purposes
             if "no routes found" in error_str or "pool not found" in error_str:
                 self._pool_validation_error = (
-                    f"No pool found for {self.config.dex_trading_pair} on {self.config.dex_connector}. "
-                    f"Verify the trading pair exists on this DEX."
+                    f"⚠️ Pool may not exist for {self.config.dex_trading_pair} on {self.config.dex_connector}. "
+                    f"Will still attempt quotes."
                 )
             elif "token not found" in error_str:
                 self._pool_validation_error = (
-                    f"Token not found: {self.config.dex_trading_pair}. "
-                    f"Ensure token symbols match Gateway's token list (use WETH not ETH, etc.)"
+                    f"⚠️ Token may not be in Gateway's list: {self.config.dex_trading_pair}. "
+                    f"Will still attempt quotes."
                 )
             elif "insufficient" in error_str or "revert" in error_str:
                 self._pool_validation_error = (
-                    f"Pool exists but quote failed (possibly low liquidity): {e}"
+                    f"Pool exists but validation quote reverted (common with router connectors): {e}"
                 )
-                # Don't mark as fatal - pool exists, just had issues
-                self._pool_validated = True
             else:
-                self._pool_validation_error = f"Pool validation error: {e}"
+                self._pool_validation_error = f"Pool validation issue: {e}"
             
-            self.logger().error(self._pool_validation_error)
+            self.logger().warning(self._pool_validation_error)
     
     async def _fetch_dex_quotes(self):
         """
@@ -554,15 +559,9 @@ class AmmArbV2(ScriptStrategyBase):
                 # Still in pause period, silently skip
                 return
             
-            # Check if pool validation failed fatally
-            if self._pool_validation_error and not self._pool_validated:
-                # Only log occasionally to avoid spam
-                if self._consecutive_quote_failures % 10 == 0:
-                    self.logger().warning(
-                        f"DEX quotes skipped: {self._pool_validation_error}"
-                    )
-                self._consecutive_quote_failures += 1
-                return
+            # Pool validation is informational only - don't block quotes
+            # The original quote fetching with correction logic was working,
+            # so we should still try even if validation had issues
             
             dex_connector = self.connectors.get(self.config.dex_connector)
             if dex_connector is None:
@@ -1374,9 +1373,11 @@ class AmmArbV2(ScriptStrategyBase):
         lines.append("")
         lines.append("DEX Pool Status:")
         if self._pool_validated:
-            lines.append("  Pool: ✅ Validated")
-        elif self._pool_validation_error:
-            lines.append(f"  Pool: ❌ {self._pool_validation_error}")
+            if self._pool_validation_error:
+                # Validated but had a warning
+                lines.append(f"  Pool: ⚠️ {self._pool_validation_error[:60]}...")
+            else:
+                lines.append("  Pool: ✅ Validated")
         else:
             lines.append("  Pool: ⏳ Validation pending...")
         
