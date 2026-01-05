@@ -68,6 +68,7 @@ multi_strategy_orchestrator.py by:
 - Tracking pending orders per market
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -204,6 +205,29 @@ class AmmArbV2Config(BaseClientModel):
         None,
         json_schema_extra={
             "prompt": "DEX pool address (optional, leave empty for auto-discovery)",
+            "prompt_on_new": False
+        }
+    )
+    
+    # Quote Robustness Configuration
+    max_quote_retries: int = Field(
+        2,
+        json_schema_extra={
+            "prompt": "Maximum retries for failed DEX quotes",
+            "prompt_on_new": False
+        }
+    )
+    validate_pool_on_start: bool = Field(
+        True,
+        json_schema_extra={
+            "prompt": "Validate DEX pool existence on startup",
+            "prompt_on_new": False
+        }
+    )
+    quote_amount_factor: Decimal = Field(
+        Decimal("0.5"),
+        json_schema_extra={
+            "prompt": "Factor to reduce amount on quote retry (0.5 = try 50% on retry)",
             "prompt_on_new": False
         }
     )
@@ -363,12 +387,24 @@ class AmmArbV2(ScriptStrategyBase):
         if config.use_oracle_conversion_rate:
             self._rate_source = RateOracle.get_instance()
         
+        # Pool validation state (to prevent repeated errors)
+        self._pool_validated: bool = False
+        self._pool_validation_error: Optional[str] = None
+        self._consecutive_quote_failures: int = 0
+        self._max_consecutive_failures: int = 5  # Pause quotes after this many failures
+        self._quote_pause_until: float = 0  # Timestamp when to resume quote fetching
+        
+        # Schedule pool validation if enabled
+        if config.validate_pool_on_start:
+            safe_ensure_future(self._validate_dex_pool())
+        
         self.logger().info(
             f"AmmArbV2 initialized:\n"
             f"  CEX: {config.cex_connector}/{config.cex_trading_pair}\n"
             f"  DEX: {config.dex_connector}/{config.dex_trading_pair} (Gateway={self._is_dex_gateway})\n"
             f"  Order Amount: {config.order_amount}\n"
-            f"  Min Profitability: {config.min_profitability}%"
+            f"  Min Profitability: {config.min_profitability}%\n"
+            f"  Pool Validation: {'Enabled' if config.validate_pool_on_start else 'Disabled'}"
         )
     
     # ========================================================================
@@ -420,18 +456,114 @@ class AmmArbV2(ScriptStrategyBase):
                 self.logger().info(f"Profitable opportunity found: {opportunity}")
                 safe_ensure_future(self._execute_arbitrage(opportunity))
     
+    async def _validate_dex_pool(self):
+        """
+        Validate that the DEX pool exists and can provide quotes.
+        
+        This is called on startup to catch configuration issues early,
+        rather than failing repeatedly during runtime.
+        
+        Common issues caught:
+        - Pool doesn't exist for the trading pair
+        - Token symbols not recognized by Gateway
+        - Network connectivity issues to Gateway
+        - Insufficient liquidity for order size
+        """
+        self.logger().info(f"Validating DEX pool for {self.config.dex_trading_pair}...")
+        
+        try:
+            dex_connector = self.connectors.get(self.config.dex_connector)
+            if dex_connector is None:
+                self._pool_validation_error = f"DEX connector {self.config.dex_connector} not found"
+                self.logger().error(self._pool_validation_error)
+                return
+            
+            if not hasattr(dex_connector, 'get_quote_price'):
+                # Non-Gateway connector, skip validation
+                self._pool_validated = True
+                return
+            
+            # Try to get a small quote to validate pool existence
+            pool_address = self.config.dex_pool_address if self.config.dex_pool_address else None
+            
+            # Use a tiny amount for validation to minimize chance of liquidity issues
+            test_amount = self.config.order_amount * Decimal("0.01")
+            
+            test_quote = await dex_connector.get_quote_price(
+                self.config.dex_trading_pair,
+                is_buy=True,
+                amount=test_amount,
+                pool_address=pool_address
+            )
+            
+            if test_quote is not None and test_quote > 0:
+                self._pool_validated = True
+                self.logger().info(
+                    f"✅ DEX pool validated: {self.config.dex_trading_pair} "
+                    f"(test quote: {test_quote:.8f})"
+                )
+            else:
+                self._pool_validation_error = (
+                    f"Pool validation failed: No quote returned for {self.config.dex_trading_pair}. "
+                    f"Check that the pool exists and has liquidity."
+                )
+                self.logger().warning(self._pool_validation_error)
+                
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Classify the error for better user feedback
+            if "no routes found" in error_str or "pool not found" in error_str:
+                self._pool_validation_error = (
+                    f"No pool found for {self.config.dex_trading_pair} on {self.config.dex_connector}. "
+                    f"Verify the trading pair exists on this DEX."
+                )
+            elif "token not found" in error_str:
+                self._pool_validation_error = (
+                    f"Token not found: {self.config.dex_trading_pair}. "
+                    f"Ensure token symbols match Gateway's token list (use WETH not ETH, etc.)"
+                )
+            elif "insufficient" in error_str or "revert" in error_str:
+                self._pool_validation_error = (
+                    f"Pool exists but quote failed (possibly low liquidity): {e}"
+                )
+                # Don't mark as fatal - pool exists, just had issues
+                self._pool_validated = True
+            else:
+                self._pool_validation_error = f"Pool validation error: {e}"
+            
+            self.logger().error(self._pool_validation_error)
+    
     async def _fetch_dex_quotes(self):
         """
-        Fetch buy and sell quotes from DEX via Gateway.
+        Fetch buy and sell quotes from DEX via Gateway with robust error handling.
         
-        This calls GatewaySwap.get_quote_price() which:
-        1. Sends request to Gateway's /connectors/{connector}/quote-swap endpoint
-        2. Gateway queries the DEX (e.g., Uniswap router) for swap quote
-        3. Returns the price with slippage consideration
+        Key improvements:
+        1. Checks for pool validation status before attempting quotes
+        2. Implements retry logic with smaller amounts if quotes fail
+        3. Tracks consecutive failures and pauses to prevent log spam
+        4. Classifies errors to distinguish recoverable vs fatal issues
+        5. Automatically resumes after pause period
         
         The quotes are cached for quote_refresh_interval seconds.
         """
         try:
+            # Check if we're in a pause period due to too many failures
+            current_time = self.current_timestamp
+            if current_time < self._quote_pause_until:
+                # Still in pause period, silently skip
+                return
+            
+            # Check if pool validation failed fatally
+            if self._pool_validation_error and not self._pool_validated:
+                # Only log occasionally to avoid spam
+                if self._consecutive_quote_failures % 10 == 0:
+                    self.logger().warning(
+                        f"DEX quotes skipped: {self._pool_validation_error}"
+                    )
+                self._consecutive_quote_failures += 1
+                return
+            
             dex_connector = self.connectors.get(self.config.dex_connector)
             if dex_connector is None:
                 self.logger().warning(f"DEX connector {self.config.dex_connector} not found")
@@ -447,23 +579,11 @@ class AmmArbV2(ScriptStrategyBase):
                 buy_quote = dex_connector.get_price(self.config.dex_trading_pair, is_buy=True)
                 sell_quote = dex_connector.get_price(self.config.dex_trading_pair, is_buy=False)
             else:
-                # Gateway connectors: async quote with amount consideration
-                # This accounts for price impact based on trade size
-                # If dex_pool_address is specified, use that specific pool
+                # Gateway connectors: async quote with amount consideration and retry logic
                 pool_address = self.config.dex_pool_address if self.config.dex_pool_address else None
                 
-                buy_quote = await dex_connector.get_quote_price(
-                    self.config.dex_trading_pair,
-                    is_buy=True,
-                    amount=self.config.order_amount,
-                    pool_address=pool_address
-                )
-                
-                sell_quote = await dex_connector.get_quote_price(
-                    self.config.dex_trading_pair,
-                    is_buy=False,
-                    amount=self.config.order_amount,
-                    pool_address=pool_address
+                buy_quote, sell_quote = await self._fetch_quotes_with_retry(
+                    dex_connector, pool_address
                 )
             
             if buy_quote is not None and sell_quote is not None:
@@ -471,30 +591,27 @@ class AmmArbV2(ScriptStrategyBase):
                 sell_price = Decimal(str(sell_quote))
                 
                 # CRITICAL: Detect and correct inverted quotes
-                # Gateway sometimes returns "how many base tokens per quote token" 
-                # instead of "quote tokens per base token" for BUY side
+                # Gateway/PancakeSwap router returns different semantics for BUY vs SELL:
+                # - SELL: "I have X base, how much quote do I get?" → quote/base (correct)
+                # - BUY: "I want X base, how much quote do I need?" → sometimes returns base/quote (inverted)
                 # 
-                # Detection: if buy_price / sell_price > 1000, the buy is likely inverted
-                # Example: WKC-WBNB
-                #   Correct: buy=0.00000000077 (WBNB per WKC), sell=0.00000000076
-                #   Inverted: buy=12999970041 (WKC per WBNB), sell=0.00000000076
+                # Detection: if buy_price / sell_price > 100, the buy is likely inverted
+                # This is a known Gateway quirk - we correct it silently
                 
                 if buy_price > 0 and sell_price > 0:
                     price_ratio = buy_price / sell_price
                     
                     if price_ratio > Decimal("100"):
-                        # Buy quote is likely inverted - it's returning WKC/WBNB instead of WBNB/WKC
-                        self.logger().warning(
-                            f"DEX buy quote appears inverted (ratio={price_ratio:.2f}). "
-                            f"Correcting: 1/{buy_price} = {1/buy_price}"
+                        # Buy quote is inverted - silently correct it
+                        self.logger().debug(
+                            f"DEX buy quote inverted (ratio={price_ratio:.0f}), correcting"
                         )
                         buy_price = Decimal("1") / buy_price
                     
                     elif price_ratio < Decimal("0.01"):
-                        # Sell quote might be inverted
-                        self.logger().warning(
-                            f"DEX sell quote appears inverted (ratio={price_ratio:.6f}). "
-                            f"Correcting: 1/{sell_price} = {1/sell_price}"
+                        # Sell quote is inverted - silently correct it
+                        self.logger().debug(
+                            f"DEX sell quote inverted (ratio={price_ratio:.6f}), correcting"
                         )
                         sell_price = Decimal("1") / sell_price
                 
@@ -502,11 +619,12 @@ class AmmArbV2(ScriptStrategyBase):
                 self._dex_sell_price = sell_price
                 self._last_quote_fetch = self.current_timestamp
                 
-                # Log the corrected prices
-                self.logger().info(
-                    f"DEX quotes for {self.config.dex_trading_pair}: "
-                    f"Buy={self._dex_buy_price} {self.dex_quote}/{self.dex_base}, "
-                    f"Sell={self._dex_sell_price} {self.dex_quote}/{self.dex_base}"
+                # Reset failure counter on success
+                self._consecutive_quote_failures = 0
+                
+                # Log the final corrected prices
+                self.logger().debug(
+                    f"DEX quotes: Buy={self._dex_buy_price:.12e} Sell={self._dex_sell_price:.12e} {self.dex_quote}/{self.dex_base}"
                 )
                 
                 # Final sanity check
@@ -516,14 +634,118 @@ class AmmArbV2(ScriptStrategyBase):
                     )
                 
             else:
-                self.logger().warning(
-                    f"Failed to get DEX quotes: buy={buy_quote}, sell={sell_quote}"
-                )
+                self._handle_quote_failure("Quotes returned None")
                 
         except Exception as e:
-            self.logger().error(f"Error fetching DEX quotes: {e}", exc_info=True)
+            self._handle_quote_failure(str(e))
         finally:
             self._quote_fetch_in_progress = False
+    
+    async def _fetch_quotes_with_retry(
+        self,
+        connector,
+        pool_address: Optional[str]
+    ) -> tuple:
+        """
+        Fetch quotes with retry logic using progressively smaller amounts.
+        
+        If the initial quote fails (e.g., due to liquidity issues), retry with
+        smaller amounts. This helps identify if the issue is:
+        - Amount too large (liquidity issue) - will succeed with smaller amount
+        - Pool doesn't exist (config issue) - will fail at all sizes
+        - Temporary network issue - may succeed on retry
+        """
+        last_error = None
+        amount = self.config.order_amount
+        
+        for attempt in range(self.config.max_quote_retries + 1):
+            try:
+                buy_quote = await connector.get_quote_price(
+                    self.config.dex_trading_pair,
+                    is_buy=True,
+                    amount=amount,
+                    pool_address=pool_address
+                )
+                
+                sell_quote = await connector.get_quote_price(
+                    self.config.dex_trading_pair,
+                    is_buy=False,
+                    amount=amount,
+                    pool_address=pool_address
+                )
+                
+                if buy_quote is not None and sell_quote is not None:
+                    if attempt > 0:
+                        self.logger().info(
+                            f"DEX quote succeeded on retry #{attempt} with amount={amount}"
+                        )
+                    return buy_quote, sell_quote
+                    
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                
+                # Check if this is a recoverable error worth retrying
+                is_recoverable = any(keyword in error_str for keyword in [
+                    "insufficient", "liquidity", "revert", "timeout", "simulation"
+                ])
+                
+                if not is_recoverable:
+                    # Fatal error (e.g., token not found) - don't retry
+                    self.logger().debug(f"Quote failed with non-recoverable error: {e}")
+                    break
+                
+                if attempt < self.config.max_quote_retries:
+                    # Reduce amount for next attempt
+                    amount = amount * self.config.quote_amount_factor
+                    self.logger().debug(
+                        f"Quote failed (attempt {attempt+1}), retrying with smaller amount={amount}: {e}"
+                    )
+                    await asyncio.sleep(0.5)  # Brief delay before retry
+        
+        # All retries exhausted
+        if last_error:
+            raise last_error
+        return None, None
+    
+    def _handle_quote_failure(self, error_msg: str):
+        """
+        Handle quote failure with progressive backoff to prevent log spam.
+        """
+        self._consecutive_quote_failures += 1
+        
+        # Classify error for better logging
+        error_lower = error_msg.lower()
+        if "no routes" in error_lower or "pool not found" in error_lower:
+            error_type = "POOL_NOT_FOUND"
+        elif "token not found" in error_lower:
+            error_type = "TOKEN_NOT_FOUND"
+        elif "revert" in error_lower or "simulation" in error_lower:
+            error_type = "REVERTED"
+        elif "timeout" in error_lower:
+            error_type = "TIMEOUT"
+        elif "insufficient" in error_lower or "liquidity" in error_lower:
+            error_type = "LOW_LIQUIDITY"
+        else:
+            error_type = "UNKNOWN"
+        
+        # Log with decreasing frequency to prevent spam
+        if self._consecutive_quote_failures <= 3:
+            self.logger().warning(
+                f"DEX quote failed [{error_type}] ({self._consecutive_quote_failures}/{self._max_consecutive_failures}): {error_msg}"
+            )
+        elif self._consecutive_quote_failures == self._max_consecutive_failures:
+            # Pause quote fetching
+            pause_duration = 60  # Pause for 60 seconds
+            self._quote_pause_until = self.current_timestamp + pause_duration
+            self.logger().error(
+                f"DEX quotes failing repeatedly [{error_type}]. "
+                f"Pausing for {pause_duration}s. Check your configuration:\n"
+                f"  - Trading pair: {self.config.dex_trading_pair}\n"
+                f"  - Connector: {self.config.dex_connector}\n"
+                f"  - Pool address: {self.config.dex_pool_address or 'auto'}\n"
+                f"  - Last error: {error_msg}"
+            )
     
     def _find_arbitrage_opportunity(self) -> Optional[ArbOpportunity]:
         """
@@ -1147,6 +1369,24 @@ class AmmArbV2(ScriptStrategyBase):
         balance_df = self.get_balance_df()
         for line in balance_df.to_string(index=False).split("\n"):
             lines.append(f"  {line}")
+        
+        # Pool Status (new section for debugging quote issues)
+        lines.append("")
+        lines.append("DEX Pool Status:")
+        if self._pool_validated:
+            lines.append("  Pool: ✅ Validated")
+        elif self._pool_validation_error:
+            lines.append(f"  Pool: ❌ {self._pool_validation_error}")
+        else:
+            lines.append("  Pool: ⏳ Validation pending...")
+        
+        if self._consecutive_quote_failures > 0:
+            lines.append(f"  Quote Failures: {self._consecutive_quote_failures} consecutive")
+            if self._quote_pause_until > self.current_timestamp:
+                remaining = self._quote_pause_until - self.current_timestamp
+                lines.append(f"  Status: ⏸️ Paused for {remaining:.0f}s")
+        else:
+            lines.append("  Quote Status: ✅ Working")
         
         # Current Prices - use dynamic formatting for micro-priced tokens
         lines.append("")
