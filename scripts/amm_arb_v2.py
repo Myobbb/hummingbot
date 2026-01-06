@@ -72,11 +72,11 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from pydantic import ConfigDict, Field
@@ -94,6 +94,7 @@ from hummingbot.core.event.events import (
     OrderFilledEvent,
     SellOrderCompletedEvent,
 )
+from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -225,6 +226,64 @@ class AmmArbV2Config(BaseClientModel):
         }
     )
     
+    # ========== Dynamic Order Sizing (Depth Discovery) ==========
+    # Enable batch quote multicall for dynamic order sizing
+    enable_depth_discovery: bool = Field(
+        True,
+        json_schema_extra={
+            "prompt": "Enable depth discovery via batch multicall quotes",
+            "prompt_on_new": False
+        }
+    )
+    
+    # Multipliers of order_amount to query for depth discovery
+    # e.g., if order_amount=100, multipliers=[1,2.5,5,10] -> query 100,250,500,1000
+    depth_multipliers: List[float] = Field(
+        default_factory=lambda: [1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0],
+        json_schema_extra={
+            "prompt": "Depth discovery multipliers (list of floats)",
+            "prompt_on_new": False
+        }
+    )
+    
+    # V3 pool fee tier for batch quotes (100=0.01%, 500=0.05%, 2500=0.25%, 10000=1%)
+    dex_pool_fee: int = Field(
+        2500,
+        json_schema_extra={
+            "prompt": "V3 pool fee tier in bps (100, 500, 2500, 10000)",
+            "prompt_on_new": False
+        }
+    )
+    
+    # Pool type for batch quotes (v2 or v3)
+    dex_pool_type: str = Field(
+        "v3",
+        json_schema_extra={
+            "prompt": "DEX pool type (v2 or v3)",
+            "prompt_on_new": False
+        }
+    )
+    
+    # Gateway URL for batch quote endpoint
+    # NOTE: DEPRECATED - we now use GatewayHttpClient which reads Gateway URL
+    # from Hummingbot's global configuration. Kept for backward compatibility.
+    gateway_url: str = Field(
+        "http://localhost:15888",
+        json_schema_extra={
+            "prompt": "Gateway URL (deprecated - uses global config)",
+            "prompt_on_new": False
+        }
+    )
+    
+    # Network for batch quotes (bsc, mainnet, arbitrum, etc.)
+    gateway_network: str = Field(
+        "bsc",
+        json_schema_extra={
+            "prompt": "Gateway network name for batch quotes",
+            "prompt_on_new": False
+        }
+    )
+    
 
 # ============================================================================
 # Data Types
@@ -289,6 +348,34 @@ class PendingArbTrade:
     @property
     def is_partial(self) -> bool:
         return self.cex_filled != self.dex_filled
+
+
+@dataclass
+class DexDepthLevel:
+    """
+    Represents a synthetic orderbook level from DEX batch quote.
+    
+    This is used for depth discovery - getting multiple quote amounts
+    in a single multicall to build a synthetic DEX orderbook.
+    """
+    amount: Decimal           # Base asset amount quoted
+    price: Decimal            # Effective price (quote/base)
+    side: str                 # "BUY" or "SELL"
+    pool_type: str            # "v2" or "v3"
+    success: bool = True      # Whether the quote succeeded
+    slippage_pct: Decimal = Decimal("0")  # Price impact from base amount
+
+
+@dataclass
+class OptimalArbResult:
+    """
+    Result of depth discovery - the optimal order size and expected profit.
+    """
+    optimal_amount: Decimal
+    expected_profit_pct: Decimal
+    direction: ArbDirection
+    dex_levels: List[DexDepthLevel] = field(default_factory=list)
+    cex_available_depth: Decimal = Decimal("0")  # CEX depth at optimal level
 
 
 # ============================================================================
@@ -385,12 +472,23 @@ class AmmArbV2(ScriptStrategyBase):
         self._max_consecutive_failures: int = 5  # Pause quotes after this many failures
         self._quote_pause_until: float = 0  # Timestamp when to resume quote fetching
         
+        # Depth discovery state (batch multicall quotes)
+        self._dex_depth_levels: List[DexDepthLevel] = []  # Synthetic orderbook from batch quotes
+        self._last_depth_discovery: float = 0  # Timestamp of last depth discovery
+        self._depth_discovery_in_progress: bool = False
+        self._current_optimal_result: Optional[OptimalArbResult] = None
+        
+        # HTTP session for batch quote calls (reused for efficiency)
+        self._http_session: Optional[object] = None  # aiohttp.ClientSession
+        
         self.logger().info(
             f"AmmArbV2 initialized:\n"
             f"  CEX: {config.cex_connector}/{config.cex_trading_pair}\n"
             f"  DEX: {config.dex_connector}/{config.dex_trading_pair} (Gateway={self._is_dex_gateway})\n"
             f"  Order Amount: {config.order_amount}\n"
-            f"  Min Profitability: {config.min_profitability}%"
+            f"  Min Profitability: {config.min_profitability}%\n"
+            f"  Depth Discovery: {'Enabled' if config.enable_depth_discovery else 'Disabled'}\n"
+            f"  Depth Multipliers: {config.depth_multipliers if config.enable_depth_discovery else 'N/A'}"
         )
     
     # ========================================================================
@@ -401,23 +499,30 @@ class AmmArbV2(ScriptStrategyBase):
         """
         Main strategy tick - called every second by the clock.
         
-        Flow:
+        Flow (with Depth Discovery enabled):
         1. Check if all connectors are ready
-        2. Refresh DEX quotes if needed (async via Gateway)
-        3. Check for active pending trade
-        4. Find arbitrage opportunity
-        5. Execute if profitable
+        2. Fetch screening quote at base order_amount
+        3. If screening quote exceeds min_profitability threshold:
+           - Trigger depth discovery via batch multicall
+           - Get quotes for order_amount * each depth_multiplier
+        4. Compare DEX synthetic orderbook with CEX real orderbook
+        5. Find optimal order size (best profit considering both sides)
+        6. Execute simultaneous CEX limit + DEX swap orders
+        
+        Flow (with Depth Discovery disabled):
+        - Same as before: single quote, single execution
         """
         # Check readiness
         if not self._all_connectors_ready():
             return
         
-        # Refresh DEX quotes periodically
         current_time = self.current_timestamp
+        
+        # Refresh DEX screening quotes periodically
         if current_time - self._last_quote_fetch >= self.config.quote_refresh_interval:
             if not self._quote_fetch_in_progress:
                 self._quote_fetch_in_progress = True
-                # Async fetch via Gateway API (see gateway_swap.py get_quote_price)
+                # Async fetch via Gateway API (screening quote at order_amount)
                 safe_ensure_future(self._fetch_dex_quotes())
         
         # Skip if we have an active trade pending
@@ -433,14 +538,28 @@ class AmmArbV2(ScriptStrategyBase):
         if self._dex_buy_price is None or self._dex_sell_price is None:
             return
         
-        # Find arbitrage opportunity
+        # Find arbitrage opportunity (screening at base order_amount)
         opportunity = self._find_arbitrage_opportunity()
-        if opportunity is not None and opportunity.is_profitable:
-            self._arb_opportunities_found += 1
-            
-            if opportunity.profitability_pct >= self.config.min_profitability:
-                self.logger().info(f"Profitable opportunity found: {opportunity}")
-                safe_ensure_future(self._execute_arbitrage(opportunity))
+        if opportunity is None or not opportunity.is_profitable:
+            return
+        
+        self._arb_opportunities_found += 1
+        
+        # Check if profitable enough to proceed
+        if opportunity.profitability_pct < self.config.min_profitability:
+            return
+        
+        # === DEPTH DISCOVERY FLOW ===
+        if self.config.enable_depth_discovery and not self._depth_discovery_in_progress:
+            self.logger().info(
+                f"🔍 Screening profitable ({opportunity.profitability_pct:.4f}%) - triggering depth discovery"
+            )
+            self._depth_discovery_in_progress = True
+            safe_ensure_future(self._execute_depth_discovery_and_trade(opportunity))
+        else:
+            # Depth discovery disabled - use single quote execution
+            self.logger().info(f"Profitable opportunity found: {opportunity}")
+            safe_ensure_future(self._execute_arbitrage(opportunity))
     
     async def _fetch_dex_quotes(self):
         """
@@ -754,15 +873,309 @@ class AmmArbV2(ScriptStrategyBase):
         
         return None
     
+    # ========================================================================
+    # Depth Discovery (Batch Multicall Quotes)
+    # ========================================================================
+    
+    async def _execute_depth_discovery_and_trade(self, screening_opportunity: ArbOpportunity):
+        """
+        Execute depth discovery and trade the optimal size.
+        
+        Flow:
+        1. Fetch batch quotes at multiple amounts via Gateway multicall
+        2. Build synthetic DEX orderbook from batch quote results
+        3. Compare with CEX orderbook at each level
+        4. Find optimal trade size (maximize profit considering both sides)
+        5. Execute simultaneous orders at optimal size
+        """
+        try:
+            direction = screening_opportunity.direction
+            is_dex_sell = (direction == ArbDirection.BUY_CEX_SELL_DEX)
+            dex_side = "SELL" if is_dex_sell else "BUY"
+            
+            # Step 1: Fetch batch quotes via Gateway multicall
+            base_amount = float(self.config.order_amount)
+            amounts = [base_amount * m for m in self.config.depth_multipliers]
+            
+            self.logger().info(
+                f"📊 Depth Discovery: fetching {len(amounts)} quotes at amounts: "
+                f"{[f'{a:.2f}' for a in amounts]}"
+            )
+            
+            dex_levels = await self._fetch_batch_quotes(amounts, dex_side)
+            
+            if not dex_levels:
+                self.logger().warning("Depth discovery failed - no valid quotes received")
+                await self._execute_arbitrage(screening_opportunity)
+                return
+            
+            self._dex_depth_levels = dex_levels
+            self._last_depth_discovery = self.current_timestamp
+            
+            # Step 2: Find optimal trade size by comparing with CEX orderbook
+            optimal_result = self._find_optimal_trade_size(dex_levels, direction)
+            
+            if optimal_result is None or optimal_result.expected_profit_pct < self.config.min_profitability:
+                self.logger().info(
+                    f"No profitable depth level found above {self.config.min_profitability}%"
+                )
+                return
+            
+            self._current_optimal_result = optimal_result
+            
+            self.logger().info(
+                f"✅ Optimal trade size found:\n"
+                f"   Amount: {optimal_result.optimal_amount} (vs base {self.config.order_amount})\n"
+                f"   Expected Profit: {optimal_result.expected_profit_pct:.4f}%\n"
+                f"   Direction: {optimal_result.direction.value}\n"
+                f"   CEX Depth Available: {optimal_result.cex_available_depth}"
+            )
+            
+            # Step 3: Update opportunity with optimal amount and execute
+            optimal_opportunity = ArbOpportunity(
+                direction=direction,
+                cex_price=screening_opportunity.cex_price,
+                dex_price=screening_opportunity.dex_price,
+                profitability_pct=optimal_result.expected_profit_pct,
+                amount=optimal_result.optimal_amount,
+                cex_order_price=screening_opportunity.cex_order_price,
+                dex_order_price=screening_opportunity.dex_order_price,
+                estimated_gas_cost=screening_opportunity.estimated_gas_cost,
+                cex_fee_pct=screening_opportunity.cex_fee_pct
+            )
+            
+            await self._execute_arbitrage(optimal_opportunity)
+            
+        except Exception as e:
+            self.logger().error(f"Depth discovery failed: {e}", exc_info=True)
+            # Fallback to screening opportunity
+            await self._execute_arbitrage(screening_opportunity)
+        finally:
+            self._depth_discovery_in_progress = False
+    
+    async def _fetch_batch_quotes(
+        self, 
+        amounts: List[float], 
+        side: str
+    ) -> List[DexDepthLevel]:
+        """
+        Fetch batch quotes via Gateway's multicall batch-quote endpoint.
+        
+        Uses Hummingbot's GatewayHttpClient for proper SSL certificate handling
+        and consistent error management.
+        
+        Calls: POST /connectors/pancakeswap/router/batch-quote
+        
+        Args:
+            amounts: List of base asset amounts to quote
+            side: "BUY" or "SELL"
+            
+        Returns:
+            List of DexDepthLevel objects representing synthetic orderbook
+        """
+        try:
+            # Build batch quote request
+            quotes_request = []
+            for amount in amounts:
+                quotes_request.append({
+                    "baseToken": self.dex_base,
+                    "quoteToken": self.dex_quote,
+                    "amount": amount,
+                    "side": side,
+                    "poolType": self.config.dex_pool_type,
+                    "fee": self.config.dex_pool_fee
+                })
+            
+            request_body = {
+                "network": self.config.gateway_network,
+                "quotes": quotes_request
+            }
+            
+            # Use Hummingbot's GatewayHttpClient for proper SSL/cert handling
+            gateway_client = GatewayHttpClient.get_instance()
+            
+            # Call Gateway batch-quote endpoint via api_request
+            # Path: connectors/pancakeswap/router/batch-quote
+            result = await gateway_client.api_request(
+                method="post",
+                path_url="connectors/pancakeswap/router/batch-quote",
+                params=request_body,
+                fail_silently=False
+            )
+            
+            if result is None or not isinstance(result, dict):
+                self.logger().error("Batch quote returned invalid response")
+                return []
+            
+            # Parse results into DexDepthLevel objects
+            dex_levels: List[DexDepthLevel] = []
+            
+            for quote_result in result.get("quotes", []):
+                if not quote_result.get("success", False):
+                    continue
+                
+                amount_in = Decimal(str(quote_result.get("amountIn", 0)))
+                amount_out = Decimal(str(quote_result.get("amountOut", 0)))
+                
+                if amount_in <= 0 or amount_out <= 0:
+                    continue
+                
+                # Calculate effective price
+                # For SELL: we send base, receive quote -> price = quote_received / base_sent
+                # For BUY: we receive base, send quote -> price = quote_sent / base_received
+                # Gateway returns: amountIn (what goes in), amountOut (what comes out)
+                # For SELL (exactInput): amountIn = base, amountOut = quote -> price = out/in
+                # For BUY (exactOutput): amountIn = quote needed, amountOut = base wanted -> price = in/out
+                if side == "SELL":
+                    price = amount_out / amount_in
+                    base_amount = amount_in
+                else:
+                    price = amount_in / amount_out
+                    base_amount = amount_out
+                
+                # Calculate slippage from base price (first level)
+                if dex_levels:
+                    base_price = dex_levels[0].price
+                    if side == "SELL":
+                        # For SELL, higher amounts get lower prices (worse)
+                        slippage = ((base_price - price) / base_price) * Decimal("100")
+                    else:
+                        # For BUY, higher amounts get higher prices (worse)
+                        slippage = ((price - base_price) / base_price) * Decimal("100")
+                else:
+                    slippage = Decimal("0")
+                
+                dex_levels.append(DexDepthLevel(
+                    amount=base_amount,
+                    price=price,
+                    side=side,
+                    pool_type=quote_result.get("poolType", self.config.dex_pool_type),
+                    success=True,
+                    slippage_pct=slippage
+                ))
+            
+            self.logger().info(
+                f"📈 Batch quotes received: {len(dex_levels)}/{len(amounts)} successful"
+            )
+            
+            return dex_levels
+            
+        except asyncio.TimeoutError:
+            self.logger().error("Batch quote request timed out")
+            return []
+        except Exception as e:
+            self.logger().error(f"Batch quote error: {e}", exc_info=True)
+            return []
+    
+    def _find_optimal_trade_size(
+        self,
+        dex_levels: List[DexDepthLevel],
+        direction: ArbDirection
+    ) -> Optional[OptimalArbResult]:
+        """
+        Find optimal trade size by comparing DEX synthetic orderbook with CEX orderbook.
+        
+        For each DEX depth level:
+        1. Get the DEX price at that amount
+        2. Get the CEX VWAP at that amount (considers CEX liquidity)
+        3. Calculate profitability
+        4. Track the amount with maximum profit
+        
+        Returns the OptimalArbResult with best trade parameters.
+        """
+        cex_connector = self.connectors.get(self.config.cex_connector)
+        if cex_connector is None or not dex_levels:
+            return None
+        
+        is_buy_cex = (direction == ArbDirection.BUY_CEX_SELL_DEX)
+        cex_fee_pct = self._get_cex_fee_percent()
+        gas_cost = self._get_estimated_gas_cost()
+        
+        best_result: Optional[OptimalArbResult] = None
+        best_profit = Decimal("-100")  # Start with negative to find any positive
+        
+        for level in dex_levels:
+            amount = level.amount
+            dex_price = level.price
+            
+            # Get CEX price at this amount (VWAP for accurate depth consideration)
+            cex_price = None
+            cex_depth = Decimal("0")
+            
+            try:
+                if hasattr(cex_connector, 'get_vwap_for_volume'):
+                    vwap_result = cex_connector.get_vwap_for_volume(
+                        self.config.cex_trading_pair,
+                        is_buy_cex,
+                        amount
+                    )
+                    if vwap_result:
+                        cex_price = Decimal(str(vwap_result.result_price))
+                        # ClientOrderBookQueryResult uses result_volume, not total_quantity
+                        cex_depth = Decimal(str(vwap_result.result_volume))
+                        
+                        # If CEX doesn't have enough depth at this amount, skip
+                        if cex_depth < amount * Decimal("0.95"):  # Allow 5% tolerance
+                            self.logger().debug(
+                                f"CEX depth insufficient at {amount}: only {cex_depth} available"
+                            )
+                            continue
+                else:
+                    cex_price = Decimal(str(cex_connector.get_price(
+                        self.config.cex_trading_pair,
+                        is_buy=is_buy_cex
+                    )))
+                    cex_depth = amount  # Assume available at top of book
+            except Exception as e:
+                self.logger().debug(f"Error getting CEX price for {amount}: {e}")
+                continue
+            
+            if cex_price is None or cex_price <= 0:
+                continue
+            
+            # Apply quote conversion if needed
+            dex_price_converted = self._convert_dex_price(dex_price)
+            
+            # Calculate profitability for this level
+            if direction == ArbDirection.BUY_CEX_SELL_DEX:
+                # Buy CEX (pay cex_price + fee), Sell DEX (receive dex_price - gas)
+                cex_cost = cex_price * (Decimal("1") + cex_fee_pct / Decimal("100"))
+                dex_proceeds = dex_price_converted - gas_cost / amount  # Gas per unit
+                profit_pct = ((dex_proceeds / cex_cost) - Decimal("1")) * Decimal("100")
+            else:
+                # Buy DEX (pay dex_price + gas), Sell CEX (receive cex_price - fee)
+                dex_cost = dex_price_converted + gas_cost / amount
+                cex_proceeds = cex_price * (Decimal("1") - cex_fee_pct / Decimal("100"))
+                profit_pct = ((cex_proceeds / dex_cost) - Decimal("1")) * Decimal("100")
+            
+            self.logger().debug(
+                f"  Level {amount}: DEX={dex_price:.8f} CEX={cex_price:.8f} "
+                f"Profit={profit_pct:.4f}% Slippage={level.slippage_pct:.4f}%"
+            )
+            
+            # Track best profitable level
+            if profit_pct > best_profit and profit_pct >= self.config.min_profitability:
+                best_profit = profit_pct
+                best_result = OptimalArbResult(
+                    optimal_amount=amount,
+                    expected_profit_pct=profit_pct,
+                    direction=direction,
+                    dex_levels=dex_levels,
+                    cex_available_depth=cex_depth
+                )
+        
+        return best_result
+    
     async def _execute_arbitrage(self, opportunity: ArbOpportunity):
         """
         Execute arbitrage trade on both legs.
         
         Order placement flow:
-        1. Create OrderCandidate objects (like xrpl_arb_example)
-        2. Adjust to budget constraints
-        3. Place limit order on CEX via connector's buy/sell
-        4. Place swap order on DEX via Gateway
+        1. Re-verify quote to ensure freshness (prevents reverts)
+        2. Create OrderCandidate objects (like xrpl_arb_example)
+        3. Adjust to budget constraints
+        4. Place limit order on CEX via connector's buy/sell
+        5. Place swap order on DEX via Gateway
         
         CEX Order: Uses ScriptStrategyBase.buy/sell -> buy_with_specific_market
                    -> connector.buy() which creates the order on exchange
@@ -773,6 +1186,111 @@ class AmmArbV2(ScriptStrategyBase):
         """
         self.logger().info(f"Executing arbitrage: {opportunity}")
         
+        # --- Pre-Trade Validation: Re-fetch Quote ---
+        # This aligns with standard scripts (amm_arb.py) and ArbitrageExecutor that use fresh data for every trade decision.
+        # It prevents "reverted" or unprofitable transactions caused by stale data (e.g., latency).
+        try:
+            dex_connector = self.connectors.get(self.config.dex_connector)
+            cex_connector = self.connectors.get(self.config.cex_connector)
+            pool_address = self.config.dex_pool_address if self.config.dex_pool_address else None
+            
+            is_buy_dex = (opportunity.direction == ArbDirection.BUY_DEX_SELL_CEX)
+            is_buy_cex = not is_buy_dex # If we buy DEX, we sell CEX, and vice versa.
+            
+            self.logger().info(f"Re-verifying fresh prices for {opportunity.direction.name}...")
+
+            # 1. Fetch Fresh DEX Quote (Async - Volatile)
+            fresh_dex_price = await dex_connector.get_quote_price(
+                self.config.dex_trading_pair,
+                is_buy=is_buy_dex,
+                amount=opportunity.amount,
+                pool_address=pool_address
+            )
+            
+            if fresh_dex_price is None or fresh_dex_price <= 0:
+                self.logger().warning("⚠️ Re-verification failed: Could not get fresh DEX quote. Aborting trade.")
+                return
+
+            # 2. Fetch Fresh CEX Price (Sync usually - Fast)
+            # We need the price we will execute at:
+            # If is_buy_cex=True (Buy CEX), we need ASK price.
+            # If is_buy_cex=False (Sell CEX), we need BID price.
+            fresh_cex_price = None
+            if hasattr(cex_connector, 'get_vwap_for_volume'):
+                 vwap_result = cex_connector.get_vwap_for_volume(
+                    self.config.cex_trading_pair, 
+                    is_buy_cex, 
+                    opportunity.amount
+                 )
+                 fresh_cex_price = vwap_result.result_price if vwap_result else None
+            
+            if fresh_cex_price is None:
+                # Fallback to top of book
+                fresh_cex_price = cex_connector.get_price(
+                    self.config.cex_trading_pair, 
+                    is_buy=is_buy_cex
+                )
+            
+            fresh_cex_price = Decimal(str(fresh_cex_price)) if fresh_cex_price else None
+
+            if fresh_cex_price is None or fresh_cex_price <= 0:
+                self.logger().warning("⚠️ Re-verification failed: Could not get fresh CEX price. Aborting trade.")
+                return
+
+            # Apply conversion (RateOracle or fixed)
+            fresh_dex_converted = self._convert_dex_price(fresh_dex_price)
+            gas_cost = opportunity.estimated_gas_cost
+            cex_fee_pct = opportunity.cex_fee_pct
+            
+            # Recalculate Profitability with BOTH fresh prices
+            if opportunity.direction == ArbDirection.BUY_CEX_SELL_DEX:
+                # Buy CEX (Fresh Ask), Sell DEX (Fresh Bid)
+                cex_buy_cost = fresh_cex_price * (Decimal("1") + cex_fee_pct / Decimal("100"))
+                # DEX Sell Proceeds (converted)
+                new_profit_pct = ((fresh_dex_converted - gas_cost) / cex_buy_cost - Decimal("1")) * Decimal("100")
+                
+                # Update DEX order price (Slippage applied to fresh price)
+                new_dex_order_price = fresh_dex_price * (Decimal("1") - self.config.dex_slippage_buffer / Decimal("100"))
+                # Update CEX order price (Slippage applied to fresh price)
+                # For Buy Limit: Price * (1 + Buffer)
+                # Note: CEX market might have its own slippage logic, usually we send Limit at price * (1+buffer) to ensure fill
+                # But here we stick to whatever logic we had or use fresh price as base
+                cex_candidate.price = fresh_cex_price
+                
+            else:
+                # Buy DEX (Fresh Ask), Sell CEX (Fresh Bid)
+                cex_sell_proceeds = fresh_cex_price * (Decimal("1") - cex_fee_pct / Decimal("100"))
+                # DEX Buy Cost (converted)
+                dex_buy_cost = fresh_dex_converted + gas_cost
+                new_profit_pct = (cex_sell_proceeds / dex_buy_cost - Decimal("1")) * Decimal("100")
+                
+                # Update DEX order price
+                new_dex_order_price = fresh_dex_price * (Decimal("1") + self.config.dex_slippage_buffer / Decimal("100"))
+                cex_candidate.price = fresh_cex_price
+
+            self.logger().info(
+                f"Fresh Verification:\n"
+                f"  DEX Price: {opportunity.dex_price:.6f} -> {fresh_dex_price:.6f}\n"
+                f"  CEX Price: {opportunity.cex_price:.6f} -> {fresh_cex_price:.6f}\n"
+                f"  Profit: {opportunity.profitability_pct:.4f}% -> {new_profit_pct:.4f}%"
+            )
+
+            if new_profit_pct < self.config.min_profitability:
+                self.logger().warning(f"⛔ Trade aborted: Profitability dropped below minimum ({new_profit_pct:.4f}% < {self.config.min_profitability}%)")
+                return
+
+            # Update Opportunity with fresh data
+            opportunity.dex_price = fresh_dex_price
+            opportunity.cex_price = fresh_cex_price
+            opportunity.profitability_pct = new_profit_pct
+            opportunity.dex_order_price = new_dex_order_price
+            # CEX order price is usually handled by connector or candidate, but we updated candidate price above roughly
+            
+        except Exception as e:
+            self.logger().error(f"Error during quote re-verification: {e}", exc_info=True)
+            return
+        # --------------------------------------------
+
         # Create order candidates (like xrpl_arb_example pattern)
         cex_candidate, dex_candidate = self._create_order_candidates(opportunity)
         
@@ -1402,6 +1920,40 @@ class AmmArbV2(ScriptStrategyBase):
             lines.append(f"    Filled: {self._pending_trade.dex_filled}")
             age = self.current_timestamp - self._pending_trade.created_at
             lines.append(f"  Age: {age:.0f}s")
+        
+        # Depth Discovery Status
+        lines.append("")
+        lines.append("Depth Discovery:")
+        if self.config.enable_depth_discovery:
+            lines.append("  Status: ✅ Enabled")
+            lines.append(f"  Multipliers: {self.config.depth_multipliers}")
+            lines.append(f"  Pool Type: {self.config.dex_pool_type} (fee: {self.config.dex_pool_fee}bps)")
+            
+            if self._dex_depth_levels:
+                age = self.current_timestamp - self._last_depth_discovery
+                lines.append(f"  Last Discovery: {age:.1f}s ago ({len(self._dex_depth_levels)} levels)")
+                lines.append("  Synthetic DEX Orderbook:")
+                for i, level in enumerate(self._dex_depth_levels[:5]):  # Show max 5 levels
+                    lines.append(
+                        f"    [{i+1}] Amount={level.amount:.2f} "
+                        f"Price={self._format_price(level.price)} "
+                        f"Slip={level.slippage_pct:.3f}%"
+                    )
+                if len(self._dex_depth_levels) > 5:
+                    lines.append(f"    ... and {len(self._dex_depth_levels) - 5} more levels")
+            else:
+                lines.append("  Synthetic Orderbook: Not yet fetched")
+            
+            if self._current_optimal_result:
+                lines.append("  Last Optimal Result:")
+                lines.append(f"    Amount: {self._current_optimal_result.optimal_amount}")
+                lines.append(f"    Expected Profit: {self._current_optimal_result.expected_profit_pct:.4f}%")
+                lines.append(f"    Direction: {self._current_optimal_result.direction.value}")
+            
+            if self._depth_discovery_in_progress:
+                lines.append("  🔄 Discovery in progress...")
+        else:
+            lines.append("  Status: ⏹️ Disabled (using single quote)")
         
         return "\n".join(lines)
     
