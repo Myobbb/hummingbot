@@ -1091,12 +1091,31 @@ class AmmArbV2(ScriptStrategyBase):
         cex_fee_pct = self._get_cex_fee_percent()
         gas_cost = self._get_estimated_gas_cost()
         
+        # Get maximum tradeable amount based on available balances (like arbitrage_l)
+        max_tradeable = self._get_max_tradeable_amount(direction)
+        if max_tradeable <= Decimal("0"):
+            self.logger().warning(
+                f"Insufficient balance for {direction.value}: max_tradeable={max_tradeable}"
+            )
+            return None
+        
+        self.logger().debug(
+            f"Balance constraint: max_tradeable={max_tradeable:.4f} for {direction.value}"
+        )
+        
         best_result: Optional[OptimalArbResult] = None
         best_profit = Decimal("-100")  # Start with negative to find any positive
         
         for level in dex_levels:
             amount = level.amount
             dex_price = level.price
+            
+            # Skip levels that exceed available balance
+            if amount > max_tradeable:
+                self.logger().debug(
+                    f"Skipping level {amount} - exceeds max tradeable {max_tradeable}"
+                )
+                continue
             
             # Get CEX price at this amount (VWAP for accurate depth consideration)
             cex_price = None
@@ -1394,14 +1413,60 @@ class AmmArbV2(ScriptStrategyBase):
         """
         Adjust order candidate to available budget.
         
-        Uses the budget_checker pattern from xrpl_arb_example.
+        Uses budget_checker if available, falls back to direct balance check.
+        This is critical for preventing order rejections due to insufficient funds.
         """
         connector = self.connectors.get(connector_name)
         if connector is None:
             return candidate
         
+        # Try budget_checker first (preferred - handles all edge cases)
         if hasattr(connector, 'budget_checker'):
-            return connector.budget_checker.adjust_candidate(candidate, all_or_none=False)
+            try:
+                adjusted = connector.budget_checker.adjust_candidate(candidate, all_or_none=False)
+                if adjusted.amount > Decimal("0"):
+                    return adjusted
+            except Exception as e:
+                self.logger().debug(f"budget_checker failed for {connector_name}: {e}")
+        
+        # Fallback: Direct balance check (like arbitrage_l)
+        try:
+            base, quote = candidate.trading_pair.split("-")
+            
+            if candidate.order_side == TradeType.BUY:
+                # Buying base with quote - check quote balance
+                required_quote = candidate.amount * candidate.price
+                
+                if hasattr(connector, 'c_get_available_balance'):
+                    available = Decimal(str(connector.c_get_available_balance(quote)))
+                elif hasattr(connector, 'get_available_balance'):
+                    available = Decimal(str(connector.get_available_balance(quote)))
+                else:
+                    return candidate
+                
+                if required_quote > available and candidate.price > 0:
+                    # Reduce amount to what we can afford
+                    max_base = available / candidate.price
+                    candidate.amount = min(candidate.amount, max_base)
+                    self.logger().debug(
+                        f"Budget limited {connector_name} BUY: {available} {quote} -> {candidate.amount} {base}"
+                    )
+            else:
+                # Selling base - check base balance
+                if hasattr(connector, 'c_get_available_balance'):
+                    available = Decimal(str(connector.c_get_available_balance(base)))
+                elif hasattr(connector, 'get_available_balance'):
+                    available = Decimal(str(connector.get_available_balance(base)))
+                else:
+                    return candidate
+                
+                if candidate.amount > available:
+                    candidate.amount = available
+                    self.logger().debug(
+                        f"Budget limited {connector_name} SELL: {available} {base}"
+                    )
+        except Exception as e:
+            self.logger().debug(f"Direct balance check failed for {connector_name}: {e}")
         
         return candidate
     
@@ -1473,6 +1538,79 @@ class AmmArbV2(ScriptStrategyBase):
             if not connector.ready:
                 return False
         return True
+    
+    def _get_available_balances(self, direction: ArbDirection) -> Tuple[Decimal, Decimal]:
+        """
+        Get available balances for both sides of the arbitrage.
+        
+        Like arbitrage_l's c_get_available_balance pattern, checks what we can
+        actually trade based on direction.
+        
+        For BUY_CEX_SELL_DEX:
+          - CEX: Need quote asset to buy base
+          - DEX: Need base asset to sell
+          
+        For BUY_DEX_SELL_CEX:
+          - DEX: Need quote asset to buy base  
+          - CEX: Need base asset to sell
+          
+        Returns:
+            Tuple of (max_base_from_cex, max_base_from_dex) that can be traded
+        """
+        cex_connector = self.connectors.get(self.config.cex_connector)
+        dex_connector = self.connectors.get(self.config.dex_connector)
+        
+        if cex_connector is None or dex_connector is None:
+            return Decimal("0"), Decimal("0")
+        
+        # Helper to get available balance from connector (handles both cython and python)
+        def get_balance(connector, asset: str) -> Decimal:
+            try:
+                # Try Cython method first (ExchangeBase)
+                if hasattr(connector, 'c_get_available_balance'):
+                    return Decimal(str(connector.c_get_available_balance(asset)))
+                # Fall back to Python method
+                elif hasattr(connector, 'get_available_balance'):
+                    return Decimal(str(connector.get_available_balance(asset)))
+                else:
+                    return Decimal("0")
+            except Exception as e:
+                self.logger().debug(f"Error getting balance for {asset}: {e}")
+                return Decimal("0")
+        
+        if direction == ArbDirection.BUY_CEX_SELL_DEX:
+            # CEX: buying base with quote -> limited by quote balance
+            cex_quote_balance = get_balance(cex_connector, self.cex_quote)
+            cex_ask = cex_connector.get_price(self.config.cex_trading_pair, is_buy=True)
+            if cex_ask and cex_ask > 0:
+                max_base_from_cex = cex_quote_balance / Decimal(str(cex_ask))
+            else:
+                max_base_from_cex = Decimal("0")
+            
+            # DEX: selling base -> limited by base balance
+            max_base_from_dex = get_balance(dex_connector, self.dex_base)
+        else:
+            # BUY_DEX_SELL_CEX
+            # CEX: selling base -> limited by base balance
+            max_base_from_cex = get_balance(cex_connector, self.cex_base)
+            
+            # DEX: buying base with quote -> limited by quote balance
+            dex_quote_balance = get_balance(dex_connector, self.dex_quote)
+            if self._dex_buy_price and self._dex_buy_price > 0:
+                max_base_from_dex = dex_quote_balance / self._dex_buy_price
+            else:
+                max_base_from_dex = Decimal("0")
+        
+        return max_base_from_cex, max_base_from_dex
+    
+    def _get_max_tradeable_amount(self, direction: ArbDirection) -> Decimal:
+        """
+        Get the maximum tradeable amount considering both sides' balance constraints.
+        
+        Returns the minimum of what's available on CEX vs DEX.
+        """
+        max_cex, max_dex = self._get_available_balances(direction)
+        return min(max_cex, max_dex)
     
     @staticmethod
     @lru_cache(maxsize=10)
@@ -1859,6 +1997,19 @@ class AmmArbV2(ScriptStrategyBase):
         gas_cost = self._get_estimated_gas_cost()
         if gas_cost > Decimal("0"):
             lines.append(f"  Gas Est: {self._format_price(gas_cost)} {self.cex_quote}")
+        
+        # Balance Constraints (like arbitrage_l status)
+        lines.append("")
+        lines.append("Balance Constraints:")
+        try:
+            max_cex_buy, max_dex_sell = self._get_available_balances(ArbDirection.BUY_CEX_SELL_DEX)
+            max_cex_sell, max_dex_buy = self._get_available_balances(ArbDirection.BUY_DEX_SELL_CEX)
+            lines.append(f"  Buy CEX → Sell DEX: max {min(max_cex_buy, max_dex_sell):.4f} {self.cex_base}")
+            lines.append(f"    (CEX buy cap: {max_cex_buy:.4f}, DEX sell cap: {max_dex_sell:.4f})")
+            lines.append(f"  Buy DEX → Sell CEX: max {min(max_cex_sell, max_dex_buy):.4f} {self.cex_base}")
+            lines.append(f"    (DEX buy cap: {max_dex_buy:.4f}, CEX sell cap: {max_cex_sell:.4f})")
+        except Exception as e:
+            lines.append(f"  Error calculating: {e}")
         
         # Profitability Analysis
         lines.append("")
