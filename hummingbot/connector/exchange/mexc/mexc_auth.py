@@ -21,28 +21,39 @@ class MexcAuth(AuthBase):
         Adds the server time and the signature to the request, required for authenticated interactions. It also adds
         the required parameter in the request header.
         :param request: the request to be configured for authenticated interaction
+        
+        NOTE: For Unicode trading pairs (e.g., Chinese characters), we must handle encoding 
+        carefully. yarl (used by aiohttp) does NOT percent-encode Unicode chars the same way
+        as Python's urlencode. To ensure signature matches, we append the pre-encoded query 
+        string directly to the URL.
         """
         if request.method == RESTMethod.POST:
             if request.data is not None:
-                # POST with data (e.g., orders): use URL-encoded body
-                # This is critical for Unicode symbols: urlencode produces %E6%88%91...
-                # but aiohttp's yarl would send raw UTF-8 if we pass a dict.
+                # POST with data (e.g., orders)
                 params = json.loads(request.data)
-                authenticated_params = self.add_auth_to_params(params=params)
-                request.data = urlencode(authenticated_params)
-                content_type = "application/x-www-form-urlencoded"
             else:
-                # POST without data (e.g., userDataStream): use query params
-                request.params = self.add_auth_to_params(params=request.params or {})
-                content_type = "application/json"
+                # POST without data (e.g., userDataStream)
+                params = request.params or {}
+            authenticated_params = self.add_auth_to_params(params=params)
+            # Build pre-encoded query string and append to URL
+            encoded_query = urlencode(authenticated_params)
+            separator = "&" if "?" in request.url else "?"
+            request.url = f"{request.url}{separator}{encoded_query}"
+            request.params = None  # Clear params so yarl doesn't re-encode
+            request.data = None    # Clear body
         else:
-            request.params = self.add_auth_to_params(params=request.params)
-            content_type = "application/json"
+            # GET/DELETE: also use pre-encoded URL
+            existing_params = request.params or {}
+            authenticated_params = self.add_auth_to_params(params=existing_params)
+            encoded_query = urlencode(authenticated_params)
+            separator = "&" if "?" in request.url else "?"
+            request.url = f"{request.url}{separator}{encoded_query}"
+            request.params = None  # Clear params so yarl doesn't re-encode
 
         headers = {}
         if request.headers is not None:
             headers.update(request.headers)
-        headers.update(self.header_for_authentication(content_type))
+        headers.update(self.header_for_authentication())
         request.headers = headers
 
         return request
@@ -66,8 +77,8 @@ class MexcAuth(AuthBase):
 
         return request_params
 
-    def header_for_authentication(self, content_type: str = "application/json") -> Dict[str, str]:
-        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": content_type}
+    def header_for_authentication(self) -> Dict[str, str]:
+        return {"X-MEXC-APIKEY": self.api_key}
 
     def _generate_signature(self, params: Dict[str, Any]) -> str:
         encoded_params_str = urlencode(params)
