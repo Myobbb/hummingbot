@@ -23,13 +23,18 @@ class MexcAuth(AuthBase):
         :param request: the request to be configured for authenticated interaction
         """
         if request.method == RESTMethod.POST:
-            params = json.loads(request.data) if request.data is not None else {}
-            authenticated_params = self.add_auth_to_params(params=params)
-            # Return pre-URL-encoded string to ensure body matches signature exactly.
-            # This is critical for Unicode symbols: urlencode produces %E6%88%91...
-            # but aiohttp's yarl would send raw UTF-8 if we pass a dict.
-            request.data = urlencode(authenticated_params)
-            content_type = "application/x-www-form-urlencoded"
+            if request.data is not None:
+                # POST with data (e.g., orders): use URL-encoded body
+                # This is critical for Unicode symbols: urlencode produces %E6%88%91...
+                # but aiohttp's yarl would send raw UTF-8 if we pass a dict.
+                params = json.loads(request.data)
+                authenticated_params = self.add_auth_to_params(params=params)
+                request.data = urlencode(authenticated_params)
+                content_type = "application/x-www-form-urlencoded"
+            else:
+                # POST without data (e.g., userDataStream): use query params
+                request.params = self.add_auth_to_params(params=request.params or {})
+                content_type = "application/json"
         else:
             request.params = self.add_auth_to_params(params=request.params)
             content_type = "application/json"
