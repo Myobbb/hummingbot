@@ -23,7 +23,11 @@ class MexcAuth(AuthBase):
         :param request: the request to be configured for authenticated interaction
         """
         if request.method == RESTMethod.POST:
-            request.data = self.add_auth_to_params(params=json.loads(request.data) if request.data is not None else {})
+            params = json.loads(request.data) if request.data is not None else {}
+            authenticated_params = self.add_auth_to_params(params=params)
+            # Return as JSON string with ensure_ascii=False to preserve raw UTF-8 chars
+            # This ensures Chinese characters are sent as-is, not as \uXXXX escapes
+            request.data = json.dumps(authenticated_params, ensure_ascii=False)
         else:
             request.params = self.add_auth_to_params(params=request.params)
 
@@ -58,7 +62,6 @@ class MexcAuth(AuthBase):
         return {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/json"}
 
     def _generate_signature(self, params: Dict[str, Any]) -> str:
-
         encoded_params_str = urlencode(params)
         digest = hmac.new(self.secret_key.encode("utf8"), encoded_params_str.encode("utf8"), hashlib.sha256).hexdigest()
         return digest
