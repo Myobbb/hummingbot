@@ -23,11 +23,15 @@ class MexcAuth(AuthBase):
         :param request: the request to be configured for authenticated interaction
         """
         if request.method == RESTMethod.POST:
-            params = json.loads(request.data) if request.data is not None else {}
-            authenticated_params = self.add_auth_to_params(params=params)
-            # Return as JSON string with ensure_ascii=False to preserve raw UTF-8 chars
-            # This ensures Chinese characters are sent as-is, not as \uXXXX escapes
-            request.data = json.dumps(authenticated_params, ensure_ascii=False)
+            if request.data is not None:
+                # POST with data (e.g., orders): parse JSON, add auth, return as JSON string
+                # Use ensure_ascii=False to preserve raw UTF-8 chars for Unicode trading pairs
+                params = json.loads(request.data)
+                authenticated_params = self.add_auth_to_params(params=params)
+                request.data = json.dumps(authenticated_params, ensure_ascii=False)
+            else:
+                # POST with no data (e.g., userDataStream): return dict for form-encoding
+                request.data = self.add_auth_to_params(params={})
         else:
             request.params = self.add_auth_to_params(params=request.params)
 
