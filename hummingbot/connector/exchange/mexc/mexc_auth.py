@@ -23,15 +23,12 @@ class MexcAuth(AuthBase):
         :param request: the request to be configured for authenticated interaction
         """
         if request.method == RESTMethod.POST:
-            if request.data is not None:
-                # POST with data (e.g., orders): parse JSON, add auth, return as JSON string
-                # Use ensure_ascii=False to preserve raw UTF-8 chars for Unicode trading pairs
-                params = json.loads(request.data)
-                authenticated_params = self.add_auth_to_params(params=params)
-                request.data = json.dumps(authenticated_params, ensure_ascii=False)
-            else:
-                # POST with no data (e.g., userDataStream): return dict for form-encoding
-                request.data = self.add_auth_to_params(params={})
+            params = json.loads(request.data) if request.data is not None else {}
+            authenticated_params = self.add_auth_to_params(params=params)
+            # Return pre-URL-encoded string to ensure body matches signature exactly.
+            # This is critical for Unicode symbols: urlencode produces %E6%88%91...
+            # but aiohttp's yarl would send raw UTF-8 if we pass a dict.
+            request.data = urlencode(authenticated_params)
         else:
             request.params = self.add_auth_to_params(params=request.params)
 
@@ -63,7 +60,7 @@ class MexcAuth(AuthBase):
         return request_params
 
     def header_for_authentication(self) -> Dict[str, str]:
-        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/json"}
+        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
 
     def _generate_signature(self, params: Dict[str, Any]) -> str:
         encoded_params_str = urlencode(params)
