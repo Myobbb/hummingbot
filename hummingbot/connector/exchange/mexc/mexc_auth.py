@@ -29,13 +29,15 @@ class MexcAuth(AuthBase):
             # This is critical for Unicode symbols: urlencode produces %E6%88%91...
             # but aiohttp's yarl would send raw UTF-8 if we pass a dict.
             request.data = urlencode(authenticated_params)
+            content_type = "application/x-www-form-urlencoded"
         else:
             request.params = self.add_auth_to_params(params=request.params)
+            content_type = "application/json"
 
         headers = {}
         if request.headers is not None:
             headers.update(request.headers)
-        headers.update(self.header_for_authentication())
+        headers.update(self.header_for_authentication(content_type))
         request.headers = headers
 
         return request
@@ -59,8 +61,8 @@ class MexcAuth(AuthBase):
 
         return request_params
 
-    def header_for_authentication(self) -> Dict[str, str]:
-        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
+    def header_for_authentication(self, content_type: str = "application/json") -> Dict[str, str]:
+        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": content_type}
 
     def _generate_signature(self, params: Dict[str, Any]) -> str:
         encoded_params_str = urlencode(params)
