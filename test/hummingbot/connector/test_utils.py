@@ -75,6 +75,45 @@ class UtilsTest(unittest.TestCase):
         self.assertEqual(expected_shortened_id, shortened_id)
         self.assertEqual(expected_extra_reduced_id, extra_reduced_id)
 
+    def test_get_new_client_order_id_with_unicode_base(self):
+        """Test that Unicode asset names produce alphanumeric order IDs."""
+        trading_pair = "我踏马来了-USDT"
+        order_id = get_new_client_order_id(is_buy=True, trading_pair=trading_pair)
+
+        # Verify order ID is fully alphanumeric (required by exchanges)
+        self.assertTrue(order_id.isalnum(), f"Order ID '{order_id}' contains non-alphanumeric characters")
+
+    def test_get_new_client_order_id_with_unicode_quote(self):
+        """Test that Unicode quote asset names produce alphanumeric order IDs."""
+        trading_pair = "BTC-我踏马来了"
+        order_id = get_new_client_order_id(is_buy=False, trading_pair=trading_pair)
+
+        self.assertTrue(order_id.isalnum(), f"Order ID '{order_id}' contains non-alphanumeric characters")
+
+    def test_get_new_client_order_id_with_both_unicode(self):
+        """Test with both base and quote being Unicode."""
+        trading_pair = "我踏马来了-测试币"
+        order_id = get_new_client_order_id(is_buy=True, trading_pair=trading_pair)
+
+        self.assertTrue(order_id.isalnum(), f"Order ID '{order_id}' contains non-alphanumeric characters")
+
+    def test_sanitize_for_order_id_ascii(self):
+        """Test that ASCII asset names remain unchanged."""
+        from hummingbot.connector.utils import _sanitize_for_order_id
+
+        self.assertEqual(_sanitize_for_order_id("HBOT", 2), "HT")
+        self.assertEqual(_sanitize_for_order_id("BTC", 2), "BC")
+        self.assertEqual(_sanitize_for_order_id("A", 2), "AX")  # Padded
+
+    def test_sanitize_for_order_id_unicode(self):
+        """Test that Unicode asset names are hashed to alphanumeric."""
+        from hummingbot.connector.utils import _sanitize_for_order_id
+
+        result = _sanitize_for_order_id("我踏马来了", 2)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result.isalnum())
+        self.assertTrue(result.isascii())
+
     def test_connector_config_maps(self):
         connector_exceptions = ["mock_paper_exchange", "mock_pure_python_paper_exchange", "paper_trade", "amm", "clob"]
 

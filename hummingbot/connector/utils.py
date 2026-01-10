@@ -47,6 +47,30 @@ def _bot_instance_id() -> str:
     return md5(f"{platform.uname()}_pid:{os.getpid()}_ppid:{os.getppid()}".encode("utf-8")).hexdigest()
 
 
+def _sanitize_for_order_id(text: str, max_len: int = 2) -> str:
+    """
+    Sanitize a string for use in client order IDs.
+
+    Exchanges typically only allow alphanumeric characters in order IDs.
+    This function converts any non-alphanumeric or non-ASCII characters
+    to a hash-based alphanumeric representation.
+
+    :param text: The input string (e.g., asset name)
+    :param max_len: Maximum length of the output
+    :return: Alphanumeric string of length max_len
+    """
+    # Check if text is already ASCII alphanumeric
+    if text.isalnum() and text.isascii():
+        # Standard behavior: first and last character
+        if len(text) >= 2:
+            return f"{text[0]}{text[-1]}"
+        return text.ljust(max_len, 'X')[:max_len]
+
+    # For non-ASCII or non-alphanumeric: hash to alphanumeric
+    hash_hex = md5(text.encode('utf-8')).hexdigest()
+    return hash_hex[:max_len].upper()
+
+
 def get_new_client_order_id(
     is_buy: bool, trading_pair: str, hbot_order_id_prefix: str = "", max_id_len: Optional[int] = None
 ) -> str:
@@ -66,8 +90,8 @@ def get_new_client_order_id(
     symbols = split_hb_trading_pair(trading_pair)
     base = symbols[0].upper()
     quote = symbols[1].upper()
-    base_str = f"{base[0]}{base[-1]}"
-    quote_str = f"{quote[0]}{quote[-1]}"
+    base_str = _sanitize_for_order_id(base, 2)
+    quote_str = _sanitize_for_order_id(quote, 2)
     client_instance_id = _bot_instance_id()
     ts_hex = hex(get_tracking_nonce())[2:]
     client_order_id = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}{ts_hex}{client_instance_id}".replace("$", "")
