@@ -43,6 +43,11 @@ cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order 
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
 
+# --- Pending Cancel Wait ---
+# How long to wait for cancel confirmation before allowing force cleanup
+# This prevents orphaned orders on exchanges with slow cancel confirmations (e.g., BitMart)
+cdef double PENDING_CANCEL_WAIT_SECONDS = 10.0  # Wait at least 10s for cancel confirmation
+
 # --- Price Threshold Constants ---
 cdef double TICK_TOLERANCE = 0.9            # Tolerance for detecting if order matches top of book (90% of tick)
 cdef double HALF_TICK_TOLERANCE = 0.5       # Half-tick tolerance for price matching
@@ -899,16 +904,31 @@ cdef class PositionBalancerHandler:
     # HELPER METHODS FOR CANCELLATION LOGIC
     # ========================================================================
 
-    cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time):
+    cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=False):
         """
         Detect and cleanup stuck cancellations.
+        
+        Args:
+            order_id: The order ID to check
+            asset: The asset key
+            is_buy: True for buy orders, False for sell orders
+            current_time: Current timestamp
+            force_short_timeout: If True, use shorter PENDING_CANCEL_WAIT_SECONDS timeout
+                               (for order replacement scenarios). Otherwise use the longer
+                               STUCK_CANCEL_MULTIPLIER * refresh_interval.
         
         Returns True if stuck cancel was detected and cleaned up, False otherwise.
         """
         cdef:
             double cancel_request_time
             double time_since_cancel_request
-            double timeout_threshold = self._limit_refresh_interval * STUCK_CANCEL_MULTIPLIER
+            double timeout_threshold
+        
+        # Use shorter timeout for order replacement, longer for general stuck cancel detection
+        if force_short_timeout:
+            timeout_threshold = PENDING_CANCEL_WAIT_SECONDS
+        else:
+            timeout_threshold = self._limit_refresh_interval * STUCK_CANCEL_MULTIPLIER
         
         if order_id not in self.strategy._timeout_cancelled_orders:
             return False
@@ -924,7 +944,7 @@ cdef class PositionBalancerHandler:
         
         time_since_cancel_request = current_time - cancel_request_time
         
-        # Force cleanup if cancel has been pending for > 2x refresh interval
+        # Force cleanup if cancel has been pending for > timeout threshold
         if time_since_cancel_request > timeout_threshold:
             order_type = "buy" if is_buy else "sell"
             self.strategy.logger().warning(
@@ -1850,17 +1870,31 @@ cdef class PositionBalancerHandler:
             if shortfall_or_excess > 0:
                 # Check if already have pending buy order for ANY alias
                 # Only place new order if no aliases have active orders
-                # EXCEPTION: If the active order has a pending cancel, we can place a new one
+                # IMPORTANT: Orders with pending cancel are treated as STILL ACTIVE
+                # until exchange confirms the cancel OR stuck cancel timeout is reached.
+                # This prevents orphaned orders on exchanges with slow cancel confirmations.
                 has_active_order = False
                 for alias in asset_aliases:
                     if alias in self._active_buy_orders:
                         existing_order_id = self._active_buy_orders[alias]
                         # Check if this order has a pending cancel
                         if existing_order_id in self.strategy._timeout_cancelled_orders:
-                            # Order is being cancelled - force clear tracking to allow replacement
-                            self.strategy.logger().info(
-                                f"Position balancer: Active buy order {existing_order_id} has pending cancel - clearing for replacement")
-                            self.handle_order_cancellation(existing_order_id)
+                            # Order has pending cancel - check if we've waited long enough
+                            cancel_request_time = self._buy_cancel_request_time.get(alias, 0.0)
+                            time_since_cancel = self.strategy._current_timestamp - cancel_request_time
+                            
+                            if time_since_cancel >= PENDING_CANCEL_WAIT_SECONDS:
+                                # Force cleanup via stuck cancel mechanism after timeout
+                                if self.c_check_stuck_cancel(existing_order_id, alias, True, self.strategy._current_timestamp, True):
+                                    # Stuck cancel was cleaned up - continue to check other aliases
+                                    continue
+                            
+                            # Cancel still pending, haven't waited long enough - block new order
+                            self.strategy.logger().debug(
+                                f"Position balancer: Buy order {existing_order_id} pending cancel "
+                                f"({time_since_cancel:.1f}s/{PENDING_CANCEL_WAIT_SECONDS:.0f}s) - waiting for confirmation")
+                            has_active_order = True
+                            break
                         else:
                             has_active_order = True
                             break
@@ -1894,17 +1928,31 @@ cdef class PositionBalancerHandler:
             if shortfall_or_excess > 0:
                 # Check if already have pending sell order for ANY alias
                 # Only place new order if no aliases have active orders
-                # EXCEPTION: If the active order has a pending cancel, we can place a new one
+                # IMPORTANT: Orders with pending cancel are treated as STILL ACTIVE
+                # until exchange confirms the cancel OR stuck cancel timeout is reached.
+                # This prevents orphaned orders on exchanges with slow cancel confirmations.
                 has_active_order = False
                 for alias in asset_aliases:
                     if alias in self._active_sell_orders:
                         existing_order_id = self._active_sell_orders[alias]
                         # Check if this order has a pending cancel
                         if existing_order_id in self.strategy._timeout_cancelled_orders:
-                            # Order is being cancelled - force clear tracking to allow replacement
-                            self.strategy.logger().info(
-                                f"Position balancer: Active sell order {existing_order_id} has pending cancel - clearing for replacement")
-                            self.handle_order_cancellation(existing_order_id)
+                            # Order has pending cancel - check if we've waited long enough
+                            cancel_request_time = self._sell_cancel_request_time.get(alias, 0.0)
+                            time_since_cancel = self.strategy._current_timestamp - cancel_request_time
+                            
+                            if time_since_cancel >= PENDING_CANCEL_WAIT_SECONDS:
+                                # Force cleanup via stuck cancel mechanism after timeout
+                                if self.c_check_stuck_cancel(existing_order_id, alias, False, self.strategy._current_timestamp, True):
+                                    # Stuck cancel was cleaned up - continue to check other aliases
+                                    continue
+                            
+                            # Cancel still pending, haven't waited long enough - block new order
+                            self.strategy.logger().debug(
+                                f"Position balancer: Sell order {existing_order_id} pending cancel "
+                                f"({time_since_cancel:.1f}s/{PENDING_CANCEL_WAIT_SECONDS:.0f}s) - waiting for confirmation")
+                            has_active_order = True
+                            break
                         else:
                             has_active_order = True
                             break
