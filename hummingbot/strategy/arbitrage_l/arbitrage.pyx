@@ -657,18 +657,20 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self.c_execute_arbitrage(best_buy, best_sell, best_result)
             elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is not None and best_sell is not None:
                 # Not enough edge for normal arbitrage. Still try position balancing.
-                # Attempt with current best direction (respect pending/cool-off)
+                # CRITICAL: Position balancer MUST run even with pending orders to detect undercuts
+                # and refresh stale orders. It internally handles whether to place new orders.
                 placed = False
-                if self.c_ready_for_new_orders([best_buy, best_sell]) and self.c_books_ready_for_direction(best_buy, best_sell):
+                if self.c_books_ready_for_direction(best_buy, best_sell):
                     placed = self._position_balancer.c_handle_position_balancing(best_buy, best_sell) or False
                 # Also attempt reversed only if nothing was placed in current direction
                 if (not placed) and self._position_balancer.is_active:
-                    if self.c_ready_for_new_orders([best_sell, best_buy]) and self.c_books_ready_for_direction(best_sell, best_buy):
+                    if self.c_books_ready_for_direction(best_sell, best_buy):
                         self._position_balancer.c_handle_position_balancing(best_sell, best_buy)
             elif self._position_balancer is not None and self._position_balancer.is_active and best_buy is None:
                 # No arbitrageable pair found. Proactively scan all pairs for position balancing.
+                # CRITICAL: Position balancer MUST run even with pending orders to detect undercuts.
                 for market_pair in self._market_pairs:
-                    if self.c_ready_for_new_orders([market_pair.first, market_pair.second]) and self.c_books_ready_for_direction(market_pair.first, market_pair.second):
+                    if self.c_books_ready_for_direction(market_pair.first, market_pair.second):
                         if self._position_balancer.c_handle_position_balancing(market_pair.first, market_pair.second):
                             break
             
@@ -1009,11 +1011,24 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 
                 # Only log warning and cleanup if order was ACTUALLY stuck (still in tracker)
                 if market_pair is not None:
+                    # CRITICAL: Actually CANCEL the order on the exchange first!
+                    # Previously this only stopped tracking locally, leaving orders orphaned on exchanges.
+                    try:
+                        self._timeout_cancelled_orders.add(oid)  # Mark to skip cooldown
+                        self.c_cancel_order(market_pair, oid)
+                        self.logger().warning(
+                            f"Force cleaned up stuck order {oid} on {market_pair[0].name} "
+                            f"(older than {self._order_timeout * 2}s) - CANCEL SENT to exchange")
+                    except Exception as cancel_error:
+                        self.logger().warning(
+                            f"Failed to cancel stuck order {oid} on exchange: {cancel_error} - "
+                            f"stopping local tracking anyway")
+                        self._timeout_cancelled_orders.discard(oid)
+                    
                     self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, oid)
                     self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
                     if self._position_balancer is not None:
                         self._position_balancer.handle_old_order_cleanup(oid)
-                    self.logger().warning(f"Force cleaned up stuck order {oid} (older than {self._order_timeout * 2}s)")
                 
                 # Clean up auxiliary tracking
                 self._recent_order_market_pair.pop(oid, None)
