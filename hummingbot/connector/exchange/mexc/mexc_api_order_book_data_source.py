@@ -81,7 +81,17 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             # Pre-populate symbol cache for hot path optimization
             for trading_pair in self._trading_pairs:
-                ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                try:
+                    ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                except KeyError:
+                    # Fallback for missing pairs (dynamic or stale map)
+                    try:
+                        await self._connector._add_trading_pair_to_symbol_map(trading_pair)
+                        ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    except Exception as e:
+                        self.logger().error(f"Failed to resolve symbol for {trading_pair}: {e}")
+                        continue
+                        
                 self._symbol_to_pair_cache[ex_symbol] = trading_pair
             
             # Use the subscription manager to handle multiple connections
