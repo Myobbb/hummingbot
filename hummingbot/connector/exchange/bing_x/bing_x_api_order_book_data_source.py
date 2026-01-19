@@ -233,6 +233,7 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     ws_headers={"Accept-Encoding": "gzip"},
                     max_msg_size=16 * 1024 * 1024,
                 )
+                self._active_ws = ws
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
                 await self._process_ws_messages(ws=ws)

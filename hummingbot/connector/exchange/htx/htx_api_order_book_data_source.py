@@ -60,6 +60,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         
         # Track active WebSocket for snapshot requests
         self._active_ws: Optional[WSAssistant] = None
+        self._trade_ws: Optional[WSAssistant] = None
 
     def _extract_close_code(self, exc: Exception) -> Optional[str]:
         try:
@@ -112,6 +113,17 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         return ws
 
+    async def _subscribe_single_trading_pair(self, trading_pair: str):
+        """
+        Force a reconnection to include the new trading pair.
+        HTX override to disconnect both MBP and Trade connections.
+        """
+        self._reconnect_requested = True
+        if self._active_ws:
+            await self._active_ws.disconnect()
+        if self._trade_ws:
+            await self._trade_ws.disconnect()
+
     async def listen_for_subscriptions(self):
         """
         Main entry point. Manages two separate WebSocket connections:
@@ -139,6 +151,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 if name == "MBP":
                     self._active_ws = ws
+                elif name == "Trade":
+                    self._trade_ws = ws
                     
                 await subscribe_func(ws)
                 

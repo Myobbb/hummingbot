@@ -283,6 +283,7 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
+                self._active_ws = ws
                 await self._subscribe_channels(ws)
                 self._ping_task = asyncio.create_task(self.send_interval_ping(ws))
                 await self._process_websocket_messages(websocket_assistant=ws)

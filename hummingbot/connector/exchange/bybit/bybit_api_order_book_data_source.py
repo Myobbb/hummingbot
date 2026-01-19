@@ -349,6 +349,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
+                self._active_ws = ws
                 await ws.connect(
                     ws_url=CONSTANTS.WSS_PUBLIC_URL[self._domain],
                     # Disable protocol-level heartbeat; rely on JSON ping/pong and watchdogs
