@@ -2608,6 +2608,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 # Add to strategy's connector pool
                 self.connectors[exchange] = new_connector
                 
+                # Reset strategy readiness to ensure we wait for the new connector to sync
+                self.ready_to_trade = False
+                
                 # Check readiness (it won't be ready immediately, but loop will handle it)
                 if not new_connector.ready:
                     self.logger().info(f"Connector '{exchange}' initialized but not yet ready. It will sync in background.")

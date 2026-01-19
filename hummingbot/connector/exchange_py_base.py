@@ -1180,28 +1180,23 @@ class ExchangePyBase(ExchangeBase, ABC):
             # Continue anyway - will retry on reconnect
             
         try:
-            success = await self.order_book_tracker.add_trading_pair(trading_pair)
+            # Idempotent add: we don't care if it returns False (meaning already tracking)
+            await self.order_book_tracker.add_trading_pair(trading_pair)
             
-            if success:
-                # Fetch trading rules for the new pair if needed
-                if trading_pair not in self._trading_rules:
-                    try:
-                        await self._fetch_trading_rule_for_pair(trading_pair)
-                    except Exception as e:
-                        self.logger().warning(
-                            f"Could not fetch trading rules for {trading_pair}: {e}. "
-                            f"Trading rules will be updated on next polling cycle."
-                        )
-                
-                self.logger().info(
-                    f"Successfully added trading pair subscription: {trading_pair}"
-                )
-                return True
-            else:
-                self.logger().warning(
-                    f"Order book tracker could not add {trading_pair}"
-                )
-                return False
+            # Fetch trading rules for the new pair if needed (check even if already tracked)
+            if trading_pair not in self._trading_rules:
+                try:
+                    await self._fetch_trading_rule_for_pair(trading_pair)
+                except Exception as e:
+                    self.logger().warning(
+                        f"Could not fetch trading rules for {trading_pair}: {e}. "
+                        f"Trading rules will be updated on next polling cycle."
+                    )
+            
+            self.logger().info(
+                f"Successfully added trading pair subscription: {trading_pair}"
+            )
+            return True
                 
         except Exception as e:
             self.logger().error(
