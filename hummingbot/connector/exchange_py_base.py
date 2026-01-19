@@ -1232,7 +1232,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         
         :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
         """
-        # Get current symbol map
+        # Get current symbol map (returned by reference)
         symbol_map = await self.trading_pair_symbol_map()
         
         # Check if already in map
@@ -1242,24 +1242,18 @@ class ExchangePyBase(ExchangeBase, ABC):
         
         # Convert trading pair to exchange symbol
         # Most exchanges use format like "BTCUSDT" from "BTC-USDT"
-        # Extract base and quote from trading pair
         if "-" in trading_pair:
             base, quote = trading_pair.split("-", 1)
-            # Create the exchange symbol (most common format: BASEQUOTE without separator)
             exchange_symbol = f"{base}{quote}"
         else:
-            # Fallback: use as-is
             exchange_symbol = trading_pair
         
-        # Add to the bidict
-        if hasattr(self, '_trading_pair_symbol_map') and self._trading_pair_symbol_map is not None:
-            try:
-                self._trading_pair_symbol_map[exchange_symbol] = trading_pair
-                self.logger().info(f"Added {trading_pair} ({exchange_symbol}) to symbol map")
-            except Exception as e:
-                self.logger().warning(f"Could not add to symbol map: {e}")
-        else:
-            self.logger().warning("Symbol map not initialized yet")
+        # Add directly to the bidict (it's returned by reference)
+        try:
+            symbol_map[exchange_symbol] = trading_pair
+            self.logger().info(f"Added {trading_pair} ({exchange_symbol}) to symbol map")
+        except Exception as e:
+            self.logger().warning(f"Could not add to symbol map: {e}")
 
     def is_trading_pair_subscribed(self, trading_pair: str) -> bool:
         """
