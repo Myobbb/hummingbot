@@ -219,7 +219,10 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param trading_pair: the trading pair to check for market conditions
         :param price: the starting point price
         """
-        trading_rule = self._trading_rules[trading_pair]
+        trading_rule = self._trading_rules.get(trading_pair)
+        if trading_rule is None:
+            # Fallback for dynamically added pairs without trading rules yet
+            return Decimal("1e-8")
         return Decimal(trading_rule.min_price_increment)
 
     def get_order_size_quantum(self, trading_pair: str, order_size: Decimal) -> Decimal:
@@ -230,7 +233,10 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param trading_pair: the trading pair to check for market conditions
         :param order_size: the starting point order price
         """
-        trading_rule = self._trading_rules[trading_pair]
+        trading_rule = self._trading_rules.get(trading_pair)
+        if trading_rule is None:
+            # Fallback for dynamically added pairs without trading rules yet
+            return Decimal("1e-8")
         return Decimal(trading_rule.min_base_amount_increment)
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
