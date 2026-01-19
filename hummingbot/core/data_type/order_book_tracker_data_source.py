@@ -28,6 +28,9 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         # Active websocket reference for dynamic subscriptions
         self._active_ws: Optional[WSAssistant] = None
         self._ws_lock: asyncio.Lock = asyncio.Lock()
+        
+        # Flag to signal that a reconnection is needed (for dynamic pair additions)
+        self._reconnect_requested: bool = False
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -284,15 +287,16 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
         """
-        Subscribe to a new trading pair on the active websocket connection.
+        Subscribe to a new trading pair by triggering a websocket reconnection.
         The trading pair must already be added via add_trading_pair().
         
-        This method is safe to call at runtime and will send subscription messages
-        to the active websocket if available. If no active websocket exists,
-        the pair will be subscribed on the next reconnection.
+        This method triggers a graceful reconnection which will cause the
+        exchange's standard _subscribe_channels() to subscribe to ALL trading
+        pairs including the newly added one. This approach is universal and
+        works for all exchanges without per-exchange modifications.
         
         :param trading_pair: The trading pair to subscribe to
-        :return: True if subscription was sent successfully, False otherwise
+        :return: True if reconnection was triggered, False if pair not in list
         """
         if trading_pair not in self._trading_pairs:
             self.logger().warning(
@@ -301,57 +305,66 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
             )
             return False
         
-        async with self._ws_lock:
-            if self._active_ws is None:
-                self.logger().info(
-                    f"No active websocket for {trading_pair} subscription. "
-                    f"Will subscribe on next reconnection."
-                )
-                return False
-            
-            try:
-                await self._subscribe_single_trading_pair(self._active_ws, trading_pair)
-                self.logger().info(f"Subscribed to trading pair: {trading_pair}")
-                return True
-            except Exception as e:
-                self.logger().error(
-                    f"Failed to subscribe to {trading_pair}: {e}",
-                    exc_info=True
-                )
-                return False
-
-    async def _subscribe_single_trading_pair(self, ws: WSAssistant, trading_pair: str):
-        """
-        Subscribe to a single trading pair on an active websocket.
-        
-        DEFAULT IMPLEMENTATION: Triggers a graceful websocket reconnect.
-        This ensures all trading pairs (including the new one) are properly
-        subscribed using the exchange's standard subscription flow.
-        
-        This approach is universal and works for ALL exchanges without
-        requiring exchange-specific implementations.
-        
-        Exchange-specific implementations can override this method to
-        send subscription messages directly to an existing websocket
-        for faster subscription without reconnection.
-        
-        :param ws: The active websocket assistant
-        :param trading_pair: The trading pair to subscribe to
-        """
-        # Trigger graceful disconnect - the listen_for_subscriptions loop
-        # will automatically reconnect and subscribe to all trading pairs
-        # including the newly added one
         self.logger().info(
-            f"Triggering websocket reconnect to subscribe to {trading_pair}. "
-            f"This ensures proper subscription using exchange's standard flow."
+            f"Triggering websocket reconnection to subscribe to {trading_pair}. "
+            f"All trading pairs will be re-subscribed using exchange's standard flow."
         )
         
+        # Set reconnect flag for exchanges that check it
+        self._reconnect_requested = True
+        
+        # Call exchange-specific subscription handler (or default which disconnects)
+        # This allows exchanges like MEXC to override and force their own reconnection
+        try:
+            await self._subscribe_single_trading_pair(self._active_ws, trading_pair)
+            return True
+        except Exception as e:
+            self.logger().warning(f"Error in subscribe: {e}. Will reconnect naturally.")
+            return True  # Pair is in list, will be subscribed on reconnection
+
+    async def _subscribe_single_trading_pair(self, ws: Optional[WSAssistant], trading_pair: str):
+        """
+        Subscribe to a single trading pair by forcing a websocket reconnection.
+        
+        DEFAULT IMPLEMENTATION: Disconnects the active websocket if available.
+        The listen_for_subscriptions loop will automatically reconnect and
+        subscribe to all trading pairs including the newly added one.
+        
+        Exchange-specific implementations can override this method to force
+        reconnection using their own connection management (e.g., MEXC's
+        subscription manager).
+        
+        :param ws: The active websocket assistant (may be None for custom implementations)
+        :param trading_pair: The trading pair to subscribe to
+        """
         # Disconnect the active websocket to trigger reconnection
         if ws is not None:
             try:
+                self.logger().info(
+                    f"Disconnecting websocket to force reconnection for {trading_pair}"
+                )
                 await ws.disconnect()
             except Exception:
                 pass  # Ignore disconnect errors - reconnection will happen anyway
+
+    def trigger_reconnection(self):
+        """
+        Set the reconnection flag to signal that listen_for_subscriptions should reconnect.
+        This is useful for exchanges with custom implementations to check and respond to.
+        """
+        self._reconnect_requested = True
+
+    def check_and_clear_reconnect_request(self) -> bool:
+        """
+        Check if a reconnection was requested and clear the flag.
+        Used by custom listen_for_subscriptions implementations.
+        
+        :return: True if reconnection was requested, False otherwise
+        """
+        if self._reconnect_requested:
+            self._reconnect_requested = False
+            return True
+        return False
 
     @property
     def trading_pairs(self) -> List[str]:

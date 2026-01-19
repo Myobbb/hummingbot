@@ -246,3 +246,27 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             else:
                 channel = self._trade_messages_queue_key
         return channel
+
+    async def _subscribe_single_trading_pair(self, ws: WSAssistant, trading_pair: str):
+        """
+        Subscribe to a single trading pair by forcing a websocket reconnection.
+        
+        MEXC uses a custom subscription manager with multiple connections,
+        so we can't simply send a subscribe message to a single websocket.
+        Instead, we force a reconnection which will re-subscribe to all
+        trading pairs including the newly added one.
+        
+        :param ws: The websocket assistant (ignored for MEXC)
+        :param trading_pair: The trading pair to subscribe to
+        """
+        # Pre-populate symbol cache
+        ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        self._symbol_to_pair_cache[ex_symbol] = trading_pair
+        
+        self.logger().info(
+            f"MEXC: Forcing websocket reconnection to subscribe to {trading_pair}"
+        )
+        
+        # Force reconnection by closing all active connections
+        # The listen_for_subscriptions loop will reconnect and subscribe to all pairs
+        await self._cleanup_connections()
