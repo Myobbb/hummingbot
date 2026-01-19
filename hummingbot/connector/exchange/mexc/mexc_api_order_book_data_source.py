@@ -110,6 +110,20 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             raise
 
+
+    async def _subscribe_single_trading_pair(self, trading_pair: str):
+        """
+        Force a reconnection to include the new trading pair.
+        MEXC override to handle custom connection manager.
+        """
+        self._reconnect_requested = True
+        
+        # Disconnect all active connections to force the main loop to restart
+        if self._active_connections:
+            self.logger().info(f"Disconnecting {len(self._active_connections)} MEXC connections to force update for {trading_pair}")
+            for conn in self._active_connections:
+                await conn.ws_assistant.disconnect()
+
     async def listen_for_subscriptions(self):
         """
         Override the base class method to handle multiple websocket connections.
