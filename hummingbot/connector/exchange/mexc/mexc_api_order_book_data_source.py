@@ -259,9 +259,13 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param ws: The websocket assistant (ignored for MEXC)
         :param trading_pair: The trading pair to subscribe to
         """
-        # Pre-populate symbol cache
-        ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        self._symbol_to_pair_cache[ex_symbol] = trading_pair
+        # Try to pre-populate symbol cache (may fail for new pairs)
+        try:
+            ex_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            self._symbol_to_pair_cache[ex_symbol] = trading_pair
+        except Exception:
+            # Symbol mapping not available yet - will be populated on reconnect
+            pass
         
         self.logger().info(
             f"MEXC: Forcing websocket reconnection to subscribe to {trading_pair}"
