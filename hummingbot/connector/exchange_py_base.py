@@ -1175,12 +1175,9 @@ class ExchangePyBase(ExchangeBase, ABC):
         # Add to symbol map if not already there (critical for websocket subscriptions)
         try:
             await self._add_trading_pair_to_symbol_map(trading_pair)
-            # Yield control to ensure map update propagates before subscription
-            await asyncio.sleep(0)
         except Exception as e:
             self.logger().warning(f"Could not add {trading_pair} to symbol map: {e}")
             # Continue anyway - will retry on reconnect
-            
             
         try:
             success = await self.order_book_tracker.add_trading_pair(trading_pair)

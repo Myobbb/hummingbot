@@ -2585,8 +2585,38 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Check if exchange exists in connector pool
         if exchange not in self.connectors:
-            self.logger().error(f"Exchange '{exchange}' not in connector pool. Available: {list(self.connectors.keys())}")
-            return False
+            self.logger().info(f"Exchange '{exchange}' not in connector pool. Attempting to initialize it runtime...")
+            
+            try:
+                from hummingbot.client.hummingbot_application import HummingbotApplication
+                app = HummingbotApplication.main_application()
+                if not app or not app.trading_core:
+                    self.logger().error("Could not access main application/trading core to initialize new connector")
+                    return False
+                
+                # Initialize the new connector via TradingCore
+                # This handles creation, adding to clock, and markets recorder
+                await app.trading_core.initialize_markets([(exchange, [pair])])
+                
+                # Retrieve the newly created connector
+                new_connector = app.trading_core.connector_manager.connectors.get(exchange)
+                
+                if not new_connector:
+                    self.logger().error(f"Failed to initialize connector '{exchange}'")
+                    return False
+                
+                # Add to strategy's connector pool
+                self.connectors[exchange] = new_connector
+                
+                # Check readiness (it won't be ready immediately, but loop will handle it)
+                if not new_connector.ready:
+                    self.logger().info(f"Connector '{exchange}' initialized but not yet ready. It will sync in background.")
+                    
+                self.logger().info(f"Successfully initialized and added exchange '{exchange}' to connector pool")
+                
+            except Exception as e:
+                self.logger().error(f"Error initializing exchange '{exchange}': {e}", exc_info=True)
+                return False
 
         # Get strategy instance
         strategy_instance = self._get_strategy_instance(strategy_name)
