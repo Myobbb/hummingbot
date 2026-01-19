@@ -2639,6 +2639,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().warning(f"Market '{market_spec}' already exists in strategy '{strategy_name}'")
                 return False
 
+        # Update self.markets to ensure get_assets works for the new/updated connector
+        if exchange not in self.markets:
+            self.markets[exchange] = set()
+        self.markets[exchange].add(pair)
+
         # Build new market tuple
         base, quote = pair.split('-', 1)
         new_tuple = MarketTradingPairTuple(
