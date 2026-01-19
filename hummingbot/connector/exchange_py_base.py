@@ -1149,10 +1149,11 @@ class ExchangePyBase(ExchangeBase, ABC):
         
         This method:
         1. Validates the trading pair format
-        2. Adds the pair to the internal trading pairs list
-        3. Initializes the order book for the pair
-        4. Subscribes to websocket updates for the pair
-        5. Fetches trading rules for the pair (if needed)
+        2. Adds the pair to the symbol map (for exchange symbol lookups)
+        3. Adds the pair to the internal trading pairs list
+        4. Initializes the order book for the pair
+        5. Subscribes to websocket updates for the pair
+        6. Fetches trading rules for the pair (if needed)
         
         :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
         :return: True if successfully added, False otherwise
@@ -1164,8 +1165,14 @@ class ExchangePyBase(ExchangeBase, ABC):
             # Add to connector's internal list
             if hasattr(self, '_trading_pairs') and isinstance(self._trading_pairs, list):
                 self._trading_pairs.append(trading_pair)
+        
+        # Add to symbol map if not already there (critical for websocket subscriptions)
+        try:
+            await self._add_trading_pair_to_symbol_map(trading_pair)
+        except Exception as e:
+            self.logger().warning(f"Could not add {trading_pair} to symbol map: {e}")
+            # Continue anyway - will retry on reconnect
             
-        # Add to order book tracker
         try:
             success = await self.order_book_tracker.add_trading_pair(trading_pair)
             
@@ -1216,6 +1223,44 @@ class ExchangePyBase(ExchangeBase, ABC):
                 return
         self.logger().warning(f"Trading rules not found for {trading_pair}")
 
+    async def _add_trading_pair_to_symbol_map(self, trading_pair: str):
+        """
+        Add a trading pair to the exchange symbol map (bidict).
+        
+        This is essential for dynamic trading pair additions, as the symbol map
+        is initially populated only at connector startup.
+        
+        :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
+        """
+        # Get current symbol map
+        symbol_map = await self.trading_pair_symbol_map()
+        
+        # Check if already in map
+        if trading_pair in symbol_map.inverse:
+            self.logger().debug(f"Trading pair {trading_pair} already in symbol map")
+            return
+        
+        # Convert trading pair to exchange symbol
+        # Most exchanges use format like "BTCUSDT" from "BTC-USDT"
+        # Extract base and quote from trading pair
+        if "-" in trading_pair:
+            base, quote = trading_pair.split("-", 1)
+            # Create the exchange symbol (most common format: BASEQUOTE without separator)
+            exchange_symbol = f"{base}{quote}"
+        else:
+            # Fallback: use as-is
+            exchange_symbol = trading_pair
+        
+        # Add to the bidict
+        if hasattr(self, '_trading_pair_symbol_map') and self._trading_pair_symbol_map is not None:
+            try:
+                self._trading_pair_symbol_map[exchange_symbol] = trading_pair
+                self.logger().info(f"Added {trading_pair} ({exchange_symbol}) to symbol map")
+            except Exception as e:
+                self.logger().warning(f"Could not add to symbol map: {e}")
+        else:
+            self.logger().warning("Symbol map not initialized yet")
+
     def is_trading_pair_subscribed(self, trading_pair: str) -> bool:
         """
         Check if a trading pair is currently subscribed.
@@ -1224,3 +1269,4 @@ class ExchangePyBase(ExchangeBase, ABC):
         :return: True if subscribed, False otherwise
         """
         return self.order_book_tracker.has_order_book(trading_pair)
+
