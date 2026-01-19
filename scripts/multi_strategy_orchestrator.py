@@ -2610,6 +2610,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 
                 # Reset strategy readiness to ensure we wait for the new connector to sync
                 self.ready_to_trade = False
+
+                # IMPORTANT: Register the new connector with the strategy's market registry
+                # This populates self.markets which is required for get_assets/format_status
+                self.add_markets([new_connector])
                 
                 # Check readiness (it won't be ready immediately, but loop will handle it)
                 if not new_connector.ready:
