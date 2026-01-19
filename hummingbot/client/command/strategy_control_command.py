@@ -661,14 +661,20 @@ class StrategyControlCommand:
     async def _control_add_market(self,  # type: HummingbotApplication
                                   identifier: str,
                                   market_spec: str):
-        """Add a market to a strategy's additional_markets."""
+        """Add a market to a strategy's additional_markets with dynamic websocket subscription."""
         try:
             strategy = self.trading_core.strategy
-            success = strategy.add_market_by_identifier(identifier, market_spec)
+            
+            self.notify(f"Adding market '{market_spec}' to {identifier}...")
+            self.notify("  This includes dynamic websocket subscription for order book data")
+            
+            # Await the async method
+            success = await strategy.add_market_by_identifier(identifier, market_spec)
 
             if success:
                 self.notify(f"\n✓ Market '{market_spec}' added successfully to {identifier}")
                 self.notify("  New arbitrage pairs created; trading will include the new market")
+                self.notify("  Order book data subscription is active")
             else:
                 self.notify(f"\n✗ Failed to add market '{market_spec}' to: {identifier}")
                 self.notify("  Check logs for details. Use 'control list' to see strategies")

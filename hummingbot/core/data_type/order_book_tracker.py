@@ -447,3 +447,96 @@ class OrderBookTracker:
     @staticmethod
     async def _sleep(delay: float):
         await asyncio.sleep(delay=delay)
+
+    # === Dynamic Trading Pair Management ===
+
+    async def add_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamically add a new trading pair to the order book tracker.
+        
+        This method:
+        1. Adds the pair to the data source's trading pairs list
+        2. Creates an order book for the pair
+        3. Sets up tracking message queue and task
+        4. Subscribes to the websocket for the pair
+        
+        :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
+        :return: True if successfully added, False otherwise
+        """
+        if trading_pair in self._order_books:
+            self.logger().warning(f"Trading pair {trading_pair} already tracked.")
+            return False
+
+        if trading_pair in self._trading_pairs:
+            self.logger().warning(
+                f"Trading pair {trading_pair} in list but not initialized. "
+                f"Initializing now."
+            )
+        else:
+            self._trading_pairs.append(trading_pair)
+
+        try:
+            # Add to data source's trading pairs
+            self._data_source.add_trading_pair(trading_pair)
+
+            # Initialize order book (with timeout to avoid hanging)
+            try:
+                self._order_books[trading_pair] = await asyncio.wait_for(
+                    self._initial_order_book_for_trading_pair(trading_pair),
+                    timeout=30.0
+                )
+                self.logger().info(f"Initialized order book for {trading_pair}")
+            except asyncio.TimeoutError:
+                self.logger().warning(
+                    f"Timeout initializing order book for {trading_pair}. "
+                    f"Creating empty orderbook, will be populated by WebSocket."
+                )
+                self._order_books[trading_pair] = self.order_book_create_function()
+            except Exception as e:
+                self.logger().warning(
+                    f"Error initializing order book for {trading_pair}: {e}. "
+                    f"Creating empty orderbook, will be populated by WebSocket."
+                )
+                self._order_books[trading_pair] = self.order_book_create_function()
+
+            # Set up tracking queue and task
+            self._tracking_message_queues[trading_pair] = asyncio.Queue()
+            self._tracking_tasks[trading_pair] = safe_ensure_future(
+                self._track_single_book(trading_pair)
+            )
+
+            # Subscribe to websocket for this pair
+            subscribed = await self._data_source.subscribe_to_trading_pair(trading_pair)
+            if subscribed:
+                self.logger().info(
+                    f"Successfully added and subscribed to trading pair: {trading_pair}"
+                )
+            else:
+                self.logger().info(
+                    f"Added trading pair {trading_pair}. "
+                    f"Will subscribe on next websocket reconnection."
+                )
+
+            return True
+
+        except Exception as e:
+            self.logger().error(
+                f"Failed to add trading pair {trading_pair}: {e}",
+                exc_info=True
+            )
+            # Clean up partial state
+            self._order_books.pop(trading_pair, None)
+            self._tracking_message_queues.pop(trading_pair, None)
+            task = self._tracking_tasks.pop(trading_pair, None)
+            if task:
+                task.cancel()
+            return False
+
+    def has_order_book(self, trading_pair: str) -> bool:
+        """Check if an order book exists for the given trading pair."""
+        return trading_pair in self._order_books
+
+    @property
+    def order_book_create_function(self):
+        """Get the order book creation function from the data source."""
+        return self._data_source.order_book_create_function

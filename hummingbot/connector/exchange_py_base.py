@@ -1140,3 +1140,87 @@ class ExchangePyBase(ExchangeBase, ABC):
             self.SHORT_POLL_INTERVAL if last_recv_diff > self.TICK_INTERVAL_LIMIT else self.LONG_POLL_INTERVAL
         )
         return poll_interval
+
+    # === Dynamic Trading Pair Management ===
+
+    async def add_trading_pair_subscription(self, trading_pair: str) -> bool:
+        """
+        Dynamically add a trading pair subscription to this connector at runtime.
+        
+        This method:
+        1. Validates the trading pair format
+        2. Adds the pair to the internal trading pairs list
+        3. Initializes the order book for the pair
+        4. Subscribes to websocket updates for the pair
+        5. Fetches trading rules for the pair (if needed)
+        
+        :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
+        :return: True if successfully added, False otherwise
+        """
+        # Check if already tracked
+        if hasattr(self, '_trading_pairs') and trading_pair in self._trading_pairs:
+            self.logger().info(f"Trading pair {trading_pair} already in connector's trading pairs.")
+        else:
+            # Add to connector's internal list
+            if hasattr(self, '_trading_pairs') and isinstance(self._trading_pairs, list):
+                self._trading_pairs.append(trading_pair)
+            
+        # Add to order book tracker
+        try:
+            success = await self.order_book_tracker.add_trading_pair(trading_pair)
+            
+            if success:
+                # Fetch trading rules for the new pair if needed
+                if trading_pair not in self._trading_rules:
+                    try:
+                        await self._fetch_trading_rule_for_pair(trading_pair)
+                    except Exception as e:
+                        self.logger().warning(
+                            f"Could not fetch trading rules for {trading_pair}: {e}. "
+                            f"Trading rules will be updated on next polling cycle."
+                        )
+                
+                self.logger().info(
+                    f"Successfully added trading pair subscription: {trading_pair}"
+                )
+                return True
+            else:
+                self.logger().warning(
+                    f"Order book tracker could not add {trading_pair}"
+                )
+                return False
+                
+        except Exception as e:
+            self.logger().error(
+                f"Failed to add trading pair subscription for {trading_pair}: {e}",
+                exc_info=True
+            )
+            return False
+
+    async def _fetch_trading_rule_for_pair(self, trading_pair: str):
+        """
+        Fetch trading rules for a specific trading pair.
+        
+        Default implementation fetches all rules and filters. Override in exchange
+        implementations if the exchange supports fetching rules for a single pair.
+        
+        :param trading_pair: The trading pair to fetch rules for
+        """
+        # Default: fetch all and filter
+        exchange_info = await self._make_trading_rules_request()
+        all_rules = await self._format_trading_rules(exchange_info)
+        for rule in all_rules:
+            if rule.trading_pair == trading_pair:
+                self._trading_rules[trading_pair] = rule
+                self.logger().info(f"Fetched trading rules for {trading_pair}")
+                return
+        self.logger().warning(f"Trading rules not found for {trading_pair}")
+
+    def is_trading_pair_subscribed(self, trading_pair: str) -> bool:
+        """
+        Check if a trading pair is currently subscribed.
+        
+        :param trading_pair: The trading pair to check
+        :return: True if subscribed, False otherwise
+        """
+        return self.order_book_tracker.has_order_book(trading_pair)

@@ -139,3 +139,40 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
             channel = (self._diff_messages_queue_key if event_type == CONSTANTS.DIFF_EVENT_TYPE
                        else self._trade_messages_queue_key)
         return channel
+
+    async def _subscribe_single_trading_pair(self, ws: WSAssistant, trading_pair: str):
+        """
+        Subscribe to a single trading pair on an active websocket.
+        
+        Binance specific implementation that sends SUBSCRIBE command for
+        trades and depth streams.
+        
+        :param ws: The active websocket assistant
+        :param trading_pair: The trading pair to subscribe to
+        """
+        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        symbol_lower = symbol.lower()
+        
+        # Subscribe to trades
+        trade_payload = {
+            "method": "SUBSCRIBE",
+            "params": [f"{symbol_lower}@trade"],
+            "id": int(time.time() * 1000)  # Unique ID
+        }
+        subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
+        
+        # Subscribe to depth
+        depth_payload = {
+            "method": "SUBSCRIBE",
+            "params": [f"{symbol_lower}@depth@100ms"],
+            "id": int(time.time() * 1000) + 1
+        }
+        subscribe_depth_request: WSJSONRequest = WSJSONRequest(payload=depth_payload)
+        
+        await ws.send(subscribe_trade_request)
+        await ws.send(subscribe_depth_request)
+        
+        self.logger().info(
+            f"Binance: Dynamically subscribed to {trading_pair} (trades + depth)"
+        )
+

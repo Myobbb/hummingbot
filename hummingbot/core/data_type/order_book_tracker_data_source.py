@@ -24,6 +24,10 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         self._trading_pairs: List[str] = trading_pairs
         self._order_book_create_function = lambda: OrderBook()
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        
+        # Active websocket reference for dynamic subscriptions
+        self._active_ws: Optional[WSAssistant] = None
+        self._ws_lock: asyncio.Lock = asyncio.Lock()
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -76,6 +80,9 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
+                # Track active websocket for dynamic subscription support
+                async with self._ws_lock:
+                    self._active_ws = ws
                 await self._subscribe_channels(ws)
                 await self._process_websocket_messages(websocket_assistant=ws)
             except asyncio.CancelledError:
@@ -88,6 +95,9 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
                 )
                 await self._sleep(1.0)
             finally:
+                # Clear active websocket reference before cleanup
+                async with self._ws_lock:
+                    self._active_ws = None
                 await self._on_order_stream_interruption(websocket_assistant=ws)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
@@ -256,3 +266,99 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
 
     def _time(self):
         return time.time()
+
+    # === Dynamic Trading Pair Subscription Methods ===
+
+    def add_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Add a trading pair to the internal list. This must be called before 
+        subscribe_to_trading_pair to ensure the pair is tracked.
+        
+        :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
+        :return: True if added, False if already present
+        """
+        if trading_pair in self._trading_pairs:
+            return False
+        self._trading_pairs.append(trading_pair)
+        return True
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Subscribe to a new trading pair on the active websocket connection.
+        The trading pair must already be added via add_trading_pair().
+        
+        This method is safe to call at runtime and will send subscription messages
+        to the active websocket if available. If no active websocket exists,
+        the pair will be subscribed on the next reconnection.
+        
+        :param trading_pair: The trading pair to subscribe to
+        :return: True if subscription was sent successfully, False otherwise
+        """
+        if trading_pair not in self._trading_pairs:
+            self.logger().warning(
+                f"Trading pair {trading_pair} not in tracked list. "
+                f"Call add_trading_pair() first."
+            )
+            return False
+        
+        async with self._ws_lock:
+            if self._active_ws is None:
+                self.logger().info(
+                    f"No active websocket for {trading_pair} subscription. "
+                    f"Will subscribe on next reconnection."
+                )
+                return False
+            
+            try:
+                await self._subscribe_single_trading_pair(self._active_ws, trading_pair)
+                self.logger().info(f"Subscribed to trading pair: {trading_pair}")
+                return True
+            except Exception as e:
+                self.logger().error(
+                    f"Failed to subscribe to {trading_pair}: {e}",
+                    exc_info=True
+                )
+                return False
+
+    async def _subscribe_single_trading_pair(self, ws: WSAssistant, trading_pair: str):
+        """
+        Subscribe to a single trading pair on an active websocket.
+        
+        DEFAULT IMPLEMENTATION: Triggers a graceful websocket reconnect.
+        This ensures all trading pairs (including the new one) are properly
+        subscribed using the exchange's standard subscription flow.
+        
+        This approach is universal and works for ALL exchanges without
+        requiring exchange-specific implementations.
+        
+        Exchange-specific implementations can override this method to
+        send subscription messages directly to an existing websocket
+        for faster subscription without reconnection.
+        
+        :param ws: The active websocket assistant
+        :param trading_pair: The trading pair to subscribe to
+        """
+        # Trigger graceful disconnect - the listen_for_subscriptions loop
+        # will automatically reconnect and subscribe to all trading pairs
+        # including the newly added one
+        self.logger().info(
+            f"Triggering websocket reconnect to subscribe to {trading_pair}. "
+            f"This ensures proper subscription using exchange's standard flow."
+        )
+        
+        # Disconnect the active websocket to trigger reconnection
+        if ws is not None:
+            try:
+                await ws.disconnect()
+            except Exception:
+                pass  # Ignore disconnect errors - reconnection will happen anyway
+
+    @property
+    def trading_pairs(self) -> List[str]:
+        """Return the list of currently tracked trading pairs."""
+        return self._trading_pairs.copy()
+
+    @property
+    def has_active_websocket(self) -> bool:
+        """Check if there is an active websocket connection."""
+        return self._active_ws is not None

@@ -403,20 +403,44 @@ def remove(identifier: str) -> bool:
 def add_market(identifier: str, market_spec: str) -> bool:
     """
     Add a market to a strategy's additional_markets (runtime + config file).
+    
+    This function initiates the market addition asynchronously, including
+    dynamic websocket subscription to the new trading pair.
 
     Args:
         identifier: Full strategy name or token symbol
         market_spec: Market specification as 'exchange:PAIR' (e.g., 'mexc:BSX-USDT')
 
     Returns:
-        True if successful
+        True if the task was scheduled successfully (actual result logs async)
 
     Examples:
         >>> add_market("arb_bsx_gate_bitmart", "mexc:BSX-USDT")
         >>> add_market("BSX", "htx:BSX-USDT")
     """
+    import asyncio
     orchestrator = _get_orchestrator()
-    return orchestrator.add_market_by_identifier(identifier, market_spec)
+    
+    # Schedule the async operation
+    try:
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(orchestrator.add_market_by_identifier(identifier, market_spec))
+        # Log result when complete
+        def _log_result(future):
+            try:
+                result = future.result()
+                if result:
+                    orchestrator.logger().info(f"Market addition completed successfully: {market_spec}")
+                else:
+                    orchestrator.logger().warning(f"Market addition returned False: {market_spec}")
+            except Exception as e:
+                orchestrator.logger().error(f"Market addition failed: {e}")
+        task.add_done_callback(_log_result)
+        orchestrator.logger().info(f"Market addition initiated for {market_spec} (async)")
+        return True
+    except Exception as e:
+        orchestrator.logger().error(f"Failed to schedule market addition: {e}")
+        return False
 
 
 def remove_market(identifier: str, market_spec: str) -> bool:
@@ -2510,7 +2534,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # MARKET MANIPULATION (add/remove markets from strategies at runtime)
     # ====================================================================================
 
-    def add_market_by_identifier(self, identifier: str, market_spec: str) -> bool:
+    async def add_market_by_identifier(self, identifier: str, market_spec: str) -> bool:
         """
         Add a market to a strategy's additional_markets by name or token symbol.
 
@@ -2525,9 +2549,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if not strategy_name:
             self.logger().error(f"Could not resolve identifier '{identifier}' to a strategy name")
             return False
-        return self.add_market_to_strategy(strategy_name, market_spec)
+        return await self.add_market_to_strategy(strategy_name, market_spec)
 
-    def add_market_to_strategy(self, strategy_name: str, market_spec: str) -> bool:
+    async def add_market_to_strategy(self, strategy_name: str, market_spec: str) -> bool:
         """
         Add a market to a strategy's additional_markets (runtime + config file).
 
@@ -2586,6 +2610,34 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             base_asset=base,
             quote_asset=quote
         )
+
+        # DYNAMIC SUBSCRIPTION: Subscribe to the trading pair on the connector's websocket
+        # This ensures order book data is available immediately without restart
+        connector = self.connectors[exchange]
+        subscription_success = False
+        try:
+            if hasattr(connector, 'add_trading_pair_subscription'):
+                # Use the new unified subscription method
+                subscription_success = await connector.add_trading_pair_subscription(pair)
+                if subscription_success:
+                    self.logger().info(
+                        f"Dynamically subscribed to {pair} on {exchange}"
+                    )
+                else:
+                    self.logger().warning(
+                        f"Could not dynamically subscribe to {pair} on {exchange}. "
+                        f"Will be subscribed on next connector reconnection."
+                    )
+            else:
+                self.logger().info(
+                    f"Exchange {exchange} does not support dynamic subscriptions. "
+                    f"Trading pair will use existing data or require restart."
+                )
+        except Exception as e:
+            self.logger().warning(
+                f"Failed to dynamically subscribe to {pair} on {exchange}: {e}. "
+                f"Market added but subscription may be delayed."
+            )
 
         # Add to strategy's market_pairs list
         strategy_instance.market_pairs.append(new_tuple)
