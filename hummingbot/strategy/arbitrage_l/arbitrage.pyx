@@ -47,6 +47,7 @@ cdef:
     double DEFAULT_RATE_CACHE_DURATION = 10.0
 
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
+    double DEFAULT_ORDER_TIMEOUT = 600.0  # 10 minutes timeout for unfilled orders
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
@@ -78,7 +79,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._logging_options = 0  # No logging by default
         self._status_report_interval = 60.0  # Default 60 seconds
         self._next_trade_delay = 2.0  # Default 2 seconds
-        self._order_timeout = 180.0  # Default 3 minutes
+        self._order_timeout = DEFAULT_ORDER_TIMEOUT
         self._filled_order_timeout = 3600.0  # Default 1 hour
 
         self._min_order_usd = 10.0  # Default minimum order size
@@ -124,7 +125,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging_options: int = OPTION_LOG_STATUS_REPORT,
                     status_report_interval: float = 60.0,
                     next_trade_delay_interval: float = 2.0,
-                    order_timeout: float = 180.0,
+                    order_timeout: float = DEFAULT_ORDER_TIMEOUT,
                     filled_order_timeout: float = DEFAULT_FILLED_ORDER_TIMEOUT,
                     use_oracle_conversion_rate: bool = False,
                     secondary_to_primary_base_conversion_rate: Decimal = Decimal("1"),
@@ -1405,8 +1406,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Prices already prepared above as Decimal for quantization
 
             # Execute both orders in rapid succession
-            # This is the best we can do in Cython without async support
-            # The actual network calls happen inside the exchange connectors
+            # NOTE: c_buy/c_sell_with_specific_market return immediately (async order placement)
+            # Actual exchange failures are handled via MarketOrderFailureEvent -> c_did_fail_order
+            # The try/except here only catches rare synchronous validation errors (e.g. TypeError)
             try:
                 buy_order_id = self.c_buy_with_specific_market(
                     buy_market_tuple, quantized_amount,
@@ -1414,9 +1416,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     price=buy_price_decimal,
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
-                # CRITICAL: Set failure timestamp to enforce cooldown
-                self._last_failure_timestamps[buy_market_tuple] = self._current_timestamp
-                self.logger().warning(f"Error submitting buy order to {buy_market.name}: {e}")
+                # Rare synchronous error (e.g. invalid type, market not whitelisted)
+                # Do NOT set cooldown here - this is a programming/config error, not exchange issue
+                self.logger().error(f"Sync error submitting buy order to {buy_market.name}: {e}")
                 return
 
             # Immediately place the sell order - minimal delay
@@ -1427,10 +1429,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     price=sell_price_decimal,
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
-                # CRITICAL: Set failure timestamp to enforce cooldown
-                # Note: Buy order may have been placed - will timeout/cancel naturally
-                self._last_failure_timestamps[sell_market_tuple] = self._current_timestamp
-                self.logger().warning(f"Error submitting sell order to {sell_market.name}: {e}")
+                # Rare synchronous error - buy order may have been submitted (will timeout/cancel)
+                # Do NOT set cooldown here - this is a programming/config error, not exchange issue
+                self.logger().error(f"Sync error submitting sell order to {sell_market.name}: {e}")
                 return
 
             # Track orders
@@ -1616,10 +1617,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self.logger().info(
                 f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was TIMEOUT-CANCELLED - no cooldown enforced")
         else:
-            # Limit order cancelled naturally (by exchange or market conditions) - enforce cooldown
+            # Safety net: Order was cancelled by exchange without us requesting it
+            # This could be: price protection, exchange-side cancellation, or any edge case
+            # that didn't go through c_did_fail_order. Enforce cooldown as defensive measure.
             self._last_failure_timestamps[market_pair] = self._current_timestamp
             self.logger().warning(
-                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was NATURALLY CANCELLED - cooldown enforced")
+                f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was "
+                f"EXTERNALLY CANCELLED (safety net) - cooldown enforced for {self._order_timeout:.0f}s")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -1634,6 +1638,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef:
             str order_id = order_failed_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
+            str error_msg = ""
+        
+        # Extract error message from the event if available
+        try:
+            if hasattr(order_failed_event, 'error_message') and order_failed_event.error_message:
+                error_msg = str(order_failed_event.error_message)
+        except Exception:
+            pass
         
         # Always clean up tracking for failed orders to prevent stuck state
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair_tuple, order_id)
@@ -1644,9 +1656,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # CRITICAL: Set failure timestamp to enforce cooldown
         self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp
-        self.logger().warning(
-            f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
-            f"cooling down for {self._order_timeout:.0f}s")
+        
+        # Log with exchange error message if available
+        if error_msg:
+            self.logger().warning(
+                f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}: "
+                f"{error_msg}; cooling down for {self._order_timeout:.0f}s")
+        else:
+            self.logger().warning(
+                f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
+                f"cooling down for {self._order_timeout:.0f}s")
 
     cdef void c_check_all_order_timeouts(self):
         """
