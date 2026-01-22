@@ -50,6 +50,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _status_debounce_until
         double _last_global_trade_timestamp
         dict _last_failure_timestamps
+        dict _failure_first_timestamps
         double _last_cleanup_timestamp
         double _last_conv_rates_logged
         

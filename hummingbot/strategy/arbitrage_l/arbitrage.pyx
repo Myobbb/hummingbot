@@ -49,6 +49,8 @@ cdef:
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
     double DEFAULT_ORDER_TIMEOUT = 600.0  # 10 minutes timeout for unfilled orders
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
+    double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
+    double ESCALATED_COOLDOWN = 3600.0  # 60 min extended timeout for repeat failures
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
@@ -90,7 +92,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._fixed_base_rate = 1.0  # Default conversion rate
         self._fixed_quote_rate = 1.0  # Default conversion rate
         self._last_global_trade_timestamp = 0.0
-        self._last_failure_timestamps = {}
+        self._last_failure_timestamps = {}  # market_tuple -> cooldown END timestamp (when cooldown expires)
+        self._failure_first_timestamps = {}  # market_tuple -> first failure timestamp (for escalation detection)
         self._position_balancer = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
@@ -177,6 +180,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._status_debounce_until = 0
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
+        self._failure_first_timestamps = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
         
@@ -1046,7 +1050,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if self._order_timestamps.size() > self._max_tracked_orders:
             self.logger().warning(f"Tracked orders exceed limit: {self._order_timestamps.size()}")
 
-        # Cleanup stale failure timestamps beyond cutoff
+        # Cleanup stale failure timestamps beyond cutoff (these store END times)
         try:
             keys_to_drop = []
             for mp_tuple, ts in self._last_failure_timestamps.items():
@@ -1054,6 +1058,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     keys_to_drop.append(mp_tuple)
             for k in keys_to_drop:
                 self._last_failure_timestamps.pop(k, None)
+                self._failure_first_timestamps.pop(k, None)  # Also clear escalation tracking
         except Exception:
             pass
 
@@ -1142,16 +1147,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Failure cooldown window (treat placement errors like cancels/timeouts)
+        # Failure cooldown window - _last_failure_timestamps now stores cooldown END time
         for market_tuple in market_tuples:
             if market_tuple in self._last_failure_timestamps:
-                time_left = (self._last_failure_timestamps[market_tuple] +
-                        self._order_timeout - self._current_timestamp)
-                if time_left > 0:
+                cooldown_end = self._last_failure_timestamps[market_tuple]
+                if self._current_timestamp < cooldown_end:
                     return False
                 else:
-                    # Cooldown expired - auto-clean
+                    # Cooldown expired - auto-clean both cooldown and escalation tracking
                     self._last_failure_timestamps.pop(market_tuple, None)
+                    self._failure_first_timestamps.pop(market_tuple, None)
 
         return True
 
@@ -1495,8 +1500,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 pass
 
             # If any cooldown was set earlier for this market tuple due to cancel/timeout, remove it now
+            # Also clear escalation tracking - successful trade = fresh start
             if cooldown_tuple is not None and cooldown_tuple in self._last_failure_timestamps:
                 self._last_failure_timestamps.pop(cooldown_tuple, None)
+                self._failure_first_timestamps.pop(cooldown_tuple, None)
                 self.logger().info(f"Completion detected for {order_id} - removing cooldown on {cooldown_tuple[0].name}")
 
             # Remove from pending orders - check both buy and sell dicts
@@ -1559,6 +1566,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         if market_pair_tuple is not None and market_pair_tuple in self._last_failure_timestamps:
             self._last_failure_timestamps.pop(market_pair_tuple, None)
+            self._failure_first_timestamps.pop(market_pair_tuple, None)
             self.logger().info(f"Late fills detected for {order_id} - removing cooldown on {market_pair_tuple[0].name}")
 
     cdef c_did_cancel_order_tracker(self, object order_cancelled_event):
@@ -1568,6 +1576,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             string order_id_str = self._to_cpp_str(order_id)
             object market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
             bint was_already_completed = False
+            double first_failure_time
+            double cooldown_duration
+            str escalation_note
 
         if market_pair is None:
             # Try to get from recent mapping for late events
@@ -1619,11 +1630,24 @@ cdef class ArbitrageLStrategy(StrategyBase):
         else:
             # Safety net: Order was cancelled by exchange without us requesting it
             # This could be: price protection, exchange-side cancellation, or any edge case
-            # that didn't go through c_did_fail_order. Enforce cooldown as defensive measure.
-            self._last_failure_timestamps[market_pair] = self._current_timestamp
+            # that didn't go through c_did_fail_order. Enforce cooldown with escalation logic.
+            first_failure_time = self._failure_first_timestamps.get(market_pair, 0.0)
+            
+            if first_failure_time > 0 and (self._current_timestamp - first_failure_time) < ESCALATION_WINDOW:
+                # SECOND failure within window -> escalate to 60 min
+                cooldown_duration = ESCALATED_COOLDOWN
+                escalation_note = " (ESCALATED - repeat failure)"
+                self._failure_first_timestamps.pop(market_pair, None)
+            else:
+                # FIRST failure -> normal cooldown
+                cooldown_duration = self._order_timeout
+                escalation_note = ""
+                self._failure_first_timestamps[market_pair] = self._current_timestamp
+            
+            self._last_failure_timestamps[market_pair] = self._current_timestamp + cooldown_duration
             self.logger().warning(
                 f"Limit order {order_id} on {market_pair[0].name if market_pair else 'unknown'} was "
-                f"EXTERNALLY CANCELLED (safety net) - cooldown enforced for {self._order_timeout:.0f}s")
+                f"EXTERNALLY CANCELLED (safety net) - cooldown enforced for {cooldown_duration:.0f}s{escalation_note}")
 
     cdef c_did_complete_buy_order(self, object buy_order_completed_event):
         """Handle buy order completion"""
@@ -1634,11 +1658,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self.c_handle_order_completion(sell_order_completed_event, False)
 
     cdef c_did_fail_order(self, object order_failed_event):
-        """On order placement failure, gate new orders for the affected market tuple for _order_timeout."""
+        """
+        On order placement failure, gate new orders for the affected market tuple.
+        
+        Escalation logic:
+        - First failure: normal cooldown (_order_timeout, default 600s)
+        - Second failure within 60 min window: escalated cooldown (60 min)
+        - After escalated cooldown expires: fresh start
+        """
         cdef:
             str order_id = order_failed_event.order_id
             object market_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
             str error_msg = ""
+            double first_failure_time
+            double cooldown_duration
+            bint is_escalated = False
         
         # Extract error message from the event if available
         try:
@@ -1654,18 +1688,34 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if market_pair_tuple is None:
             return
 
-        # CRITICAL: Set failure timestamp to enforce cooldown
-        self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp
+        # Escalation logic: check if there was a recent failure within the window
+        first_failure_time = self._failure_first_timestamps.get(market_pair_tuple, 0.0)
+        
+        if first_failure_time > 0 and (self._current_timestamp - first_failure_time) < ESCALATION_WINDOW:
+            # SECOND failure within 60 min window -> escalate to 60 min cooldown
+            cooldown_duration = ESCALATED_COOLDOWN
+            is_escalated = True
+            # Clear escalation tracking - after this 60 min cooldown, fresh start
+            self._failure_first_timestamps.pop(market_pair_tuple, None)
+        else:
+            # FIRST failure (or previous window expired) -> normal cooldown
+            cooldown_duration = self._order_timeout
+            # Record this as the first failure in a new window
+            self._failure_first_timestamps[market_pair_tuple] = self._current_timestamp
+        
+        # Set cooldown END time (when cooldown expires)
+        self._last_failure_timestamps[market_pair_tuple] = self._current_timestamp + cooldown_duration
         
         # Log with exchange error message if available
+        escalation_note = " (ESCALATED - repeat failure)" if is_escalated else ""
         if error_msg:
             self.logger().warning(
                 f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}: "
-                f"{error_msg}; cooling down for {self._order_timeout:.0f}s")
+                f"{error_msg}; cooling down for {cooldown_duration:.0f}s{escalation_note}")
         else:
             self.logger().warning(
                 f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
-                f"cooling down for {self._order_timeout:.0f}s")
+                f"cooling down for {cooldown_duration:.0f}s{escalation_note}")
 
     cdef void c_check_all_order_timeouts(self):
         """
@@ -1761,9 +1811,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Remove from pending orders tracking - check both buy and sell dicts
             self.c_remove_pending_order(market_tuple, order_id, "")
-
-            # Enforce cooldown for this market
-            self._last_failure_timestamps[market_tuple] = self._current_timestamp
+            
+            # NOTE: Do NOT set cooldown here - timeout cancellations are our choice,
+            # not exchange rejections. Cooldown is only for actual placement failures.
 
     cdef void c_check_filled_order_timeouts(self):
         """

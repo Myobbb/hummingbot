@@ -338,6 +338,22 @@ class BitmartExchange(ExchangePyBase):
 
         return trade_updates
 
+    async def _update_orders_fills(self, orders):
+        """
+        Override to skip HTTP polling for fills.
+        
+        Bitmart WebSocket provides real-time order state updates via spot/user/orders channel.
+        HTTP polling for fills was causing 429 rate limit errors (limit: 30 req/5s).
+        
+        The WebSocket events provide: order_state, filled_size, and other aggregate data.
+        Individual trade details (trade_id, fee per fill) are not available via WS,
+        but order completion/state tracking works correctly without them.
+        
+        To re-enable HTTP fill polling selectively in the future, call:
+            await super()._update_orders_fills(orders)
+        """
+        pass
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         updated_order_data = await self._request_order_update(order=tracked_order)
 
@@ -458,18 +474,22 @@ class BitmartExchange(ExchangePyBase):
                                             self._order_tracker.process_order_update(order_update=forced_update)
                                     except Exception:
                                         pass
-                                    try:
-                                        trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
-                                        trade_updates = self._create_order_fill_updates(
-                                            order=fillable_order,
-                                            fill_update=trade_fills)
-                                        for trade_update in trade_updates:
-                                            self._order_tracker.process_trade_update(trade_update)
-                                    except asyncio.CancelledError:
-                                        raise
-                                    except Exception:
-                                        self.logger().exception("Unexpected error requesting order fills for "
-                                                                f"{fillable_order.client_order_id}")
+                                    # NOTE: HTTP fill request removed to avoid 429 rate limit errors.
+                                    # WebSocket order progress events provide sufficient data for order state tracking.
+                                    # To re-enable HTTP fills for detailed trade data, uncomment below:
+                                    # try:
+                                    #     trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
+                                    #     trade_updates = self._create_order_fill_updates(
+                                    #         order=fillable_order,
+                                    #         fill_update=trade_fills)
+                                    #     for trade_update in trade_updates:
+                                    #         self._order_tracker.process_trade_update(trade_update)
+                                    # except asyncio.CancelledError:
+                                    #     raise
+                                    # except Exception:
+                                    #     self.logger().exception("Unexpected error requesting order fills for "
+                                    #                             f"{fillable_order.client_order_id}")
+                                    pass
                             if updatable_order is not None:
                                 order_update = OrderUpdate(
                                     trading_pair=updatable_order.trading_pair,
