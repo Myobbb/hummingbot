@@ -5,10 +5,15 @@ from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
+from aiohttp import ClientError, WSServerHandshakeError, ServerDisconnectedError
+
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+
+# HTTP status codes considered transient (server-side issues that typically resolve on retry)
+TRANSIENT_HTTP_STATUS_CODES = {502, 503, 504, 520, 521, 522, 523, 524}
 
 
 class OrderBookTrackerDataSource(metaclass=ABCMeta):
@@ -37,6 +42,34 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         if cls._logger is None:
             cls._logger = logging.getLogger(HummingbotLogger.logger_name_for_class(cls))
         return cls._logger
+
+    def _is_transient_connection_error(self, exc: Exception) -> bool:
+        """
+        Check if an exception represents a transient connection error that should be
+        logged as a warning rather than an error with full traceback.
+
+        :param exc: The exception to check
+        :return: True if the error is transient and expected during network issues
+        """
+        # WSServerHandshakeError with transient HTTP status codes (502, 503, 504, etc.)
+        if isinstance(exc, WSServerHandshakeError):
+            return exc.status in TRANSIENT_HTTP_STATUS_CODES
+
+        # Server disconnection errors are transient
+        if isinstance(exc, ServerDisconnectedError):
+            return True
+
+        # Check for common transient error patterns in the exception message
+        exc_str = str(exc).lower()
+        transient_patterns = [
+            "connection reset",
+            "connection refused",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+        ]
+        return any(pattern in exc_str for pattern in transient_patterns)
 
     @property
     def order_book_create_function(self) -> Callable[[], OrderBook]:
@@ -92,11 +125,22 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
                 raise
             except ConnectionError as connection_exception:
                 self.logger().warning(f"The websocket connection was closed ({connection_exception})")
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
-                )
-                await self._sleep(1.0)
+            except ClientError as client_error:
+                # Handle aiohttp client errors (WSServerHandshakeError, ServerDisconnectedError, etc.)
+                if self._is_transient_connection_error(client_error):
+                    self.logger().warning(f"Transient connection error, reconnecting... ({type(client_error).__name__}: {client_error})")
+                else:
+                    self.logger().exception("Client error while listening to order book streams. Retrying in 5 seconds...")
+                    await self._sleep(1.0)
+            except Exception as e:
+                # Check if the general exception has transient characteristics
+                if self._is_transient_connection_error(e):
+                    self.logger().warning(f"Transient connection error, reconnecting... ({type(e).__name__}: {e})")
+                else:
+                    self.logger().exception(
+                        "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
+                    )
+                    await self._sleep(1.0)
             finally:
                 # Clear active websocket reference before cleanup
                 async with self._ws_lock:
