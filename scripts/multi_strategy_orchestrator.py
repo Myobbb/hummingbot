@@ -2769,16 +2769,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             additional_markets = config.get('additional_markets', [])
 
             if is_removing_primary:
-                # Removing primary: need at least secondary + 1 additional (to become new secondary)
-                if len(additional_markets) < 1 and len(strategy_instance.market_pairs) <= 3:
-                    # If no additional markets and only 2 markets total, cannot promote
-                    if len(strategy_instance.market_pairs) <= 2:
-                        self.logger().error(
-                            f"Cannot remove primary market '{market_spec}': no additional_markets to promote. "
-                            f"Add another market first with 'control add_market'."
-                        )
-                        return False
-                # Secondary becomes new primary, first additional becomes new secondary
+                # Removing primary: secondary becomes primary
+                # If additional_markets exist, first additional becomes new secondary
+                # If no additional_markets, strategy will have only the (promoted) primary left
+                if len(strategy_instance.market_pairs) <= 1:
+                    self.logger().error(
+                        f"Cannot remove primary market '{market_spec}': it is the only market left."
+                    )
+                    return False
+                # Secondary becomes new primary, first additional becomes new secondary (or None)
                 promotion_info = {
                     'type': 'primary_removed',
                     'new_primary_market': config.get('secondary_market'),
@@ -2789,21 +2788,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     f"Removing primary market '{market_spec}' - promoting secondary to primary"
                 )
             else:  # is_removing_secondary
-                # Removing secondary: need at least 1 additional to promote
+                # Removing secondary: if additional_markets exist, first additional becomes new secondary
+                # If no additional_markets, strategy will have only the primary left
                 if not additional_markets:
-                    self.logger().error(
-                        f"Cannot remove secondary market '{market_spec}': no additional_markets to promote. "
-                        f"Add another market first with 'control add_market'."
+                    # Going down to single-market mode (primary only)
+                    promotion_info = {
+                        'type': 'secondary_removed_no_replacement',
+                    }
+                    self.logger().info(
+                        f"Removing secondary market '{market_spec}' - no additional_markets to promote. "
+                        f"Strategy will operate in single-market mode (sell-off only)."
                     )
-                    return False
-                # First additional becomes new secondary
-                promotion_info = {
-                    'type': 'secondary_removed',
-                    'new_secondary_from_additional': additional_markets[0]
-                }
-                self.logger().info(
-                    f"Removing secondary market '{market_spec}' - promoting from additional_markets"
-                )
+                else:
+                    # First additional becomes new secondary
+                    promotion_info = {
+                        'type': 'secondary_removed',
+                        'new_secondary_from_additional': additional_markets[0]
+                    }
+                    self.logger().info(
+                        f"Removing secondary market '{market_spec}' - promoting from additional_markets"
+                    )
 
         # Find and remove the market tuple
         found = False
@@ -2820,13 +2824,20 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             self.logger().error(f"Market '{market_spec}' not found in strategy '{strategy_name}'")
             return False
 
-        # Check minimum markets requirement (need at least 2 for arbitrage)
-        if len(new_market_pairs) < 2:
+        # Check minimum markets requirement (need at least 1 market remaining)
+        if len(new_market_pairs) < 1:
             self.logger().error(
-                f"Cannot remove market '{market_spec}': strategy requires at least 2 markets for arbitrage. "
-                f"Current market count: {len(strategy_instance.market_pairs)}"
+                f"Cannot remove market '{market_spec}': cannot remove the last market. "
+                f"Use 'control remove' to remove the entire strategy instead."
             )
             return False
+
+        # Warn if going to single-market mode (no arbitrage, sell-off only)
+        if len(new_market_pairs) == 1:
+            self.logger().warning(
+                f"⚠ Strategy '{strategy_name}' will have only 1 market remaining after removal. "
+                f"Arbitrage trading is DISABLED. Only position balancer (sell-off) will function."
+            )
 
         # Apply promotion if needed (update runtime config dict)
         if promotion_info:
@@ -2834,7 +2845,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 # Secondary becomes primary
                 config['primary_market'] = config['secondary_market']
                 config['primary_trading_pair'] = config['secondary_trading_pair']
-                # First additional becomes secondary
+                # First additional becomes secondary (if available)
                 if promotion_info.get('new_secondary_from_additional'):
                     new_sec_spec = promotion_info['new_secondary_from_additional']
                     if ':' in new_sec_spec:
@@ -2846,6 +2857,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             m for m in config.get('additional_markets', [])
                             if m.lower() != new_sec_spec.lower()
                         ]
+                else:
+                    # No replacement for secondary - single-market mode
+                    config['secondary_market'] = ''
+                    config['secondary_trading_pair'] = ''
             elif promotion_info['type'] == 'secondary_removed':
                 # First additional becomes secondary
                 new_sec_spec = promotion_info['new_secondary_from_additional']
@@ -2858,6 +2873,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         m for m in config.get('additional_markets', [])
                         if m.lower() != new_sec_spec.lower()
                     ]
+            elif promotion_info['type'] == 'secondary_removed_no_replacement':
+                # Secondary removed with no additional_markets to promote - single-market mode
+                config['secondary_market'] = ''
+                config['secondary_trading_pair'] = ''
 
         # Update strategy's market_pairs list
         strategy_instance.market_pairs = new_market_pairs
@@ -2903,13 +2922,22 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Build all permutations
         new_market_pairs = []
-        for i in range(len(market_tuples)):
-            for j in range(len(market_tuples)):
-                if i != j:
-                    new_market_pairs.append(MarketPairClass(
-                        first=market_tuples[i],
-                        second=market_tuples[j]
-                    ))
+        if len(market_tuples) == 1:
+            # Single-market mode: create a self-pair so position balancer can still 
+            # find the market when scanning _market_pairs. The arbitrage loop won't
+            # find profitable opportunities (same market on both sides), but sell-off works.
+            new_market_pairs.append(MarketPairClass(
+                first=market_tuples[0],
+                second=market_tuples[0]
+            ))
+        else:
+            for i in range(len(market_tuples)):
+                for j in range(len(market_tuples)):
+                    if i != j:
+                        new_market_pairs.append(MarketPairClass(
+                            first=market_tuples[i],
+                            second=market_tuples[j]
+                        ))
 
         # Update strategy's internal _market_pairs directly
         strategy._market_pairs = new_market_pairs
@@ -3181,7 +3209,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     target_strategy_config['primary_market'] = target_strategy_config['secondary_market']
                     target_strategy_config['primary_trading_pair'] = target_strategy_config['secondary_trading_pair']
 
-                    # First additional becomes secondary
+                    # First additional becomes secondary (if available)
                     new_sec_spec = promotion_info.get('new_secondary_from_additional')
                     if new_sec_spec and ':' in new_sec_spec:
                         new_sec_exchange, new_sec_pair = new_sec_spec.split(':', 1)
@@ -3195,10 +3223,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             ]
                             if not target_strategy_config['additional_markets']:
                                 del target_strategy_config['additional_markets']
+                    else:
+                        # No replacement for secondary - single-market mode
+                        target_strategy_config['secondary_market'] = ''
+                        target_strategy_config['secondary_trading_pair'] = ''
 
                     self.logger().info(
                         f"Config: promoted secondary to primary, "
-                        f"new secondary: {new_sec_spec or 'none'}"
+                        f"new secondary: {new_sec_spec or 'none (single-market mode)'}"
                     )
 
                 elif promotion_info['type'] == 'secondary_removed':
@@ -3218,6 +3250,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                 del target_strategy_config['additional_markets']
 
                     self.logger().info(f"Config: promoted {new_sec_spec} to secondary")
+
+                elif promotion_info['type'] == 'secondary_removed_no_replacement':
+                    # Secondary removed, no additional_markets to promote - single-market mode
+                    target_strategy_config['secondary_market'] = ''
+                    target_strategy_config['secondary_trading_pair'] = ''
+                    self.logger().info("Config: secondary removed, single-market mode (sell-off only)")
 
             else:
                 # No promotion - just remove from additional_markets

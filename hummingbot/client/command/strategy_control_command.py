@@ -696,8 +696,8 @@ class StrategyControlCommand:
                 self.notify("  Arbitrage pairs updated; trading will exclude the removed market")
             else:
                 self.notify(f"\n✗ Failed to remove market '{market_spec}' from: {identifier}")
-                self.notify("  Possible reasons: market not found, or need at least 2 markets remaining")
-                self.notify("  Primary/secondary removal requires additional_markets for promotion")
+                self.notify("  Possible reasons: market not found, or it is the last market remaining")
+                self.notify("  Use 'control remove' to remove the entire strategy instead")
                 self.notify("  Use 'control list' to see strategies")
 
         except Exception as e:
