@@ -696,8 +696,8 @@ class StrategyControlCommand:
                 self.notify("  Arbitrage pairs updated; trading will exclude the removed market")
             else:
                 self.notify(f"\n✗ Failed to remove market '{market_spec}' from: {identifier}")
-                self.notify("  Possible reasons: market not found, or it is the last market remaining")
-                self.notify("  Use 'control remove' to remove the entire strategy instead")
+                self.notify("  Possible reasons: market not found, or need at least 2 markets remaining")
+                self.notify("  Primary/secondary removal requires additional_markets for promotion")
                 self.notify("  Use 'control list' to see strategies")
 
         except Exception as e:
@@ -709,15 +709,18 @@ class StrategyControlCommand:
                               primary_spec: str,
                               secondary_spec: str,
                               min_profitability: float = 1.5):
-        """Create a new arbitrage strategy at runtime."""
+        """Create a new arbitrage strategy at runtime (always starts PAUSED)."""
         try:
             strategy = self.trading_core.strategy
-            success = strategy.create_strategy(
+
+            self.notify(f"Creating strategy '{name}'...")
+            self.notify("  This includes dynamic websocket subscriptions for order book data")
+
+            success = await strategy.create_strategy(
                 name=name,
                 primary_spec=primary_spec,
                 secondary_spec=secondary_spec,
                 min_profitability=min_profitability,
-                paused=True  # Always start paused for safety
             )
 
             if success:
