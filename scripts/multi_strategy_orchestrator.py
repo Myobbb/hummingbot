@@ -465,7 +465,7 @@ def remove_market(identifier: str, market_spec: str) -> bool:
 
 
 def create(name: str, primary_spec: str, secondary_spec: str,
-           min_profitability: float = 1.5,
+           min_profitability: float = 2.1,
            additional_markets: str = None) -> bool:
     """
     Create a new arbitrage strategy at runtime (always starts PAUSED).
@@ -2553,6 +2553,59 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # MARKET MANIPULATION (add/remove markets from strategies at runtime)
     # ====================================================================================
 
+    async def _ensure_connector(self, exchange: str, pair: str) -> bool:
+        """
+        Ensure a connector exists for the given exchange, initializing it at runtime if needed.
+
+        Used by create_strategy and add_market_to_strategy when the exchange
+        is not yet in the connector pool.
+
+        Returns:
+            True if connector is available (existing or newly created), False on failure
+        """
+        if exchange in self.connectors:
+            return True
+
+        self.logger().info(f"Exchange '{exchange}' not in connector pool. Initializing at runtime...")
+
+        try:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            app = HummingbotApplication.main_application()
+            if not app or not app.trading_core:
+                self.logger().error("Could not access main application/trading core to initialize new connector")
+                return False
+
+            # Initialize the new connector via TradingCore
+            # This handles creation, adding to clock, and markets recorder
+            await app.trading_core.initialize_markets([(exchange, [pair])])
+
+            # Retrieve the newly created connector
+            new_connector = app.trading_core.connector_manager.connectors.get(exchange)
+
+            if not new_connector:
+                self.logger().error(f"Failed to initialize connector '{exchange}'")
+                return False
+
+            # Add to strategy's connector pool
+            self.connectors[exchange] = new_connector
+
+            # Reset strategy readiness to ensure we wait for the new connector to sync
+            self.ready_to_trade = False
+
+            # Register the new connector with the strategy's market registry
+            # This populates self.markets which is required for get_assets/format_status
+            self.add_markets([new_connector])
+
+            if not new_connector.ready:
+                self.logger().info(f"Connector '{exchange}' initialized but not yet ready. It will sync in background.")
+
+            self.logger().info(f"Successfully initialized exchange '{exchange}'")
+            return True
+
+        except Exception as e:
+            self.logger().error(f"Error initializing exchange '{exchange}': {e}", exc_info=True)
+            return False
+
     async def add_market_by_identifier(self, identifier: str, market_spec: str) -> bool:
         """
         Add a market to a strategy's additional_markets by name or token symbol.
@@ -2602,47 +2655,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             self.logger().error(f"Invalid trading pair '{pair}'. Expected format: 'BASE-QUOTE' (e.g., 'BSX-USDT')")
             return False
 
-        # Check if exchange exists in connector pool
-        if exchange not in self.connectors:
-            self.logger().info(f"Exchange '{exchange}' not in connector pool. Attempting to initialize it runtime...")
-            
-            try:
-                from hummingbot.client.hummingbot_application import HummingbotApplication
-                app = HummingbotApplication.main_application()
-                if not app or not app.trading_core:
-                    self.logger().error("Could not access main application/trading core to initialize new connector")
-                    return False
-                
-                # Initialize the new connector via TradingCore
-                # This handles creation, adding to clock, and markets recorder
-                await app.trading_core.initialize_markets([(exchange, [pair])])
-                
-                # Retrieve the newly created connector
-                new_connector = app.trading_core.connector_manager.connectors.get(exchange)
-                
-                if not new_connector:
-                    self.logger().error(f"Failed to initialize connector '{exchange}'")
-                    return False
-                
-                # Add to strategy's connector pool
-                self.connectors[exchange] = new_connector
-                
-                # Reset strategy readiness to ensure we wait for the new connector to sync
-                self.ready_to_trade = False
-
-                # IMPORTANT: Register the new connector with the strategy's market registry
-                # This populates self.markets which is required for get_assets/format_status
-                self.add_markets([new_connector])
-                
-                # Check readiness (it won't be ready immediately, but loop will handle it)
-                if not new_connector.ready:
-                    self.logger().info(f"Connector '{exchange}' initialized but not yet ready. It will sync in background.")
-                    
-                self.logger().info(f"Successfully initialized and added exchange '{exchange}' to connector pool")
-                
-            except Exception as e:
-                self.logger().error(f"Error initializing exchange '{exchange}': {e}", exc_info=True)
-                return False
+        # Ensure connector exists (initialize at runtime if missing)
+        if not await self._ensure_connector(exchange, pair):
+            return False
 
         # Get strategy instance
         strategy_instance = self._get_strategy_instance(strategy_name)
@@ -2991,7 +3006,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # ====================================================================================
 
     async def create_strategy(self, name: str, primary_spec: str, secondary_spec: str,
-                              min_profitability: float = 1.5,
+                              min_profitability: float = 2.1,
                               additional_markets: str = None) -> bool:
         """
         Create a new arbitrage strategy at runtime (always starts PAUSED).
@@ -3037,16 +3052,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"Invalid secondary trading pair '{secondary_pair}'. Expected format: 'BASE-QUOTE'")
                 return False
 
-            # Check exchanges are available
-            missing = []
-            if primary_exchange not in self.connectors:
-                missing.append(primary_exchange)
-            if secondary_exchange not in self.connectors:
-                missing.append(secondary_exchange)
-            if missing:
-                self.logger().error(f"Missing connectors: {', '.join(missing)}. Available: {list(self.connectors.keys())}")
-                return False
-
             # Parse additional_markets
             additional_list = []
             if additional_markets:
@@ -3054,17 +3059,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     am = am.strip()
                     if am and ':' in am:
                         additional_list.append(am)
-
-            # Create config
-            config = ArbitrageMInstanceConfig(
-                name=name,
-                primary_market=primary_exchange,
-                secondary_market=secondary_exchange,
-                primary_trading_pair=primary_pair,
-                secondary_trading_pair=secondary_pair,
-                min_profitability=Decimal(str(min_profitability)),
-                additional_markets=additional_list
-            )
 
             # Collect all exchange:pair combos
             all_pairs = [
@@ -3075,6 +3069,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if ':' in am:
                     ex, pr = am.split(':', 1)
                     all_pairs.append((ex.lower(), pr))
+
+            # Ensure all required connectors exist (initialize missing ones at runtime)
+            for exchange, pair in all_pairs:
+                if exchange not in self.connectors:
+                    ok = await self._ensure_connector(exchange, pair)
+                    if not ok:
+                        return False
+
+            # Create config
+            config = ArbitrageMInstanceConfig(
+                name=name,
+                primary_market=primary_exchange,
+                secondary_market=secondary_exchange,
+                primary_trading_pair=primary_pair,
+                secondary_trading_pair=secondary_pair,
+                min_profitability=Decimal(str(min_profitability)),
+                buy_in_enabled=True,
+                buy_in_target_usd=1100.0,
+                additional_markets=additional_list
+            )
 
             # Update self.markets so the framework tracks the new pairs
             for exchange, pair in all_pairs:

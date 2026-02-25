@@ -196,7 +196,7 @@ class StrategyControlCommand:
             primary_spec = value[0]
             secondary_spec = value[1]
             # Parse optional min_profitability if provided (e.g., "2.0" as third arg)
-            min_profitability = 1.5
+            min_profitability = 2.1
             if len(value) > 2:
                 try:
                     min_profitability = float(value[2])
@@ -708,7 +708,7 @@ class StrategyControlCommand:
                               name: str,
                               primary_spec: str,
                               secondary_spec: str,
-                              min_profitability: float = 1.5):
+                              min_profitability: float = 2.1):
         """Create a new arbitrage strategy at runtime (always starts PAUSED)."""
         try:
             strategy = self.trading_core.strategy
