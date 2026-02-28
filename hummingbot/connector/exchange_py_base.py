@@ -505,12 +505,25 @@ class ExchangePyBase(ExchangeBase, ABC):
         exception: Exception,
         **kwargs,
     ):
-        self.logger().network(
-            f"Error submitting {trade_type.name.lower()} {order_type.name.upper()} order to {self.name_cap} for "
-            f"{amount} {trading_pair} {price}.",
-            exc_info=True,
-            app_warning_msg=f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. Check API key and network connection."
-        )
+        error_str = str(exception)
+        # Distinguish exchange business-logic rejections (HTTP 4xx) from infrastructure errors.
+        # Exchange rejections (price limits, insufficient margin, etc.) are expected operational
+        # events and should not log noisy tracebacks or misleading "check API key" warnings.
+        is_exchange_rejection = isinstance(exception, IOError) and "HTTP status is 4" in error_str
+
+        if is_exchange_rejection:
+            self.logger().warning(
+                f"{self.name_cap} rejected {trade_type.name.lower()} {order_type.name.upper()} order "
+                f"for {amount} {trading_pair} at {price}: {error_str}"
+            )
+        else:
+            self.logger().network(
+                f"Error submitting {trade_type.name.lower()} {order_type.name.upper()} order to {self.name_cap} for "
+                f"{amount} {trading_pair} {price}.",
+                exc_info=True,
+                app_warning_msg=f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. "
+                                f"Check API key and network connection."
+            )
         self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
 
     def _update_order_after_failure(self, order_id: str, trading_pair: str, exception: Optional[Exception] = None):
