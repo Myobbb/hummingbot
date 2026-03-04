@@ -2362,6 +2362,11 @@ cdef class PositionBalancerHandler:
         )
 
         if amount_to_sell <= EPSILON:
+            self.strategy.logger().warning(
+                f"Position balancer: Sell order blocked - amount too small. "
+                f"amount_to_sell={amount_to_sell:.10f}, excess_adjusted={excess_adjusted:.6f}, "
+                f"last_bid={last_bid:.8f}, base_bal_raw={base_bal_raw:.8f}, "
+                f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8f}")
             return False
 
         # Quantize
@@ -2371,6 +2376,9 @@ cdef class PositionBalancerHandler:
             Decimal(str(sell_price)))
 
         if quantized_amount <= Decimal("0"):
+            self.strategy.logger().warning(
+                f"Position balancer: Sell order blocked - quantized to zero. "
+                f"pre_quantize={amount_to_sell:.10f}, quantized={quantized_amount}")
             return False
 
         # Apply max_order_size cap
@@ -2385,6 +2393,10 @@ cdef class PositionBalancerHandler:
         # Check minimum notional
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self.strategy._min_order_usd:
+            self.strategy.logger().warning(
+                f"Position balancer: Sell order blocked - below min notional. "
+                f"volume_usd={volume_usd:.6f} < min_order_usd={self.strategy._min_order_usd:.6f}, "
+                f"quantized_amount={quantized_amount}, sell_price={sell_price:.8f}")
             # Too small, mark complete
             if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
                 return False
