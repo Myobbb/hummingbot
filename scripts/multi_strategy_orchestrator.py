@@ -2953,15 +2953,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Rebuild strategy's internal _market_pairs (ArbitrageLMarketPair permutations)
         self._rebuild_strategy_market_pairs(strategy_instance)
 
-        # Rebuild position balancer asset aliases (assets may have changed)
-        strategy = strategy_instance.strategy
-        if hasattr(strategy, '_position_balancer') and strategy._position_balancer is not None:
-            try:
-                strategy._position_balancer._asset_aliases = {}
-                strategy._position_balancer._canonical_asset = {}
-                strategy._position_balancer._build_asset_aliases()
-            except Exception as e:
-                self.logger().warning(f"Failed to rebuild position balancer aliases: {e}")
+        # NOTE: Position balancer asset aliases (_asset_aliases, _canonical_asset) are cdef
+        # fields and cannot be reset from Python. Stale aliases are harmless because
+        # c_find_best_sell_market/c_find_best_buy_market only match against markets that
+        # actually exist in _market_pairs. Aliases will be correctly rebuilt on next restart.
 
         self.logger().info(f"Removed market '{market_spec}' from strategy '{strategy_name}' (runtime)")
 
