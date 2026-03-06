@@ -1912,6 +1912,15 @@ cdef class PositionBalancerHandler:
                         # Find the best market to buy on (lowest ask)
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
+                            # Pre-check: ensure selected market has enough quote balance for min notional
+                            market_quote_bal = float(selected_buy_market.market.c_get_available_balance(
+                                selected_buy_market.quote_asset))
+                            if market_quote_bal < self.strategy._min_order_usd:
+                                self.strategy.logger().warning(
+                                    f"Position balancer: {canonical_asset} buy skipped - "
+                                    f"{selected_buy_market.market.name} insufficient quote "
+                                    f"({market_quote_bal:.2f} < min {self.strategy._min_order_usd:.2f})")
+                                return False
                             # For sell market, just use the other market from the pair
                             # (not critical since we're only buying)
                             selected_sell_market = sell_market_tuple
@@ -1967,9 +1976,19 @@ cdef class PositionBalancerHandler:
                     base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
                     if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
-                        # Find the best market to sell on (lowest ask)
+                        # Find the best market to sell on (highest bid)
                         selected_sell_market = self.c_find_best_sell_market(asset_key)
                         if selected_sell_market is not None:
+                            # Pre-check: ensure selected market has enough base balance for min notional
+                            market_base_bal = float(selected_sell_market.market.c_get_available_balance(
+                                selected_sell_market.base_asset))
+                            if market_base_bal * last_bid < self.strategy._min_order_usd:
+                                self.strategy.logger().warning(
+                                    f"Position balancer: {canonical_asset} sell skipped - "
+                                    f"{selected_sell_market.market.name} insufficient balance "
+                                    f"({market_base_bal:.4f} {selected_sell_market.base_asset} "
+                                    f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f})")
+                                return False
                             # For buy market, just use the other market from the pair
                             # (not critical since we're only selling)
                             selected_buy_market = buy_market_tuple
