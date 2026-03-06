@@ -1913,7 +1913,7 @@ cdef class PositionBalancerHandler:
                         selected_buy_market = self.c_find_best_buy_market(asset_key)
                         if selected_buy_market is not None:
                             # Pre-check: ensure selected market has enough quote balance for min notional
-                            market_quote_bal = float(selected_buy_market.market.c_get_available_balance(
+                            market_quote_bal = float(selected_buy_market.market.get_available_balance(
                                 selected_buy_market.quote_asset))
                             if market_quote_bal < self.strategy._min_order_usd:
                                 self.strategy.logger().warning(
@@ -1980,7 +1980,7 @@ cdef class PositionBalancerHandler:
                         selected_sell_market = self.c_find_best_sell_market(asset_key)
                         if selected_sell_market is not None:
                             # Pre-check: ensure selected market has enough base balance for min notional
-                            market_base_bal = float(selected_sell_market.market.c_get_available_balance(
+                            market_base_bal = float(selected_sell_market.market.get_available_balance(
                                 selected_sell_market.base_asset))
                             if market_base_bal * last_bid < self.strategy._min_order_usd:
                                 self.strategy.logger().warning(
