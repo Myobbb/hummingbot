@@ -2938,13 +2938,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 config['secondary_to_primary_quote_conversion_rate'] = 1.0
                 # Clear additional_markets
                 config['additional_markets'] = []
-                # CRITICAL: Also update LIVE strategy fields (config dict is only read at init)
-                strategy = strategy_instance.strategy
-                strategy._use_oracle_conversion_rate = False
-                strategy._fixed_base_rate = 1.0
-                strategy._fixed_quote_rate = 1.0
-                strategy._cached_base_rate = 1.0
-                strategy._cached_quote_rate = 1.0
+                # NOTE: Strategy's Cython fields (_use_oracle_conversion_rate, _fixed_base_rate, etc.)
+                # are cdef and cannot be set from Python. However, this is safe because:
+                # - _conv_rate() fast-path returns 1.0 when both market tuples have identical
+                #   base_asset and quote_asset (which they will since both slots are the same market)
+                # - No oracle lookup is ever triggered for same-asset pairs
 
         # Update strategy's market_pairs list
         strategy_instance.market_pairs = new_market_pairs
