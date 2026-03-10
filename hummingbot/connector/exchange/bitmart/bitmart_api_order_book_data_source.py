@@ -647,49 +647,72 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Detect symbols whose depth stream has stalled and take corrective action.
         Called periodically from main loop's watchdog check.
+        
+        Recovery strategy:
+        - ALL pairs stale → subscription likely dead, force full WS reconnect
+        - SOME pairs stale → per-pair snapshot refresh (non-disruptive)
         """
         now = time.time()
         stale_pairs = []
+        total_initialized = 0
         
         # Check all trading pairs for staleness
         for trading_pair in list(self._trading_pairs):
             # Use _last_any_message_ts which includes heartbeats and snapshots
             last_any_ts = float(self._last_any_message_ts.get(trading_pair, 0.0) or 0.0)
             
-            # Check 1: Complete staleness (no messages at all)
-            if last_any_ts > 0 and (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
-                stale_pairs.append(trading_pair)
+            # Only consider pairs that have been initialized (have a timestamp)
+            if last_any_ts > 0:
+                total_initialized += 1
+                if (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
+                    stale_pairs.append(trading_pair)
         
-        # Handle complete staleness (only if not excessive)
-        # If >50% pairs are stale, let the main watchdog handle it as a broken connection
-        if stale_pairs and len(stale_pairs) <= len(self._trading_pairs) // 2:
-            for trading_pair in stale_pairs:
-                try:
-                    # Fast path: use cached trading_pair -> symbol mapping
-                    symbol = self._pair_to_symbol_cache.get(trading_pair)
-                    if symbol is None:
-                        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                        self._pair_to_symbol_cache[trading_pair] = symbol
-                    
-                    last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
-                    stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
-                    
-                    # Log warning but ONLY request snapshot (non-disruptive)
-                    self.logger().warning(
-                        f"BitMart {trading_pair}: No messages for {stale_duration}s "
-                        f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), requesting snapshot to provoke exchange"
-                    )
-                    
-                    # Do NOT set _waiting_for_snapshot (would filter updates)
-                    # Just fire the request; the response (snapshot) will update timestamps and clear staleness
-                    await self._refresh_snapshot_for_pair(trading_pair, symbol)
-                    
-                    # Reset staleness timer temporarily to avoid spamming requests
-                    # If real data comes in, it will overwrite this
-                    self._last_any_message_ts[trading_pair] = now
-                    
-                except Exception as e:
-                    self.logger().warning(f"BitMart depth watchdog: failed to recover {trading_pair}: {e}")
+        if not stale_pairs:
+            return
+        
+        # ALL initialized pairs are stale → subscription-level failure
+        # Force full reconnect to re-subscribe all channels
+        if total_initialized > 0 and len(stale_pairs) >= total_initialized:
+            oldest_stale = max(
+                (now - float(self._last_any_message_ts.get(tp, 0.0) or 0.0))
+                for tp in stale_pairs
+            )
+            self.logger().warning(
+                f"BitMart: ALL {len(stale_pairs)} pair(s) stale "
+                f"(oldest: {int(oldest_stale)}s). Subscription likely dead, forcing reconnect."
+            )
+            raise ConnectionError(
+                f"BitMart WS: all {len(stale_pairs)} subscriptions stale, forcing reconnect"
+            )
+        
+        # SOME pairs stale → attempt per-pair recovery via snapshot refresh
+        for trading_pair in stale_pairs:
+            try:
+                # Fast path: use cached trading_pair -> symbol mapping
+                symbol = self._pair_to_symbol_cache.get(trading_pair)
+                if symbol is None:
+                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    self._pair_to_symbol_cache[trading_pair] = symbol
+                
+                last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
+                stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
+                
+                # Log warning but ONLY request snapshot (non-disruptive)
+                self.logger().warning(
+                    f"BitMart {trading_pair}: No messages for {stale_duration}s "
+                    f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), requesting snapshot to provoke exchange"
+                )
+                
+                # Do NOT set _waiting_for_snapshot (would filter updates)
+                # Just fire the request; the response (snapshot) will update timestamps and clear staleness
+                await self._refresh_snapshot_for_pair(trading_pair, symbol)
+                
+                # Reset staleness timer temporarily to avoid spamming requests
+                # If real data comes in, it will overwrite this
+                self._last_any_message_ts[trading_pair] = now
+                
+            except Exception as e:
+                self.logger().warning(f"BitMart depth watchdog: failed to recover {trading_pair}: {e}")
 
 
     async def listen_for_subscriptions(self):

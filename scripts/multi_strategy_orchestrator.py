@@ -1714,11 +1714,13 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
         
         if stale:
-            # Stale books are a warning but not blocking - WS should recover
+            # Stale books detected - actively trigger recovery rather than hoping WS recovers passively
             self.logger().warning(
-                f"Resuming '{strategy_name}' with stale order books (will recover): {', '.join(stale[:3])}"
+                f"Resuming '{strategy_name}' with stale order books, triggering active recovery: {', '.join(stale[:3])}"
                 f"{'...' if len(stale) > 3 else ''}"
             )
+            # Actively request fresh snapshots for stale pairs
+            self._trigger_stale_book_recovery(strategy_instance)
         
         # Reset exception tracking on resume
         strategy_instance.exception_count = 0
@@ -1728,6 +1730,71 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         strategy_instance.paused = False
         self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
         return True
+
+    def _trigger_stale_book_recovery(self, si: 'V1StrategyInstance'):
+        """
+        Actively trigger recovery for stale order books by requesting fresh snapshots.
+        
+        This is called on resume when stale books are detected, to avoid the scenario
+        where a silently dropped subscription leaves the order book frozen forever.
+        
+        Uses fire-and-forget async tasks since this is called from sync context.
+        """
+        import asyncio
+        import time as _time
+        STALE_THRESHOLD_SECONDS = 120.0
+        now = _time.perf_counter()
+        
+        for mt in si.market_pairs:
+            try:
+                connector = mt.market
+                ex_name = getattr(connector, "name", "?")
+                trading_pair = mt.trading_pair
+                
+                # Check if this specific order book is stale
+                ob = connector.get_order_book(trading_pair)
+                last_diff = getattr(ob, 'last_applied_diff', -1000.0)
+                if last_diff > 0 and (now - last_diff) <= STALE_THRESHOLD_SECONDS:
+                    continue  # This book is fresh, skip
+                
+                # Try to get the data source and trigger recovery
+                if hasattr(connector, 'order_book_tracker'):
+                    tracker = connector.order_book_tracker
+                    if hasattr(tracker, 'data_source'):
+                        ds = tracker.data_source
+                        
+                        # Method 1: BitMart-style per-pair refresh (preferred)
+                        if hasattr(ds, '_refresh_snapshot_for_pair') and hasattr(ds, '_pair_to_symbol_cache'):
+                            symbol = ds._pair_to_symbol_cache.get(trading_pair)
+                            if symbol is None and hasattr(ds, '_connector'):
+                                # Schedule async symbol lookup + refresh
+                                async def _do_refresh(ds_ref, tp, conn):
+                                    try:
+                                        sym = await conn.exchange_symbol_associated_to_pair(trading_pair=tp)
+                                        ds_ref._pair_to_symbol_cache[tp] = sym
+                                        await ds_ref._refresh_snapshot_for_pair(tp, sym)
+                                        self.logger().info(f"Recovery snapshot requested for {tp} on {ex_name}")
+                                    except Exception as e:
+                                        self.logger().warning(f"Failed to request recovery for {tp}: {e}")
+                                asyncio.ensure_future(_do_refresh(ds, trading_pair, ds._connector))
+                            elif symbol is not None:
+                                async def _do_refresh_cached(ds_ref, tp, sym):
+                                    try:
+                                        await ds_ref._refresh_snapshot_for_pair(tp, sym)
+                                        self.logger().info(f"Recovery snapshot requested for {tp} on {ex_name}")
+                                    except Exception as e:
+                                        self.logger().warning(f"Failed to request recovery for {tp}: {e}")
+                                asyncio.ensure_future(_do_refresh_cached(ds, trading_pair, symbol))
+                        
+                        # Method 2: Generic - trigger reconnection to re-subscribe all channels
+                        elif hasattr(ds, 'trigger_reconnection'):
+                            self.logger().info(
+                                f"Triggering WS reconnection for {ex_name} to recover stale {trading_pair}"
+                            )
+                            ds.trigger_reconnection()
+                            
+            except Exception as e:
+                self.logger().warning(f"Error triggering recovery for market pair: {e}")
 
     def pause_all_strategies(self) -> int:
         """Pause all running strategies.
