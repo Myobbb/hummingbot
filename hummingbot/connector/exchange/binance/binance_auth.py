@@ -57,6 +57,25 @@ class BinanceAuth(AuthBase):
     def header_for_authentication(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
 
+    def generate_ws_subscribe_params(self) -> Dict[str, Any]:
+        """
+        Builds the signed params dict for a ``userDataStream.subscribe.signature``
+        WS-API request (HMAC-SHA256).
+        """
+        timestamp = int(self.time_provider.time() * 1e3)
+        params: Dict[str, Any] = {"timestamp": timestamp}
+        encoded = urlencode(params)
+        signature = hmac.new(
+            self.secret_key.encode("utf8"),
+            encoded.encode("utf8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {
+            "apiKey": self.api_key,
+            "timestamp": timestamp,
+            "signature": signature,
+        }
+
     def _generate_signature(self, params: Dict[str, Any]) -> str:
 
         encoded_params_str = urlencode(params)
