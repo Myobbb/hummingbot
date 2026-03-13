@@ -1396,6 +1396,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object buy_order_type
         cdef object sell_order_type
         cdef double placement_latency
+        cdef str dummy_order_id
 
         if quantized_amount > Decimal("0"):
             # Log timing for latency monitoring
@@ -1422,8 +1423,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error (e.g. invalid type, market not whitelisted)
-                # Do NOT set cooldown here - this is a programming/config error, not exchange issue
-                self.logger().error(f"Sync error submitting buy order to {buy_market.name}: {e}")
+                # Use existing framework to trigger timeout logic and logging
+                from hummingbot.core.event.events import MarketOrderFailureEvent
+                dummy_order_id = f"sync_error_{buy_market.name}_{self._current_timestamp}"
+                self.c_start_tracking_limit_order(buy_market_tuple, dummy_order_id, True, buy_price_decimal, quantized_amount)
+                self.c_did_fail_order(MarketOrderFailureEvent(
+                    self._current_timestamp, dummy_order_id, buy_order_type, f"Sync error: {str(e)}"
+                ))
                 return
 
             # Immediately place the sell order - minimal delay
@@ -1435,8 +1441,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error - buy order may have been submitted (will timeout/cancel)
-                # Do NOT set cooldown here - this is a programming/config error, not exchange issue
-                self.logger().error(f"Sync error submitting sell order to {sell_market.name}: {e}")
+                # Use existing framework to trigger timeout logic and logging
+                from hummingbot.core.event.events import MarketOrderFailureEvent
+                dummy_order_id = f"sync_error_{sell_market.name}_{self._current_timestamp}"
+                self.c_start_tracking_limit_order(sell_market_tuple, dummy_order_id, False, sell_price_decimal, quantized_amount)
+                self.c_did_fail_order(MarketOrderFailureEvent(
+                    self._current_timestamp, dummy_order_id, sell_order_type, f"Sync error: {str(e)}"
+                ))
                 return
 
             # Track orders
