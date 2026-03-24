@@ -318,17 +318,38 @@ class OrderBookTracker:
     async def _track_single_book(self, trading_pair: str):
         """
         Process orderbook messages for a single trading pair.
-        
+
         IMPORTANT: ALL diff messages must be processed in order - skipping diffs
         would corrupt the orderbook since diffs are incremental (not idempotent).
+
+        Handles three message types:
+        - DIFF:     incremental update applied directly to the live order book
+        - SNAPSHOT: full book reset via restore_from_snapshot_and_diffs, which
+                    replays only post-snapshot DIFFs from past_diffs_window.
+                    past_diffs_window is cleared after each snapshot.
         """
         past_diffs_window = self._past_diffs_windows[trading_pair]
         message_queue: asyncio.Queue = self._tracking_message_queues[trading_pair]
         order_book: OrderBook = self._order_books[trading_pair]
-        
+
+        # Resolve raw-method capability once per task (avoids hasattr on every message)
+        use_raw = hasattr(order_book, 'apply_diffs_raw')
+
         last_message_timestamp: float = time.time()
         last_queue_warning_ts: float = 0.0
         diff_messages_accepted: int = 0
+
+        def _apply_diff(msg: OrderBookMessage) -> None:
+            raw_bids = msg.content.get("bids")
+            raw_asks = msg.content.get("asks")
+            if use_raw and raw_bids is not None and raw_asks is not None:
+                order_book.apply_diffs_raw(raw_bids, raw_asks, msg.update_id)
+            else:
+                order_book.apply_diffs(msg.bids, msg.asks, msg.update_id)
+
+        def _apply_snapshot(msg: OrderBookMessage) -> None:
+            order_book.restore_from_snapshot_and_diffs(msg, list(past_diffs_window))
+            past_diffs_window.clear()  # stale pre-snapshot DIFFs already absorbed
 
         while True:
             try:
@@ -342,31 +363,20 @@ class OrderBookTracker:
 
                 # Process the message
                 if message.type is OrderBookMessageType.DIFF:
-                    # Use optimized raw method if available (bypasses OrderBookRow allocation)
-                    raw_bids = message.content.get("bids")
-                    raw_asks = message.content.get("asks")
-                    if raw_bids is not None and raw_asks is not None and hasattr(order_book, 'apply_diffs_raw'):
-                        order_book.apply_diffs_raw(raw_bids, raw_asks, message.update_id)
-                    else:
-                        order_book.apply_diffs(message.bids, message.asks, message.update_id)
+                    _apply_diff(message)
                     past_diffs_window.append(message)
                     diff_messages_accepted += 1
 
-                    # Batch processing: drain queue without await to reduce loop overhead
+                    # Batch drain: process remaining queue without yielding to event loop
                     while not message_queue.empty():
                         try:
                             batch_msg = message_queue.get_nowait()
                             if batch_msg.type is OrderBookMessageType.DIFF:
-                                raw_bids = batch_msg.content.get("bids")
-                                raw_asks = batch_msg.content.get("asks")
-                                if raw_bids is not None and raw_asks is not None and hasattr(order_book, 'apply_diffs_raw'):
-                                    order_book.apply_diffs_raw(raw_bids, raw_asks, batch_msg.update_id)
-                                else:
-                                    order_book.apply_diffs(batch_msg.bids, batch_msg.asks, batch_msg.update_id)
+                                _apply_diff(batch_msg)
                                 past_diffs_window.append(batch_msg)
                                 diff_messages_accepted += 1
                             elif batch_msg.type is OrderBookMessageType.SNAPSHOT:
-                                order_book.restore_from_snapshot_and_diffs(batch_msg, list(past_diffs_window))
+                                _apply_snapshot(batch_msg)
                                 break
                         except asyncio.QueueEmpty:
                             break
@@ -386,7 +396,22 @@ class OrderBookTracker:
                     last_message_timestamp = now
 
                 elif message.type is OrderBookMessageType.SNAPSHOT:
-                    order_book.restore_from_snapshot_and_diffs(message, list(past_diffs_window))
+                    _apply_snapshot(message)
+                    # Drain any messages queued behind this snapshot without yielding to
+                    # the event loop — applies subsequent DIFFs immediately
+                    while not message_queue.empty():
+                        try:
+                            batch_msg = message_queue.get_nowait()
+                            if batch_msg.type is OrderBookMessageType.DIFF:
+                                _apply_diff(batch_msg)
+                                past_diffs_window.append(batch_msg)
+                                diff_messages_accepted += 1
+                            elif batch_msg.type is OrderBookMessageType.SNAPSHOT:
+                                # Back-to-back snapshots: newer one wins
+                                _apply_snapshot(batch_msg)
+                                break
+                        except asyncio.QueueEmpty:
+                            break
 
             except asyncio.CancelledError:
                 raise

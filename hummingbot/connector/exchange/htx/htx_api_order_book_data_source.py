@@ -55,9 +55,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Key: exchange symbol (lowercase), Value: last received seqNum
         self._last_seq_num: Dict[str, int] = {}
         
-        # Track symbols needing snapshot refresh (due to sequence gaps)
-        self._symbols_needing_refresh: set = set()
-        
         # Track active WebSocket for snapshot requests
         self._active_ws: Optional[WSAssistant] = None
         self._trade_ws: Optional[WSAssistant] = None
@@ -312,7 +309,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """Subscribe to MBP Incremental (5) and Refresh (20) channels"""
         try:
             self._last_seq_num.clear()
-            self._symbols_needing_refresh.clear()
             
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -435,8 +431,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
             # Update sequence tracking
             self._last_seq_num[order_book_symbol] = seq_num
-            if order_book_symbol in self._symbols_needing_refresh:
-                self._symbols_needing_refresh.discard(order_book_symbol)
+
             
             # Use cache for O(1) lookup
             trading_pair = self._symbol_to_pair_cache.get(order_book_symbol)
@@ -474,8 +469,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # mbp.refresh.X - full snapshot at 100ms intervals
                 # Always update sequence tracking from refresh
                 self._last_seq_num[order_book_symbol] = seq_num
-                if order_book_symbol in self._symbols_needing_refresh:
-                    self._symbols_needing_refresh.discard(order_book_symbol)
                 
                 trading_pair = self._symbol_to_pair_cache.get(order_book_symbol)
                 if trading_pair is None:
@@ -505,21 +498,16 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 # Optimistic processing: apply incrementals if they're moving forward
                 # The next refresh snapshot (within 100ms) will correct any inconsistencies
-                # This allows us to get real-time top-5 updates while refresh handles sync
                 
                 if seq_num <= last_seq:
                     # Old/duplicate message - skip
                     return
                 
-                # Forward-looking message - apply it optimistically
-                # Track the sequence for logging but don't block on gaps
-                if prev_seq_num != last_seq and order_book_symbol not in self._symbols_needing_refresh:
-                    # Log gap at debug level since refresh will auto-correct within 100ms
+                # Log sequence gaps at debug level; mbp.refresh.20 auto-corrects within 100ms
+                if prev_seq_num != last_seq:
                     self.logger().debug(
                         f"MBP incremental gap for {order_book_symbol}: had seq={last_seq}, got prevSeq={prev_seq_num}, seqNum={seq_num}"
                     )
-                    # Mark for clarity but don't skip - apply optimistically
-                    self._symbols_needing_refresh.add(order_book_symbol)
                 
                 # Update sequence tracking
                 self._last_seq_num[order_book_symbol] = seq_num
