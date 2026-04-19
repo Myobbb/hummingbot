@@ -61,10 +61,19 @@ class BinanceAuth(AuthBase):
         """
         Builds the signed params dict for a ``userDataStream.subscribe.signature``
         WS-API request (HMAC-SHA256).
+
+        Binance WS-API SIGNED requests require ALL parameters (including apiKey)
+        to be sorted alphabetically by key, then URL-encoded, before signing.
+        Payload string: ``apiKey=...&timestamp=...``
         """
         timestamp = int(self.time_provider.time() * 1e3)
-        params: Dict[str, Any] = {"timestamp": timestamp}
-        encoded = urlencode(params)
+        # All params that go into the JSON request (excluding signature)
+        # must be sorted alphabetically before signing.
+        params_to_sign = OrderedDict(sorted({
+            "apiKey": self.api_key,
+            "timestamp": timestamp,
+        }.items()))
+        encoded = urlencode(params_to_sign)
         signature = hmac.new(
             self.secret_key.encode("utf8"),
             encoded.encode("utf8"),
