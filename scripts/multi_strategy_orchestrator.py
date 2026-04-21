@@ -180,7 +180,7 @@ logger = None
 # Export convenience functions for easy import
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
-    'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff',
+    'enable_buyin', 'disable_buyin', 'enable_selloff', 'disable_selloff', 'clean',
     'set_min_profitability', 'add_market', 'remove_market', 'create',
     'MultiStrategyOrchestrator'
 ]
@@ -314,6 +314,24 @@ def disable_selloff(identifier: str) -> bool:
     """
     orchestrator = _get_orchestrator()
     return orchestrator.disable_selloff_by_identifier(identifier)
+
+
+def clean(identifier: str) -> bool:
+    """
+    Set sell-off target to 0 and enable sell-off (sell entire position).
+
+    Args:
+        identifier: Full strategy name or token symbol
+
+    Returns:
+        True if successful
+
+    Examples:
+        >>> clean("arb_bsx_gate_bitmart")
+        >>> clean("BSX")
+    """
+    orchestrator = _get_orchestrator()
+    return orchestrator.clean_by_identifier(identifier)
 
 
 def set_min_profitability(identifier: str, value: float) -> bool:
@@ -2148,6 +2166,40 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
         position_balancer.disable_sell_off()
+        return True
+
+    def clean_by_identifier(self, identifier: str) -> bool:
+        """
+        Set sell-off target to 0 and enable sell-off for a strategy by full name or token symbol.
+        Sells the entire position (target = 0 USD).
+
+        Args:
+            identifier: Full strategy name or token symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        if not strategy_name:
+            return False
+        return self.clean(strategy_name)
+
+    def clean(self, strategy_name: str) -> bool:
+        """
+        Set sell-off target to 0 and enable sell-off (sell entire position).
+
+        Args:
+            strategy_name: The name of the strategy
+
+        Returns:
+            True if successful, False otherwise
+        """
+        position_balancer = self._get_strategy_position_balancer(strategy_name)
+        if not position_balancer:
+            return False
+
+        position_balancer.set_sell_target(0.0)
+        position_balancer.enable_sell_off()
         return True
 
     def set_min_profitability_by_identifier(self, identifier: str, value: float) -> bool:

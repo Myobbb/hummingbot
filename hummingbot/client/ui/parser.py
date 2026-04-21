@@ -87,10 +87,10 @@ def load_parser(hummingbot: "HummingbotApplication", command_tabs) -> ThrowingAr
     control_parser.add_argument("action", nargs="?", default=None,
                                 choices=["list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
                                          "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set",
-                                         "add_market", "remove_market", "create"],
+                                         "add_market", "remove_market", "create", "clean"],
                                 help="Action to perform: list, pause, resume, pause_all, resume_all, remove, add, "
                                      "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set, "
-                                     "add_market, remove_market, create")
+                                     "add_market, remove_market, create, clean")
     control_parser.add_argument("identifier", nargs="?", default=None,
                                 help="Strategy name/token (pause/resume/remove/enable/disable), config file (add), "
                                      "or parameter name (set: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval, min_profitability)")

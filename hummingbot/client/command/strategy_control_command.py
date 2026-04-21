@@ -41,6 +41,7 @@ class StrategyControlCommand:
             control set min_profitability <id> <value>  - Set minimum profitability percentage
             control add_market <id> <exchange:PAIR>     - Add market to strategy (e.g., 'mexc:BSX-USDT')
             control remove_market <id> <exchange:PAIR>  - Remove market from strategy
+            control clean <id>                          - Set sell-off target to 0 and enable sell-off (sell entire position)
         """
         if not self.trading_core.strategy:
             self.notify("No strategy is currently running.")
@@ -203,11 +204,20 @@ class StrategyControlCommand:
                 except ValueError:
                     pass  # Keep default
             safe_ensure_future(self._control_create(identifier, primary_spec, secondary_spec, min_profitability), loop=self.ev_loop)
+        elif action == "clean":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control clean <strategy_name_or_token>")
+                return
+            if not hasattr(strategy, 'clean_by_identifier'):
+                self.notify("The current strategy does not support the clean command.")
+                return
+            safe_ensure_future(self._control_clean(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
             self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
                        "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set, "
-                       "add_market, remove_market, create")
+                       "add_market, remove_market, create, clean")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -272,6 +282,7 @@ class StrategyControlCommand:
             self.notify("  control set min_profitability <name> <value>     - Set min profitability (%)")
             self.notify("  control add_market <name_or_token> <exchange:PAIR> - Add market to strategy")
             self.notify("  control remove_market <name_or_token> <exchange:PAIR> - Remove market from strategy")
+            self.notify("  control clean <name_or_token>                     - Set sell-off target to 0 and enable sell-off")
             self.notify("=" * 80 + "\n")
 
         except Exception as e:
@@ -453,6 +464,25 @@ class StrategyControlCommand:
         except Exception as e:
             self.notify(f"Error disabling sell-off: {e}")
             self.logger().error(f"Error in control disable_selloff: {e}", exc_info=True)
+
+    async def _control_clean(self,  # type: HummingbotApplication
+                             identifier: str):
+        """Set sell-off target to 0 and enable sell-off (sell entire position)."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.clean_by_identifier(identifier)
+
+            if success:
+                self.notify(f"\n✓ Clean initiated for {identifier}")
+                self.notify("  Sell-off target set to 0, sell-off enabled — will sell entire position")
+            else:
+                self.notify(f"\n✗ Failed to initiate clean for: {identifier}")
+                self.notify("  Strategy may not have position balancer enabled")
+                self.notify("  Use 'control list' to see available strategies")
+
+        except Exception as e:
+            self.notify(f"Error in control clean: {e}")
+            self.logger().error(f"Error in control clean: {e}", exc_info=True)
 
     async def _control_set(self,  # type: HummingbotApplication
                           parameter: str,
