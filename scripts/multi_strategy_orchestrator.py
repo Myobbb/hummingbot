@@ -2559,6 +2559,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             self.logger().warning("Config file path not set, skipping file update")
 
         self.logger().info(f"Strategy '{strategy_name}' removed successfully")
+
+        # Evict dead pairs from connector internal trading_pairs lists
+        for exchange_name, pairs in removed_markets.items():
+            for pair in pairs:
+                self._maybe_remove_pair_from_connector(exchange_name, pair)
+
         return True
 
     def _get_strategy_markets(self, strategy_instance: V1StrategyInstance) -> Dict[str, Set[str]]:
@@ -3090,6 +3096,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         else:
             self.logger().warning("Config file path not set, skipping file update")
 
+        # Evict dead pair from connector's internal trading_pairs list
+        self._maybe_remove_pair_from_connector(exchange, pair)
+
         return True
 
     def _rebuild_strategy_market_pairs(self, strategy_instance: V1StrategyInstance):
@@ -3398,6 +3407,31 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
 
         self.logger().info(f"Strategy '{config.name}' added to config file")
+
+    def _maybe_remove_pair_from_connector(self, exchange_name: str, trading_pair: str):
+        """
+        Evict trading_pair from connector._trading_pairs if no remaining strategy still needs it.
+        Called after remove_market_from_strategy() and remove_strategy() to prevent the Binance
+        (and potentially other) fill-polling loops from continuing to iterate dead pairs.
+        """
+        still_needed = any(
+            any(mt.market.name == exchange_name and mt.trading_pair == trading_pair
+                for mt in s.market_pairs)
+            for s in self.strategies
+        )
+        if still_needed:
+            return
+
+        connector = self.connectors.get(exchange_name)
+        if connector is None:
+            return
+
+        tp_list = getattr(connector, '_trading_pairs', None)
+        if isinstance(tp_list, list) and trading_pair in tp_list:
+            tp_list.remove(trading_pair)
+            self.logger().info(
+                f"Evicted {trading_pair} from {exchange_name} connector._trading_pairs (no longer used by any strategy)"
+            )
 
     def _remove_market_from_config(self, strategy_name: str, market_spec: str, promotion_info: dict = None):
         """

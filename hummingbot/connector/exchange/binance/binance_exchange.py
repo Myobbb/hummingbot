@@ -377,10 +377,16 @@ class BinanceExchange(ExchangePyBase):
                 order_by_exchange_id_map[order.exchange_order_id] = order
 
             tasks = []
-            trading_pairs = self.trading_pairs
-            for trading_pair in trading_pairs:
+            symbol_map = await self.trading_pair_symbol_map()
+            valid_pairs = []
+            for trading_pair in self.trading_pairs:
+                if trading_pair not in symbol_map.inverse:
+                    self.logger().warning(
+                        f"Skipping {trading_pair} in fill poll — not in exchange symbol map (delisted?)"
+                    )
+                    continue
                 params = {
-                    "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    "symbol": symbol_map.inverse[trading_pair]
                 }
                 if self._last_poll_timestamp > 0:
                     params["startTime"] = query_time
@@ -388,11 +394,12 @@ class BinanceExchange(ExchangePyBase):
                     path_url=CONSTANTS.MY_TRADES_PATH_URL,
                     params=params,
                     is_auth_required=True))
+                valid_pairs.append(trading_pair)
 
             self.logger().debug(f"Polling for order fills of {len(tasks)} trading pairs.")
             results = await safe_gather(*tasks, return_exceptions=True)
 
-            for trades, trading_pair in zip(results, trading_pairs):
+            for trades, trading_pair in zip(results, valid_pairs):
 
                 if isinstance(trades, Exception):
                     self.logger().network(
