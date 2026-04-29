@@ -23,10 +23,10 @@ if TYPE_CHECKING:
 class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
-    _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
-    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
-    _DEPTH_STALENESS_SECONDS: float = 300.0  # 5 minutes - relaxed for low-volume pairs
-    _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0  # Refresh snapshot every 3 minutes for fresher baseline
+    _PING_INTERVAL_SECONDS: float = 15.0           # < 20s per BitMart docs
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0    # disconnect if no frames (including pong) for 30s
+    _DEPTH_STALENESS_SECONDS: float = 60.0         # trigger per-pair snapshot refresh after 60s of silence
+    _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -62,9 +62,6 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_asks_update_ts: Dict[str, float] = {}
         # Per-trading_pair last full snapshot refresh time
         self._last_snapshot_refresh_ts: Dict[str, float] = {}
-        # Maximum time to wait for snapshot before forcing recovery
-        # Only blocks on initial connect; version gaps no longer block (optimistic mode)
-        self._SNAPSHOT_WAIT_TIMEOUT_SECONDS: float = 10.0
         self._active_ws: Optional[WSAssistant] = None
         self._ws_consumer_task: Optional[asyncio.Task] = None
         self._watchdog_check_interval: float = 5.0  # Check watchdogs every 5s
@@ -180,16 +177,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        # Depth-Increase incremental updates
+        # Depth-Increase incremental updates only (depth50 has no diffs)
         if not isinstance(raw_message, dict):
             return
-        event_table = raw_message.get("table")
-        if event_table != CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
-            # No diffs expected for depth50
+        if raw_message.get("table") != CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
             return
-        diff_updates: Dict[str, Any] = raw_message.get("data") or []
+        diff_updates = raw_message.get("data") or []
         for diff_data in diff_updates:
-            # Ignore empty heartbeats (asks=[], bids=[]) and invalid entries
             bids_list = diff_data.get("bids", [])
             asks_list = diff_data.get("asks", [])
             ms_t = diff_data.get("ms_t")
@@ -197,290 +191,194 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             symbol = diff_data.get("symbol")
             if symbol is None or ms_t is None or version is None:
                 continue
-            # Fast path: use cached symbol -> trading_pair mapping to avoid async lookup
+
             trading_pair = self._symbol_to_pair_cache.get(symbol)
             if trading_pair is None:
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
-                # Cache for subsequent messages
                 self._symbol_to_pair_cache[symbol] = trading_pair
-            
-            # Track ANY message received for this pair (proves subscription is alive)
+
             current_time = time.time()
-            try:
-                self._last_any_message_ts[trading_pair] = current_time
-            except Exception:
-                pass
-            
-            # Check if this is a heartbeat (both sides empty)
+            self._last_any_message_ts[trading_pair] = current_time
+
+            # BitMart sends empty-body updates as keepalives — no book data, skip
             is_heartbeat = (not bids_list) and (not asks_list)
-            
-            # Update data timestamp ONLY for non-heartbeat messages (actual orderbook changes)
-            if not is_heartbeat:
-                try:
-                    self._last_depth_update_ts[trading_pair] = current_time
-                    # Track per-side updates to detect one-sided staleness
-                    if bids_list:
-                        self._last_bids_update_ts[trading_pair] = current_time
-                    if asks_list:
-                        self._last_asks_update_ts[trading_pair] = current_time
-                except Exception:
-                    pass
-            # Skip heartbeats early (no version check needed as they don't have actual data)
             if is_heartbeat:
                 continue
-                
-            # Version sequencing for actual data updates
-            last_ver = self._last_depth_version.get(trading_pair)
+
+            self._last_depth_update_ts[trading_pair] = current_time
+            if bids_list:
+                self._last_bids_update_ts[trading_pair] = current_time
+            if asks_list:
+                self._last_asks_update_ts[trading_pair] = current_time
+
             new_ver = int(version)
-            
-            # Debug logging for version tracking and one-sided updates
-            update_type = "two-sided"
-            if not bids_list and asks_list:
-                update_type = "asks-only"
-            elif bids_list and not asks_list:
-                update_type = "bids-only"
-            
-            # Check if we are waiting for initial snapshot
-            # Only strictly block if we are in the initial connection phase (~10s)
+
+            # --- Strict version sequencing per BitMart Depth-Increase protocol ---
+            # Docs: snapshot → apply update only if version == last+1
+            #       version <= last  → discard (old/duplicate)
+            #       version >  last+1 → discard + request new snapshot
+
             if self._waiting_for_snapshot.get(trading_pair, False):
-                wait_start = self._waiting_for_snapshot_since.get(trading_pair, 0)
-                wait_duration = time.time() - wait_start if wait_start > 0 else 0
-                
-                # OPTIMISTIC: Much shorter timeout (10s) since we only block on initial connect
-                # After 10s, accept ANY update to keep orderbook moving
-                if wait_duration >= 10.0:  # Reduced from 30s
-                    # Timeout exceeded - forced start
-                    self._waiting_for_snapshot[trading_pair] = False
-                    self._waiting_for_snapshot_since.pop(trading_pair, None)
-                    self._last_depth_version[trading_pair] = new_ver
-                    # Continue processing this update below
-                else:
-                    # Still waiting (only in first 10s after connect)
-                    # Dropping updates here is correct because we have NO baseline yet
-                    continue
-            
-            # Version validation and gap detection
-            # CORE PRINCIPLE: Prefer orderbook updates over perfect version tracking
-            # Better to have slightly gappy data than NO data (frozen orderbook)
-            skip_version_checks = False
-            
+                # Waiting for snapshot baseline — drop all diffs until it arrives.
+                # No timeout escape: a stale snapshot is safer than a gappy diff.
+                continue
+
+            last_ver = self._last_depth_version.get(trading_pair)
+
             if last_ver is None:
-                # No baseline version - establish it now
-                # This mirrors the reference implementation's optimistic initialization
-                self._last_depth_version[trading_pair] = new_ver
-                skip_version_checks = True
-                
-                # Request snapshot in background to ensure full book is correct, but don't block
-                # Only request if we're not already waiting for one
+                # No snapshot received yet — drop and (re-)request one
                 if not self._waiting_for_snapshot.get(trading_pair, False):
+                    self._waiting_for_snapshot[trading_pair] = True
+                    self._waiting_for_snapshot_since[trading_pair] = current_time
                     asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-            
-            elif new_ver <= last_ver:
-                # Old or duplicate - accept anyway for maximum freshness
-                # 10-minute test showed 0 occurrences, but if it happens, fresher data is better than skipping
-                self.logger().debug(f"BitMart {trading_pair}: Received v{new_ver} <= v{last_ver}, accepting anyway for freshness")
-                # Don't update version - keep last_ver as baseline
-            
-            elif new_ver != last_ver + 1 and not skip_version_checks:
-                # Version gap detected - OPTIMISTIC HANDLING
-                # Apply the update anyway to keep the book moving
-                gap_size = new_ver - last_ver - 1
-                
-                # Log at debug level to avoid spam, unless gap is huge
-                log_level = self.logger().warning if gap_size > 10 else self.logger().debug
-                log_level(
-                    f"BitMart {trading_pair}: Version gap detected in {update_type} update! "
-                    f"Expected v{last_ver + 1}, got v{new_ver} (gap of {gap_size}). "
-                    f"Applying update anyway, requesting snapshot for correction."
+                continue
+
+            if new_ver <= last_ver:
+                # Old or duplicate: discard (applying would remove still-valid levels)
+                self.logger().debug(
+                    f"BitMart {trading_pair}: discarding stale diff v{new_ver} (have v{last_ver})"
                 )
-                
-                # Request snapshot in background to correct specific levels
-                # Fire-and-forget, do NOT set _waiting_for_snapshot (which would block updates)
+                continue
+
+            if new_ver != last_ver + 1:
+                # Gap: we are missing at least one version — book would be corrupt if applied
+                gap = new_ver - last_ver - 1
+                self.logger().warning(
+                    f"BitMart {trading_pair}: version gap (expected v{last_ver + 1}, got v{new_ver}, "
+                    f"gap={gap}). Discarding diff and requesting snapshot."
+                )
+                self._waiting_for_snapshot[trading_pair] = True
+                self._waiting_for_snapshot_since[trading_pair] = current_time
+                self._last_depth_version.pop(trading_pair, None)
                 asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
-            
-            # Build and emit DIFF for actual updates
+                continue
+
+            # Sequential update (new_ver == last_ver + 1) — safe to emit
+            self._last_depth_version[trading_pair] = new_ver
             timestamp: float = int(ms_t) * 1e-3
-            update_id: int = int(ms_t)
-            order_book_message_content = {
-                "trading_pair": trading_pair,
-                "update_id": update_id,
-                "bids": [(bid[0], bid[1]) for bid in bids_list],
-                "asks": [(ask[0], ask[1]) for ask in asks_list],
-            }
-            diff_message: OrderBookMessage = OrderBookMessage(
+            message_queue.put_nowait(OrderBookMessage(
                 OrderBookMessageType.DIFF,
-                order_book_message_content,
-                timestamp)
-            
-            # Advance version (skip if already set during baseline establishment)
-            if not skip_version_checks:
-                self._last_depth_version[trading_pair] = new_ver
-                
-            message_queue.put_nowait(diff_message)
+                {
+                    "trading_pair": trading_pair,
+                    "update_id": int(ms_t),
+                    "bids": [(bid[0], bid[1]) for bid in bids_list],
+                    "asks": [(ask[0], ask[1]) for ask in asks_list],
+                },
+                timestamp))
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        diff_updates: Dict[str, Any] = raw_message["data"]
+        for diff_data in (raw_message.get("data") or []):
+            ms_t = diff_data.get("ms_t")
+            symbol = diff_data.get("symbol")
+            if ms_t is None or symbol is None:
+                continue
 
-        for diff_data in diff_updates:
-            timestamp: float = int(diff_data["ms_t"]) * 1e-3
-            update_id: int = int(diff_data["ms_t"])
-            symbol = diff_data["symbol"]
-            # Fast path: use cached symbol -> trading_pair mapping to avoid async lookup
             trading_pair = self._symbol_to_pair_cache.get(symbol)
             if trading_pair is None:
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
-                # Cache for subsequent messages
                 self._symbol_to_pair_cache[symbol] = trading_pair
 
-            # Check for heartbeats with empty asks/bids
             bids_list = diff_data.get("bids", [])
             asks_list = diff_data.get("asks", [])
-            is_heartbeat = (not bids_list) and (not asks_list)
-            
-            # Track ANY message received for this pair (proves subscription is alive)
-            current_time = time.time()
-            try:
-                self._last_any_message_ts[trading_pair] = current_time
-            except Exception:
-                pass
-            
-            # Update data timestamp ONLY for non-heartbeat snapshots (actual orderbook data)
-            if not is_heartbeat:
-                try:
-                    self._last_depth_update_ts[trading_pair] = current_time
-                    # Track per-side updates and snapshot refresh time
-                    if bids_list:
-                        self._last_bids_update_ts[trading_pair] = current_time
-                    if asks_list:
-                        self._last_asks_update_ts[trading_pair] = current_time
-                    # Full snapshot refreshes both sides
-                    self._last_snapshot_refresh_ts[trading_pair] = current_time
-                except Exception:
-                    pass
-            
-            # Skip heartbeats (no data to process)
-            if is_heartbeat:
+
+            # Empty-body snapshots are keepalives — no book data
+            if (not bids_list) and (not asks_list):
+                self._last_any_message_ts[trading_pair] = time.time()
                 continue
-            # For Depth-Increase 'snapshot' set base version
+
+            current_time = time.time()
+            self._last_any_message_ts[trading_pair] = current_time
+            self._last_depth_update_ts[trading_pair] = current_time
+            self._last_bids_update_ts[trading_pair] = current_time
+            self._last_asks_update_ts[trading_pair] = current_time
+            self._last_snapshot_refresh_ts[trading_pair] = current_time
+
+            # For Depth-Increase WS snapshots: has a version field that anchors sequencing.
+            # For REST fallback snapshots: no version field — we synthesise version from ms_t
+            # so that diffs arriving after (with larger ms_t-derived update_ids) still sequence
+            # correctly in restore_from_snapshot_and_diffs.
             if raw_message.get("table") == CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME:
                 version_value = diff_data.get("version")
                 was_waiting = self._waiting_for_snapshot.get(trading_pair, False)
-                wait_start = self._waiting_for_snapshot_since.get(trading_pair, 0)
-                wait_duration = int(current_time - wait_start) if (was_waiting and wait_start > 0) else 0
-                
-                # Always clear waiting flag when snapshot arrives
                 self._waiting_for_snapshot[trading_pair] = False
                 self._waiting_for_snapshot_since.pop(trading_pair, None)
-                
+
                 if version_value is not None:
-                    # WS snapshot with proper version - this is the normal case
-                    try:
-                        new_version = int(version_value)
-                        old_version = self._last_depth_version.get(trading_pair)
-                        
-                        # Log snapshot receipt
-                        if was_waiting:
-                            wait_msg = f" after {wait_duration}s wait" if wait_duration > 0 else ""
-                            self.logger().debug(
-                                f"BitMart {trading_pair}: Received requested SNAPSHOT v{new_version}{wait_msg} "
-                                f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks) - resuming diffs"
-                            )
-                        elif old_version is not None and new_version == old_version:
-                            self.logger().debug(
-                                f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
-                                f"(unchanged, {len(bids_list)} bids, {len(asks_list)} asks)"
-                            )
-                        else:
-                            self.logger().debug(
-                                f"BitMart {trading_pair}: Received SNAPSHOT v{new_version} "
-                                f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks)"
-                            )
-                        
-                        self._last_depth_version[trading_pair] = new_version
-                    except Exception as e:
-                        self.logger().warning(f"BitMart {trading_pair}: Failed to parse snapshot version: {e}")
-                        self._last_depth_version.pop(trading_pair, None)
+                    new_version = int(version_value)
+                    old_version = self._last_depth_version.get(trading_pair)
+                    self._last_depth_version[trading_pair] = new_version
+                    self.logger().info(
+                        f"BitMart {trading_pair}: snapshot v{new_version} received"
+                        f"{f' (was waiting, prev v{old_version})' if was_waiting else f' (prev v{old_version})'}"
+                        f" — {len(bids_list)} bids / {len(asks_list)} asks"
+                    )
                 else:
-                    # REST snapshot without version - clear version tracking
-                    # Next incremental update will establish new baseline
+                    # REST fallback: no WS version. Use ms_t as the version anchor so
+                    # restore_from_snapshot_and_diffs can bisect diffs correctly.
+                    # Also keep _last_depth_version pointing at ms_t so subsequent WS
+                    # diffs (which DO have versions) know to re-request a fresh WS snapshot.
                     old_version = self._last_depth_version.get(trading_pair)
                     self._last_depth_version.pop(trading_pair, None)
-                    if was_waiting:
-                        wait_msg = f" after {wait_duration}s wait" if wait_duration > 0 else ""
-                        self.logger().info(
-                            f"BitMart {trading_pair}: Received REST SNAPSHOT{wait_msg} "
-                            f"(previous v{old_version}, {len(bids_list)} bids, {len(asks_list)} asks) - "
-                            f"version tracking reset, will re-establish on next update"
-                        )
-                    else:
-                        self.logger().debug(
-                            f"BitMart {trading_pair}: Received REST SNAPSHOT "
-                            f"({len(bids_list)} bids, {len(asks_list)} asks)"
-                        )
+                    self.logger().info(
+                        f"BitMart {trading_pair}: REST snapshot received (prev v{old_version})"
+                        f" — {len(bids_list)} bids / {len(asks_list)} asks"
+                        f" — waiting for next WS snapshot to resume version tracking"
+                    )
+                    # Stay in waiting-for-snapshot state so diffs are held until the
+                    # next WS snapshot (which will carry a proper version).
+                    self._waiting_for_snapshot[trading_pair] = True
+                    self._waiting_for_snapshot_since[trading_pair] = current_time
+                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
 
-            order_book_message_content = {
-                "trading_pair": trading_pair,
-                "update_id": update_id,
-                "bids": [(bid[0], bid[1]) for bid in bids_list],
-                "asks": [(ask[0], ask[1]) for ask in asks_list],
-            }
-            diff_message: OrderBookMessage = OrderBookMessage(
+            message_queue.put_nowait(OrderBookMessage(
                 OrderBookMessageType.SNAPSHOT,
-                order_book_message_content,
-                timestamp)
+                {
+                    "trading_pair": trading_pair,
+                    "update_id": int(ms_t),
+                    "bids": [(bid[0], bid[1]) for bid in bids_list],
+                    "asks": [(ask[0], ask[1]) for ask in asks_list],
+                },
+                int(ms_t) * 1e-3))
 
-            message_queue.put_nowait(diff_message)
-    
     async def _refresh_snapshot_for_pair(self, trading_pair: str, symbol: str):
         """
-        Refresh a single pair snapshot. Prefer WS 'request' for Depth-Increase to obtain a versioned snapshot.
+        Request a fresh snapshot for one pair.
+        Always prefers WS 'request' op (returns versioned snapshot).
+        Falls back to REST only if WS is unavailable; REST snapshots have no version
+        so the caller must handle the versionless case.
         """
-        #self.logger().info(f"BitMart {trading_pair}: Requesting snapshot refresh")
         try:
             if self._use_depth_increase and self._active_ws is not None:
                 payload = {"op": "request", "args": [f"{CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME}:{symbol}"]}
                 req = WSJSONRequest(payload=payload)
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
                     await self._active_ws.send(req)
-                self.logger().debug(f"BitMart {trading_pair}: Sent WS snapshot request")
+                self.logger().debug(f"BitMart {trading_pair}: sent WS snapshot request")
                 return
         except Exception as e:
-            # Fall back to REST below
             self.logger().warning(f"BitMart {trading_pair}: WS snapshot request failed ({e}), falling back to REST")
-            pass
+
         try:
             snapshot = await self._request_order_book_snapshot(trading_pair)
             snap_data = snapshot.get("data") or {}
             ts = int(snap_data.get("ts", int(time.time() * 1000)))
-            
-            # REST snapshots don't have proper version numbers, so we need to reset version tracking
-            # The next incremental update will re-establish the version baseline
-            synthetic_data = {
-                "asks": snap_data.get("asks", []),
-                "bids": snap_data.get("bids", []),
-                "ms_t": ts,
-                "symbol": symbol,
-                "type": "snapshot",
-            }
-            # DON'T set version for REST snapshots - it would break version tracking
-            # Instead, clear version so next incremental update establishes new baseline
-            
             synthetic = {
                 "table": (CONSTANTS.PUBLIC_DEPTH_INCREASE_CHANNEL_NAME
                           if self._use_depth_increase else CONSTANTS.PUBLIC_DEPTH_CHANNEL_NAME),
-                "data": [synthetic_data]
+                "data": [{
+                    "asks": snap_data.get("asks", []),
+                    "bids": snap_data.get("bids", []),
+                    "ms_t": ts,
+                    "symbol": symbol,
+                    "type": "snapshot",
+                    # No "version" field — signals to _parse_order_book_snapshot_message
+                    # that this is a versionless REST snapshot.
+                }]
             }
             self._message_queue[self._snapshot_messages_queue_key].put_nowait(synthetic)
-            
-            # Clear version tracking - next incremental update will set new baseline
-            if self._use_depth_increase:
-                self._last_depth_version.pop(trading_pair, None)
-                self.logger().info(f"BitMart {trading_pair}: Applied REST snapshot fallback, version tracking reset (will re-establish on next update)")
-            else:
-                self.logger().debug(f"BitMart {trading_pair}: Applied REST snapshot fallback")
+            self.logger().info(f"BitMart {trading_pair}: queued REST snapshot fallback")
         except Exception as e:
-            # If REST fails, let watchdog handle later
-            self.logger().error(f"BitMart {trading_pair}: REST snapshot fallback also failed: {e}")
+            self.logger().error(f"BitMart {trading_pair}: REST snapshot fallback failed: {e}")
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
@@ -513,21 +411,25 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await send_chunked(depth_topics)
 
             self.logger().info("Subscribed to public order book and trade channels...")
-            # Initialize per-pair liveness timestamps on reconnect
+
+            # After every (re)connect: all version state is invalid.
+            # Mark each pair as waiting for its first versioned snapshot before
+            # accepting any diffs — this is the correct Depth-Increase startup sequence.
             now = time.time()
             for tp in self._trading_pairs:
-                self._last_any_message_ts[tp] = now  # Track any message
-                self._last_depth_update_ts[tp] = now  # Track actual data
-                self._last_bids_update_ts[tp] = now  # Track bids updates
-                self._last_asks_update_ts[tp] = now  # Track asks updates
-                self._last_snapshot_refresh_ts[tp] = now  # Track full snapshot refreshes
-                self._last_depth_version.pop(tp, None)  # Clear version to wait for first snapshot
-                self._waiting_for_snapshot.pop(tp, None)  # Clear waiting flag on reconnect
-                self._waiting_for_snapshot_since.pop(tp, None)  # Clear wait timer on reconnect
+                self._last_any_message_ts[tp] = now
+                self._last_depth_update_ts[tp] = now
+                self._last_bids_update_ts[tp] = now
+                self._last_asks_update_ts[tp] = now
+                self._last_snapshot_refresh_ts[tp] = now
+                self._last_depth_version.pop(tp, None)
+                self._waiting_for_snapshot[tp] = True
+                self._waiting_for_snapshot_since[tp] = now
 
-            # Depth-Increase optional: proactively request full snapshot per symbol to seed version state
-            # Disabled by default to reduce subscribe-burst load; fallback refresh logic remains in place.
-            if self._use_depth_increase and self._seed_snapshot_via_request:
+            # Always proactively request WS snapshots for Depth-Increase.
+            # BitMart sends an initial snapshot automatically on subscribe, but
+            # requesting explicitly guarantees we get one even on reconnect bursts.
+            if self._use_depth_increase:
                 CHUNK_SIZE = 20
                 for i in range(0, len(depth_topics), CHUNK_SIZE):
                     chunk = depth_topics[i:i + CHUNK_SIZE]
