@@ -802,7 +802,7 @@ class ClientConfigMap(BaseClientModel):
     color: ColorConfigMap = Field(default=ColorConfigMap())
     tick_size: float = Field(
         default=1.0,
-        ge=0.1,
+        ge=0.01,
         description="The tick size is the frequency with which the clock notifies the time iterators by calling the"
                     "\nc_tick() method, that means for example that if the tick size is 1, the logic of the strategy"
                     " \nwill run every second.",
@@ -912,7 +912,7 @@ class ClientConfigMap(BaseClientModel):
     @classmethod
     def validate_tick_size(cls, v: float):
         """Used for client-friendly error output."""
-        ret = validate_float(v, min_value=0.1)
+        ret = validate_float(v, min_value=0.01)
         if ret is not None:
             raise ValueError(ret)
         return v
