@@ -187,7 +187,7 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIPTION_LIMIT_ID):
                     await ws.send(subscribe_orderbook_request)
 
-            self.logger().info(f"Subscribed to public order book and trade channels (cached {len(self._symbol_to_pair_cache)} symbols)")
+            self.logger().info(f"Subscribed to public order book (books, 400 levels @ 100ms) and trade channels (cached {len(self._symbol_to_pair_cache)} symbols)")
         except asyncio.CancelledError:
             raise
         except Exception:
