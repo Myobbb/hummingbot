@@ -36,9 +36,12 @@ class StrategyControlCommand:
             control set buy_spread <id> <value>         - Set buy spread (% or 'min')
             control set sell_spread <id> <value>        - Set sell spread (% or 'min')
             control set order_size <id> <value>         - Set order size in USD
-            control set order_size <id> <value>         - Set order size in USD
             control set refresh_interval <id> <value>   - Set limit order refresh interval in seconds
             control set min_profitability <id> <value>  - Set minimum profitability percentage
+            control enable_hold <id>                    - Enable hold-band guardrail (arb size capped near target)
+            control disable_hold <id>                   - Disable hold-band guardrail
+            control set hold_target <id> <value>        - Set hold target USD (also enables guardrail)
+            control set hold_band <id> <value>          - Set hold band half-width USD
             control add_market <id> <exchange:PAIR>     - Add market to strategy (e.g., 'mexc:BSX-USDT')
             control remove_market <id> <exchange:PAIR>  - Remove market from strategy
             control clean <id>                          - Set sell-off target to 0 and enable sell-off (sell entire position)
@@ -213,11 +216,29 @@ class StrategyControlCommand:
                 self.notify("The current strategy does not support the clean command.")
                 return
             safe_ensure_future(self._control_clean(identifier), loop=self.ev_loop)
+        elif action == "enable_hold":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control enable_hold <strategy_name_or_token>")
+                return
+            if not hasattr(strategy, 'enable_hold_by_identifier'):
+                self.notify("The current strategy does not support hold-band controls.")
+                return
+            safe_ensure_future(self._control_enable_hold(identifier), loop=self.ev_loop)
+        elif action == "disable_hold":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control disable_hold <strategy_name_or_token>")
+                return
+            if not hasattr(strategy, 'disable_hold_by_identifier'):
+                self.notify("The current strategy does not support hold-band controls.")
+                return
+            safe_ensure_future(self._control_disable_hold(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
             self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
-                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff, set, "
-                       "add_market, remove_market, create, clean")
+                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff, "
+                       "enable_hold, disable_hold, set, add_market, remove_market, create, clean")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -260,6 +281,15 @@ class StrategyControlCommand:
                     if 'win_rate' in stats:
                         self.notify(f"   Win Rate: {stats['win_rate']:.1f}%")
 
+                # Show hold-band guardrail state
+                hold_target = info.get('hold_target')
+                hold_band = info.get('hold_band')
+                if hold_target is not None:
+                    self.notify(f"   Hold: target=${hold_target:.0f} band=±${hold_band:.0f} "
+                                f"(range ${hold_target - hold_band:.0f}–${hold_target + hold_band:.0f})")
+                else:
+                    self.notify(f"   Hold: disabled")
+
             self.notify("\n" + "=" * 80)
             self.notify("\nCommands:")
             self.notify("  control pause <name_or_token>                    - Pause a strategy")
@@ -277,9 +307,12 @@ class StrategyControlCommand:
             self.notify("  control set buy_spread <name> <value>            - Set buy spread (% or 'min')")
             self.notify("  control set sell_spread <name> <value>           - Set sell spread (% or 'min')")
             self.notify("  control set order_size <name> <value>            - Set order size (USD)")
-            self.notify("  control set order_size <name> <value>            - Set order size (USD)")
             self.notify("  control set refresh_interval <name> <value>      - Set refresh interval (seconds)")
             self.notify("  control set min_profitability <name> <value>     - Set min profitability (%)")
+            self.notify("  control enable_hold <name_or_token>               - Enable hold-band guardrail")
+            self.notify("  control disable_hold <name_or_token>              - Disable hold-band guardrail")
+            self.notify("  control set hold_target <name> <usd>              - Set hold target USD (also enables)")
+            self.notify("  control set hold_band <name> <usd>                - Set hold band half-width USD")
             self.notify("  control add_market <name_or_token> <exchange:PAIR> - Add market to strategy")
             self.notify("  control remove_market <name_or_token> <exchange:PAIR> - Remove market from strategy")
             self.notify("  control clean <name_or_token>                     - Set sell-off target to 0 and enable sell-off")
@@ -680,13 +713,83 @@ class StrategyControlCommand:
                     self.notify(f"\n✗ Failed to set min profitability for: {strategy_id}")
                     self.notify("  Use 'control list' to see available strategies")
 
+            elif parameter == "hold_target":
+                if not hasattr(strategy, 'set_hold_target_by_identifier'):
+                    self.notify("The current strategy does not support hold-band controls.")
+                    return
+                try:
+                    value = float(value_str)
+                    if value < 0:
+                        self.notify("Error: Hold target must be non-negative (0 disables the guardrail)")
+                        return
+                except ValueError:
+                    self.notify(f"Error: Invalid value '{value_str}'. Must be a number.")
+                    return
+                success = strategy.set_hold_target_by_identifier(strategy_id, value)
+                if success:
+                    self.notify(f"\n✓ Hold target set to {value:.0f} USD for {strategy_id}")
+                    self.notify("  Guardrail enabled — arb size will be capped to stay near this target")
+                else:
+                    self.notify(f"\n✗ Failed to set hold target for: {strategy_id}")
+
+            elif parameter == "hold_band":
+                if not hasattr(strategy, 'set_hold_band_by_identifier'):
+                    self.notify("The current strategy does not support hold-band controls.")
+                    return
+                try:
+                    value = float(value_str)
+                    if value <= 0:
+                        self.notify("Error: Hold band must be greater than 0")
+                        return
+                except ValueError:
+                    self.notify(f"Error: Invalid value '{value_str}'. Must be a number.")
+                    return
+                success = strategy.set_hold_band_by_identifier(strategy_id, value)
+                if success:
+                    self.notify(f"\n✓ Hold band set to ±{value:.0f} USD for {strategy_id}")
+                    self.notify(f"  Acceptable range will be [target - {value:.0f}, target + {value:.0f}]")
+                else:
+                    self.notify(f"\n✗ Failed to set hold band for: {strategy_id}")
+
             else:
                 self.notify(f"Unknown parameter: {parameter}")
-                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval, min_profitability")
+                self.notify("Available parameters: buyin, selloff, buy_spread, sell_spread, order_size, "
+                            "refresh_interval, min_profitability, hold_target, hold_band")
 
         except Exception as e:
             self.notify(f"Error setting parameter: {e}")
             self.logger().error(f"Error in control set: {e}", exc_info=True)
+
+    async def _control_enable_hold(self,  # type: HummingbotApplication
+                                   identifier: str):
+        """Enable hold-band guardrail for a strategy."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.enable_hold_by_identifier(identifier)
+            if success:
+                self.notify(f"\n✓ Hold-band guardrail enabled for {identifier}")
+                self.notify("  Arb order sizes will be capped to keep total holding near target")
+            else:
+                self.notify(f"\n✗ Failed to enable hold-band for: {identifier}")
+                self.notify("  Check hold_target_usd is set (use 'control set hold_target <id> <usd>')")
+        except Exception as e:
+            self.notify(f"Error enabling hold-band: {e}")
+            self.logger().error(f"Error in control enable_hold: {e}", exc_info=True)
+
+    async def _control_disable_hold(self,  # type: HummingbotApplication
+                                    identifier: str):
+        """Disable hold-band guardrail for a strategy."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.disable_hold_by_identifier(identifier)
+            if success:
+                self.notify(f"\n✓ Hold-band guardrail disabled for {identifier}")
+                self.notify("  Arb orders will no longer be size-capped by hold target")
+            else:
+                self.notify(f"\n✗ Failed to disable hold-band for: {identifier}")
+        except Exception as e:
+            self.notify(f"Error disabling hold-band: {e}")
+            self.logger().error(f"Error in control disable_hold: {e}", exc_info=True)
 
     async def _control_add_market(self,  # type: HummingbotApplication
                                   identifier: str,

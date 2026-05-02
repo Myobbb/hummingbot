@@ -87,9 +87,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode
-        
+
         # Trade counter (strategy-specific, incremented on each completed order)
         int64_t _total_trades
+
+        # Hold-band guardrail: keeps total asset value near a target by capping arb order size.
+        # hold_target_usd == 0.0 means disabled (default).
+        public double _hold_target_usd   # centre of acceptable band, e.g. 1100.0
+        public double _hold_band_usd     # half-width, e.g. 150.0 → band is [950, 1250]
+        double _cached_total_base_qty    # sum of base across all venues; refreshed every 60 s
+        double _cached_mid_price_usd     # mid-price of primary pair; refreshed every 60 s
+        bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         
         # Optimization: Reusable vector to avoid heap allocation in hot loop
         vector[ArbOpportunity] _reusable_arb_opps
@@ -141,6 +149,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_check_all_order_timeouts(self)
     cdef void c_check_filled_order_timeouts(self)
     cdef void c_cleanup_old_orders(self)
+    cdef void c_refresh_hold_cache(self)
 
 # Single optimized function for finding profitable orders (nogil compliant)
 cdef void c_find_profitable_arbitrage_orders(

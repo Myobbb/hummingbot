@@ -121,6 +121,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._orchestrated_mode = False
         # Trade counter (strategy-specific, not affected by shared connectors)
         self._total_trades = 0
+        # Hold-band guardrail (disabled by default)
+        self._hold_target_usd = 0.0
+        self._hold_band_usd = 150.0
+        self._cached_total_base_qty = 0.0
+        self._cached_mid_price_usd = 0.0
+        self._hold_correction_active = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -150,7 +156,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # Position balancer - order management
                     position_balancer_refresh_interval: float = 60.0,
                     position_balancer_order_size_usd: float = 100.0,
-                    orchestrated_mode: bool = False):
+                    orchestrated_mode: bool = False,
+                    # Hold-band guardrail
+                    hold_target_usd: float = 0.0,
+                    hold_band_usd: float = 150.0):
         """Initialize arbitrage strategy with configurable parameters"""
         
         if not market_pairs:
@@ -251,6 +260,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
+
+        # Hold-band guardrail
+        self._hold_target_usd = hold_target_usd
+        self._hold_band_usd = hold_band_usd
+        self._cached_total_base_qty = 0.0
+        self._cached_mid_price_usd = 0.0
+        self._hold_correction_active = False
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -1062,6 +1078,88 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
+        # Refresh hold-band cache (once per cleanup cycle = once per ~60 s).
+        # Always refresh — even when currently disabled — so that runtime enable_hold
+        # activates immediately with a warm cache rather than waiting up to 60 s.
+        self.c_refresh_hold_cache()
+
+    cdef void c_refresh_hold_cache(self):
+        """
+        Refresh cached total base quantity and mid-price used by the hold-band guardrail.
+        Also updates the hysteresis flag (_hold_correction_active).
+
+        Called from c_cleanup_old_orders (~60 s interval) — never on the hot arb path.
+        Uses the same balance-aggregation pattern as PositionBalancerHandler so the two
+        systems see a consistent view of holdings.
+
+        Hysteresis logic:
+          - Flag set True  when total_usd crosses outside the outer band (target ± band).
+          - Flag cleared   when total_usd returns within the settle zone (target ± settle),
+            where settle = max(15.0, band * 0.10).  This prevents oscillation near the
+            band boundary without adding a new config parameter.
+        """
+        cdef:
+            double total = 0.0
+            double mid = 0.0
+            double total_usd = 0.0
+            double settle_margin = 0.0
+            object mp, mt, key
+            str base_asset
+            set checked
+
+        if not self._market_pairs:
+            return
+
+        try:
+            # Sum available base balance across all venues, de-duplicating by (market, asset) key.
+            base_asset = (<object>self._market_pairs[0]).first.base_asset
+            checked = set()
+            for mp in self._market_pairs:
+                for mt in [(<object>mp).first, (<object>mp).second]:
+                    if (<object>mt).base_asset == base_asset:
+                        key = ((<object>mt).market, (<object>mt).base_asset)
+                        if key not in checked:
+                            checked.add(key)
+                            total += float((<object>mt).market.c_get_available_balance((<object>mt).base_asset))
+            self._cached_total_base_qty = total
+
+            # Mid-price from the primary connector of the first pair.
+            try:
+                mid = float((<object>self._market_pairs[0]).first.market.get_mid_price(
+                    (<object>self._market_pairs[0]).first.trading_pair))
+                if mid > 0.0:
+                    self._cached_mid_price_usd = mid
+                # If mid == 0 keep the previous cached value — do not zero out unexpectedly.
+            except Exception:
+                pass  # keep stale value
+
+            # ── Hysteresis: update correction flag ───────────────────────────────
+            # Only meaningful when guardrail is enabled and cache is warm.
+            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
+                total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+                settle_margin = max(15.0, self._hold_band_usd * 0.10)
+
+                if not self._hold_correction_active:
+                    # Activate correction when position breaches the outer band.
+                    if (total_usd > self._hold_target_usd + self._hold_band_usd or
+                            total_usd < self._hold_target_usd - self._hold_band_usd):
+                        self._hold_correction_active = True
+                        self.logger().info(
+                            f"Hold-band: correction activated — total ${total_usd:.0f} "
+                            f"outside band [{self._hold_target_usd - self._hold_band_usd:.0f}, "
+                            f"{self._hold_target_usd + self._hold_band_usd:.0f}]")
+                else:
+                    # Deactivate only when position settles within the inner settle zone.
+                    if abs(total_usd - self._hold_target_usd) <= settle_margin:
+                        self._hold_correction_active = False
+                        self.logger().info(
+                            f"Hold-band: correction complete — total ${total_usd:.0f} "
+                            f"within settle zone (target ${self._hold_target_usd:.0f} "
+                            f"± ${settle_margin:.0f})")
+
+        except Exception:
+            pass  # never crash cleanup on a cache miss
+
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
         # Skip logging if rates are exactly 1:1
@@ -1260,6 +1358,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object quantized_sell_cap
             object quantized_buy_cap
             object buy_req
+            # Hold-band guardrail: independent per-leg amounts
+            # When guardrail is inactive both equal `amount`; when active they may diverge.
+            double _hold_buy_amount
+            double _hold_sell_amount
+            double _total_usd
+            double _delta_base
+            # Final per-leg Decimal amounts used at order placement
+            object _final_buy_qty
+            object _final_sell_qty
             object dec_eps
             double buy_quote_available_now
             double buy_required_quote
@@ -1284,7 +1391,49 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if self._logging_options & self.OPTION_LOG_INSUFFICIENT_ASSET:
                 self.logger().info("Insufficient balance or no profitable amount found")
             return
-        
+
+        # ── Hold-band guardrail ───────────────────────────────────────────────────
+        # Keep total asset value near hold_target_usd by adjusting each arb leg
+        # independently using a delta approach with hysteresis.
+        #
+        # State machine (updated every 60 s in c_refresh_hold_cache):
+        #   _hold_correction_active = False  →  inside band, no intervention.
+        #   _hold_correction_active = True   →  outside outer band, correcting.
+        #     Deactivates only when total enters the inner settle zone (target ± settle),
+        #     where settle = max($15, band×10%).  This prevents toggling on/off near
+        #     the boundary due to price noise.
+        #
+        # When correcting:
+        #   Overbought (total > target + band):
+        #     Sell leg = full amount      — sell-strand always moves in right direction.
+        #     Buy  leg = max(0, amount − delta_base)  — delta measured from target.
+        #     → if excess ≥ amount, buy is fully suppressed.
+        #
+        #   Oversold (total < target − band):
+        #     Buy  leg = full amount      — buy-strand always moves in right direction.
+        #     Sell leg = max(0, amount − delta_base).
+        #     → if deficit ≥ amount, sell is fully suppressed.
+        #
+        # Zero overhead when disabled: single bint check on the hot path.
+        _hold_buy_amount  = amount
+        _hold_sell_amount = amount
+        if self._hold_target_usd > 0.0 and self._hold_correction_active and self._cached_mid_price_usd > 0.0:
+            _total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+
+            if _total_usd > self._hold_target_usd:
+                # Overbought: delta measured from target so each trade nudges toward centre.
+                _delta_base = (_total_usd - self._hold_target_usd) / self._cached_mid_price_usd
+                _hold_buy_amount  = max(0.0, amount - _delta_base)
+                # _hold_sell_amount stays at `amount`
+
+            else:
+                # Oversold (correction active but not overbought → must be below target).
+                _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
+                _hold_sell_amount = max(0.0, amount - _delta_base)
+                # _hold_buy_amount stays at `amount`
+
+        # ─────────────────────────────────────────────────────────────────────────
+
         # PRICE TICK ADJUSTMENT: Make orders more aggressive for better fills
         # Adjusts float prices BEFORE balance checks so calculations are correct
         # Buy orders: increase price by 2 ticks (bid higher to fill faster)
@@ -1307,63 +1456,67 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object buy_price_decimal = Decimal.from_float(buy_price)
         cdef object sell_price_decimal = Decimal.from_float(sell_price)
         
-        # Calculate safe amount using float math first
-        cdef double safe_amount_float = max(0.0, amount - QUANTIZATION_EPSILON)
+        # Quantize using the larger of the two leg amounts as the capacity reference.
+        # The per-leg Decimal amounts are derived just before order placement below.
+        # Safety caps (balance checks) use the larger leg — conservative and correct.
+        cdef double safe_amount_float = max(0.0, max(_hold_buy_amount, _hold_sell_amount) - QUANTIZATION_EPSILON)
         cdef object dec_safe_amount = Decimal.from_float(safe_amount_float)
-        
-        quantized_buy = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, dec_safe_amount, buy_price_decimal)
+
+        quantized_buy  = self.c_safe_quantize_order_amount(buy_market,  buy_market_tuple.trading_pair,  dec_safe_amount, buy_price_decimal)
         quantized_sell = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
         quantized_amount = min(quantized_buy, quantized_sell)
         
-        # Safety cap: re-check sell venue's live available base and re-quantize to prevent oversold at submission time
+        # Safety cap: re-check sell venue's live available base to prevent overselling at submission time.
+        # Use _hold_sell_amount as the reference — base is only consumed by the sell leg.
+        # When sell is suppressed (oversold, _hold_sell_amount==0) skip the check entirely
+        # so a low base balance cannot incorrectly shrink the buy-leg quantized_amount.
         sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
-        
-        # Only do extra work if available shrank below our planned amount
-        # OPTIMIZATION: Compare floats directly to avoid Decimal overhead
-        if sell_available_now + 1e-15 < float(quantized_amount):
-            # Calculate cap using float math
-            # safe_cap = max(0.0, sell_available_now - QUANTIZATION_EPSILON)
-            # Use Decimal.from_float for speed
+
+        # Compare against _hold_sell_amount, not quantized_amount: the sell leg will only
+        # consume _hold_sell_amount base, so that is the relevant threshold for the cap.
+        if _hold_sell_amount > 0.0 and sell_available_now + 1e-15 < _hold_sell_amount:
             sell_cap_dec = Decimal.from_float(max(0.0, sell_available_now - QUANTIZATION_EPSILON))
-            
+
             quantized_sell_cap = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_cap_dec, sell_price_decimal)
-            
+
             # Re-quantize buy side to the capped amount
-            # OPTIMIZATION: Avoid Decimal arithmetic where possible
             if quantized_sell_cap is None:
                 buy_req = Decimal("0")
             else:
-                 buy_req = quantized_sell_cap
-            
-            # Ensure epsilon safety for buy side (using Decimal subtract only once)
+                buy_req = quantized_sell_cap
+
+            # Ensure epsilon safety for buy side
             dec_eps = Decimal("1e-12")
             if buy_req > dec_eps:
                 buy_req = buy_req - dec_eps
             else:
                 buy_req = Decimal("0")
-                
+
             quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
             quantized_amount = min(quantized_amount, quantized_sell_cap, quantized_buy_cap)
 
-        # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability
+        # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability.
+        # Use _hold_buy_amount as the reference — quote is only consumed by the buy leg.
+        # When buy is suppressed (overbought, _hold_buy_amount==0) skip the check entirely
+        # so a low quote balance cannot incorrectly shrink the sell-leg quantized_amount.
         buy_quote_available_now = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
-        buy_required_quote = float(quantized_amount) * buy_price
-        
-        if buy_quote_available_now + 1e-15 < buy_required_quote:
+        buy_required_quote = _hold_buy_amount * buy_price
+
+        if _hold_buy_amount > 0.0 and buy_quote_available_now + 1e-15 < buy_required_quote:
             # Reduce to affordable base amount and re-quantize both sides accordingly
             affordable_base = 0.0
             if buy_price > 0.0:
                 affordable_base = max(0.0, buy_quote_available_now / buy_price)
-            
+
             # OPTIMIZATION: Use Decimal.from_float
             affordable_dec = Decimal.from_float(max(0.0, affordable_base - QUANTIZATION_EPSILON))
-            
+
             q_buy2 = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, affordable_dec, buy_price_decimal)
-            
+
             # Align sell side to the reduced buy size
             sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
             q_sell2 = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_req2, sell_price_decimal)
-            
+
             # Handle potential None from quantization
             if q_buy2 is not None and q_sell2 is not None:
                 quantized_amount = min(quantized_amount, q_buy2, q_sell2)
@@ -1385,12 +1538,51 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass  # Fail gracefully if trading rules unavailable; balance caps already applied
 
-        # Check minimum order size after any safety caps
-        # NOTE: volume_usd is notional value in sell market quote currency, not necessarily USD
-        # _min_order_usd should be configured in same units as the quote currency
-        volume_usd = float(quantized_amount) * sell_price
-        if volume_usd < self._min_order_usd:
+        # ── Per-leg final amounts ─────────────────────────────────────────────────
+        # Convert float hold amounts to quantized Decimals capped by quantized_amount
+        # (which embeds all balance safety checks).  When guardrail is inactive both
+        # hold amounts equal `amount` so both finals equal quantized_amount — no
+        # behavioural change from the original single-amount path.
+        if _hold_buy_amount <= 0.0:
+            _final_buy_qty = Decimal("0")
+        elif _hold_buy_amount >= float(quantized_amount):
+            _final_buy_qty = quantized_amount
+        else:
+            _final_buy_qty = self.c_safe_quantize_order_amount(
+                buy_market, buy_market_tuple.trading_pair,
+                Decimal.from_float(max(0.0, _hold_buy_amount - QUANTIZATION_EPSILON)),
+                buy_price_decimal) or Decimal("0")
+            if _final_buy_qty > quantized_amount:
+                _final_buy_qty = quantized_amount
+
+        if _hold_sell_amount <= 0.0:
+            _final_sell_qty = Decimal("0")
+        elif _hold_sell_amount >= float(quantized_amount):
+            _final_sell_qty = quantized_amount
+        else:
+            _final_sell_qty = self.c_safe_quantize_order_amount(
+                sell_market, sell_market_tuple.trading_pair,
+                Decimal.from_float(max(0.0, _hold_sell_amount - QUANTIZATION_EPSILON)),
+                sell_price_decimal) or Decimal("0")
+            if _final_sell_qty > quantized_amount:
+                _final_sell_qty = quantized_amount
+
+        # Both legs suppressed → skip entirely and undo cooldown stamp.
+        if _final_buy_qty <= Decimal("0") and _final_sell_qty <= Decimal("0"):
+            self._last_global_trade_timestamp = 0.0
             return
+
+        # Notional check: at least one leg must meet min_order_usd.
+        # Use sell leg notional when sell is active, otherwise buy leg.
+        if _final_sell_qty > Decimal("0"):
+            volume_usd = float(_final_sell_qty) * sell_price
+        else:
+            volume_usd = float(_final_buy_qty) * buy_price
+        if volume_usd < self._min_order_usd:
+            self._last_global_trade_timestamp = 0.0
+            return
+        # ─────────────────────────────────────────────────────────────────────────
+
         # Declare variables before the if block (Cython requirement)
         cdef double order_start_time
         cdef object buy_order_type
@@ -1398,35 +1590,36 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef double placement_latency
         cdef str dummy_order_id
 
-        if quantized_amount > Decimal("0"):
+        if _final_buy_qty > Decimal("0") or _final_sell_qty > Decimal("0"):
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
 
-            # CRITICAL: Place both limit orders with minimal latency
-            # The price is used as the limit price for the orders
-
-            # Pre-calculate all parameters to minimize latency between orders
             # Use LIMIT order type for both buy and sell orders
             buy_order_type = OrderType.LIMIT
             sell_order_type = OrderType.LIMIT
-            # Prices already prepared above as Decimal for quantization
 
-            # Execute both orders in rapid succession
+            # Initialize order IDs to None; only set when the respective leg is placed
+            buy_order_id = None
+            sell_order_id = None
+
+            # Execute both orders in rapid succession.
+            # When one leg is suppressed (qty=0) that branch is skipped entirely.
             # NOTE: c_buy/c_sell_with_specific_market return immediately (async order placement)
             # Actual exchange failures are handled via MarketOrderFailureEvent -> c_did_fail_order
             # The try/except here only catches rare synchronous validation errors (e.g. TypeError)
             try:
-                buy_order_id = self.c_buy_with_specific_market(
-                    buy_market_tuple, quantized_amount,
-                    order_type=buy_order_type,
-                    price=buy_price_decimal,
-                    expiration_seconds=self._next_trade_delay)
+                if _final_buy_qty > Decimal("0"):
+                    buy_order_id = self.c_buy_with_specific_market(
+                        buy_market_tuple, _final_buy_qty,
+                        order_type=buy_order_type,
+                        price=buy_price_decimal,
+                        expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error (e.g. invalid type, market not whitelisted)
                 # Use existing framework to trigger timeout logic and logging
                 from hummingbot.core.event.events import MarketOrderFailureEvent
                 dummy_order_id = f"sync_error_{buy_market.name}_{self._current_timestamp}"
-                self.c_start_tracking_limit_order(buy_market_tuple, dummy_order_id, True, buy_price_decimal, quantized_amount)
+                self.c_start_tracking_limit_order(buy_market_tuple, dummy_order_id, True, buy_price_decimal, _final_buy_qty)
                 self.c_did_fail_order(MarketOrderFailureEvent(
                     self._current_timestamp, dummy_order_id, buy_order_type, f"Sync error: {str(e)}"
                 ))
@@ -1434,42 +1627,42 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Immediately place the sell order - minimal delay
             try:
-                sell_order_id = self.c_sell_with_specific_market(
-                    sell_market_tuple, quantized_amount,
-                    order_type=sell_order_type,
-                    price=sell_price_decimal,
-                    expiration_seconds=self._next_trade_delay)
+                if _final_sell_qty > Decimal("0"):
+                    sell_order_id = self.c_sell_with_specific_market(
+                        sell_market_tuple, _final_sell_qty,
+                        order_type=sell_order_type,
+                        price=sell_price_decimal,
+                        expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error - buy order may have been submitted (will timeout/cancel)
-                # Use existing framework to trigger timeout logic and logging
                 from hummingbot.core.event.events import MarketOrderFailureEvent
                 dummy_order_id = f"sync_error_{sell_market.name}_{self._current_timestamp}"
-                self.c_start_tracking_limit_order(sell_market_tuple, dummy_order_id, False, sell_price_decimal, quantized_amount)
+                self.c_start_tracking_limit_order(sell_market_tuple, dummy_order_id, False, sell_price_decimal, _final_sell_qty)
                 self.c_did_fail_order(MarketOrderFailureEvent(
                     self._current_timestamp, dummy_order_id, sell_order_type, f"Sync error: {str(e)}"
                 ))
                 return
 
-            # Track orders
-            buy_id_str = self._to_cpp_str(buy_order_id)
-            sell_id_str = self._to_cpp_str(sell_order_id)
+            # Track orders — only for legs that were actually placed
+            if _final_buy_qty > Decimal("0") and buy_order_id:
+                buy_id_str = self._to_cpp_str(buy_order_id)
+                self._order_timestamps[buy_id_str] = order_start_time
+                try:
+                    if buy_market_tuple not in self._pending_buy_orders_by_market:
+                        self._pending_buy_orders_by_market[buy_market_tuple] = set()
+                    self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
+                except Exception as e:
+                    self.logger().warning(f"Failed to track pending buy order: {e}")
 
-            self._order_timestamps[buy_id_str] = order_start_time
-            self._order_timestamps[sell_id_str] = order_start_time
-
-            # Track pending orders per market - SEPARATE by side (buy/sell) for smart parallel trading
-            try:
-                # Track BUY order on buy market
-                if buy_market_tuple not in self._pending_buy_orders_by_market:
-                    self._pending_buy_orders_by_market[buy_market_tuple] = set()
-                self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
-
-                # Track SELL order on sell market
-                if sell_market_tuple not in self._pending_sell_orders_by_market:
-                    self._pending_sell_orders_by_market[sell_market_tuple] = set()
-                self._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
-            except Exception as e:
-                self.logger().warning(f"Failed to track pending orders by market: {e}")
+            if _final_sell_qty > Decimal("0") and sell_order_id:
+                sell_id_str = self._to_cpp_str(sell_order_id)
+                self._order_timestamps[sell_id_str] = order_start_time
+                try:
+                    if sell_market_tuple not in self._pending_sell_orders_by_market:
+                        self._pending_sell_orders_by_market[sell_market_tuple] = set()
+                    self._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
+                except Exception as e:
+                    self.logger().warning(f"Failed to track pending sell order: {e}")
 
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *:
         """Unified order completion handler"""

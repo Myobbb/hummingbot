@@ -80,11 +80,13 @@ class HummingbotCompleter(Completer):
         self._mqtt_completer = WordCompleter(["start", "stop", "restart"], ignore_case=True)
         self._control_completer = WordCompleter([
             "list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
-            "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff", "set",
+            "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff",
+            "enable_hold", "disable_hold", "set",
             "add_market", "remove_market", "create", "clean"
         ], ignore_case=True)
         self._control_set_completer = WordCompleter([
-            "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval", "min_profitability"
+            "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval",
+            "min_profitability", "hold_target", "hold_band"
         ], ignore_case=True)
         self._gateway_chains = GATEWAY_CHAINS
         self._gateway_networks = []

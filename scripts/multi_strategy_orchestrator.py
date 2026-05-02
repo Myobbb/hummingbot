@@ -671,6 +671,21 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Maximum order size in USD per position balancer order (e.g., 100.0 = $100 max per order)"
     )
 
+    # Hold-band guardrail — caps arb order size to keep total asset value near a target.
+    # Disabled by default so existing configs load without change.
+    hold_target_enabled: bool = Field(
+        default=False,
+        description="Enable hold-band guardrail (caps arb size to keep total holding near target)"
+    )
+    hold_target_usd: float = Field(
+        default=1100.0,
+        description="Centre of the acceptable holding band in USD (e.g. 1100 → aim to hold ~$1100 worth)"
+    )
+    hold_band_usd: float = Field(
+        default=150.0,
+        description="Half-width of the band in USD (target ± band = acceptable range, e.g. 150 → [950, 1250])"
+    )
+
     # Timing parameters
     status_report_interval: float = Field(
         default=60.0,
@@ -1122,6 +1137,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             "position_balancer_refresh_interval": config.position_balancer_refresh_interval,
             "position_balancer_order_size_usd": config.position_balancer_order_size_usd,
             "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
+            # Hold-band guardrail: pass target > 0 only when enabled; 0.0 disables the feature
+            "hold_target_usd": config.hold_target_usd if config.hold_target_enabled else 0.0,
+            "hold_band_usd": config.hold_band_usd,
         }
 
         # Add filled_order_timeout for arbitrage_l only
@@ -2271,6 +2289,108 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error setting min profitability for '{strategy_name}': {e}")
             return False
+
+    # ── Hold-band guardrail control ───────────────────────────────────────────
+
+    def enable_hold_by_identifier(self, identifier: str) -> bool:
+        """Enable hold-band guardrail for a strategy (restores last configured target)."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.enable_hold(strategy_name) if strategy_name else False
+
+    def enable_hold(self, strategy_name: str) -> bool:
+        """Enable hold-band guardrail for a strategy by full name."""
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy = strategy_instance.strategy
+            if not hasattr(strategy, '_hold_target_usd'):
+                return False
+            # Re-read the value stored in the instance config so the target is meaningful.
+            # If it was already set to 0 (disabled), restore from the original YAML config.
+            target = float(strategy_instance.config.get('hold_target_usd', 1100.0))
+            if target <= 0.0:
+                self.logger().warning(f"hold_target_usd is 0 for '{strategy_name}' — set it first with "
+                                      f"'control set hold_target {strategy_name} <usd>'")
+                return False
+            strategy._hold_target_usd = target
+            self.logger().info(f"Hold-band enabled for '{strategy_name}': target={target:.0f} USD "
+                               f"band=±{strategy._hold_band_usd:.0f}")
+            return True
+        except Exception as e:
+            self.logger().error(f"Error enabling hold for '{strategy_name}': {e}")
+            return False
+
+    def disable_hold_by_identifier(self, identifier: str) -> bool:
+        """Disable hold-band guardrail for a strategy (sets target to 0, disabling the clamp)."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.disable_hold(strategy_name) if strategy_name else False
+
+    def disable_hold(self, strategy_name: str) -> bool:
+        """Disable hold-band guardrail for a strategy by full name."""
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy = strategy_instance.strategy
+            if not hasattr(strategy, '_hold_target_usd'):
+                return False
+            strategy._hold_target_usd = 0.0
+            if hasattr(strategy, '_hold_correction_active'):
+                strategy._hold_correction_active = False
+            self.logger().info(f"Hold-band disabled for '{strategy_name}'")
+            return True
+        except Exception as e:
+            self.logger().error(f"Error disabling hold for '{strategy_name}': {e}")
+            return False
+
+    def set_hold_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
+        """Set hold-band target USD for a strategy (also enables the guardrail)."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_hold_target(strategy_name, target_usd) if strategy_name else False
+
+    def set_hold_target(self, strategy_name: str, target_usd: float) -> bool:
+        """Set hold-band target USD for a strategy by full name and enable the guardrail."""
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy = strategy_instance.strategy
+            if not hasattr(strategy, '_hold_target_usd'):
+                return False
+            strategy._hold_target_usd = target_usd
+            # Mirror into instance config so enable_hold can restore it later
+            strategy_instance.config['hold_target_usd'] = target_usd
+            enabled_str = "enabled" if target_usd > 0.0 else "disabled (target=0)"
+            self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' ({enabled_str})")
+            return True
+        except Exception as e:
+            self.logger().error(f"Error setting hold target for '{strategy_name}': {e}")
+            return False
+
+    def set_hold_band_by_identifier(self, identifier: str, band_usd: float) -> bool:
+        """Set hold-band half-width USD for a strategy."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_hold_band(strategy_name, band_usd) if strategy_name else False
+
+    def set_hold_band(self, strategy_name: str, band_usd: float) -> bool:
+        """Set hold-band half-width USD for a strategy by full name."""
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy = strategy_instance.strategy
+            if not hasattr(strategy, '_hold_band_usd'):
+                return False
+            strategy._hold_band_usd = band_usd
+            strategy_instance.config['hold_band_usd'] = band_usd
+            self.logger().info(f"Hold-band half-width set to ±{band_usd:.0f} USD for '{strategy_name}'")
+            return True
+        except Exception as e:
+            self.logger().error(f"Error setting hold band for '{strategy_name}': {e}")
+            return False
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def set_buy_target_by_identifier(self, identifier: str, target_usd: float) -> bool:
         """
@@ -3912,6 +4032,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except Exception:
                 pass
 
+            # Hold-band guardrail live state (read from the Cython instance, not config)
+            hold_target = None
+            hold_band = None
+            try:
+                strat = strategy_instance.strategy
+                if hasattr(strat, '_hold_target_usd') and float(strat._hold_target_usd) > 0.0:
+                    hold_target = float(strat._hold_target_usd)
+                    hold_band = float(strat._hold_band_usd)
+            except Exception:
+                pass
+
             strategy_summary[strategy_instance.name] = {
                 "status": status,
                 "paused": strategy_instance.paused,
@@ -3921,6 +4052,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 "secondary_pair": strategy_instance.config.get('secondary_trading_pair', 'N/A'),
                 "min_profitability": strategy_instance.config.get('min_profitability', 'N/A'),
                 "best_profitability": best_prof_str,
+                "hold_target": hold_target,   # None means disabled
+                "hold_band": hold_band,
             }
 
         return strategy_summary
