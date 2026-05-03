@@ -621,7 +621,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     lines.append(
                         f"    total=${hold_total_usd:.2f}"
                         f"  base={self._cached_total_base_qty:.6f}"
-                        f"  mid=${self._cached_mid_price_usd:.4f}"
+                        f"  bid=${self._cached_mid_price_usd:.4f}"
                         f"  status={hold_state}"
                     )
                 else:
@@ -1139,7 +1139,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """
         cdef:
             double total = 0.0
-            double mid = 0.0
+            double bid = 0.0
             double total_usd = 0.0
             double settle_margin = 0.0
             object mp, mt, key
@@ -1150,7 +1150,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
 
         try:
-            # Sum available base balance across all venues, de-duplicating by (market, asset) key.
+            # Balance: same pattern as PositionBalancerHandler.c_get_aggregated_base_balance —
+            # de-duplicate by (market, base_asset), call get_available_balance (Python method,
+            # works for all connector types without hasattr dance).
             base_asset = (<object>self._market_pairs[0]).first.base_asset
             checked = set()
             for mp in self._market_pairs:
@@ -1159,25 +1161,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         key = ((<object>mt).market, (<object>mt).base_asset)
                         if key not in checked:
                             checked.add(key)
-                            mkt = (<object>mt).market
-                            if hasattr(mkt, 'c_get_available_balance'):
-                                total += float(mkt.c_get_available_balance((<object>mt).base_asset))
-                            else:
-                                total += float(mkt.get_available_balance((<object>mt).base_asset))
+                            total += float((<object>mt).market.get_available_balance((<object>mt).base_asset))
             self._cached_total_base_qty = total
 
-            # Mid-price: try each market tuple until we get a non-zero value.
-            for mp in self._market_pairs:
-                for mt in [(<object>mp).first, (<object>mp).second]:
-                    try:
-                        mid = float((<object>mt).market.get_mid_price((<object>mt).trading_pair))
-                        if mid > 0.0:
-                            self._cached_mid_price_usd = mid
-                            break
-                    except Exception:
-                        pass
-                if self._cached_mid_price_usd > 0.0:
-                    break
+            # Price: same source as PositionBalancerHandler — top-of-book bid via C++ order book
+            # (c_get_reference_bid_for_asset). Faster than get_mid_price, never returns 0 if
+            # the book has any bids, and consistent with how position value is computed everywhere.
+            bid = self.c_get_reference_bid_for_asset(base_asset)
+            if bid > 0.0:
+                self._cached_mid_price_usd = bid
+            # If bid == 0 (no order book yet) keep previous cached value — do not zero out.
 
             # ── Hysteresis: update correction flag ───────────────────────────────
             # Only meaningful when guardrail is enabled and cache is warm.
