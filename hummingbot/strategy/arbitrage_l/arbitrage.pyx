@@ -1479,7 +1479,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # _hold_sell_amount stays at `amount`
 
             else:
-                # Oversold (correction active but not overbought → must be below target).
+                # Oversold (total <= target): delta = 0 when exactly at target, so no suppression.
                 _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
                 _hold_sell_amount = max(0.0, amount - _delta_base)
                 # _hold_buy_amount stays at `amount`

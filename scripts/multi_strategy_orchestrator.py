@@ -2404,6 +2404,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             # Immediately refresh so _hold_correction_active reflects new target.
             if target_usd > 0.0 and hasattr(strategy, 'refresh_hold_cache'):
                 strategy.refresh_hold_cache()
+            elif target_usd <= 0.0:
+                if hasattr(strategy, '_hold_correction_active'):
+                    strategy._hold_correction_active = False
             enabled_str = "enabled" if target_usd > 0.0 else "disabled (target=0)"
             self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' ({enabled_str})")
             return True
