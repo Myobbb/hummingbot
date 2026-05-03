@@ -1180,10 +1180,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     break
 
             # ── Hysteresis: update correction flag ───────────────────────────────
-            self.logger().info(
-                f"Hold-band cache refresh: base={self._cached_total_base_qty:.4f} "
-                f"mid={self._cached_mid_price_usd:.6f} target={self._hold_target_usd:.0f} "
-                f"active={self._hold_correction_active}")
             # Only meaningful when guardrail is enabled and cache is warm.
             if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
                 total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
