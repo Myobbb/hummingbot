@@ -547,7 +547,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double hold_total_usd
             double hold_floor
             double hold_ceiling
-            double hold_settle
             double hold_live_bid
             double hold_display_bid
             str hold_base_asset
@@ -602,14 +601,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if self._hold_target_usd > 0.0:
                 hold_floor   = self._hold_target_usd - self._hold_band_usd
                 hold_ceiling = self._hold_target_usd + self._hold_band_usd
-                hold_settle  = max(15.0, self._hold_band_usd * 0.10)
                 lines.extend([
                     "",
                     f"  Hold-band guardrail:"
                     f"  target=${self._hold_target_usd:.0f}"
                     f"  band=±${self._hold_band_usd:.0f}"
-                    f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]"
-                    f"  settle=±${hold_settle:.0f}",
+                    f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]",
                 ])
                 try:
                     hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
@@ -1185,25 +1182,26 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Only meaningful when guardrail is enabled and cache is warm.
             if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
                 total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
-                settle_margin = max(15.0, self._hold_band_usd * 0.10)
+                hold_lower = self._hold_target_usd - self._hold_band_usd
+                hold_upper = self._hold_target_usd + self._hold_band_usd
 
                 if not self._hold_correction_active:
                     # Activate correction when position breaches the outer band.
-                    if (total_usd > self._hold_target_usd + self._hold_band_usd or
-                            total_usd < self._hold_target_usd - self._hold_band_usd):
+                    if total_usd > hold_upper or total_usd < hold_lower:
                         self._hold_correction_active = True
                         self.logger().info(
                             f"Hold-band: correction activated — total ${total_usd:.0f} "
-                            f"outside band [{self._hold_target_usd - self._hold_band_usd:.0f}, "
-                            f"{self._hold_target_usd + self._hold_band_usd:.0f}]")
+                            f"outside band [${hold_lower:.0f}, ${hold_upper:.0f}]")
                 else:
-                    # Deactivate only when position settles within the inner settle zone.
-                    if abs(total_usd - self._hold_target_usd) <= settle_margin:
+                    # Deactivate when back inside the band.
+                    # Overbought → complete as soon as we drop to upper bound or below.
+                    # Oversold  → complete as soon as we rise to lower bound or above.
+                    # Using band edges (not a tight settle zone) so one good arb trade is enough.
+                    if hold_lower <= total_usd <= hold_upper:
                         self._hold_correction_active = False
                         self.logger().info(
                             f"Hold-band: correction complete — total ${total_usd:.0f} "
-                            f"within settle zone (target ${self._hold_target_usd:.0f} "
-                            f"± ${settle_margin:.0f})")
+                            f"back inside band [${hold_lower:.0f}, ${hold_upper:.0f}]")
 
         except Exception as e:
             self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
