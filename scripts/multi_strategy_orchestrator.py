@@ -2314,6 +2314,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                       f"'control set hold_target {strategy_name} <usd>'")
                 return False
             strategy._hold_target_usd = target
+            # Immediately refresh the cache so _hold_correction_active is set without
+            # waiting up to 60 s for the next c_cleanup_old_orders cycle.
+            if hasattr(strategy, 'refresh_hold_cache'):
+                strategy.refresh_hold_cache()
             self.logger().info(f"Hold-band enabled for '{strategy_name}': target={target:.0f} USD "
                                f"band=±{strategy._hold_band_usd:.0f}")
             return True
@@ -2361,6 +2365,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy._hold_target_usd = target_usd
             # Mirror into instance config so enable_hold can restore it later
             strategy_instance.config['hold_target_usd'] = target_usd
+            # Immediately refresh so _hold_correction_active reflects new target.
+            if target_usd > 0.0 and hasattr(strategy, 'refresh_hold_cache'):
+                strategy.refresh_hold_cache()
             enabled_str = "enabled" if target_usd > 0.0 else "disabled (target=0)"
             self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' ({enabled_str})")
             return True
