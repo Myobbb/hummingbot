@@ -127,6 +127,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._cached_total_base_qty = 0.0
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
+        self._hold_correction_oversold = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -267,6 +268,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._cached_total_base_qty = 0.0
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
+        self._hold_correction_oversold = False
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -617,10 +619,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 if hold_display_bid > 0.0:
                     hold_total_usd = self._cached_total_base_qty * hold_display_bid
                     if self._hold_correction_active:
-                        if hold_total_usd > self._hold_target_usd:
-                            hold_direction = "REDUCING (overbought)"
-                        else:
+                        if self._hold_correction_oversold:
                             hold_direction = "BUILDING (oversold)"
+                        else:
+                            hold_direction = "REDUCING (overbought)"
                         hold_state = f"correcting → {hold_direction}"
                     else:
                         hold_state = "inside band"
@@ -1186,22 +1188,29 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_upper = self._hold_target_usd + self._hold_band_usd
 
                 if not self._hold_correction_active:
-                    # Activate correction when position breaches the outer band.
-                    if total_usd > hold_upper or total_usd < hold_lower:
+                    # Activate correction when position breaches the outer band; record direction.
+                    if total_usd < hold_lower:
                         self._hold_correction_active = True
+                        self._hold_correction_oversold = True
                         self.logger().info(
-                            f"Hold-band: correction activated — total ${total_usd:.0f} "
-                            f"outside band [${hold_lower:.0f}, ${hold_upper:.0f}]")
+                            f"Hold-band: correction activated (oversold) — total ${total_usd:.0f} "
+                            f"below band floor ${hold_lower:.0f}")
+                    elif total_usd > hold_upper:
+                        self._hold_correction_active = True
+                        self._hold_correction_oversold = False
+                        self.logger().info(
+                            f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
+                            f"above band ceiling ${hold_upper:.0f}")
                 else:
-                    # Deactivate when back inside the band.
-                    # Overbought → complete as soon as we drop to upper bound or below.
-                    # Oversold  → complete as soon as we rise to lower bound or above.
-                    # Using band edges (not a tight settle zone) so one good arb trade is enough.
-                    if hold_lower <= total_usd <= hold_upper:
+                    # Deactivate when position reaches target from the correcting direction.
+                    # Oversold: stop buying once total >= target (reached center, don't overbuy).
+                    # Overbought: stop selling once total <= target (reached center, don't oversell).
+                    if ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
+                            (not self._hold_correction_oversold and total_usd <= self._hold_target_usd)):
                         self._hold_correction_active = False
                         self.logger().info(
                             f"Hold-band: correction complete — total ${total_usd:.0f} "
-                            f"back inside band [${hold_lower:.0f}, ${hold_upper:.0f}]")
+                            f"reached target ${self._hold_target_usd:.0f}")
 
         except Exception as e:
             self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
