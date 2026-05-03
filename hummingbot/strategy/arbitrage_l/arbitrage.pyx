@@ -1159,7 +1159,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         key = ((<object>mt).market, (<object>mt).base_asset)
                         if key not in checked:
                             checked.add(key)
-                            total += float((<object>mt).market.c_get_available_balance((<object>mt).base_asset))
+                            mkt = (<object>mt).market
+                            if hasattr(mkt, 'c_get_available_balance'):
+                                total += float(mkt.c_get_available_balance((<object>mt).base_asset))
+                            else:
+                                total += float(mkt.get_available_balance((<object>mt).base_asset))
             self._cached_total_base_qty = total
 
             # Mid-price: try each market tuple until we get a non-zero value.
