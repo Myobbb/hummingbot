@@ -2292,6 +2292,23 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     # ── Hold-band guardrail control ───────────────────────────────────────────
 
+    def _persist_hold_config(self, strategy_name: str, updates: dict):
+        """Write hold-band field updates to the YAML config file."""
+        if not self.config.config_file_path:
+            return
+        try:
+            config_path = Path(self.config.config_file_path)
+            with open(config_path, 'r') as f:
+                yaml_data = yaml.safe_load(f)
+            for strat_config in yaml_data.get('arbitrage_m_strategies', []):
+                if strat_config.get('name') == strategy_name:
+                    strat_config.update(updates)
+                    break
+            with open(config_path, 'w') as f:
+                yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        except Exception as e:
+            self.logger().warning(f"Failed to persist hold config for '{strategy_name}': {e}")
+
     def enable_hold_by_identifier(self, identifier: str) -> bool:
         """Enable hold-band guardrail for a strategy (restores last configured target)."""
         strategy_name = self._resolve_identifier_to_name(identifier)
@@ -2314,6 +2331,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                       f"'control set hold_target {strategy_name} <usd>'")
                 return False
             strategy._hold_target_usd = target
+            strategy_instance.config['hold_target_usd'] = target
+            self._persist_hold_config(strategy_name, {'hold_target_usd': target, 'hold_target_enabled': True})
             # Immediately refresh the cache so _hold_correction_active is set without
             # waiting up to 60 s for the next c_cleanup_old_orders cycle.
             if hasattr(strategy, 'refresh_hold_cache'):
@@ -2342,6 +2361,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy._hold_target_usd = 0.0
             if hasattr(strategy, '_hold_correction_active'):
                 strategy._hold_correction_active = False
+            self._persist_hold_config(strategy_name, {'hold_target_enabled': False})
             self.logger().info(f"Hold-band disabled for '{strategy_name}'")
             return True
         except Exception as e:
@@ -2365,6 +2385,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy._hold_target_usd = target_usd
             # Mirror into instance config so enable_hold can restore it later
             strategy_instance.config['hold_target_usd'] = target_usd
+            persist = {'hold_target_usd': target_usd}
+            if target_usd > 0.0:
+                persist['hold_target_enabled'] = True
+            self._persist_hold_config(strategy_name, persist)
             # Immediately refresh so _hold_correction_active reflects new target.
             if target_usd > 0.0 and hasattr(strategy, 'refresh_hold_cache'):
                 strategy.refresh_hold_cache()
@@ -2391,6 +2415,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 return False
             strategy._hold_band_usd = band_usd
             strategy_instance.config['hold_band_usd'] = band_usd
+            self._persist_hold_config(strategy_name, {'hold_band_usd': band_usd})
             self.logger().info(f"Hold-band half-width set to ±{band_usd:.0f} USD for '{strategy_name}'")
             return True
         except Exception as e:
