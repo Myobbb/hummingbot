@@ -1275,6 +1275,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info("Markets ready. Trading started.")
         self.logger().info("=" * 70)
 
+        # Warm hold-band cache for all strategies that have it enabled.
+        # Must run after markets are ready so balances and order books are available.
+        for si in self.strategies:
+            try:
+                strat = si.strategy
+                if (hasattr(strat, '_hold_target_usd') and
+                        float(strat._hold_target_usd) > 0.0 and
+                        hasattr(strat, 'refresh_hold_cache')):
+                    strat.refresh_hold_cache()
+            except Exception as e:
+                self.logger().warning(f"Hold-band cache warm-up failed for '{si.name}': {e}")
+
     def _start_all_strategies_if_needed(self):
         """
         Start all V1 strategies with the clock.
