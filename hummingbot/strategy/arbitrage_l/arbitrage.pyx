@@ -1173,6 +1173,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 pass  # keep stale value
 
             # ── Hysteresis: update correction flag ───────────────────────────────
+            self.logger().info(
+                f"Hold-band cache refresh: base={self._cached_total_base_qty:.4f} "
+                f"mid={self._cached_mid_price_usd:.6f} target={self._hold_target_usd:.0f} "
+                f"active={self._hold_correction_active}")
             # Only meaningful when guardrail is enabled and cache is warm.
             if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
                 total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
@@ -1196,8 +1200,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             f"within settle zone (target ${self._hold_target_usd:.0f} "
                             f"± ${settle_margin:.0f})")
 
-        except Exception:
-            pass  # never crash cleanup on a cache miss
+        except Exception as e:
+            self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
 
     def refresh_hold_cache(self):
         """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
