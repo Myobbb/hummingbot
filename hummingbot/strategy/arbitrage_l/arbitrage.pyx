@@ -543,6 +543,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object best_pair = None
             list prof_lines = []
             tuple key
+            # Hold-band display locals
+            double hold_total_usd
+            double hold_floor
+            double hold_ceiling
+            double hold_settle
+            str hold_direction
+            str hold_state
 
         try:
             # Aggregate unique market tuples across all ordered pairs
@@ -587,6 +594,32 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Position balancer status (delegate to handler)
             if self._position_balancer is not None:
                 lines.extend(self._position_balancer.get_status_lines(unique_tuples, balance_map))
+
+            # Hold-band guardrail status
+            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
+                hold_total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+                hold_floor     = self._hold_target_usd - self._hold_band_usd
+                hold_ceiling   = self._hold_target_usd + self._hold_band_usd
+                hold_settle    = max(15.0, self._hold_band_usd * 0.10)
+                if self._hold_correction_active:
+                    if hold_total_usd > self._hold_target_usd:
+                        hold_direction = "REDUCING (overbought)"
+                    else:
+                        hold_direction = "BUILDING (oversold)"
+                    hold_state = f"correcting → {hold_direction}"
+                else:
+                    hold_state = "inside band"
+                lines.extend([
+                    "",
+                    f"  Hold-band guardrail: target=${self._hold_target_usd:.0f}"
+                    f"  band=±${self._hold_band_usd:.0f}"
+                    f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]"
+                    f"  settle=±${hold_settle:.0f}",
+                    f"    total=${hold_total_usd:.2f}"
+                    f"  base={self._cached_total_base_qty:.6f}"
+                    f"  mid=${self._cached_mid_price_usd:.4f}"
+                    f"  status={hold_state}",
+                ])
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
@@ -1159,6 +1192,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         except Exception:
             pass  # never crash cleanup on a cache miss
+
+    def refresh_hold_cache(self):
+        """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
+        self.c_refresh_hold_cache()
 
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
