@@ -674,7 +674,7 @@ class ArbitrageMInstanceConfig(BaseModel):
     # Hold-band guardrail — caps arb order size to keep total asset value near a target.
     # Disabled by default so existing configs load without change.
     hold_target_enabled: bool = Field(
-        default=True,
+        default=False,
         description="Enable hold-band guardrail (caps arb size to keep total holding near target)"
     )
     hold_target_usd: float = Field(
@@ -3435,6 +3435,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 min_profitability=Decimal(str(min_profitability)),
                 buy_in_enabled=True,
                 buy_in_target_usd=1100.0,
+                hold_target_enabled=True,
+                hold_target_usd=1100.0,
+                hold_band_usd=150.0,
                 additional_markets=additional_list
             )
 
