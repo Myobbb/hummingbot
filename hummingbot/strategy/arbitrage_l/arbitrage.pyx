@@ -1162,15 +1162,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             total += float((<object>mt).market.c_get_available_balance((<object>mt).base_asset))
             self._cached_total_base_qty = total
 
-            # Mid-price from the primary connector of the first pair.
-            try:
-                mid = float((<object>self._market_pairs[0]).first.market.get_mid_price(
-                    (<object>self._market_pairs[0]).first.trading_pair))
-                if mid > 0.0:
-                    self._cached_mid_price_usd = mid
-                # If mid == 0 keep the previous cached value — do not zero out unexpectedly.
-            except Exception:
-                pass  # keep stale value
+            # Mid-price: try each market tuple until we get a non-zero value.
+            for mp in self._market_pairs:
+                for mt in [(<object>mp).first, (<object>mp).second]:
+                    try:
+                        mid = float((<object>mt).market.get_mid_price((<object>mt).trading_pair))
+                        if mid > 0.0:
+                            self._cached_mid_price_usd = mid
+                            break
+                    except Exception:
+                        pass
+                if self._cached_mid_price_usd > 0.0:
+                    break
 
             # ── Hysteresis: update correction flag ───────────────────────────────
             self.logger().info(
