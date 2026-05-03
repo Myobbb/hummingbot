@@ -1193,11 +1193,25 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
                             f"above band ceiling ${hold_upper:.0f}")
                 else:
+                    # Direction flip: if target changed and total is now outside the band on the
+                    # opposite side (e.g. was overbought at $1321 with target=1100, target raised
+                    # to 2100 making $1321 < floor $1950 → now oversold), switch direction so the
+                    # guardrail corrects correctly instead of staying stuck.
+                    if total_usd < hold_lower and not self._hold_correction_oversold:
+                        self._hold_correction_oversold = True
+                        self.logger().info(
+                            f"Hold-band: direction switched to oversold — total ${total_usd:.0f} "
+                            f"below new band floor ${hold_lower:.0f}")
+                    elif total_usd > hold_upper and self._hold_correction_oversold:
+                        self._hold_correction_oversold = False
+                        self.logger().info(
+                            f"Hold-band: direction switched to overbought — total ${total_usd:.0f} "
+                            f"above new band ceiling ${hold_upper:.0f}")
                     # Deactivate once inside band AND crossed back through target center.
                     # Oversold correction: total must reach [target, upper] — i.e. $1100–$1250.
                     # Overbought correction: total must reach [lower, target] — i.e. $950–$1100.
                     # The inside-band check prevents false-positive on price spikes past the far band.
-                    if (hold_lower <= total_usd <= hold_upper and
+                    elif (hold_lower <= total_usd <= hold_upper and
                             ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
                              (not self._hold_correction_oversold and total_usd <= self._hold_target_usd))):
                         self._hold_correction_active = False
