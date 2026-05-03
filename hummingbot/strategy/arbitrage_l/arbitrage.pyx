@@ -1202,11 +1202,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
                             f"above band ceiling ${hold_upper:.0f}")
                 else:
-                    # Deactivate when position reaches target from the correcting direction.
-                    # Oversold: stop buying once total >= target (reached center, don't overbuy).
-                    # Overbought: stop selling once total <= target (reached center, don't oversell).
-                    if ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
-                            (not self._hold_correction_oversold and total_usd <= self._hold_target_usd)):
+                    # Deactivate once inside band AND crossed back through target center.
+                    # Oversold correction: total must reach [target, upper] — i.e. $1100–$1250.
+                    # Overbought correction: total must reach [lower, target] — i.e. $950–$1100.
+                    # The inside-band check prevents false-positive on price spikes past the far band.
+                    if (hold_lower <= total_usd <= hold_upper and
+                            ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
+                             (not self._hold_correction_oversold and total_usd <= self._hold_target_usd))):
                         self._hold_correction_active = False
                         self.logger().info(
                             f"Hold-band: correction complete — total ${total_usd:.0f} "
