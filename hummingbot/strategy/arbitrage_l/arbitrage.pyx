@@ -553,7 +553,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double hold_display_bid
             str hold_base_asset
             str hold_direction
-            str hold_state
 
         try:
             # Aggregate unique market tuples across all ordered pairs
@@ -599,17 +598,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if self._position_balancer is not None:
                 lines.extend(self._position_balancer.get_status_lines(unique_tuples, balance_map))
 
-            # Hold-band guardrail status (shown whenever enabled, even before cache warms)
-            if self._hold_target_usd > 0.0:
+            # Hold-band guardrail status (only shown when actively correcting)
+            if self._hold_target_usd > 0.0 and self._hold_correction_active:
                 hold_floor   = self._hold_target_usd - self._hold_band_usd
                 hold_ceiling = self._hold_target_usd + self._hold_band_usd
-                lines.extend([
-                    "",
-                    f"  Hold-band guardrail:"
-                    f"  target=${self._hold_target_usd:.0f}"
-                    f"  band=±${self._hold_band_usd:.0f}"
-                    f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]",
-                ])
                 try:
                     hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
                     hold_live_bid = self.c_get_reference_bid_for_asset(hold_base_asset)
@@ -618,22 +610,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_display_bid = hold_live_bid if hold_live_bid > 0.0 else self._cached_mid_price_usd
                 if hold_display_bid > 0.0:
                     hold_total_usd = self._cached_total_base_qty * hold_display_bid
-                    if self._hold_correction_active:
-                        if self._hold_correction_oversold:
-                            hold_direction = "BUILDING (oversold)"
-                        else:
-                            hold_direction = "REDUCING (overbought)"
-                        hold_state = f"correcting → {hold_direction}"
+                    if self._hold_correction_oversold:
+                        hold_direction = "BUILDING (oversold)"
                     else:
-                        hold_state = "inside band"
-                    lines.append(
+                        hold_direction = "REDUCING (overbought)"
+                    lines.extend([
+                        "",
+                        f"  Hold-band guardrail:"
+                        f"  target=${self._hold_target_usd:.0f}"
+                        f"  band=±${self._hold_band_usd:.0f}"
+                        f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]",
                         f"    total=${hold_total_usd:.2f}"
                         f"  base={self._cached_total_base_qty:.6f}"
                         f"  bid=${hold_display_bid:.4f}"
-                        f"  status={hold_state}"
-                    )
-                else:
-                    lines.append("    (cache warming — waiting for first price tick)")
+                        f"  correcting → {hold_direction}",
+                    ])
 
             # Pending orders
             if self.tracked_limit_orders or self.tracked_market_orders:
