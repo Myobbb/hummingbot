@@ -4182,6 +4182,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # One-line per strategy; collect optional sections for the bottom
         buyin_sections = []
+        hold_sections = []
 
         # Collect row data first to compute column widths for aligned output
         rows: List[Dict[str, str]] = []
@@ -4238,6 +4239,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 bi_lines = self._extract_buyin_lines(status_blob)
                 if bi_lines:
                     buyin_sections.append((strategy_name, bi_lines))
+                hd_lines = self._extract_hold_lines(status_blob)
+                if hd_lines:
+                    hold_sections.append((strategy_name, hd_lines))
 
         if rows:
             # Calculate max widths
@@ -4256,6 +4260,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             for name, blines in buyin_sections:
                 lines.append(f"  {name}:")
                 lines.extend([f"    {ln}" for ln in blines])
+
+        if hold_sections:
+            lines.append("\nHold-band guardrail active:")
+            for name, hlines in hold_sections:
+                lines.append(f"  {name}:")
+                lines.extend([f"    {ln}" for ln in hlines])
 
         # Pending Orders (aggregated across all strategies)
         pending_orders_info = self._get_pending_orders_summary()
@@ -4460,6 +4470,28 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                    f"min_prof={val:.1f}%", s)
                 except Exception:
                     pass
+                out.append(s)
+                collecting = True
+                continue
+            if collecting:
+                if raw.startswith("    ") and s:
+                    out.append(s)
+                    continue
+                if out:
+                    break
+        return out
+
+    def _extract_hold_lines(self, status_blob: str) -> List[str]:
+        """Extract hold-band guardrail lines from a strategy's format_status output.
+        Returns [] when hold-band is disabled or cache not yet warm."""
+        if not status_blob:
+            return []
+        raw_lines = status_blob.split("\n")
+        out: List[str] = []
+        collecting = False
+        for raw in raw_lines:
+            s = raw.strip()
+            if s.startswith("Hold-band guardrail:"):
                 out.append(s)
                 collecting = True
                 continue
