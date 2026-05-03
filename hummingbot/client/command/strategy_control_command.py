@@ -281,14 +281,15 @@ class StrategyControlCommand:
                     if 'win_rate' in stats:
                         self.notify(f"   Win Rate: {stats['win_rate']:.1f}%")
 
-                # Show hold-band guardrail state
+                # Show hold-band guardrail state (only for strategies that support it)
                 hold_target = info.get('hold_target')
                 hold_band = info.get('hold_band')
-                if hold_target is not None:
-                    self.notify(f"   Hold: target=${hold_target:.0f} band=±${hold_band:.0f} "
-                                f"(range ${hold_target - hold_band:.0f}–${hold_target + hold_band:.0f})")
-                else:
-                    self.notify(f"   Hold: disabled")
+                if 'hold_target' in info:
+                    if hold_target is not None:
+                        self.notify(f"   Hold: target=${hold_target:.0f} band=±${hold_band:.0f} "
+                                    f"(range ${hold_target - hold_band:.0f}–${hold_target + hold_band:.0f})")
+                    else:
+                        self.notify(f"   Hold: disabled")
 
             self.notify("\n" + "=" * 80)
             self.notify("\nCommands:")
