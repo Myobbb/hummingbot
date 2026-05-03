@@ -548,6 +548,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double hold_floor
             double hold_ceiling
             double hold_settle
+            double hold_live_bid
+            double hold_display_bid
+            str hold_base_asset
             str hold_direction
             str hold_state
 
@@ -608,8 +611,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]"
                     f"  settle=±${hold_settle:.0f}",
                 ])
-                if self._cached_mid_price_usd > 0.0:
-                    hold_total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+                try:
+                    hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
+                    hold_live_bid = self.c_get_reference_bid_for_asset(hold_base_asset)
+                except Exception:
+                    hold_live_bid = 0.0
+                hold_display_bid = hold_live_bid if hold_live_bid > 0.0 else self._cached_mid_price_usd
+                if hold_display_bid > 0.0:
+                    hold_total_usd = self._cached_total_base_qty * hold_display_bid
                     if self._hold_correction_active:
                         if hold_total_usd > self._hold_target_usd:
                             hold_direction = "REDUCING (overbought)"
@@ -621,7 +630,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     lines.append(
                         f"    total=${hold_total_usd:.2f}"
                         f"  base={self._cached_total_base_qty:.6f}"
-                        f"  bid=${self._cached_mid_price_usd:.4f}"
+                        f"  bid=${hold_display_bid:.4f}"
                         f"  status={hold_state}"
                     )
                 else:
