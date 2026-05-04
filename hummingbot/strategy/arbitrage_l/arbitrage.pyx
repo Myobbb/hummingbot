@@ -1126,21 +1126,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
         Refresh cached total base quantity and mid-price used by the hold-band guardrail.
         Also updates the hysteresis flag (_hold_correction_active).
 
-        Called from c_cleanup_old_orders (~60 s interval) — never on the hot arb path.
+        Called from c_cleanup_old_orders (~60 s interval, handles activation) and
+        c_handle_order_completion (only while _hold_correction_active, handles fast deactivation).
+        Never on the hot arb path.
         Uses the same balance-aggregation pattern as PositionBalancerHandler so the two
         systems see a consistent view of holdings.
 
         Hysteresis logic:
           - Flag set True  when total_usd crosses outside the outer band (target ± band).
-          - Flag cleared   when total_usd returns within the settle zone (target ± settle),
-            where settle = max(15.0, band * 0.10).  This prevents oscillation near the
-            band boundary without adding a new config parameter.
+          - Flag cleared   when total_usd crosses back through target center from the
+            correcting direction (oversold: at total >= target; overbought: at total <= target).
         """
         cdef:
             double total = 0.0
             double bid = 0.0
             double total_usd = 0.0
-            double settle_margin = 0.0
             object mp, mt, key
             str base_asset
             set checked
@@ -1149,18 +1149,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
 
         try:
-            # Balance: same pattern as PositionBalancerHandler.c_get_aggregated_base_balance —
-            # de-duplicate by (market, base_asset), call get_available_balance (Python method,
-            # works for all connector types without hasattr dance).
+            # Balance: delegate to PositionBalancerHandler.c_get_aggregated_base_balance when
+            # available — it handles NODE/NODEOPS-style alias pairs (same asset, different tickers
+            # on different exchanges) and de-duplicates by (market, base_asset).
+            # Fall back to a direct scan when no position balancer is present.
             base_asset = (<object>self._market_pairs[0]).first.base_asset
-            checked = set()
-            for mp in self._market_pairs:
-                for mt in [(<object>mp).first, (<object>mp).second]:
-                    if (<object>mt).base_asset == base_asset:
-                        key = ((<object>mt).market, (<object>mt).base_asset)
-                        if key not in checked:
-                            checked.add(key)
-                            total += float((<object>mt).market.get_available_balance((<object>mt).base_asset))
+            if self._position_balancer is not None:
+                total = self._position_balancer.c_get_aggregated_base_balance(base_asset)
+            else:
+                checked = set()
+                for mp in self._market_pairs:
+                    for mt in [(<object>mp).first, (<object>mp).second]:
+                        if (<object>mt).base_asset == base_asset:
+                            key = ((<object>mt).market, (<object>mt).base_asset)
+                            if key not in checked:
+                                checked.add(key)
+                                total += float((<object>mt).market.get_available_balance((<object>mt).base_asset))
             self._cached_total_base_qty = total
 
             # Price: same source as PositionBalancerHandler — top-of-book bid via C++ order book
@@ -1462,12 +1466,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Keep total asset value near hold_target_usd by adjusting each arb leg
         # independently using a delta approach with hysteresis.
         #
-        # State machine (updated every 60 s in c_refresh_hold_cache):
+        # State machine (updated in c_refresh_hold_cache — every 60 s + after each trade):
         #   _hold_correction_active = False  →  inside band, no intervention.
         #   _hold_correction_active = True   →  outside outer band, correcting.
-        #     Deactivates only when total enters the inner settle zone (target ± settle),
-        #     where settle = max($15, band×10%).  This prevents toggling on/off near
-        #     the boundary due to price noise.
+        #     Deactivates when total crosses back through target center from the correcting
+        #     direction (oversold: deactivates at total >= target; overbought: at total <= target).
         #
         # When correcting:
         #   Overbought (total > target + band):
@@ -1797,6 +1800,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Cleanup position balancer tracking (delegated to handler)
             if self._position_balancer is not None:
                 self._position_balancer.handle_order_completion(order_id, is_buy)
+
+            # Refresh hold-band cache after each trade only while a correction is in progress.
+            # The 60s cycle handles activation (band breach detection); this handles deactivation
+            # fast enough so back-to-back trades (position balancer, rapid arb) don't overshoot.
+            if self._hold_correction_active:
+                self.c_refresh_hold_cache()
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
