@@ -1446,7 +1446,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Declarations for quantization and safety caps
             object quantized_buy
             object quantized_sell
-            object quantized_amount
             double sell_available_now
             object sell_cap_dec
             object quantized_sell_cap
@@ -1550,115 +1549,96 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object sell_price_decimal = Decimal.from_float(sell_price)
         
         # Quantize using the larger of the two leg amounts as the capacity reference.
-        # The per-leg Decimal amounts are derived just before order placement below.
-        # Safety caps (balance checks) use the larger leg — conservative and correct.
+        # This gives the exchange-rounded ceiling that both legs are then capped against.
         cdef double safe_amount_float = max(0.0, max(_hold_buy_amount, _hold_sell_amount) - QUANTIZATION_EPSILON)
         cdef object dec_safe_amount = Decimal.from_float(safe_amount_float)
 
         quantized_buy  = self.c_safe_quantize_order_amount(buy_market,  buy_market_tuple.trading_pair,  dec_safe_amount, buy_price_decimal)
         quantized_sell = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, dec_safe_amount, sell_price_decimal)
-        quantized_amount = min(quantized_buy, quantized_sell)
-        
-        # Safety cap: re-check sell venue's live available base to prevent overselling at submission time.
-        # Use _hold_sell_amount as the reference — base is only consumed by the sell leg.
-        # When sell is suppressed (oversold, _hold_sell_amount==0) skip the check entirely
-        # so a low base balance cannot incorrectly shrink the buy-leg quantized_amount.
-        sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
 
-        # Compare against _hold_sell_amount, not quantized_amount: the sell leg will only
-        # consume _hold_sell_amount base, so that is the relevant threshold for the cap.
+        # Per-leg caps: each leg has its own ceiling so a balance constraint on one
+        # leg never reduces the other. When the guardrail is inactive both amounts
+        # equal `amount` and the legs stay in sync as before.
+        cdef object quantized_amount_buy  = min(quantized_buy, quantized_sell)
+        cdef object quantized_amount_sell = min(quantized_buy, quantized_sell)
+
+        # Safety cap — sell venue base balance.
+        # Only the sell leg consumes base; when sell is fully suppressed (_hold_sell_amount==0)
+        # skip entirely so a zero base balance cannot shrink the buy cap.
+        sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if _hold_sell_amount > 0.0 and sell_available_now + 1e-15 < _hold_sell_amount:
             sell_cap_dec = Decimal.from_float(max(0.0, sell_available_now - QUANTIZATION_EPSILON))
-
             quantized_sell_cap = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_cap_dec, sell_price_decimal)
+            if quantized_sell_cap is not None:
+                # Sell is base-limited: cap sell leg directly.
+                quantized_amount_sell = min(quantized_amount_sell, quantized_sell_cap)
+                # Only propagate to buy if buy is also the full leg (no guardrail or sell is reduced).
+                # When buy is the full arb leg, we must not buy more than we can sell.
+                if _hold_buy_amount >= _hold_sell_amount:
+                    dec_eps = Decimal("1e-12")
+                    buy_req = quantized_sell_cap - dec_eps if quantized_sell_cap > dec_eps else Decimal("0")
+                    quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
+                    if quantized_buy_cap is not None:
+                        quantized_amount_buy = min(quantized_amount_buy, quantized_buy_cap)
 
-            # Re-quantize buy side to the capped amount
-            if quantized_sell_cap is None:
-                buy_req = Decimal("0")
-            else:
-                buy_req = quantized_sell_cap
-
-            # Ensure epsilon safety for buy side
-            dec_eps = Decimal("1e-12")
-            if buy_req > dec_eps:
-                buy_req = buy_req - dec_eps
-            else:
-                buy_req = Decimal("0")
-
-            quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
-            quantized_amount = min(quantized_amount, quantized_sell_cap, quantized_buy_cap)
-
-        # Symmetric safety cap on buy venue: ensure we do not exceed current quote availability.
-        # Use _hold_buy_amount as the reference — quote is only consumed by the buy leg.
-        # When buy is suppressed (overbought, _hold_buy_amount==0) skip the check entirely
-        # so a low quote balance cannot incorrectly shrink the sell-leg quantized_amount.
+        # Safety cap — buy venue quote balance.
+        # Only the buy leg consumes quote; when buy is fully suppressed (_hold_buy_amount==0)
+        # skip entirely so a zero quote balance cannot shrink the sell cap.
         buy_quote_available_now = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset))
         buy_required_quote = _hold_buy_amount * buy_price
-
         if _hold_buy_amount > 0.0 and buy_quote_available_now + 1e-15 < buy_required_quote:
-            # Reduce to affordable base amount and re-quantize both sides accordingly
-            affordable_base = 0.0
-            if buy_price > 0.0:
-                affordable_base = max(0.0, buy_quote_available_now / buy_price)
-
-            # OPTIMIZATION: Use Decimal.from_float
+            affordable_base = max(0.0, buy_quote_available_now / buy_price) if buy_price > 0.0 else 0.0
             affordable_dec = Decimal.from_float(max(0.0, affordable_base - QUANTIZATION_EPSILON))
-
             q_buy2 = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, affordable_dec, buy_price_decimal)
+            if q_buy2 is not None:
+                # Buy is quote-limited: cap buy leg directly.
+                quantized_amount_buy = min(quantized_amount_buy, q_buy2)
+                # Only propagate to sell if sell is also the full leg (no guardrail or buy is reduced).
+                # When sell is the full arb leg, we must not sell more than we can buy.
+                if _hold_sell_amount >= _hold_buy_amount:
+                    sell_req2 = q_buy2
+                    q_sell2 = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_req2, sell_price_decimal)
+                    if q_sell2 is not None:
+                        quantized_amount_sell = min(quantized_amount_sell, q_sell2)
 
-            # Align sell side to the reduced buy size
-            sell_req2 = q_buy2 if q_buy2 is not None else Decimal("0")
-            q_sell2 = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_req2, sell_price_decimal)
-
-            # Handle potential None from quantization
-            if q_buy2 is not None and q_sell2 is not None:
-                quantized_amount = min(quantized_amount, q_buy2, q_sell2)
-            elif q_buy2 is not None:
-                quantized_amount = min(quantized_amount, q_buy2)
-            elif q_sell2 is not None:
-                quantized_amount = min(quantized_amount, q_sell2)
-
-        # Apply max_order_size cap from trading rules
+        # Apply max_order_size cap from trading rules (per-leg, same reasoning).
         try:
-            buy_trading_rule = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
+            buy_trading_rule  = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
             sell_trading_rule = sell_market._trading_rules.get(sell_market_tuple.trading_pair)
             if buy_trading_rule is not None and buy_trading_rule.max_order_size > Decimal("0"):
-                if quantized_amount > buy_trading_rule.max_order_size:
-                    quantized_amount = min(quantized_amount, buy_trading_rule.max_order_size)
+                quantized_amount_buy  = min(quantized_amount_buy,  buy_trading_rule.max_order_size)
             if sell_trading_rule is not None and sell_trading_rule.max_order_size > Decimal("0"):
-                if quantized_amount > sell_trading_rule.max_order_size:
-                    quantized_amount = min(quantized_amount, sell_trading_rule.max_order_size)
+                quantized_amount_sell = min(quantized_amount_sell, sell_trading_rule.max_order_size)
         except Exception:
-            pass  # Fail gracefully if trading rules unavailable; balance caps already applied
+            pass
 
         # ── Per-leg final amounts ─────────────────────────────────────────────────
-        # Convert float hold amounts to quantized Decimals capped by quantized_amount
-        # (which embeds all balance safety checks).  When guardrail is inactive both
-        # hold amounts equal `amount` so both finals equal quantized_amount — no
-        # behavioural change from the original single-amount path.
+        # Each leg is capped by its own ceiling (quantized_amount_buy / _sell).
+        # When the guardrail is inactive both amounts equal `amount` and both ceilings
+        # are identical, so behaviour is unchanged from the original single-cap path.
         if _hold_buy_amount <= 0.0:
             _final_buy_qty = Decimal("0")
-        elif _hold_buy_amount >= float(quantized_amount):
-            _final_buy_qty = quantized_amount
+        elif _hold_buy_amount >= float(quantized_amount_buy):
+            _final_buy_qty = quantized_amount_buy
         else:
             _final_buy_qty = self.c_safe_quantize_order_amount(
                 buy_market, buy_market_tuple.trading_pair,
                 Decimal.from_float(max(0.0, _hold_buy_amount - QUANTIZATION_EPSILON)),
                 buy_price_decimal) or Decimal("0")
-            if _final_buy_qty > quantized_amount:
-                _final_buy_qty = quantized_amount
+            if _final_buy_qty > quantized_amount_buy:
+                _final_buy_qty = quantized_amount_buy
 
         if _hold_sell_amount <= 0.0:
             _final_sell_qty = Decimal("0")
-        elif _hold_sell_amount >= float(quantized_amount):
-            _final_sell_qty = quantized_amount
+        elif _hold_sell_amount >= float(quantized_amount_sell):
+            _final_sell_qty = quantized_amount_sell
         else:
             _final_sell_qty = self.c_safe_quantize_order_amount(
                 sell_market, sell_market_tuple.trading_pair,
                 Decimal.from_float(max(0.0, _hold_sell_amount - QUANTIZATION_EPSILON)),
                 sell_price_decimal) or Decimal("0")
-            if _final_sell_qty > quantized_amount:
-                _final_sell_qty = quantized_amount
+            if _final_sell_qty > quantized_amount_sell:
+                _final_sell_qty = quantized_amount_sell
 
         # Both legs suppressed → skip entirely and undo cooldown stamp.
         if _final_buy_qty <= Decimal("0") and _final_sell_qty <= Decimal("0"):
