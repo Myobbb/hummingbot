@@ -99,6 +99,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _cached_mid_price_usd     # top-of-book bid (same source as position balancer); refreshed every 60 s
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
+        int  _hold_breach_count          # consecutive 60s-cycle readings outside band before activation
         
         # Optimization: Reusable vector to avoid heap allocation in hot loop
         vector[ArbOpportunity] _reusable_arb_opps

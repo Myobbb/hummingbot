@@ -128,6 +128,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
         self._hold_correction_oversold = False
+        self._hold_breach_count = 0
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -269,6 +270,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
         self._hold_correction_oversold = False
+        self._hold_breach_count = 0
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -1183,19 +1185,41 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_upper = self._hold_target_usd + self._hold_band_usd
 
                 if not self._hold_correction_active:
-                    # Activate correction when position breaches the outer band; record direction.
+                    # Require two consecutive 60s-cycle readings outside the band before activating.
+                    # This prevents a false trigger when one arb leg completes (sell side lands,
+                    # buy side still pending) — the imbalance is temporary and self-correcting.
+                    # Per-trade refresh never runs this branch (only fires when already active).
                     if total_usd < hold_lower:
-                        self._hold_correction_active = True
-                        self._hold_correction_oversold = True
-                        self.logger().info(
-                            f"Hold-band: correction activated (oversold) — total ${total_usd:.0f} "
-                            f"below band floor ${hold_lower:.0f}")
+                        self._hold_breach_count += 1
+                        if self._hold_breach_count >= 2:
+                            self._hold_correction_active = True
+                            self._hold_correction_oversold = True
+                            self._hold_breach_count = 0
+                            self.logger().info(
+                                f"Hold-band: correction activated (oversold) — total ${total_usd:.0f} "
+                                f"below band floor ${hold_lower:.0f}")
+                        else:
+                            self.logger().info(
+                                f"Hold-band: breach pending confirmation (oversold) — "
+                                f"total ${total_usd:.0f} below floor ${hold_lower:.0f} "
+                                f"({self._hold_breach_count}/2)")
                     elif total_usd > hold_upper:
-                        self._hold_correction_active = True
-                        self._hold_correction_oversold = False
-                        self.logger().info(
-                            f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
-                            f"above band ceiling ${hold_upper:.0f}")
+                        self._hold_breach_count += 1
+                        if self._hold_breach_count >= 2:
+                            self._hold_correction_active = True
+                            self._hold_correction_oversold = False
+                            self._hold_breach_count = 0
+                            self.logger().info(
+                                f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
+                                f"above band ceiling ${hold_upper:.0f}")
+                        else:
+                            self.logger().info(
+                                f"Hold-band: breach pending confirmation (overbought) — "
+                                f"total ${total_usd:.0f} above ceiling ${hold_upper:.0f} "
+                                f"({self._hold_breach_count}/2)")
+                    else:
+                        # Back inside band — reset counter so a brief spike doesn't accumulate.
+                        self._hold_breach_count = 0
                 else:
                     # Direction flip: if target changed and total is now outside the band on the
                     # opposite side (e.g. was overbought at $1321 with target=1100, target raised
