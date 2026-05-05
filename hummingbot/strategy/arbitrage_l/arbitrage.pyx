@@ -1226,14 +1226,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self._hold_correction_active = False
                         self._hold_breach_count = 0
                         self.logger().info(
-                            f"Hold-band: guardrail suspended — venue balance ${min_venue_usd_val:.2f} "
+                            f"Hold-band [{base_asset}]: guardrail suspended — venue balance ${min_venue_usd_val:.2f} "
                             f"< threshold ${LOW_BALANCE_SUSPEND_USD:.0f} (transfer in progress or dust)")
                     return  # Skip hysteresis entirely this cycle
                 elif self._hold_low_balance_suspend:
                     # All venues recovered — lift suspend, let normal hysteresis resume next cycle
                     self._hold_low_balance_suspend = False
                     self.logger().info(
-                        f"Hold-band: low-balance suspend lifted — min venue ${min_venue_usd_val:.2f} "
+                        f"Hold-band [{base_asset}]: low-balance suspend lifted — min venue ${min_venue_usd_val:.2f} "
                         f">= threshold ${LOW_BALANCE_SUSPEND_USD:.0f}")
 
             # ── Hysteresis: update correction flag ───────────────────────────────
