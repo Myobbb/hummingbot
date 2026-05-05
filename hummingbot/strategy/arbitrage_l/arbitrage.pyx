@@ -1544,40 +1544,29 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
 
         # ── Hold-band guardrail ───────────────────────────────────────────────────
-        # Keep total asset value near hold_target_usd by adjusting each arb leg
-        # independently using a delta approach with hysteresis.
+        # _hold_correction_active drives everything. It is managed entirely by
+        # c_refresh_hold_cache (60s cleanup cycle + per-trade when already active).
+        # When inactive: both legs run at full `amount`. No other checks needed here.
+        # When active (total confirmed outside band, all venues > $20):
+        #   Overbought → reduce buy leg by (total - target) / bid; sell runs full.
+        #   Oversold   → reduce sell leg by (target - total) / bid; buy runs full.
+        #   If delta ≥ amount, the reduced leg is fully suppressed (set to 0).
         #
-        # State machine (updated in c_refresh_hold_cache — every 60 s + after each trade):
-        #   _hold_correction_active = False  →  inside band, no intervention.
-        #   _hold_correction_active = True   →  outside outer band, correcting.
-        #     Deactivates when total crosses back through target center from the correcting
-        #     direction (oversold: deactivates at total >= target; overbought: at total <= target).
-        #
-        # When correcting:
-        #   Overbought (total > target + band):
-        #     Sell leg = full amount      — sell-strand always moves in right direction.
-        #     Buy  leg = max(0, amount − delta_base)  — delta measured from target.
-        #     → if excess ≥ amount, buy is fully suppressed.
-        #
-        #   Oversold (total < target − band):
-        #     Buy  leg = full amount      — buy-strand always moves in right direction.
-        #     Sell leg = max(0, amount − delta_base).
-        #     → if deficit ≥ amount, sell is fully suppressed.
-        #
-        # Zero overhead when disabled: single bint check on the hot path.
+        # _hold_correction_active is set/cleared exclusively in c_refresh_hold_cache (60s cycle +
+        # per-trade when already active). It is True only when guardrail is enabled, price cache
+        # is warm, and total is confirmed outside the band. Single bint read — zero overhead.
         _hold_buy_amount  = amount
         _hold_sell_amount = amount
-        if self._hold_target_usd > 0.0 and self._hold_correction_active and self._cached_mid_price_usd > 0.0:
+        if self._hold_correction_active:
             _total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
 
             if _total_usd > self._hold_target_usd:
-                # Overbought: delta measured from target so each trade nudges toward centre.
+                # Overbought: reduce buy leg by exact excess from target.
                 _delta_base = (_total_usd - self._hold_target_usd) / self._cached_mid_price_usd
                 _hold_buy_amount  = max(0.0, amount - _delta_base)
                 # _hold_sell_amount stays at `amount`
-
             else:
-                # Oversold (total <= target): delta = 0 when exactly at target, so no suppression.
+                # Oversold: reduce sell leg by exact deficit from target.
                 _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
                 _hold_sell_amount = max(0.0, amount - _delta_base)
                 # _hold_buy_amount stays at `amount`
