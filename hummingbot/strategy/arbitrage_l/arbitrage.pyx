@@ -607,11 +607,26 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 try:
                     hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
                     hold_live_bid = self.c_get_reference_bid_for_asset(hold_base_asset)
+                    # Live balance read for display — avoids stale cache (e.g. mid-transfer)
+                    if self._position_balancer is not None:
+                        hold_live_base = self._position_balancer.c_get_aggregated_base_balance(hold_base_asset)
+                    else:
+                        hold_live_base = 0.0
+                        hold_checked = set()
+                        for _mp in self._market_pairs:
+                            for _mt in [(<object>_mp).first, (<object>_mp).second]:
+                                if (<object>_mt).base_asset == hold_base_asset:
+                                    _key = ((<object>_mt).market, (<object>_mt).base_asset)
+                                    if _key not in hold_checked:
+                                        hold_checked.add(_key)
+                                        hold_live_base += float((<object>_mt).market.get_available_balance(hold_base_asset))
                 except Exception:
                     hold_live_bid = 0.0
+                    hold_live_base = self._cached_total_base_qty
                 hold_display_bid = hold_live_bid if hold_live_bid > 0.0 else self._cached_mid_price_usd
+                hold_display_base = hold_live_base if hold_live_base > 0.0 else self._cached_total_base_qty
                 if hold_display_bid > 0.0:
-                    hold_total_usd = self._cached_total_base_qty * hold_display_bid
+                    hold_total_usd = hold_display_base * hold_display_bid
                     if self._hold_correction_oversold:
                         hold_direction = "BUILDING (oversold)"
                     else:
@@ -623,7 +638,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         f"  band=±${self._hold_band_usd:.0f}"
                         f"  range=[${hold_floor:.0f}, ${hold_ceiling:.0f}]",
                         f"    total=${hold_total_usd:.2f}"
-                        f"  base={self._cached_total_base_qty:.6f}"
+                        f"  base={hold_display_base:.6f}"
                         f"  bid=${hold_display_bid:.4f}"
                         f"  correcting → {hold_direction}",
                     ])
