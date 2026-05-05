@@ -55,6 +55,7 @@ cdef:
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
     double PARTIAL_FILL_COOLOFF = 5.0  # Cooldown for orders with partial fills
+    double LOW_BALANCE_SUSPEND_USD = 20.0  # Suspend hold-band guardrail when any single venue has < this USD of base
     # NOTE: AGGRESSIVE_REFRESH_INTERVAL is defined in position_balancer_handler.pyx (5.0s default)
 
 cdef class ArbitrageLStrategy(StrategyBase):
@@ -129,6 +130,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_active = False
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
+        self._hold_low_balance_suspend = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -271,6 +273,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_active = False
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
+        self._hold_low_balance_suspend = False
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -1158,6 +1161,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double total = 0.0
             double bid = 0.0
             double total_usd = 0.0
+            double venue_bal = 0.0
+            double min_venue_usd = 0.0
+            double min_venue_usd_val = 0.0
             object mp, mt, key
             str base_asset
             set checked
@@ -1166,22 +1172,33 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
 
         try:
-            # Balance: delegate to PositionBalancerHandler.c_get_aggregated_base_balance when
-            # available — it handles NODE/NODEOPS-style alias pairs (same asset, different tickers
-            # on different exchanges) and de-duplicates by (market, base_asset).
-            # Fall back to a direct scan when no position balancer is present.
             base_asset = (<object>self._market_pairs[0]).first.base_asset
+
+            # ── Per-venue balance scan ────────────────────────────────────────────
+            # Always do the direct scan (O(market_pairs), typically 2–4 items).
+            # Two purposes:
+            #   1. Per-venue low-balance detection (suspend guardrail when any venue < $20).
+            #   2. Aggregate total when no position balancer is present.
+            # When position balancer is present, it also aggregates (handles aliases), but
+            # we still need the per-venue pass for the low-balance check.
+            checked = set()
+            min_venue_usd = 1e18  # sentinel: will be overwritten on first venue
+            for mp in self._market_pairs:
+                for mt in [(<object>mp).first, (<object>mp).second]:
+                    if (<object>mt).base_asset == base_asset:
+                        key = ((<object>mt).market, (<object>mt).base_asset)
+                        if key not in checked:
+                            checked.add(key)
+                            venue_bal = float((<object>mt).market.get_available_balance(base_asset))
+                            total += venue_bal
+                            # Track minimum — used for low-balance suspend check below.
+                            if venue_bal < min_venue_usd:
+                                min_venue_usd = venue_bal
+
             if self._position_balancer is not None:
+                # Delegate aggregate to position balancer (alias-aware, de-duped).
+                # Per-venue min computed above is still valid — balancer uses same underlying balances.
                 total = self._position_balancer.c_get_aggregated_base_balance(base_asset)
-            else:
-                checked = set()
-                for mp in self._market_pairs:
-                    for mt in [(<object>mp).first, (<object>mp).second]:
-                        if (<object>mt).base_asset == base_asset:
-                            key = ((<object>mt).market, (<object>mt).base_asset)
-                            if key not in checked:
-                                checked.add(key)
-                                total += float((<object>mt).market.get_available_balance((<object>mt).base_asset))
             self._cached_total_base_qty = total
 
             # Price: same source as PositionBalancerHandler — top-of-book bid via C++ order book
@@ -1191,6 +1208,32 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if bid > 0.0:
                 self._cached_mid_price_usd = bid
             # If bid == 0 (no order book yet) keep previous cached value — do not zero out.
+
+            # ── Low-balance guardrail suspend ────────────────────────────────────
+            # If any single venue holds < LOW_BALANCE_SUSPEND_USD of base (in USD terms),
+            # the aggregate total is unreliable (funds in transit, fresh deposit not settled,
+            # temporary exchange issue). Suspend the hysteresis state machine for this cycle
+            # so it cannot activate a false correction. Already-active correction is also
+            # paused to prevent over-buying/selling against a phantom deficit.
+            # The suspend flag clears automatically the next cycle when all venues recover.
+            # Zero cost on the hot arb path — only the cached bint is read there.
+            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0 and min_venue_usd < 1e18:
+                min_venue_usd_val = min_venue_usd * self._cached_mid_price_usd
+                if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD:
+                    if not self._hold_low_balance_suspend:
+                        self._hold_low_balance_suspend = True
+                        self._hold_correction_active = False
+                        self._hold_breach_count = 0
+                        self.logger().info(
+                            f"Hold-band: guardrail suspended — venue balance ${min_venue_usd_val:.2f} "
+                            f"< threshold ${LOW_BALANCE_SUSPEND_USD:.0f} (transfer in progress or dust)")
+                    return  # Skip hysteresis entirely this cycle
+                elif self._hold_low_balance_suspend:
+                    # All venues recovered — lift suspend, let normal hysteresis resume next cycle
+                    self._hold_low_balance_suspend = False
+                    self.logger().info(
+                        f"Hold-band: low-balance suspend lifted — min venue ${min_venue_usd_val:.2f} "
+                        f">= threshold ${LOW_BALANCE_SUSPEND_USD:.0f}")
 
             # ── Hysteresis: update correction flag ───────────────────────────────
             # Only meaningful when guardrail is enabled and cache is warm.

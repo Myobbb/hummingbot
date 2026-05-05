@@ -100,6 +100,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
         int  _hold_breach_count          # consecutive 60s-cycle readings outside band before activation
+        bint _hold_low_balance_suspend   # True when any single venue has < LOW_BALANCE_SUSPEND_USD of base
         
         # Optimization: Reusable vector to avoid heap allocation in hot loop
         vector[ArbOpportunity] _reusable_arb_opps
