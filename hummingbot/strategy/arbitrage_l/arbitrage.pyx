@@ -1162,8 +1162,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double bid = 0.0
             double total_usd = 0.0
             double venue_bal = 0.0
-            double min_venue_usd = 0.0
-            double min_venue_usd_val = 0.0
+            double min_venue_base = 0.0   # minimum single-venue base balance (base token units)
+            double min_venue_usd_val = 0.0  # min_venue_base converted to USD for threshold check
             object mp, mt, key
             str base_asset
             set checked
@@ -1182,7 +1182,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # When position balancer is present, it also aggregates (handles aliases), but
             # we still need the per-venue pass for the low-balance check.
             checked = set()
-            min_venue_usd = 1e18  # sentinel: will be overwritten on first venue
+            min_venue_base = 1e18  # sentinel — overwritten on first venue seen
             for mp in self._market_pairs:
                 for mt in [(<object>mp).first, (<object>mp).second]:
                     if (<object>mt).base_asset == base_asset:
@@ -1191,9 +1191,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             checked.add(key)
                             venue_bal = float((<object>mt).market.get_available_balance(base_asset))
                             total += venue_bal
-                            # Track minimum — used for low-balance suspend check below.
-                            if venue_bal < min_venue_usd:
-                                min_venue_usd = venue_bal
+                            if venue_bal < min_venue_base:
+                                min_venue_base = venue_bal
 
             if self._position_balancer is not None:
                 # Delegate aggregate to position balancer (alias-aware, de-duped).
@@ -1217,8 +1216,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # paused to prevent over-buying/selling against a phantom deficit.
             # The suspend flag clears automatically the next cycle when all venues recover.
             # Zero cost on the hot arb path — only the cached bint is read there.
-            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0 and min_venue_usd < 1e18:
-                min_venue_usd_val = min_venue_usd * self._cached_mid_price_usd
+            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0 and min_venue_base < 1e18:
+                # Convert minimum venue base quantity to USD using cached bid (USDT/base).
+                # All strategies trade XXX-USDT pairs so bid is directly in USDT.
+                min_venue_usd_val = min_venue_base * self._cached_mid_price_usd
                 if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD:
                     if not self._hold_low_balance_suspend:
                         self._hold_low_balance_suspend = True
