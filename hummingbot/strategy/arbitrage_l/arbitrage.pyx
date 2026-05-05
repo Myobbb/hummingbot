@@ -1166,6 +1166,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double min_venue_usd_val = 0.0  # min_venue_base converted to USD for threshold check
             object mp, mt, key
             str base_asset
+            str min_venue_name   # exchange name where min balance was observed
             set checked
 
         if not self._market_pairs:
@@ -1183,6 +1184,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # we still need the per-venue pass for the low-balance check.
             checked = set()
             min_venue_base = 1e18  # sentinel — overwritten on first venue seen
+            min_venue_name = ""
             for mp in self._market_pairs:
                 for mt in [(<object>mp).first, (<object>mp).second]:
                     if (<object>mt).base_asset == base_asset:
@@ -1193,6 +1195,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             total += venue_bal
                             if venue_bal < min_venue_base:
                                 min_venue_base = venue_bal
+                                min_venue_name = (<object>mt).market.name
 
             if self._position_balancer is not None:
                 # Delegate aggregate to position balancer (alias-aware, de-duped).
@@ -1226,7 +1229,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self._hold_correction_active = False
                         self._hold_breach_count = 0
                         self.logger().info(
-                            f"Hold-band [{base_asset}]: guardrail suspended — venue balance ${min_venue_usd_val:.2f} "
+                            f"Hold-band [{base_asset}]: guardrail suspended — {min_venue_name} balance ${min_venue_usd_val:.2f} "
                             f"< threshold ${LOW_BALANCE_SUSPEND_USD:.0f} (transfer in progress or dust)")
                     return  # Skip hysteresis entirely this cycle
                 elif self._hold_low_balance_suspend:
