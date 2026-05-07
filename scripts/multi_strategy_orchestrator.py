@@ -3445,9 +3445,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 secondary_trading_pair=secondary_pair,
                 min_profitability=Decimal(str(min_profitability)),
                 buy_in_enabled=True,
-                buy_in_target_usd=1100.0,
+                buy_in_target_usd=750.0,
                 hold_target_enabled=True,
-                hold_target_usd=1100.0,
+                hold_target_usd=750.0,
                 hold_band_usd=150.0,
                 additional_markets=additional_list
             )
