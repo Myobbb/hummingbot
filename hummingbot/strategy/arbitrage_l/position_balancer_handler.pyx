@@ -44,14 +44,14 @@ cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order 
 # Frontrun/undercut/gap detection is suppressed for this many seconds after placement.
 # Prevents rapid cancel-replace loops when price ticks during the first moments of an order's life.
 # 'mode disabled' cancels are always immediate regardless of this floor.
-cdef double MIN_IMMEDIATE_CHECK_DELAY = 10.0  # seconds
+cdef double MIN_IMMEDIATE_CHECK_DELAY = 60.0  # seconds — match DEFAULT_LIMIT_REFRESH_INTERVAL
 
 # --- Post-cancel cooldown before placing the next order ---
 # After any cancel (frontrun reprice, undercut reprice, gap reprice), wait this many seconds
 # before placing a replacement order. Prevents rapid place→cancel→place loops
 # that look like order-book manipulation to exchanges.
 # Distinct from DEFAULT_COMPLETION_COOLDOWN (2s, used after a fill).
-cdef double POST_CANCEL_COOLDOWN = 5.0  # seconds
+cdef double POST_CANCEL_COOLDOWN = 10.0  # seconds — ~1 order per 80s cycle minimum
 
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
