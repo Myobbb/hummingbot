@@ -42,6 +42,8 @@ cdef class PositionBalancerHandler:
         dict _sell_cancel_request_time
         dict _last_buy_completion_time
         dict _last_sell_completion_time
+        dict _last_buy_cancel_time
+        dict _last_sell_cancel_time
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset

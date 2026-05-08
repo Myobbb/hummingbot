@@ -40,6 +40,19 @@ cdef double DEFAULT_LIMIT_REFRESH_INTERVAL = 60.0       # Default refresh for mi
 cdef double DEFAULT_AGGRESSIVE_REFRESH_INTERVAL = 5.0   # Refresh for aggressive (0%) mode with partial fills
 cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
 
+# --- Minimum order age before immediate-cancel checks fire ---
+# Frontrun/undercut/gap detection is suppressed for this many seconds after placement.
+# Prevents rapid cancel-replace loops when price ticks during the first moments of an order's life.
+# 'mode disabled' cancels are always immediate regardless of this floor.
+cdef double MIN_IMMEDIATE_CHECK_DELAY = 10.0  # seconds
+
+# --- Post-cancel cooldown before placing the next order ---
+# After any cancel (frontrun reprice, undercut reprice, gap reprice), wait this many seconds
+# before placing a replacement order. Prevents rapid place→cancel→place loops
+# that look like order-book manipulation to exchanges.
+# Distinct from DEFAULT_COMPLETION_COOLDOWN (2s, used after a fill).
+cdef double POST_CANCEL_COOLDOWN = 5.0  # seconds
+
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
 
@@ -155,6 +168,8 @@ cdef class PositionBalancerHandler:
         self._sell_cancel_request_time = {}   # asset -> timestamp when cancel was requested
         self._last_buy_completion_time = {}   # asset -> timestamp when buy order completed
         self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
+        self._last_buy_cancel_time = {}       # asset -> timestamp when buy order was cancelled (for POST_CANCEL_COOLDOWN)
+        self._last_sell_cancel_time = {}      # asset -> timestamp when sell order was cancelled (for POST_CANCEL_COOLDOWN)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -647,6 +662,15 @@ cdef class PositionBalancerHandler:
 
     def handle_order_cancellation(self, str order_id):
         """Clean up pending order tracking on order cancellation."""
+        # Record cancel time for POST_CANCEL_COOLDOWN before cleaning up tracking.
+        # Check buy side first, then sell side.
+        ts = self.strategy._current_timestamp
+        if order_id in self._pending_buy_orders:
+            asset_key = self._pending_buy_orders[order_id][0]
+            self._last_buy_cancel_time[asset_key] = ts
+        elif order_id in self._pending_sell_orders:
+            asset_key = self._pending_sell_orders[order_id][0]
+            self._last_sell_cancel_time[asset_key] = ts
         # Try both buy and sell
         self.handle_order_completion(order_id, True)
         self.handle_order_completion(order_id, False)
@@ -1401,7 +1425,9 @@ cdef class PositionBalancerHandler:
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Frontrun + Gap detection
                     # All checks use same orderbook snapshot to avoid race conditions
-                    if not should_cancel:
+                    # Suppressed for MIN_IMMEDIATE_CHECK_DELAY seconds after placement to prevent
+                    # rapid cancel-replace loops from 1-tick price moves on freshly placed orders.
+                    if not should_cancel and (current_time - last_time > MIN_IMMEDIATE_CHECK_DELAY):
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, True)
 
                     # Check if refresh interval passed AND conditions changed
@@ -1581,7 +1607,9 @@ cdef class PositionBalancerHandler:
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Undercut + Gap detection
                     # All checks use same orderbook snapshot to avoid race conditions
-                    if not should_cancel:
+                    # Suppressed for MIN_IMMEDIATE_CHECK_DELAY seconds after placement to prevent
+                    # rapid cancel-replace loops from 1-tick price moves on freshly placed orders.
+                    if not should_cancel and (current_time - last_time > MIN_IMMEDIATE_CHECK_DELAY):
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, False)
 
                     # Check if refresh interval passed AND conditions changed
@@ -1900,9 +1928,14 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Check 2-second cooldown after order completion
+                    # Check 2-second cooldown after order completion (fill)
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
                     if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
+                        return False
+
+                    # Check post-cancel cooldown — prevents rapid place→cancel→replace loops
+                    time_since_cancel = self.strategy._current_timestamp - self._last_buy_cancel_time.get(canonical_asset, 0.0)
+                    if time_since_cancel < POST_CANCEL_COOLDOWN:
                         return False
 
                     # For completion check, use ACTUAL balance (not adjusted)
@@ -1967,9 +2000,14 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Check 2-second cooldown after order completion
+                    # Check 2-second cooldown after order completion (fill)
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
                     if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
+                        return False
+
+                    # Check post-cancel cooldown — prevents rapid place→cancel→replace loops
+                    time_since_cancel = self.strategy._current_timestamp - self._last_sell_cancel_time.get(canonical_asset, 0.0)
+                    if time_since_cancel < POST_CANCEL_COOLDOWN:
                         return False
 
                     # For completion check, use ACTUAL balance (not adjusted)
