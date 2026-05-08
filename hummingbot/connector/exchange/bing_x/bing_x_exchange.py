@@ -217,6 +217,11 @@ class BingXExchange(ExchangePyBase):
             trading_pair=trading_pair,
         )
 
+        if not isinstance(order_result, dict) or order_result.get("code", 0) != 0 or "data" not in order_result:
+            code = order_result.get("code", "?") if isinstance(order_result, dict) else "?"
+            msg = order_result.get("msg", "") if isinstance(order_result, dict) else str(order_result)
+            raise ValueError(f"BingX order rejected (code={code}): {msg}")
+
         o_id = str(order_result["data"]["orderId"])
         transact_time = order_result["data"]["transactTime"] * 1e-3
         return (o_id, transact_time)
