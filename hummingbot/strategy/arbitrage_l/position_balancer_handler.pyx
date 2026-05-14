@@ -2017,10 +2017,11 @@ cdef class PositionBalancerHandler:
                         # Find the best market to sell on (highest bid)
                         selected_sell_market = self.c_find_best_sell_market(asset_key)
                         if selected_sell_market is not None:
-                            # Pre-check: ensure selected market has enough base balance for min notional
+                            # Pre-check: ensure selected market has enough base balance for min notional.
+                            # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
                             market_base_bal = float(selected_sell_market.market.get_available_balance(
                                 selected_sell_market.base_asset))
-                            if market_base_bal * last_bid < self.strategy._min_order_usd:
+                            if market_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
                                 self.strategy.logger().warning(
                                     f"Position balancer: {canonical_asset} sell skipped - "
                                     f"{selected_sell_market.market.name} insufficient balance "
@@ -2447,17 +2448,28 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass
 
-        # Check minimum notional
+        # Check minimum notional.
+        # Sell-to-zero exception: when target=0 and the full remaining balance is below the software
+        # floor, send the order anyway — the exchange min notional (~$5–$10) is well below our $15
+        # floor, so most exchanges will accept it. If an exchange rejects it, the error is caught in
+        # c_sell_with_specific_market and we retry next tick. Completion never triggers for target=0
+        # while balance remains > 0, so infinite retries are not possible after a real fill.
+        # For any non-zero target, block as usual and mark complete.
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self.strategy._min_order_usd:
-            self.strategy.logger().warning(
-                f"Position balancer: Sell order blocked - below min notional. "
-                f"volume_usd={volume_usd:.6f} < min_order_usd={self.strategy._min_order_usd:.6f}, "
-                f"quantized_amount={quantized_amount}, sell_price={sell_price:.8f}")
-            # Too small, mark complete
-            if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
+            if self._sell_target_usd == 0.0:
+                self.strategy.logger().info(
+                    f"Position balancer: Sell-to-zero dust sweep for {asset_key} - "
+                    f"sending {float(quantized_amount):.6f} (${volume_usd:.2f}) below software floor")
+            else:
+                self.strategy.logger().warning(
+                    f"Position balancer: Sell order blocked - below min notional. "
+                    f"volume_usd={volume_usd:.6f} < min_order_usd={self.strategy._min_order_usd:.6f}, "
+                    f"quantized_amount={quantized_amount}, sell_price={sell_price:.8f}")
+                # Too small, mark complete
+                if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
+                    return False
                 return False
-            return False
 
         # Quantize price to match exchange precision (prevents log/actual price mismatch)
         try:

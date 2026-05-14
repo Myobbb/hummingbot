@@ -819,6 +819,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Maps connector_name -> is_ready (bool)
         self._connector_ready_cache: Dict[str, bool] = {}
 
+        # Strategies scheduled for automatic removal once their sell-off completes.
+        # Populated by clean(); drained in on_tick() when sell is no longer active.
+        self._pending_auto_remove: Set[str] = set()
+
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
 
@@ -1440,6 +1444,26 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     f"Error ticking strategy '{strategy_instance.name}' (failure #{strategy_instance.exception_count}): {e}",
                     exc_info=True
                 )
+
+        # Auto-remove strategies whose clean-triggered sell-off has finished.
+        # Sell completing sets _sell_enabled=False via c_maybe_disable_sell; we detect that here.
+        if self._pending_auto_remove:
+            to_remove = []
+            for strategy_name in list(self._pending_auto_remove):
+                instance = self._strategy_by_name.get(strategy_name)
+                if instance is None:
+                    # Already removed by other means — just clean up the set
+                    self._pending_auto_remove.discard(strategy_name)
+                    continue
+                pb = getattr(instance.strategy, '_position_balancer', None)
+                if pb is None or not pb.is_sell_enabled:
+                    self._pending_auto_remove.discard(strategy_name)
+                    to_remove.append(strategy_name)
+            for strategy_name in to_remove:
+                self.logger().info(
+                    f"Clean sell-off complete for '{strategy_name}' — auto-removing strategy"
+                )
+                self.remove_strategy(strategy_name)
 
     async def on_stop(self):
         """
@@ -2216,7 +2240,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     def clean(self, strategy_name: str) -> bool:
         """
-        Set sell-off target to 0 and enable sell-off (sell entire position).
+        Set sell-off target to 0, enable sell-off, and schedule automatic removal of the
+        strategy once the sell-off completes.
 
         Args:
             strategy_name: The name of the strategy
@@ -2230,6 +2255,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         position_balancer.set_sell_target(0.0)
         position_balancer.enable_sell_off()
+        self._pending_auto_remove.add(strategy_name)
+        self.logger().info(f"Strategy '{strategy_name}' scheduled for auto-removal after sell-off completes")
         return True
 
     def set_min_profitability_by_identifier(self, identifier: str, value: float) -> bool:
