@@ -748,6 +748,10 @@ cdef class PositionBalancerHandler:
         For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
         and selects the best one regardless of name.
 
+        Only considers markets with sufficient quote balance (>= _min_order_usd) so that
+        the selected market is always actionable. This prevents picking a cheap market that
+        has zero USDT, which would cause a per-tick warning and give up without trying others.
+
         - Aggressive (0%): Select market with LOWEST ASK (taker)
         - Percentage (>0%): Select market with LOWEST BID (maker above bid)
         - 'min' mode: Select market with LOWEST EFFECTIVE BUY PRICE (bid + min_tick)
@@ -759,6 +763,7 @@ cdef class PositionBalancerHandler:
             double current_price
             double current_bid
             double min_tick
+            double market_quote_bal
             OrderBook ob
             object mp
             object market_tuple
@@ -776,6 +781,12 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset in asset_aliases:
                         try:
+                            # Skip markets without enough quote to place even a minimum order
+                            market_quote_bal = float(market_tuple.market.get_available_balance(
+                                market_tuple.quote_asset))
+                            if market_quote_bal < self.strategy._min_order_usd:
+                                continue
+
                             # Use C-level get_order_book for compatibility with all exchanges
                             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 

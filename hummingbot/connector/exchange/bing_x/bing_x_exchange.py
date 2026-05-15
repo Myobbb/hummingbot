@@ -401,6 +401,16 @@ class BingXExchange(ExchangePyBase):
                         asset_name = balance_entry["a"]
                         free_balance = Decimal(str(balance_entry["cw"]))
                         total_balance = Decimal(str(balance_entry["wb"]))
+                        # BingX sends two simultaneous ACCOUNT_UPDATE frames on every order
+                        # event: one for the spot account (correct balances) and one for the
+                        # perpetual/funding account (cw=0, wb=0).  Whichever frame arrives last
+                        # wins, so the perp frame can silently zero out the known spot balance.
+                        # Guard: if the incoming frame reports zero for both fields but we already
+                        # hold a positive balance for this asset, the frame is the perp snapshot —
+                        # skip it to preserve the correct spot value.
+                        if free_balance == Decimal("0") and total_balance == Decimal("0"):
+                            if self._account_available_balances.get(asset_name, Decimal("0")) > Decimal("0"):
+                                continue
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
 
