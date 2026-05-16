@@ -2448,6 +2448,11 @@ cdef class PositionBalancerHandler:
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - quantized to zero. "
                 f"pre_quantize={amount_to_sell:.10f}, quantized={quantized_amount}")
+            # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
+            # Declare completion so the balancer doesn't spin forever on unsellable residue.
+            if self._sell_target_usd == 0.0:
+                self.c_try_mark_sell_complete(asset_key, current_value_quote, excess)
+                self.c_maybe_disable_sell()
             return False
 
         # Apply max_order_size cap
