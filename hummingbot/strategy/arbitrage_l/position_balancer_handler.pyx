@@ -77,6 +77,11 @@ cdef double BETTER_MARKET_SWITCH_TOLERANCE = 0.0001  # 0.01% - switch immediatel
 # This prevents flip-flopping between markets with nearly identical effective prices
 cdef double MIN_MODE_SWITCH_HYSTERESIS = 0.001  # 0.1% - require meaningful improvement before switching
 
+# --- Insufficient balance retry cooldown ---
+# When the best sell market has insufficient base balance to meet min_order_usd,
+# suppress retries for this many seconds to avoid spamming every 2s tick.
+cdef double INSUF_BAL_RETRY_COOLDOWN = 60.0  # 60s between retries on insufficient balance
+
 
 cdef class PositionBalancerHandler:
     """
@@ -170,6 +175,7 @@ cdef class PositionBalancerHandler:
         self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
         self._last_buy_cancel_time = {}       # asset -> timestamp when buy order was cancelled (for POST_CANCEL_COOLDOWN)
         self._last_sell_cancel_time = {}      # asset -> timestamp when sell order was cancelled (for POST_CANCEL_COOLDOWN)
+        self._last_sell_insuf_bal_time = {}   # asset -> timestamp of last "sell skipped - insufficient balance" (for INSUF_BAL_RETRY_COOLDOWN)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -854,6 +860,7 @@ cdef class PositionBalancerHandler:
             double best_price = 0.0
             double current_price
             double current_ask
+            double current_bid
             double min_tick
             OrderBook ob
             object mp
@@ -2021,6 +2028,14 @@ cdef class PositionBalancerHandler:
                     if time_since_cancel < POST_CANCEL_COOLDOWN:
                         return False
 
+                    # Check insufficient-balance cooldown — suppresses retry spam when the best sell
+                    # market has insufficient base balance. Only applies for non-zero target; sell-to-zero
+                    # always proceeds so c_execute_sell_limit can handle dust specially.
+                    if self._sell_target_usd > 0.0:
+                        time_since_insuf_bal = self.strategy._current_timestamp - self._last_sell_insuf_bal_time.get(canonical_asset, 0.0)
+                        if time_since_insuf_bal < INSUF_BAL_RETRY_COOLDOWN:
+                            return False
+
                     # For completion check, use ACTUAL balance (not adjusted)
                     base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                     val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
@@ -2033,11 +2048,15 @@ cdef class PositionBalancerHandler:
                             market_base_bal = float(selected_sell_market.market.get_available_balance(
                                 selected_sell_market.base_asset))
                             if market_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
+                                # Best sell market has insufficient base balance — record timestamp so we
+                                # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
+                                self._last_sell_insuf_bal_time[canonical_asset] = self.strategy._current_timestamp
                                 self.strategy.logger().warning(
                                     f"Position balancer: {canonical_asset} sell skipped - "
                                     f"{selected_sell_market.market.name} insufficient balance "
                                     f"({market_base_bal:.4f} {selected_sell_market.base_asset} "
-                                    f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f})")
+                                    f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
+                                    f"retry in {INSUF_BAL_RETRY_COOLDOWN:.0f}s")
                                 return False
                             # For buy market, just use the other market from the pair
                             # (not critical since we're only selling)
