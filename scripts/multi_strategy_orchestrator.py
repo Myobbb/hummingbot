@@ -4321,26 +4321,25 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         if buyin_sections:
             lines.append("\nPosition Balancer active:")
-            for name, blines in buyin_sections:
-                # Compact: one line per asset — strip "Position Balancer:" prefix from header,
-                # then append all detail lines inline separated by "  |  "
-                header = blines[0]
-                header = re.sub(r"^Position Balancer:\s*", "", header).strip()
+            # Truncate names to 6 chars for label column; pad to align all rows
+            bi_labels = [name[:6] for name, _ in buyin_sections]
+            bi_w = max(len(l) for l in bi_labels) if bi_labels else 6
+            for (name, blines), label in zip(buyin_sections, bi_labels):
+                header = re.sub(r"^Position Balancer:\s*", "", blines[0]).strip()
                 rest = "  |  ".join(blines[1:]) if len(blines) > 1 else ""
-                compact = f"  {name}  {header}"
+                compact = f"  {label:<{bi_w}}  {header}"
                 if rest:
                     compact += f"  |  {rest}"
                 lines.append(compact)
 
         if hold_sections:
             lines.append("\nHold-band guardrail active:")
-            for name, hlines in hold_sections:
-                # Compact: one line per strategy — strip "Hold-band guardrail:" prefix,
-                # then append state line inline
-                header = hlines[0]
-                header = re.sub(r"^Hold-band guardrail:\s*", "", header).strip()
+            hd_labels = [name[:6] for name, _ in hold_sections]
+            hd_w = max(len(l) for l in hd_labels) if hd_labels else 6
+            for (name, hlines), label in zip(hold_sections, hd_labels):
+                header = re.sub(r"^Hold-band guardrail:\s*", "", hlines[0]).strip()
                 rest = "  |  ".join(hlines[1:]) if len(hlines) > 1 else ""
-                compact = f"  {name}  {header}"
+                compact = f"  {label:<{hd_w}}  {header}"
                 if rest:
                     compact += f"  |  {rest}"
                 lines.append(compact)
@@ -4415,48 +4414,34 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if not orders_by_market:
             return []
 
-        # Format the output - show total count and breakdown by strategy
-        total_orders = sum(len(orders) for orders in orders_by_market.values())
-        lines = [f"Total: {total_orders} order(s)"]
-
-        # Group by strategy for cleaner display
-        by_strategy = defaultdict(list)
+        # Build a flat list of all orders for column-width calculation
+        # Each entry: (strategy_name, order_type, trading_pair, exchange, amount, price, order_id)
+        flat: list = []
         for (exchange, trading_pair, strategy_name), orders in orders_by_market.items():
-            by_strategy[strategy_name].append((exchange, trading_pair, orders))
+            ex_short = exchange.split("_")[0]  # gate_io -> gate
+            pair_short = trading_pair.split("-")[0][:6]  # FUNTOKEN-USDT -> FUNTOK
+            market_str = f"{pair_short}@{ex_short}"
+            for order_type, price, amount, order_id in orders:
+                flat.append((strategy_name, order_type, market_str, amount, price, order_id))
 
-        for strategy_name in sorted(by_strategy.keys()):
-            markets = by_strategy[strategy_name]
-            strategy_total = sum(len(orders) for _, _, orders in markets)
-            lines.append(f"  {strategy_name}: {strategy_total} order(s)")
+        # Sort: strategy name, then market, then side
+        flat.sort(key=lambda x: (x[0], x[2], x[1]))
 
-            for exchange, trading_pair, orders in sorted(markets):
-                # Group buys and sells for compact display
-                buys = [(p, a, oid) for ot, p, a, oid in orders if ot == "BUY"]
-                sells = [(p, a, oid) for ot, p, a, oid in orders if ot == "SELL"]
+        total_orders = len(flat)
+        # Column widths
+        name_w = min(max(len(r[0][:6]) for r in flat), 6) if flat else 6
+        mkt_w  = max(len(r[2]) for r in flat) if flat else 12
 
-                market_str = f"{trading_pair} ({exchange})"
-
-                if buys and sells:
-                    lines.append(f"    {market_str}: {len(buys)} BUY, {len(sells)} SELL")
-                elif buys:
-                    lines.append(f"    {market_str}: {len(buys)} BUY")
-                elif sells:
-                    lines.append(f"    {market_str}: {len(sells)} SELL")
-
-                # Show individual order details
-                for price, amount, order_id in buys:
-                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
-                    if price == "MARKET":
-                        lines.append(f"      BUY  {amount:>10.6f} @ MARKET     (#{short_id})")
-                    else:
-                        lines.append(f"      BUY  {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
-
-                for price, amount, order_id in sells:
-                    short_id = order_id[-6:] if len(order_id) > 6 else order_id
-                    if price == "MARKET":
-                        lines.append(f"      SELL {amount:>10.6f} @ MARKET     (#{short_id})")
-                    else:
-                        lines.append(f"      SELL {amount:>10.6f} @ {price:<12.8f} (#{short_id})")
+        lines = [f"Total: {total_orders} order(s)"]
+        for strategy_name, order_type, market_str, amount, price, order_id in flat:
+            label = strategy_name[:6]
+            short_id = f"#{order_id[-6:]}" if len(order_id) > 6 else f"#{order_id}"
+            if price == "MARKET":
+                price_str = "MARKET      "
+            else:
+                price_str = f"{price:<12.8g}"
+            amt_str = f"{amount:>14.6g}"
+            lines.append(f"  {label:<{name_w}}  {order_type:<4}  {market_str:<{mkt_w}}  {amt_str} @ {price_str}  {short_id}")
 
         return lines
 
