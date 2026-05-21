@@ -4338,6 +4338,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             hd_w = max(len(l) for l in hd_labels) if hd_labels else 6
             for (name, hlines), label in zip(hold_sections, hd_labels):
                 header = re.sub(r"^Hold-band guardrail:\s*", "", hlines[0]).strip()
+                # Pad target value to 4 digits so columns align regardless of $750 vs $1600
+                header = re.sub(r"target=\$(\d+)", lambda m: f"target=${int(m.group(1)):>4}", header)
                 rest = "  |  ".join(hlines[1:]) if len(hlines) > 1 else ""
                 compact = f"  {label:<{hd_w}}  {header}"
                 if rest:
