@@ -3569,6 +3569,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if config.min_profitability != Decimal("1.5"):
             strategy_dict['min_profitability'] = float(config.min_profitability)
 
+        # Always persist hold-band fields when enabled so they survive restart.
+        # Without this, a restart would reload defaults (enabled=False, target=1100)
+        # and the guardrail would be silently off even though create() sets it to 750/True.
+        if config.hold_target_enabled and config.hold_target_usd > 0:
+            strategy_dict['hold_target_enabled'] = True
+            strategy_dict['hold_target_usd'] = float(config.hold_target_usd)
+            strategy_dict['hold_band_usd'] = float(config.hold_band_usd)
+
         # Add additional_markets if any
         if config.additional_markets:
             strategy_dict['additional_markets'] = config.additional_markets
