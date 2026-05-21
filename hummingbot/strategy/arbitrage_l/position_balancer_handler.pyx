@@ -2466,6 +2466,7 @@ cdef class PositionBalancerHandler:
         if quantized_amount <= Decimal("0"):
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - quantized to zero. "
+                f"{sell_market_tuple.base_asset} on {market.name} "
                 f"pre_quantize={amount_to_sell:.10f}, quantized={quantized_amount}")
             # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
             # Declare completion so the balancer doesn't spin forever on unsellable residue.
