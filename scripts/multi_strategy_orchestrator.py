@@ -2431,6 +2431,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             persist = {'hold_target_usd': target_usd}
             if target_usd > 0.0:
                 persist['hold_target_enabled'] = True
+            else:
+                # Explicitly mark disabled so YAML stays consistent on reload
+                persist['hold_target_enabled'] = False
             self._persist_hold_config(strategy_name, persist)
             # Immediately refresh so _hold_correction_active reflects new target.
             if target_usd > 0.0 and hasattr(strategy, 'refresh_hold_cache'):
