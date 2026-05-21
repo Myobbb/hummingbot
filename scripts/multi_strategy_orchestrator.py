@@ -4336,15 +4336,49 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             lines.append("\nHold-band guardrail active:")
             hd_labels = [name[:6] for name, _ in hold_sections]
             hd_w = max(len(l) for l in hd_labels) if hd_labels else 6
-            for (name, hlines), label in zip(hold_sections, hd_labels):
-                header = re.sub(r"^Hold-band guardrail:\s*", "", hlines[0]).strip()
-                # Pad target value to 4 digits so columns align regardless of $750 vs $1600
-                header = re.sub(r"target=\$(\d+)", lambda m: f"target=${int(m.group(1)):>4}", header)
-                rest = "  |  ".join(hlines[1:]) if len(hlines) > 1 else ""
-                compact = f"  {label:<{hd_w}}  {header}"
-                if rest:
-                    compact += f"  |  {rest}"
-                lines.append(compact)
+            # Parse structured fields from each row so we can compute column widths
+            # hlines[0]: "Hold-band guardrail:  target=$X  band=±$Y  range=[$A, $B]"
+            # hlines[1]: "total=$T  base=...  bid=...  correcting → ..."
+            hd_parsed = []
+            for name, hlines in hold_sections:
+                h0 = re.sub(r"^Hold-band guardrail:\s*", "", hlines[0]).strip()
+                m_target = re.search(r"target=\$(\d+)", h0)
+                m_band   = re.search(r"band=±\$(\d+)", h0)
+                m_range  = re.search(r"range=(\[.*?\])", h0)
+                h1 = hlines[1] if len(hlines) > 1 else ""
+                m_total  = re.search(r"total=(\S+)", h1)
+                # Everything after "base=" is not aligned — keep as raw suffix
+                m_base   = re.search(r"(base=.*)", h1)
+                hd_parsed.append({
+                    "label":  name[:6],
+                    "target": m_target.group(1) if m_target else "?",
+                    "band":   m_band.group(1)   if m_band   else "?",
+                    "range":  m_range.group(1)  if m_range  else "?",
+                    "total":  m_total.group(1)  if m_total  else "?",
+                    "suffix": m_base.group(1)   if m_base   else h1,
+                })
+            # Compute per-column max widths
+            tw = max(len(r["target"]) for r in hd_parsed)
+            rw = max(len(r["range"])  for r in hd_parsed)
+            ow = max(len(r["total"])  for r in hd_parsed)
+            # Extract direction tag (BUILDING/REDUCING ...) from suffix for alignment
+            for r in hd_parsed:
+                dm = re.search(r"(correcting\s*→\s*\S+.*)", r["suffix"])
+                r["direction"] = dm.group(1).strip() if dm else ""
+                # Trim suffix to just base= part (drop correcting onwards)
+                r["base_part"] = re.sub(r"\s*correcting.*", "", r["suffix"]).strip()
+            dw = max(len(r["direction"]) for r in hd_parsed) if hd_parsed else 0
+            for r in hd_parsed:
+                line = (
+                    f"  {r['label']:<{hd_w}}"
+                    f"  target=${r['target']:>{tw}}"
+                    f"  band=±${r['band']}"
+                    f"  range={r['range']:<{rw}}"
+                    f"  |  total={r['total']:>{ow}}"
+                    f"  {r['base_part']}"
+                    f"  {r['direction']}"
+                )
+                lines.append(line)
 
         # Pending Orders (aggregated across all strategies)
         pending_orders_info = self._get_pending_orders_summary()
