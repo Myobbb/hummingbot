@@ -4322,14 +4322,28 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if buyin_sections:
             lines.append("\nPosition Balancer active:")
             for name, blines in buyin_sections:
-                lines.append(f"  {name}:")
-                lines.extend([f"    {ln}" for ln in blines])
+                # Compact: one line per asset — strip "Position Balancer:" prefix from header,
+                # then append all detail lines inline separated by "  |  "
+                header = blines[0]
+                header = re.sub(r"^Position Balancer:\s*", "", header).strip()
+                rest = "  |  ".join(blines[1:]) if len(blines) > 1 else ""
+                compact = f"  {name}  {header}"
+                if rest:
+                    compact += f"  |  {rest}"
+                lines.append(compact)
 
         if hold_sections:
             lines.append("\nHold-band guardrail active:")
             for name, hlines in hold_sections:
-                lines.append(f"  {name}:")
-                lines.extend([f"    {ln}" for ln in hlines])
+                # Compact: one line per strategy — strip "Hold-band guardrail:" prefix,
+                # then append state line inline
+                header = hlines[0]
+                header = re.sub(r"^Hold-band guardrail:\s*", "", header).strip()
+                rest = "  |  ".join(hlines[1:]) if len(hlines) > 1 else ""
+                compact = f"  {name}  {header}"
+                if rest:
+                    compact += f"  |  {rest}"
+                lines.append(compact)
 
         # Pending Orders (aggregated across all strategies)
         pending_orders_info = self._get_pending_orders_summary()
