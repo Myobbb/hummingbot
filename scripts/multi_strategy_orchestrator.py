@@ -2256,6 +2256,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         position_balancer.set_sell_target(0.0)
         position_balancer.enable_sell_off()
         self._pending_auto_remove.add(strategy_name)
+        # Disable hold-band so it doesn't interfere with the sell-off
+        self.disable_hold(strategy_name)
         self.logger().info(f"Strategy '{strategy_name}' scheduled for auto-removal after sell-off completes")
         return True
 
