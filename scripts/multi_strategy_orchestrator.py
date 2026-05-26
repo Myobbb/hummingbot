@@ -3050,6 +3050,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Add to strategy's market_pairs list
         strategy_instance.market_pairs.append(new_tuple)
 
+        # Register the connector in the V1 strategy's _sb_markets set.
+        # strategy.init_params() calls c_add_markets() at startup, but when a market is added
+        # at runtime the connector may already exist in the pool (e.g. MEXC already running other
+        # pairs), so _ensure_connector skips initialization and never calls c_add_markets() on
+        # this strategy. Without this call, c_sell/buy_with_specific_market raises
+        # "Market object for sell order is not in the whitelisted markets set."
+        strategy_instance.strategy.add_markets([connector])
+
         # Invalidate cached connectors set (will be recomputed on next access)
         strategy_instance._connectors = None
 
