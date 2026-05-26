@@ -1399,35 +1399,31 @@ cdef class PositionBalancerHandler:
 
         REAL-WORLD GOAL: Maintain competitive position in order book while getting best price.
 
-        Smart cancellation triggers:
-        1. Mode disabled → orphaned order cleanup
-        2. Better market available → switch to higher liquidity/better price
-        3. Got frontrun → someone placed more aggressive order, we're no longer at front
-        4. Market moved in our favor → opportunity to get better price (gap detection)
-           - BUY: market moved DOWN → can buy cheaper
-           - SELL: market moved UP → can sell higher
-        5. Significant spread gap → our order is too far from competitive price
-        6. Stuck cancel detection → force cleanup if cancel pending too long (safety net)
+        Every tick — via c_check_immediate_conditions (time-gated):
+          - Frontrun/undercut: someone placed more aggressive order (fires after MIN_FRONTRUN_CHECK_DELAY=5s)
+          - Large gap: order is > ~2 ticks away from top of book (fires after 5s)
+          - Better market: different exchange became significantly better (fires after MIN_MARKET_SWITCH_DELAY=60s)
+
+        Periodic — after effective_interval (default 60s), same orderbook snapshot:
+          1. Mode disabled → orphaned order cleanup
+          2b. 1-tick min-mode misalignment (needs got_valid_second_level)
+          3.  Market moved in our favor → can get better price
+          4.  Aggressive mode: market moved to our price
+          5.  Significant price divergence (c_check_price_divergence)
+
+        Stuck cancel detection runs unconditionally when order is in timeout_cancelled_orders.
         """
         cdef:
             double current_time = self.strategy._current_timestamp
-            object current_best_market
             OrderBook current_ob
             object trading_rule
             tuple order_details
-            str order_market_name
             double order_price
             double current_bid
             double current_ask
-            double current_calculated_price
             double min_price_increment
-            double price_diff_abs
-            double price_diff_pct
             double cancel_threshold_abs
             double cancel_threshold_pct
-            double time_since_order_placed
-            bint process_buy_order
-            bint process_sell_order
             bint should_cancel
             str cancel_reason
             str order_id
@@ -1481,136 +1477,89 @@ cdef class PositionBalancerHandler:
                                 pass
 
                     if not should_cancel and current_time - last_time > effective_interval:
-                        # Smart cancellation: only cancel if market/price changed
-                        current_best_market = None
-                        try:
-                            # Find current best market
-                            current_best_market = self.c_find_best_buy_market(asset)
-                        except Exception as e:
-                            self.strategy.logger().warning(f"Position balancer: Error finding best buy market: {e}")
-                        if current_best_market is not None:
-                            # Get order details (market_tuple, price)
-                            order_details = self._active_buy_order_details.get(asset)
-                            if order_details is not None:
-                                order_market_tuple, order_price = order_details
+                        # Periodic refresh: c_check_immediate_conditions already handles frontrun/gap
+                        # (after 5s) and better-market (after 60s) every tick, so here we only run
+                        # the checks that need a full orderbook snapshot and are not time-gated:
+                        #   2b: 1-tick min-mode frontrun (needs got_valid_second_level)
+                        #   3:  ideal-price gap (market moved down → can buy cheaper)
+                        #   4:  aggressive mode — market moved to our price
+                        #   5:  significant price divergence (c_check_price_divergence)
+                        order_details = self._active_buy_order_details.get(asset)
+                        if order_details is not None:
+                            order_market_tuple, order_price = order_details
+                            try:
+                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
 
-                                # CONDITION 1: Check if different market became better
-                                if current_best_market.market.name != order_market_tuple.market.name:
-                                    # For min mode: apply hysteresis - only switch if significantly better
-                                    if self._buy_spread_is_min:
-                                        # Get effective price of new best market
-                                        best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                                        best_min_tick = 0.0
-                                        best_tp = current_best_market.trading_pair
-                                        if best_tp in self._min_price_increment_cache:
-                                            best_min_tick = self._min_price_increment_cache[best_tp]
-                                        else:
-                                            best_tr = current_best_market.market._trading_rules.get(best_tp)
-                                            if best_tr is not None and best_tr.min_price_increment is not None:
-                                                best_min_tick = float(best_tr.min_price_increment)
-                                            self._min_price_increment_cache[best_tp] = best_min_tick
-                                        
-                                        if best_ob._bid_book.size() > 0 and best_min_tick > 0:
-                                            best_effective = float(deref(best_ob._bid_book.rbegin()).getPrice()) + best_min_tick
-                                            current_effective = order_price
-                                            # For BUY: lower effective price is better
-                                            improvement = (current_effective - best_effective) / current_effective if current_effective > 0 else 0
-                                            if improvement > MIN_MODE_SWITCH_HYSTERESIS:
-                                                should_cancel = True
-                                                cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name}, {improvement*100:.2f}% better)"
-                                        # If improvement <= threshold, don't cancel - stay on current market
-                                    else:
-                                        should_cancel = True
-                                        cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
+                                if current_ob._bid_book.size() > 0:
+                                    current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
                                 else:
-                                    # Same market - evaluate if conditions changed
-                                    try:
-                                        current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                                        
-                                        if current_ob._bid_book.size() > 0:
-                                            current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
-                                        else:
-                                            current_bid = 0.0
-                                            
-                                        if current_ob._ask_book.size() > 0:
-                                            current_ask = float(deref(current_ob._ask_book.begin()).getPrice())
-                                        else:
-                                            current_ask = 0.0
+                                    current_bid = 0.0
 
-                                        # OPTIMIZATION: Fetch trading_rule ONCE and reuse (was fetched 3x before)
-                                        # Use cache instead of dict lookup
-                                        trading_pair = current_best_market.trading_pair
-                                        if trading_pair in self._min_price_increment_cache:
-                                            min_price_increment = self._min_price_increment_cache[trading_pair]
-                                        else:
-                                            trading_rule = current_best_market.market._trading_rules.get(trading_pair)
-                                            min_price_increment = 0.0
-                                            if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                min_price_increment = float(trading_rule.min_price_increment)
-                                            self._min_price_increment_cache[trading_pair] = min_price_increment
+                                # Get min_price_increment (cached)
+                                trading_pair = order_market_tuple.trading_pair
+                                if trading_pair in self._min_price_increment_cache:
+                                    min_price_increment = self._min_price_increment_cache[trading_pair]
+                                else:
+                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
+                                    min_price_increment = 0.0
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_price_increment = float(trading_rule.min_price_increment)
+                                    self._min_price_increment_cache[trading_pair] = min_price_increment
 
-                                        # IMPORTANT: For 'min' mode gap detection, check if top bid is OUR order
-                                        # Calculate effective_bid (second level if top is our order) using helper
-                                        effective_bid = self.c_get_effective_reference_price(
-                                            current_ob, current_bid, order_price, min_price_increment, True)
-                                        
-                                        # Track if we got a valid second level (not our own order)
-                                        got_valid_second_level = (effective_bid != current_bid)
+                                # Calculate effective_bid (second level if top is OUR order)
+                                effective_bid = self.c_get_effective_reference_price(
+                                    current_ob, current_bid, order_price, min_price_increment, True)
 
-                                        # Calculate ideal order price using helper
-                                        ideal_order_price = self.c_calculate_ideal_order_price(
-                                            effective_bid, self._buy_spread_pct, self._buy_spread_is_min, 
-                                            min_price_increment, True)
+                                # Track if we got a valid second level (not our own order)
+                                got_valid_second_level = (effective_bid != current_bid)
 
-                                        # CONDITION 2: Got outbid - someone placed HIGHER bid than our order
-                                        if self._buy_spread_is_min or self._buy_spread_pct > 0.0:
-                                            if current_bid > order_price:
-                                                should_cancel = True
-                                                cancel_reason = f"outbid (top bid {current_bid:.8f} > our {order_price:.8f})"
+                                # Calculate ideal order price
+                                ideal_order_price = self.c_calculate_ideal_order_price(
+                                    effective_bid, self._buy_spread_pct, self._buy_spread_is_min,
+                                    min_price_increment, True)
 
-                                        # CONDITION 2b: For 'min' mode, explicit 1-tick frontrun detection
-                                        if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
-                                            if got_valid_second_level:
-                                                expected_price = effective_bid + min_price_increment
-                                                price_misalignment = order_price - expected_price
-                                                if abs(price_misalignment) >= min_price_increment * 0.95:
-                                                    should_cancel = True
-                                                    if price_misalignment > 0:
-                                                        cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-                                                    else:
-                                                        cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-
-                                        # CONDITION 3: Market moved DOWN - opportunity to buy cheaper (gap detection)
-                                        if not should_cancel and ideal_order_price < order_price:
-                                            gap_down = order_price - ideal_order_price
-                                            if self._buy_spread_is_min:
-                                                # Min mode: check absolute threshold, but only with valid second level
-                                                cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
-                                                if got_valid_second_level and gap_down > cancel_threshold_abs:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                # CONDITION 2b: 1-tick min-mode frontrun/gap (needs got_valid_second_level)
+                                # Complements CHECK 2 in c_check_immediate_conditions which only checks
+                                # current_bid > order_price; this catches the subtler 1-tick misalignment.
+                                if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
+                                    if got_valid_second_level:
+                                        expected_price = effective_bid + min_price_increment
+                                        price_misalignment = order_price - expected_price
+                                        if abs(price_misalignment) >= min_price_increment * 0.95:
+                                            should_cancel = True
+                                            if price_misalignment > 0:
+                                                cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
                                             else:
-                                                # Percentage mode: check percentage threshold
-                                                cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
-                                                gap_pct = gap_down / order_price if order_price > 0 else 0.0
-                                                if gap_pct > cancel_threshold_pct:
-                                                    should_cancel = True
-                                                    cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8f} vs {order_price:.8f})"
+                                                cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
-                                        # CONDITION 4: Market moved UP significantly - got closer to being filled
-                                        if not should_cancel and self._buy_spread_pct == 0.0:
-                                            if current_bid >= order_price * AGGRESSIVE_MODE_TOLERANCE:
-                                                should_cancel = True
-                                                cancel_reason = "market moved to our price (aggressive mode)"
+                                # CONDITION 3: Market moved DOWN — can buy cheaper
+                                if not should_cancel and ideal_order_price < order_price:
+                                    gap_down = order_price - ideal_order_price
+                                    if self._buy_spread_is_min:
+                                        cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
+                                        if got_valid_second_level and gap_down > cancel_threshold_abs:
+                                            should_cancel = True
+                                            cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                    else:
+                                        cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
+                                        gap_pct = gap_down / order_price if order_price > 0 else 0.0
+                                        if gap_pct > cancel_threshold_pct:
+                                            should_cancel = True
+                                            cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8f} vs {order_price:.8f})"
 
-                                        # CONDITION 5: Significant price divergence using helper
-                                        if not should_cancel:
-                                            should_cancel, cancel_reason = self.c_check_price_divergence(
-                                                order_price, ideal_order_price, self._buy_spread_is_min,
-                                                min_price_increment, got_valid_second_level)
-                                    except Exception as e:
-                                        self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
-                                        pass
+                                # CONDITION 4: Aggressive mode — market moved to our price
+                                if not should_cancel and self._buy_spread_pct == 0.0:
+                                    if current_bid >= order_price * AGGRESSIVE_MODE_TOLERANCE:
+                                        should_cancel = True
+                                        cancel_reason = "market moved to our price (aggressive mode)"
+
+                                # CONDITION 5: Significant price divergence
+                                if not should_cancel:
+                                    should_cancel, cancel_reason = self.c_check_price_divergence(
+                                        order_price, ideal_order_price, self._buy_spread_is_min,
+                                        min_price_increment, got_valid_second_level)
+                            except Exception as e:
+                                self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
 
                     if should_cancel:
                         self._cancel_buy_order(asset, order_id, cancel_reason)
@@ -1664,129 +1613,86 @@ cdef class PositionBalancerHandler:
                                 pass
 
                     if not should_cancel and current_time - last_time > effective_interval:
-                        # Smart cancellation: only cancel if market/price changed
-                        try:
-                            # Find current best market
-                            current_best_market = self.c_find_best_sell_market(asset)
-                            if current_best_market is not None:
-                                # Get order details (market_tuple, price)
-                                order_details = self._active_sell_order_details.get(asset)
-                                if order_details is not None:
-                                    order_market_tuple, order_price = order_details
+                        # Periodic refresh: c_check_immediate_conditions already handles undercut/gap
+                        # (after 5s) and better-market (after 60s) every tick, so here we only run
+                        # the checks that need a full orderbook snapshot and are not time-gated:
+                        #   2b: 1-tick min-mode undercut (needs got_valid_second_level)
+                        #   3:  ideal-price gap (market moved up → can sell higher)
+                        #   4:  aggressive mode — market moved to our price
+                        #   5:  significant price divergence (c_check_price_divergence)
+                        order_details = self._active_sell_order_details.get(asset)
+                        if order_details is not None:
+                            order_market_tuple, order_price = order_details
+                            try:
+                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
 
-                                    # CONDITION 1: Check if different market became better
-                                    if current_best_market.market.name != order_market_tuple.market.name:
-                                        # For min mode: apply hysteresis - only switch if significantly better
-                                        if self._sell_spread_is_min:
-                                            # Get effective price of new best market
-                                            best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                                            best_min_tick = 0.0
-                                            best_tp = current_best_market.trading_pair
-                                            if best_tp in self._min_price_increment_cache:
-                                                best_min_tick = self._min_price_increment_cache[best_tp]
-                                            else:
-                                                best_tr = current_best_market.market._trading_rules.get(best_tp)
-                                                if best_tr is not None and best_tr.min_price_increment is not None:
-                                                    best_min_tick = float(best_tr.min_price_increment)
-                                                self._min_price_increment_cache[best_tp] = best_min_tick
-                                            
-                                            if best_ob._ask_book.size() > 0 and best_min_tick > 0:
-                                                best_effective = float(deref(best_ob._ask_book.begin()).getPrice()) - best_min_tick
-                                                current_effective = order_price
-                                                # For SELL: higher effective price is better
-                                                improvement = (best_effective - current_effective) / current_effective if current_effective > 0 else 0
-                                                if improvement > MIN_MODE_SWITCH_HYSTERESIS:
-                                                    should_cancel = True
-                                                    cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name}, {improvement*100:.2f}% better)"
-                                            # If improvement <= threshold, don't cancel - stay on current market
-                                        else:
+                                current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
+
+                                # Get min_price_increment (cached)
+                                trading_pair = order_market_tuple.trading_pair
+                                if trading_pair in self._min_price_increment_cache:
+                                    min_price_increment = self._min_price_increment_cache[trading_pair]
+                                else:
+                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
+                                    min_price_increment = 0.0
+                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
+                                        min_price_increment = float(trading_rule.min_price_increment)
+                                    self._min_price_increment_cache[trading_pair] = min_price_increment
+
+                                # Calculate effective_ask (second level if top is OUR order)
+                                effective_ask = self.c_get_effective_reference_price(
+                                    current_ob, current_ask, order_price, min_price_increment, False)
+
+                                # Track if we got a valid second level (not our own order)
+                                got_valid_second_level = (effective_ask != current_ask)
+
+                                # Calculate ideal order price
+                                ideal_order_price = self.c_calculate_ideal_order_price(
+                                    effective_ask, self._sell_spread_pct, self._sell_spread_is_min,
+                                    min_price_increment, False)
+
+                                # CONDITION 2b: 1-tick min-mode undercut/gap (needs got_valid_second_level)
+                                # Complements CHECK 2 in c_check_immediate_conditions which only checks
+                                # current_ask < order_price; this catches the subtler 1-tick misalignment.
+                                if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
+                                    if got_valid_second_level:
+                                        expected_price = effective_ask - min_price_increment
+                                        price_misalignment = expected_price - order_price
+                                        if abs(price_misalignment) >= min_price_increment * 0.95:
                                             should_cancel = True
-                                            cancel_reason = f"better market ({current_best_market.market.name} vs {order_market_tuple.market.name})"
-                                    else:
-                                        # Same market - evaluate if conditions changed
-                                        try:
-                                            current_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                                            
-                                            # Get orderbook prices using helper
-                                            current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
-
-
-                                            # Get min_price_increment (cached)
-                                            trading_pair = current_best_market.trading_pair
-                                            if trading_pair in self._min_price_increment_cache:
-                                                min_price_increment = self._min_price_increment_cache[trading_pair]
+                                            if price_misalignment > 0:
+                                                cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
                                             else:
-                                                trading_rule = current_best_market.market._trading_rules.get(trading_pair)
-                                                min_price_increment = 0.0
-                                                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                                    min_price_increment = float(trading_rule.min_price_increment)
-                                                self._min_price_increment_cache[trading_pair] = min_price_increment
+                                                cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
-                                            # Calculate effective_ask (second level if top is our order) using helper
-                                            effective_ask = self.c_get_effective_reference_price(
-                                                current_ob, current_ask, order_price, min_price_increment, False)
-                                            
-                                            # Track if we got a valid second level (not our own order)
-                                            got_valid_second_level = (effective_ask != current_ask)
+                                # CONDITION 3: Market moved UP — can sell higher
+                                if not should_cancel and ideal_order_price > order_price:
+                                    gap_up = ideal_order_price - order_price
+                                    if self._sell_spread_is_min:
+                                        cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
+                                        if got_valid_second_level and gap_up > cancel_threshold_abs:
+                                            should_cancel = True
+                                            cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
+                                    else:
+                                        cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
+                                        gap_pct = gap_up / order_price if order_price > 0 else 0.0
+                                        if gap_pct > cancel_threshold_pct:
+                                            should_cancel = True
+                                            cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8f} vs {order_price:.8f})"
 
-                                            # Calculate ideal order price using helper
-                                            ideal_order_price = self.c_calculate_ideal_order_price(
-                                                effective_ask, self._sell_spread_pct, self._sell_spread_is_min, 
-                                                min_price_increment, False)
+                                # CONDITION 4: Aggressive mode — market moved to our price
+                                if not should_cancel and self._sell_spread_pct == 0.0:
+                                    if current_ask <= order_price * (2.0 - AGGRESSIVE_MODE_TOLERANCE):
+                                        should_cancel = True
+                                        cancel_reason = "market moved to our price (aggressive mode)"
 
-                                            # CONDITION 2: Got undercut - someone placed LOWER ask than our order
-                                            if self._sell_spread_is_min or self._sell_spread_pct > 0.0:
-                                                if current_ask < order_price:
-                                                    should_cancel = True
-                                                    cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
-
-                                            # CONDITION 2b: For 'min' mode, explicit 1-tick undercut detection
-                                            if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
-                                                if got_valid_second_level:
-                                                    expected_price = effective_ask - min_price_increment
-                                                    price_misalignment = expected_price - order_price
-                                                    if abs(price_misalignment) >= min_price_increment * 0.95:
-                                                        should_cancel = True
-                                                        if price_misalignment > 0:
-                                                            cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-                                                        else:
-                                                            cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
-
-                                            # CONDITION 3: Market moved UP - opportunity to sell higher (gap detection)
-                                            if not should_cancel and ideal_order_price > order_price:
-                                                gap_up = ideal_order_price - order_price
-                                                if self._sell_spread_is_min:
-                                                    # Min mode: check absolute threshold, but only with valid second level
-                                                    cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
-                                                    if got_valid_second_level and gap_up > cancel_threshold_abs:
-                                                        should_cancel = True
-                                                        cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
-                                                else:
-                                                    # Percentage mode: check percentage threshold
-                                                    cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
-                                                    gap_pct = gap_up / order_price if order_price > 0 else 0.0
-                                                    if gap_pct > cancel_threshold_pct:
-                                                        should_cancel = True
-                                                        cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8f} vs {order_price:.8f})"
-
-                                            # CONDITION 4: Market moved DOWN significantly - got closer to being filled
-                                            if not should_cancel and self._sell_spread_pct == 0.0:
-                                                if current_ask <= order_price * (2.0 - AGGRESSIVE_MODE_TOLERANCE):
-                                                    should_cancel = True
-                                                    cancel_reason = "market moved to our price (aggressive mode)"
-
-                                            # CONDITION 5: Significant price divergence using helper
-                                            if not should_cancel:
-                                                should_cancel, cancel_reason = self.c_check_price_divergence(
-                                                    order_price, ideal_order_price, self._sell_spread_is_min,
-                                                    min_price_increment, got_valid_second_level)
-
-                                        except Exception as e:
-                                            self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
-                                            pass
-                        except Exception as e:
-                            self.strategy.logger().warning(f"Position balancer: Error finding best sell market: {e}")
-                            pass
+                                # CONDITION 5: Significant price divergence
+                                if not should_cancel:
+                                    should_cancel, cancel_reason = self.c_check_price_divergence(
+                                        order_price, ideal_order_price, self._sell_spread_is_min,
+                                        min_price_increment, got_valid_second_level)
+                            except Exception as e:
+                                self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
 
                     if should_cancel:
                         self._cancel_sell_order(asset, order_id, cancel_reason)
