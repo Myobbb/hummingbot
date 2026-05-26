@@ -84,7 +84,7 @@ cdef class PositionBalancerHandler:
                                                bint spread_is_min, double min_price_increment, bint is_buy)
     cdef tuple c_check_price_divergence(self, double order_price, double ideal_price, bint spread_is_min, 
                                          double min_price_increment, bint got_valid_second_level)
-    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy)
+    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age)
     cdef void c_cancel_stale_orders(self, str asset)
     cdef void _cancel_buy_order(self, str asset, str order_id, str reason)
     cdef void _cancel_sell_order(self, str asset, str order_id, str reason)

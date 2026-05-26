@@ -41,10 +41,20 @@ cdef double DEFAULT_AGGRESSIVE_REFRESH_INTERVAL = 5.0   # Refresh for aggressive
 cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
 
 # --- Minimum order age before immediate-cancel checks fire ---
-# Frontrun/undercut/gap detection is suppressed for this many seconds after placement.
-# Prevents rapid cancel-replace loops when price ticks during the first moments of an order's life.
-# 'mode disabled' cancels are always immediate regardless of this floor.
-cdef double MIN_IMMEDIATE_CHECK_DELAY = 60.0  # seconds — match DEFAULT_LIMIT_REFRESH_INTERVAL
+# Two thresholds because different events have different noise profiles:
+#
+# MIN_FRONTRUN_CHECK_DELAY (5s) — frontrun/undercut and large-gap detection.
+#   These are real book events, not tick noise. Waiting 60s means sitting behind
+#   someone else in the queue for a full minute. 5s is long enough to ignore a
+#   single-tick bounce but short enough to reclaim top-of-book quickly.
+#
+# MIN_MARKET_SWITCH_DELAY (60s) — "better market" detection (different exchange).
+#   Cross-exchange price differences are noisy; switching too quickly causes
+#   flip-flopping. 60s matches the periodic refresh interval.
+#
+# 'mode disabled' cancels are always immediate regardless of either floor.
+cdef double MIN_FRONTRUN_CHECK_DELAY = 5.0    # seconds — frontrun/undercut + large-gap
+cdef double MIN_MARKET_SWITCH_DELAY  = 60.0   # seconds — better market (different exchange)
 
 # --- Post-cancel cooldown before placing the next order ---
 # After any cancel (frontrun reprice, undercut reprice, gap reprice), wait this many seconds
@@ -1178,18 +1188,18 @@ cdef class PositionBalancerHandler:
         
         return (should_cancel, cancel_reason)
 
-    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy):
+    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age):
         """
         UNIFIED immediate check for all conditions that require instant response.
-        
-        This combines:
-        1. Better market available (ALL MODES)
-        2. Frontrun/undercut detection (min/% modes only)
-        3. Large gap detection (min mode only)
-        
-        All checks use the SAME orderbook snapshot to avoid race conditions
-        and prevent duplicate fetches.
-        
+
+        Applies two separate age thresholds to avoid false triggers on fresh orders:
+          - Frontrun/undercut + large gap: MIN_FRONTRUN_CHECK_DELAY (5s)
+              Real book events — react quickly to reclaim top-of-book position.
+          - Better market (different exchange): MIN_MARKET_SWITCH_DELAY (60s)
+              Cross-exchange price differences are noisy; slow gate prevents flip-flopping.
+
+        All active checks use the SAME orderbook snapshot to avoid race conditions.
+
         Returns: (should_cancel, cancel_reason) tuple
         """
         cdef:
@@ -1262,8 +1272,12 @@ cdef class PositionBalancerHandler:
             
             # ================================================================
             # CHECK 1: Better market available (ALL MODES)
+            # Gated by MIN_MARKET_SWITCH_DELAY — cross-exchange price differences
+            # are noisy; switching too quickly causes flip-flopping.
             # ================================================================
-            if current_best_market.market.name != order_market_tuple.market.name:
+            if order_age < MIN_MARKET_SWITCH_DELAY:
+                pass  # too soon to consider switching markets
+            elif current_best_market.market.name != order_market_tuple.market.name:
                 # Different market is now best - compare prices
                 # For 'min' mode: compare effective frontrun prices with hysteresis
                 # Only switch if new market is significantly better (0.1%) to prevent flip-flopping
@@ -1334,9 +1348,11 @@ cdef class PositionBalancerHandler:
             
             # ================================================================
             # CHECK 2 & 3: Frontrun + Large Gap (MAKER MODES ONLY)
-            # Skip for aggressive mode (0%) - they don't compete for position
+            # Gated by MIN_FRONTRUN_CHECK_DELAY — these are real book events,
+            # not tick noise. 5s is enough to ignore a single-tick bounce.
+            # Skip for aggressive mode (0%) — they don't compete for position.
             # ================================================================
-            if not should_cancel and is_maker_mode:
+            if not should_cancel and is_maker_mode and order_age >= MIN_FRONTRUN_CHECK_DELAY:
                 if is_buy:
                     # CHECK 2: Frontrun - someone placed HIGHER bid than our order
                     if current_bid > order_price:
@@ -1442,11 +1458,12 @@ cdef class PositionBalancerHandler:
                         cancel_reason = "mode disabled"
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Frontrun + Gap detection
-                    # All checks use same orderbook snapshot to avoid race conditions
-                    # Suppressed for MIN_IMMEDIATE_CHECK_DELAY seconds after placement to prevent
-                    # rapid cancel-replace loops from 1-tick price moves on freshly placed orders.
-                    if not should_cancel and (current_time - last_time > MIN_IMMEDIATE_CHECK_DELAY):
-                        should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, True)
+                    # Pass order age so the function can apply per-check delay thresholds:
+                    #   frontrun/large-gap → MIN_FRONTRUN_CHECK_DELAY (5s)
+                    #   better market      → MIN_MARKET_SWITCH_DELAY  (60s)
+                    if not should_cancel:
+                        should_cancel, cancel_reason = self.c_check_immediate_conditions(
+                            asset, True, current_time - last_time)
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
@@ -1624,11 +1641,12 @@ cdef class PositionBalancerHandler:
                         cancel_reason = "mode disabled"
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Undercut + Gap detection
-                    # All checks use same orderbook snapshot to avoid race conditions
-                    # Suppressed for MIN_IMMEDIATE_CHECK_DELAY seconds after placement to prevent
-                    # rapid cancel-replace loops from 1-tick price moves on freshly placed orders.
-                    if not should_cancel and (current_time - last_time > MIN_IMMEDIATE_CHECK_DELAY):
-                        should_cancel, cancel_reason = self.c_check_immediate_conditions(asset, False)
+                    # Pass order age so the function can apply per-check delay thresholds:
+                    #   undercut/large-gap → MIN_FRONTRUN_CHECK_DELAY (5s)
+                    #   better market      → MIN_MARKET_SWITCH_DELAY  (60s)
+                    if not should_cancel:
+                        should_cancel, cancel_reason = self.c_check_immediate_conditions(
+                            asset, False, current_time - last_time)
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
