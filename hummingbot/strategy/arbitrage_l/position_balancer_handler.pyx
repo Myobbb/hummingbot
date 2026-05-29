@@ -2590,11 +2590,11 @@ cdef class PositionBalancerHandler:
         if self._sell_spread_is_min:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.8f} (spread: min tick)")
+                f"at {sell_price:.10f} (spread: min tick)")
         else:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.8f} (spread: {self._sell_spread_pct * 100:.2f}%)")
+                f"at {sell_price:.10f} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
