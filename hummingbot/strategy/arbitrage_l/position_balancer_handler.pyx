@@ -1587,7 +1587,11 @@ cdef class PositionBalancerHandler:
                                                 cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                 # CONDITION 3: Market moved DOWN — can buy cheaper
-                                if not should_cancel and ideal_order_price < order_price:
+                                # Skip in aggressive mode (0%): ideal_order_price = effective_bid,
+                                # but the order is placed at top_ask — the spread gap between bid
+                                # and ask is not a "can buy cheaper" signal. Condition 4 handles
+                                # aggressive-mode repricing correctly.
+                                if not should_cancel and not (self._buy_spread_pct == 0.0 and not self._buy_spread_is_min) and ideal_order_price < order_price:
                                     gap_down = order_price - ideal_order_price
                                     if self._buy_spread_is_min:
                                         cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
@@ -1608,7 +1612,10 @@ cdef class PositionBalancerHandler:
                                         cancel_reason = "market moved to our price (aggressive mode)"
 
                                 # CONDITION 5: Significant price divergence
-                                if not should_cancel:
+                                # Skip in aggressive mode (0%): ideal_order_price is based on
+                                # effective_bid but order is at top_ask; the spread gap is not
+                                # divergence. Condition 4 handles aggressive-mode repricing.
+                                if not should_cancel and not (self._buy_spread_pct == 0.0 and not self._buy_spread_is_min):
                                     should_cancel, cancel_reason = self.c_check_price_divergence(
                                         order_price, ideal_order_price, self._buy_spread_is_min,
                                         min_price_increment, got_valid_second_level)
@@ -1733,7 +1740,11 @@ cdef class PositionBalancerHandler:
                                                 cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
 
                                 # CONDITION 3: Market moved UP — can sell higher
-                                if not should_cancel and ideal_order_price > order_price:
+                                # Skip in aggressive mode (0%): ideal_order_price = effective_ask,
+                                # but the order is placed at top_bid — the spread gap between ask
+                                # and bid is not a "can sell higher" signal. Condition 4 handles
+                                # aggressive-mode repricing correctly.
+                                if not should_cancel and not (self._sell_spread_pct == 0.0 and not self._sell_spread_is_min) and ideal_order_price > order_price:
                                     gap_up = ideal_order_price - order_price
                                     if self._sell_spread_is_min:
                                         cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
@@ -1754,7 +1765,10 @@ cdef class PositionBalancerHandler:
                                         cancel_reason = "market moved to our price (aggressive mode)"
 
                                 # CONDITION 5: Significant price divergence
-                                if not should_cancel:
+                                # Skip in aggressive mode (0%): ideal_order_price is based on
+                                # effective_ask but order is at top_bid; the spread gap is not
+                                # divergence. Condition 4 handles aggressive-mode repricing.
+                                if not should_cancel and not (self._sell_spread_pct == 0.0 and not self._sell_spread_is_min):
                                     should_cancel, cancel_reason = self.c_check_price_divergence(
                                         order_price, ideal_order_price, self._sell_spread_is_min,
                                         min_price_increment, got_valid_second_level)
