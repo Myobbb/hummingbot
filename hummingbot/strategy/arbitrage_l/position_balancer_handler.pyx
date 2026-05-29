@@ -57,11 +57,20 @@ cdef double MIN_FRONTRUN_CHECK_DELAY = 5.0    # seconds — frontrun/undercut + 
 cdef double MIN_MARKET_SWITCH_DELAY  = 60.0   # seconds — better market (different exchange)
 
 # --- Post-cancel cooldown before placing the next order ---
-# After any cancel (frontrun reprice, undercut reprice, gap reprice), wait this many seconds
-# before placing a replacement order. Prevents rapid place→cancel→place loops
-# that look like order-book manipulation to exchanges.
-# Distinct from DEFAULT_COMPLETION_COOLDOWN (2s, used after a fill).
-cdef double POST_CANCEL_COOLDOWN = 10.0  # seconds — ~1 order per 80s cycle minimum
+# Two tiers based on cancel reason:
+#
+# POST_CANCEL_COOLDOWN_REACTIVE (3s) — market moved against us (undercut/frontrun/large-gap).
+#   We need to reprice quickly to reclaim top-of-book. 3s is enough to let the exchange
+#   process the cancel and avoid a rapid-fire burst impression.
+#
+# POST_CANCEL_COOLDOWN_PROACTIVE (10s) — we initiated the cancel (periodic refresh,
+#   better market, price divergence). No urgency; the existing order was not beaten.
+#
+# Both are distinct from DEFAULT_COMPLETION_COOLDOWN (2s, used after a fill).
+cdef double POST_CANCEL_COOLDOWN_REACTIVE  = 3.0   # seconds — reactive: undercut/frontrun/large-gap
+cdef double POST_CANCEL_COOLDOWN_PROACTIVE = 10.0  # seconds — proactive: refresh/better-market/divergence
+# Legacy alias — kept for any external references; equals PROACTIVE value
+cdef double POST_CANCEL_COOLDOWN = 10.0
 
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
@@ -183,9 +192,14 @@ cdef class PositionBalancerHandler:
         self._sell_cancel_request_time = {}   # asset -> timestamp when cancel was requested
         self._last_buy_completion_time = {}   # asset -> timestamp when buy order completed
         self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
-        self._last_buy_cancel_time = {}       # asset -> timestamp when buy order was cancelled (for POST_CANCEL_COOLDOWN)
-        self._last_sell_cancel_time = {}      # asset -> timestamp when sell order was cancelled (for POST_CANCEL_COOLDOWN)
+        self._last_buy_cancel_time = {}       # canonical_asset -> timestamp when buy order was cancelled
+        self._last_buy_cancel_cooldown = {}   # canonical_asset -> cooldown duration to apply (reactive vs proactive)
+        self._last_sell_cancel_time = {}      # canonical_asset -> timestamp when sell order was cancelled
+        self._last_sell_cancel_cooldown = {}  # canonical_asset -> cooldown duration to apply (reactive vs proactive)
         self._last_sell_insuf_bal_time = {}   # asset -> timestamp of last "sell skipped - insufficient balance" (for INSUF_BAL_RETRY_COOLDOWN)
+        # Consecutive-cancel backoff: count cancels without a fill to detect stuck-undercutter loops
+        self._buy_cancel_streak = {}          # canonical_asset -> int, resets on fill
+        self._sell_cancel_streak = {}         # canonical_asset -> int, resets on fill
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -595,6 +609,7 @@ cdef class PositionBalancerHandler:
         """
         Update pending amounts when order receives a fill.
         This ensures accurate balance tracking for partial fills.
+        Also resets the consecutive-cancel streak — a fill means we're making progress.
         """
         try:
             # Check if this is a buy order
@@ -608,6 +623,9 @@ cdef class PositionBalancerHandler:
                     float(self._pending_buy_by_asset.get(asset_key, 0.0)) - filled_amount)
                 if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
                     self._pending_buy_by_asset.pop(asset_key, None)
+                # Reset consecutive-cancel streak — a fill means progress
+                canonical = self._get_canonical_asset(asset_key)
+                self._buy_cancel_streak.pop(canonical, None)
             # Check if this is a sell order
             elif order_id in self._pending_sell_orders:
                 asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
@@ -619,6 +637,9 @@ cdef class PositionBalancerHandler:
                     float(self._pending_sell_by_asset.get(asset_key, 0.0)) - filled_amount)
                 if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
                     self._pending_sell_by_asset.pop(asset_key, None)
+                # Reset consecutive-cancel streak — a fill means progress
+                canonical = self._get_canonical_asset(asset_key)
+                self._sell_cancel_streak.pop(canonical, None)
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle fill for {order_id}: {e}")
 
@@ -650,8 +671,8 @@ cdef class PositionBalancerHandler:
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._buy_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for cooldown
-                        self._last_buy_completion_time[asset_key] = self.strategy._current_timestamp
+                        # Record completion time under canonical key — placement gate reads canonical
+                        self._last_buy_completion_time[self._get_canonical_asset(asset_key)] = self.strategy._current_timestamp
             else:
                 pend = self._pending_sell_orders.pop(order_id, None)
                 if pend is not None:
@@ -671,22 +692,38 @@ cdef class PositionBalancerHandler:
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
                         self._sell_cancel_request_time.pop(asset_key, None)
-                        # Record completion time for cooldown
-                        self._last_sell_completion_time[asset_key] = self.strategy._current_timestamp
+                        # Record completion time under canonical key — placement gate reads canonical
+                        self._last_sell_completion_time[self._get_canonical_asset(asset_key)] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
 
     def handle_order_cancellation(self, str order_id):
         """Clean up pending order tracking on order cancellation."""
-        # Record cancel time for POST_CANCEL_COOLDOWN before cleaning up tracking.
-        # Check buy side first, then sell side.
+        # Record cancel time under the CANONICAL asset key so the placement gate
+        # (which always reads canonical) never misses the cooldown on aliased assets.
+        # The cooldown duration was already stored in _last_buy/sell_cancel_cooldown by
+        # _cancel_buy/sell_order. For external cancels (exchange-initiated) we fall back
+        # to POST_CANCEL_COOLDOWN (proactive/conservative default).
         ts = self.strategy._current_timestamp
         if order_id in self._pending_buy_orders:
             asset_key = self._pending_buy_orders[order_id][0]
-            self._last_buy_cancel_time[asset_key] = ts
+            canonical = self._get_canonical_asset(asset_key)
+            # Start cooldown clock NOW (when exchange confirms cancel, not when we sent the request).
+            self._last_buy_cancel_time[canonical] = ts
+            # Cooldown duration was already set by _cancel_buy_order for internal cancels.
+            # For external/exchange-initiated cancels (not in dict), use conservative default
+            # and count toward the streak.
+            if canonical not in self._last_buy_cancel_cooldown:
+                self._last_buy_cancel_cooldown[canonical] = POST_CANCEL_COOLDOWN_PROACTIVE
+                self._buy_cancel_streak[canonical] = self._buy_cancel_streak.get(canonical, 0) + 1
+            # else: _cancel_buy_order already wrote cooldown and incremented streak; leave both.
         elif order_id in self._pending_sell_orders:
             asset_key = self._pending_sell_orders[order_id][0]
-            self._last_sell_cancel_time[asset_key] = ts
+            canonical = self._get_canonical_asset(asset_key)
+            self._last_sell_cancel_time[canonical] = ts
+            if canonical not in self._last_sell_cancel_cooldown:
+                self._last_sell_cancel_cooldown[canonical] = POST_CANCEL_COOLDOWN_PROACTIVE
+                self._sell_cancel_streak[canonical] = self._sell_cancel_streak.get(canonical, 0) + 1
         # Try both buy and sell
         self.handle_order_completion(order_id, True)
         self.handle_order_completion(order_id, False)
@@ -1188,13 +1225,16 @@ cdef class PositionBalancerHandler:
         
         return (should_cancel, cancel_reason)
 
-    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age):
+    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
+                                            double frontrun_delay=MIN_FRONTRUN_CHECK_DELAY):
         """
         UNIFIED immediate check for all conditions that require instant response.
 
         Applies two separate age thresholds to avoid false triggers on fresh orders:
-          - Frontrun/undercut + large gap: MIN_FRONTRUN_CHECK_DELAY (5s)
+          - Frontrun/undercut + large gap: frontrun_delay (default MIN_FRONTRUN_CHECK_DELAY=5s)
               Real book events — react quickly to reclaim top-of-book position.
+              Caller may pass a larger value (e.g. 20s) when a consecutive-cancel streak is
+              detected, to slow down chasing in stuck-undercutter loops.
           - Better market (different exchange): MIN_MARKET_SWITCH_DELAY (60s)
               Cross-exchange price differences are noisy; slow gate prevents flip-flopping.
 
@@ -1223,7 +1263,7 @@ cdef class PositionBalancerHandler:
             bint spread_is_min
             double spread_pct
             bint is_maker_mode
-        
+
         try:
             # Get order details
             if is_buy:
@@ -1234,31 +1274,22 @@ cdef class PositionBalancerHandler:
                 order_details = self._active_sell_order_details.get(asset)
                 spread_is_min = self._sell_spread_is_min
                 spread_pct = self._sell_spread_pct
-            
+
             if order_details is None:
                 return (False, "")
-            
+
             order_market_tuple, order_price = order_details
             is_maker_mode = spread_is_min or spread_pct > 0.0
-            
-            # Find current best market
-            if is_buy:
-                current_best_market = self.c_find_best_buy_market(asset)
-            else:
-                current_best_market = self.c_find_best_sell_market(asset)
-            
-            if current_best_market is None:
-                return (False, "")
-            
-            # Fetch current order's market orderbook ONCE
+
+            # Fetch current order's market orderbook ONCE — used by CHECK 2 & 3
             order_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
-            
+
             # Get prices from order's market
             if order_ob._bid_book.size() > 0:
                 current_bid = float(deref(order_ob._bid_book.rbegin()).getPrice())
             if order_ob._ask_book.size() > 0:
                 current_ask = float(deref(order_ob._ask_book.begin()).getPrice())
-            
+
             # Get min_price_increment (cached)
             trading_pair = order_market_tuple.trading_pair
             if trading_pair in self._min_price_increment_cache:
@@ -1269,15 +1300,23 @@ cdef class PositionBalancerHandler:
                 if trading_rule is not None and trading_rule.min_price_increment is not None:
                     min_price_increment = float(trading_rule.min_price_increment)
                 self._min_price_increment_cache[trading_pair] = min_price_increment
-            
+
             # ================================================================
             # CHECK 1: Better market available (ALL MODES)
             # Gated by MIN_MARKET_SWITCH_DELAY — cross-exchange price differences
             # are noisy; switching too quickly causes flip-flopping.
+            # The market scan (c_find_best_*_market) is intentionally deferred to
+            # inside this gate: it's the most expensive call (iterates all pairs,
+            # reads orderbooks) and is pointless before the 60s threshold.
             # ================================================================
-            if order_age < MIN_MARKET_SWITCH_DELAY:
-                pass  # too soon to consider switching markets
-            elif current_best_market.market.name != order_market_tuple.market.name:
+            if order_age >= MIN_MARKET_SWITCH_DELAY:
+                # Only now do we pay the cost of scanning all markets
+                if is_buy:
+                    current_best_market = self.c_find_best_buy_market(asset)
+                else:
+                    current_best_market = self.c_find_best_sell_market(asset)
+
+            if current_best_market is not None and current_best_market.market.name != order_market_tuple.market.name:
                 # Different market is now best - compare prices
                 # For 'min' mode: compare effective frontrun prices with hysteresis
                 # Only switch if new market is significantly better (0.1%) to prevent flip-flopping
@@ -1352,7 +1391,7 @@ cdef class PositionBalancerHandler:
             # not tick noise. 5s is enough to ignore a single-tick bounce.
             # Skip for aggressive mode (0%) — they don't compete for position.
             # ================================================================
-            if not should_cancel and is_maker_mode and order_age >= MIN_FRONTRUN_CHECK_DELAY:
+            if not should_cancel and is_maker_mode and order_age >= frontrun_delay:
                 if is_buy:
                     # CHECK 2: Frontrun - someone placed HIGHER bid than our order
                     if current_bid > order_price:
@@ -1425,8 +1464,11 @@ cdef class PositionBalancerHandler:
             double cancel_threshold_abs
             double cancel_threshold_pct
             bint should_cancel
+            bint is_reactive   # True when cancel is driven by a market event (undercut/frontrun/gap)
             str cancel_reason
             str order_id
+            int cancel_streak
+            double effective_frontrun_delay
 
         # ========================================================================
         # CHECK BUY ORDERS
@@ -1446,7 +1488,17 @@ cdef class PositionBalancerHandler:
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_buy_order_time.get(asset, 0.0)
                     should_cancel = False
+                    is_reactive = False
                     cancel_reason = ""
+
+                    # Consecutive-cancel streak backoff: after 5 cancels without a fill,
+                    # extend the frontrun check delay to slow down chasing in stuck-undercutter loops.
+                    # The streak is reset to 0 on any fill (handle_order_fill).
+                    cancel_streak = self._buy_cancel_streak.get(self._get_canonical_asset(asset), 0)
+                    if cancel_streak >= 5:
+                        effective_frontrun_delay = MIN_FRONTRUN_CHECK_DELAY * 4.0  # 20s
+                    else:
+                        effective_frontrun_delay = MIN_FRONTRUN_CHECK_DELAY  # 5s
 
                     # Cancel if mode disabled (orphaned order)
                     if not self._buy_enabled:
@@ -1454,12 +1506,14 @@ cdef class PositionBalancerHandler:
                         cancel_reason = "mode disabled"
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Frontrun + Gap detection
-                    # Pass order age so the function can apply per-check delay thresholds:
-                    #   frontrun/large-gap → MIN_FRONTRUN_CHECK_DELAY (5s)
-                    #   better market      → MIN_MARKET_SWITCH_DELAY  (60s)
+                    # Pass order age so the function can apply per-check delay thresholds.
+                    # Uses effective_frontrun_delay (backed off when streak >= 5).
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
-                            asset, True, current_time - last_time)
+                            asset, True, current_time - last_time, effective_frontrun_delay)
+                    # Immediate-check cancels are always reactive (market event)
+                    if should_cancel and cancel_reason and not cancel_reason.startswith("mode disabled"):
+                        is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
@@ -1562,7 +1616,8 @@ cdef class PositionBalancerHandler:
                                 self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
 
                     if should_cancel:
-                        self._cancel_buy_order(asset, order_id, cancel_reason)
+                        # is_reactive is True only for immediate-check (market-event) cancels
+                        self._cancel_buy_order(asset, order_id, cancel_reason, reactive=is_reactive)
 
         # ========================================================================
         # CHECK SELL ORDERS
@@ -1582,7 +1637,17 @@ cdef class PositionBalancerHandler:
                     # Only process if we haven't already sent a cancel request
                     last_time = self._last_sell_order_time.get(asset, 0.0)
                     should_cancel = False
+                    is_reactive = False
                     cancel_reason = ""
+
+                    # Consecutive-cancel streak backoff: after 5 cancels without a fill,
+                    # extend the frontrun check delay to slow down chasing in stuck-undercutter loops.
+                    # The streak is reset to 0 on any fill (handle_order_fill).
+                    cancel_streak = self._sell_cancel_streak.get(self._get_canonical_asset(asset), 0)
+                    if cancel_streak >= 5:
+                        effective_frontrun_delay = MIN_FRONTRUN_CHECK_DELAY * 4.0  # 20s
+                    else:
+                        effective_frontrun_delay = MIN_FRONTRUN_CHECK_DELAY  # 5s
 
                     # Cancel if mode disabled (orphaned order)
                     if not self._sell_enabled:
@@ -1590,12 +1655,14 @@ cdef class PositionBalancerHandler:
                         cancel_reason = "mode disabled"
 
                     # UNIFIED IMMEDIATE CHECK: Better market + Undercut + Gap detection
-                    # Pass order age so the function can apply per-check delay thresholds:
-                    #   undercut/large-gap → MIN_FRONTRUN_CHECK_DELAY (5s)
-                    #   better market      → MIN_MARKET_SWITCH_DELAY  (60s)
+                    # Pass order age so the function can apply per-check delay thresholds.
+                    # Uses effective_frontrun_delay (backed off when streak >= 5).
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
-                            asset, False, current_time - last_time)
+                            asset, False, current_time - last_time, effective_frontrun_delay)
+                    # Immediate-check cancels are always reactive (market event)
+                    if should_cancel and cancel_reason and not cancel_reason.startswith("mode disabled"):
+                        is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
@@ -1695,18 +1762,25 @@ cdef class PositionBalancerHandler:
                                 self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
 
                     if should_cancel:
-                        self._cancel_sell_order(asset, order_id, cancel_reason)
+                        # is_reactive is True only for immediate-check (market-event) cancels
+                        self._cancel_sell_order(asset, order_id, cancel_reason, reactive=is_reactive)
 
-    cdef void _cancel_buy_order(self, str asset, str order_id, str reason):
+    cdef void _cancel_buy_order(self, str asset, str order_id, str reason, bint reactive=False):
         """
         Internal method to cancel a buy order with proper cleanup tracking.
         Ensures atomic cancellation with correct state management.
 
         Uses stored market_tuple for robust direct cancellation by order_id.
+
+        Args:
+            reactive: True if cancel is driven by a market event (undercut/frontrun/large-gap).
+                      Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of PROACTIVE (10s).
         """
         cdef:
             tuple order_details
             object market_tuple
+            str canonical
+            double cooldown
 
         try:
             # Get stored market_tuple from order details for direct cancellation
@@ -1733,8 +1807,17 @@ cdef class PositionBalancerHandler:
             # Track cancel request time for stuck cancel detection
             self._buy_cancel_request_time[asset] = self.strategy._current_timestamp
 
+            # Record cooldown to apply under canonical key so handle_order_cancellation
+            # (alias-aware) picks it up correctly.
+            canonical = self._get_canonical_asset(asset)
+            cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
+            self._last_buy_cancel_cooldown[canonical] = cooldown
+            # Increment consecutive-cancel streak (reset on fill)
+            self._buy_cancel_streak[canonical] = self._buy_cancel_streak.get(canonical, 0) + 1
+
             self.strategy.logger().info(
-                f"Position balancer: Cancelled buy order {order_id} for {asset} on {market_tuple.market.name} ({reason})")
+                f"Position balancer: Cancelled buy order {order_id} for {asset} on {market_tuple.market.name} "
+                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._buy_cancel_streak[canonical]}]")
 
             # NOTE: Don't remove from _active_buy_orders here!
             # Let handle_order_cancellation() clean it up when cancel event arrives.
@@ -1744,16 +1827,22 @@ cdef class PositionBalancerHandler:
             # Clean up timeout marker if cancel failed
             self.strategy._timeout_cancelled_orders.discard(order_id)
 
-    cdef void _cancel_sell_order(self, str asset, str order_id, str reason):
+    cdef void _cancel_sell_order(self, str asset, str order_id, str reason, bint reactive=False):
         """
         Internal method to cancel a sell order with proper cleanup tracking.
         Ensures atomic cancellation with correct state management.
 
         Uses stored market_tuple for robust direct cancellation by order_id.
+
+        Args:
+            reactive: True if cancel is driven by a market event (undercut/frontrun/large-gap).
+                      Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of PROACTIVE (10s).
         """
         cdef:
             tuple order_details
             object market_tuple
+            str canonical
+            double cooldown
 
         try:
             # Get stored market_tuple from order details for direct cancellation
@@ -1780,8 +1869,17 @@ cdef class PositionBalancerHandler:
             # Track cancel request time for stuck cancel detection
             self._sell_cancel_request_time[asset] = self.strategy._current_timestamp
 
+            # Record cooldown to apply under canonical key so handle_order_cancellation
+            # (alias-aware) picks it up correctly.
+            canonical = self._get_canonical_asset(asset)
+            cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
+            self._last_sell_cancel_cooldown[canonical] = cooldown
+            # Increment consecutive-cancel streak (reset on fill)
+            self._sell_cancel_streak[canonical] = self._sell_cancel_streak.get(canonical, 0) + 1
+
             self.strategy.logger().info(
-                f"Position balancer: Cancelled sell order {order_id} for {asset} on {market_tuple.market.name} ({reason})")
+                f"Position balancer: Cancelled sell order {order_id} for {asset} on {market_tuple.market.name} "
+                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._sell_cancel_streak[canonical]}]")
 
             # NOTE: Don't remove from _active_sell_orders here!
             # Let handle_order_cancellation() clean it up when cancel event arrives.
@@ -1872,36 +1970,35 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Check 2-second cooldown after order completion (fill)
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
-                        return False
-
-                    # Check post-cancel cooldown — prevents rapid place→cancel→replace loops
-                    time_since_cancel = self.strategy._current_timestamp - self._last_buy_cancel_time.get(canonical_asset, 0.0)
-                    if time_since_cancel < POST_CANCEL_COOLDOWN:
-                        return False
-
-                    # For completion check, use ACTUAL balance (not adjusted)
-                    base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
-                    val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
-                    if not self.c_try_mark_buy_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
-                        # Find the best market to buy on (lowest ask)
-                        selected_buy_market = self.c_find_best_buy_market(asset_key)
-                        if selected_buy_market is not None:
-                            # Pre-check: ensure selected market has enough quote balance for min notional
-                            market_quote_bal = float(selected_buy_market.market.get_available_balance(
-                                selected_buy_market.quote_asset))
-                            if market_quote_bal < self.strategy._min_order_usd:
-                                self.strategy.logger().warning(
-                                    f"Position balancer: {canonical_asset} buy skipped - "
-                                    f"{selected_buy_market.market.name} insufficient quote "
-                                    f"({market_quote_bal:.2f} < min {self.strategy._min_order_usd:.2f})")
-                                return False
-                            # For sell market, just use the other market from the pair
-                            # (not critical since we're only buying)
-                            selected_sell_market = sell_market_tuple
-                            placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
-                            if placed:
-                                return True
+                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                        # Check post-cancel cooldown — duration depends on why we cancelled:
+                        #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
+                        #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        time_since_cancel = self.strategy._current_timestamp - self._last_buy_cancel_time.get(canonical_asset, 0.0)
+                        required_cooldown = self._last_buy_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
+                        if time_since_cancel >= required_cooldown:
+                            # For completion check, use ACTUAL balance (not adjusted)
+                            base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
+                            val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
+                            if not self.c_try_mark_buy_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
+                                # Find the best market to buy on (lowest ask)
+                                selected_buy_market = self.c_find_best_buy_market(asset_key)
+                                if selected_buy_market is not None:
+                                    # Pre-check: ensure selected market has enough quote balance for min notional
+                                    market_quote_bal = float(selected_buy_market.market.get_available_balance(
+                                        selected_buy_market.quote_asset))
+                                    if market_quote_bal >= self.strategy._min_order_usd:
+                                        # For sell market, just use the other market from the pair
+                                        # (not critical since we're only buying)
+                                        selected_sell_market = sell_market_tuple
+                                        placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
+                                        if placed:
+                                            return True
+                                    else:
+                                        self.strategy.logger().warning(
+                                            f"Position balancer: {canonical_asset} buy skipped - "
+                                            f"{selected_buy_market.market.name} insufficient quote "
+                                            f"({market_quote_bal:.2f} < min {self.strategy._min_order_usd:.2f})")
 
         # Check if we need to sell
         if self._sell_enabled and not self._sell_completed:
@@ -1944,50 +2041,50 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Check 2-second cooldown after order completion (fill)
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN:
-                        return False
-
-                    # Check post-cancel cooldown — prevents rapid place→cancel→replace loops
-                    time_since_cancel = self.strategy._current_timestamp - self._last_sell_cancel_time.get(canonical_asset, 0.0)
-                    if time_since_cancel < POST_CANCEL_COOLDOWN:
-                        return False
-
-                    # Check insufficient-balance cooldown — suppresses retry spam when the best sell
-                    # market has insufficient base balance. Only applies for non-zero target; sell-to-zero
-                    # always proceeds so c_execute_sell_limit can handle dust specially.
-                    if self._sell_target_usd > 0.0:
-                        time_since_insuf_bal = self.strategy._current_timestamp - self._last_sell_insuf_bal_time.get(canonical_asset, 0.0)
-                        if time_since_insuf_bal < INSUF_BAL_RETRY_COOLDOWN:
-                            return False
-
-                    # For completion check, use ACTUAL balance (not adjusted)
-                    base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
-                    val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
-                    if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
-                        # Find the best market to sell on (highest bid)
-                        selected_sell_market = self.c_find_best_sell_market(asset_key)
-                        if selected_sell_market is not None:
-                            # Pre-check: ensure selected market has enough base balance for min notional.
-                            # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
-                            market_base_bal = float(selected_sell_market.market.get_available_balance(
-                                selected_sell_market.base_asset))
-                            if market_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
-                                # Best sell market has insufficient base balance — record timestamp so we
-                                # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
-                                self._last_sell_insuf_bal_time[canonical_asset] = self.strategy._current_timestamp
-                                self.strategy.logger().warning(
-                                    f"Position balancer: {canonical_asset} sell skipped - "
-                                    f"{selected_sell_market.market.name} insufficient balance "
-                                    f"({market_base_bal:.4f} {selected_sell_market.base_asset} "
-                                    f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
-                                    f"retry in {INSUF_BAL_RETRY_COOLDOWN:.0f}s")
-                                return False
-                            # For buy market, just use the other market from the pair
-                            # (not critical since we're only selling)
-                            selected_buy_market = buy_market_tuple
-                            placed = self.c_execute_sell_limit(selected_buy_market, selected_sell_market)
-                            if placed:
-                                return True
+                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                        # Check post-cancel cooldown — duration depends on why we cancelled:
+                        #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
+                        #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        time_since_cancel = self.strategy._current_timestamp - self._last_sell_cancel_time.get(canonical_asset, 0.0)
+                        required_cooldown = self._last_sell_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
+                        if time_since_cancel >= required_cooldown:
+                            # Check insufficient-balance cooldown — suppresses retry spam when the best sell
+                            # market has insufficient base balance. Only applies for non-zero target; sell-to-zero
+                            # always proceeds so c_execute_sell_limit can handle dust specially.
+                            insuf_bal_ok = True
+                            if self._sell_target_usd > 0.0:
+                                time_since_insuf_bal = self.strategy._current_timestamp - self._last_sell_insuf_bal_time.get(canonical_asset, 0.0)
+                                if time_since_insuf_bal < INSUF_BAL_RETRY_COOLDOWN:
+                                    insuf_bal_ok = False
+                            if insuf_bal_ok:
+                                # For completion check, use ACTUAL balance (not adjusted)
+                                base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
+                                val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
+                                if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
+                                    # Find the best market to sell on (highest bid)
+                                    selected_sell_market = self.c_find_best_sell_market(asset_key)
+                                    if selected_sell_market is not None:
+                                        # Pre-check: ensure selected market has enough base balance for min notional.
+                                        # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
+                                        market_base_bal = float(selected_sell_market.market.get_available_balance(
+                                            selected_sell_market.base_asset))
+                                        if market_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
+                                            # Best sell market has insufficient base balance — record timestamp so we
+                                            # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
+                                            self._last_sell_insuf_bal_time[canonical_asset] = self.strategy._current_timestamp
+                                            self.strategy.logger().warning(
+                                                f"Position balancer: {canonical_asset} sell skipped - "
+                                                f"{selected_sell_market.market.name} insufficient balance "
+                                                f"({market_base_bal:.4f} {selected_sell_market.base_asset} "
+                                                f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
+                                                f"retry in {INSUF_BAL_RETRY_COOLDOWN:.0f}s")
+                                        else:
+                                            # For buy market, just use the other market from the pair
+                                            # (not critical since we're only selling)
+                                            selected_buy_market = buy_market_tuple
+                                            placed = self.c_execute_sell_limit(selected_buy_market, selected_sell_market)
+                                            if placed:
+                                                return True
 
         return False
 
@@ -2165,14 +2262,15 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass  # Fall back to original price if quantization fails
 
-        # Place limit buy order
+        # Place limit buy order (no expiration_seconds — limit orders are managed by the
+        # balancer's own cancel/replace logic; passing _next_trade_delay here would set a
+        # 2s expiration_ts that most connectors ignore but could cause issues on any that honour it)
         try:
             buy_order_id = self.strategy.c_buy_with_specific_market(
                 buy_market_tuple,
                 quantized_amount,
                 order_type=order_type,
-                price=Decimal(str(buy_price)),
-                expiration_seconds=self.strategy._next_trade_delay)
+                price=Decimal(str(buy_price)))
         except Exception as e:
             self.strategy._last_failure_timestamps[buy_market_tuple] = self.strategy._current_timestamp
             self.strategy.logger().warning(f"Error submitting buy limit order to {market.name}: {e}")
@@ -2438,14 +2536,13 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass  # Fall back to original price if quantization fails
 
-        # Place limit sell order
+        # Place limit sell order (no expiration_seconds — same reasoning as buy above)
         try:
             sell_order_id = self.strategy.c_sell_with_specific_market(
                 sell_market_tuple,
                 quantized_amount,
                 order_type=order_type,
-                price=Decimal(str(sell_price)),
-                expiration_seconds=self.strategy._next_trade_delay)
+                price=Decimal(str(sell_price)))
         except Exception as e:
             self.strategy._last_failure_timestamps[sell_market_tuple] = self.strategy._current_timestamp
             self.strategy.logger().warning(f"Error submitting sell limit order to {market.name}: {e}")

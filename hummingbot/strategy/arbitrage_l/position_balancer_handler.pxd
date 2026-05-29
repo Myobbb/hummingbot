@@ -43,8 +43,12 @@ cdef class PositionBalancerHandler:
         dict _last_buy_completion_time
         dict _last_sell_completion_time
         dict _last_buy_cancel_time
+        dict _last_buy_cancel_cooldown
         dict _last_sell_cancel_time
+        dict _last_sell_cancel_cooldown
         dict _last_sell_insuf_bal_time
+        dict _buy_cancel_streak
+        dict _sell_cancel_streak
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset
@@ -84,10 +88,11 @@ cdef class PositionBalancerHandler:
                                                bint spread_is_min, double min_price_increment, bint is_buy)
     cdef tuple c_check_price_divergence(self, double order_price, double ideal_price, bint spread_is_min, 
                                          double min_price_increment, bint got_valid_second_level)
-    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age)
+    cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
+                                            double frontrun_delay=*)
     cdef void c_cancel_stale_orders(self, str asset)
-    cdef void _cancel_buy_order(self, str asset, str order_id, str reason)
-    cdef void _cancel_sell_order(self, str asset, str order_id, str reason)
+    cdef void _cancel_buy_order(self, str asset, str order_id, str reason, bint reactive=*)
+    cdef void _cancel_sell_order(self, str asset, str order_id, str reason, bint reactive=*)
     cdef bint c_handle_position_balancing(self, object buy_market_tuple, object sell_market_tuple)
     cdef bint c_execute_buy_limit(self, object buy_market_tuple, object sell_market_tuple)
     cdef bint c_execute_sell_limit(self, object buy_market_tuple, object sell_market_tuple)
