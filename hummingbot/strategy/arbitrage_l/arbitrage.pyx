@@ -58,6 +58,10 @@ cdef:
     double LOW_BALANCE_SUSPEND_USD = 20.0  # Suspend hold-band guardrail when any single venue has < this USD of base
     # NOTE: AGGRESSIVE_REFRESH_INTERVAL is defined in position_balancer_handler.pyx (5.0s default)
 
+# Pre-allocated Decimal constants — avoids string parse + Decimal construction on every hot-path call
+DECIMAL_ZERO = Decimal("0")
+QUANTIZATION_EPSILON_DEC = Decimal("1e-12")
+
 cdef class ArbitrageLStrategy(StrategyBase):
     """
     Limit order arbitrage strategy (LIMIT ORDERS ONLY).
@@ -681,29 +685,28 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double best_profitability = 0.0
 
         try:
-            # Check market readiness 
+            # Check market readiness
             if not self._orchestrated_mode:
                 # Normal mode: full readiness check with logging
                 if not self.c_check_markets_ready(should_report):
                     return
             else:
-                # Orchestrated mode: check connectivity but skip redundant logging/buy-in
-                if not self.c_check_markets_ready_orchestrated():
-                    return
-                # Mark ready and do one-time position balancer check if not done yet
+                # Orchestrated mode: cooldown check FIRST (pure arithmetic, no attr access) —
+                # this is the most common early-exit and costs nothing.
+                if self._last_global_trade_timestamp > 0:
+                    if (self._last_global_trade_timestamp +
+                            self._next_trade_delay - self._current_timestamp) > 0:
+                        return
+
+                # Connectivity: skip expensive OB scan when stably connected (_all_markets_ready).
+                # Only check when not yet confirmed ready; after that, the orchestrator's per-tick
+                # _is_strategy_ready already gated this call so we don't need to re-check.
                 if not self._all_markets_ready:
+                    if not self.c_check_markets_ready_orchestrated():
+                        return
                     self._all_markets_ready = True
                     if self._position_balancer is not None:
                         self._position_balancer.c_scan_and_mark_completion()
-
-            # Early check: skip orderbook scanning if global cooldown is active
-            # This optimization avoids expensive orderbook iterations when we can't trade anyway
-            if self._last_global_trade_timestamp > 0:
-                time_left = (self._last_global_trade_timestamp +
-                            self._next_trade_delay - self._current_timestamp)
-                if time_left > 0:
-                    # Still in global cooldown - skip orderbook scanning entirely
-                    return
 
             # Find best opportunity across all ordered pairs (buy=first, sell=second)
             for market_pair in self._market_pairs:
@@ -1213,27 +1216,32 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # ── Low-balance guardrail suspend ────────────────────────────────────
             # If any single venue holds < LOW_BALANCE_SUSPEND_USD of base (in USD terms),
-            # the aggregate total is unreliable (funds in transit, fresh deposit not settled,
-            # temporary exchange issue). Suspend the hysteresis state machine for this cycle
-            # so it cannot activate a false correction. Already-active correction is also
-            # paused to prevent over-buying/selling against a phantom deficit.
+            # the aggregate total is unreliable for the oversold direction only (funds in
+            # transit show near-zero on the sending exchange, making total look artificially
+            # low). Suspend only blocks oversold activation/correction — overbought correction
+            # is real regardless of per-venue balance and must continue unimpeded.
             # The suspend flag clears automatically the next cycle when all venues recover.
             # Zero cost on the hot arb path — only the cached bint is read there.
             if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0 and min_venue_base < 1e18:
                 # Convert minimum venue base quantity to USD using cached bid (USDT/base).
                 # All strategies trade XXX-USDT pairs so bid is directly in USDT.
                 min_venue_usd_val = min_venue_base * self._cached_mid_price_usd
-                if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD:
+                total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+                hold_upper = self._hold_target_usd + self._hold_band_usd
+                # Overbought: low venue balance is irrelevant — skip suspend entirely.
+                # Oversold: a low venue is the likely cause of the false reading — suspend.
+                cond_is_oversold = total_usd <= hold_upper
+                if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD and cond_is_oversold:
                     if not self._hold_low_balance_suspend:
                         self._hold_low_balance_suspend = True
                         self._hold_correction_active = False
                         self._hold_breach_count = 0
                         self.logger().info(
-                            f"Hold-band [{base_asset}]: guardrail suspended — {min_venue_name} balance ${min_venue_usd_val:.2f} "
+                            f"Hold-band [{base_asset}]: guardrail suspended (oversold direction) — {min_venue_name} balance ${min_venue_usd_val:.2f} "
                             f"< threshold ${LOW_BALANCE_SUSPEND_USD:.0f} (transfer in progress or dust)")
                     return  # Skip hysteresis entirely this cycle
                 elif self._hold_low_balance_suspend:
-                    # All venues recovered — lift suspend, let normal hysteresis resume next cycle
+                    # All venues recovered, or condition is now overbought — lift suspend
                     self._hold_low_balance_suspend = False
                     self.logger().info(
                         f"Hold-band [{base_asset}]: low-balance suspend lifted — min venue ${min_venue_usd_val:.2f} "
@@ -1626,8 +1634,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # Only propagate to buy if buy is also the full leg (no guardrail or sell is reduced).
                 # When buy is the full arb leg, we must not buy more than we can sell.
                 if _hold_buy_amount >= _hold_sell_amount:
-                    dec_eps = Decimal("1e-12")
-                    buy_req = quantized_sell_cap - dec_eps if quantized_sell_cap > dec_eps else Decimal("0")
+                    dec_eps = QUANTIZATION_EPSILON_DEC
+                    buy_req = quantized_sell_cap - dec_eps if quantized_sell_cap > dec_eps else DECIMAL_ZERO
                     quantized_buy_cap = self.c_safe_quantize_order_amount(buy_market, buy_market_tuple.trading_pair, buy_req, buy_price_decimal)
                     if quantized_buy_cap is not None:
                         quantized_amount_buy = min(quantized_amount_buy, quantized_buy_cap)
@@ -1653,13 +1661,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         quantized_amount_sell = min(quantized_amount_sell, q_sell2)
 
         # Apply max_order_size cap from trading rules (per-leg, same reasoning).
+        # Reuses buy_tr / sell_tr already fetched above for tick adjustment — no second dict lookup.
         try:
-            buy_trading_rule  = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
-            sell_trading_rule = sell_market._trading_rules.get(sell_market_tuple.trading_pair)
-            if buy_trading_rule is not None and buy_trading_rule.max_order_size > Decimal("0"):
-                quantized_amount_buy  = min(quantized_amount_buy,  buy_trading_rule.max_order_size)
-            if sell_trading_rule is not None and sell_trading_rule.max_order_size > Decimal("0"):
-                quantized_amount_sell = min(quantized_amount_sell, sell_trading_rule.max_order_size)
+            if buy_tr is not None and buy_tr.max_order_size > DECIMAL_ZERO:
+                quantized_amount_buy  = min(quantized_amount_buy,  buy_tr.max_order_size)
+            if sell_tr is not None and sell_tr.max_order_size > DECIMAL_ZERO:
+                quantized_amount_sell = min(quantized_amount_sell, sell_tr.max_order_size)
         except Exception:
             pass
 
@@ -1668,37 +1675,37 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # When the guardrail is inactive both amounts equal `amount` and both ceilings
         # are identical, so behaviour is unchanged from the original single-cap path.
         if _hold_buy_amount <= 0.0:
-            _final_buy_qty = Decimal("0")
+            _final_buy_qty = DECIMAL_ZERO
         elif _hold_buy_amount >= float(quantized_amount_buy):
             _final_buy_qty = quantized_amount_buy
         else:
             _final_buy_qty = self.c_safe_quantize_order_amount(
                 buy_market, buy_market_tuple.trading_pair,
                 Decimal.from_float(max(0.0, _hold_buy_amount - QUANTIZATION_EPSILON)),
-                buy_price_decimal) or Decimal("0")
+                buy_price_decimal) or DECIMAL_ZERO
             if _final_buy_qty > quantized_amount_buy:
                 _final_buy_qty = quantized_amount_buy
 
         if _hold_sell_amount <= 0.0:
-            _final_sell_qty = Decimal("0")
+            _final_sell_qty = DECIMAL_ZERO
         elif _hold_sell_amount >= float(quantized_amount_sell):
             _final_sell_qty = quantized_amount_sell
         else:
             _final_sell_qty = self.c_safe_quantize_order_amount(
                 sell_market, sell_market_tuple.trading_pair,
                 Decimal.from_float(max(0.0, _hold_sell_amount - QUANTIZATION_EPSILON)),
-                sell_price_decimal) or Decimal("0")
+                sell_price_decimal) or DECIMAL_ZERO
             if _final_sell_qty > quantized_amount_sell:
                 _final_sell_qty = quantized_amount_sell
 
         # Both legs suppressed → skip entirely and undo cooldown stamp.
-        if _final_buy_qty <= Decimal("0") and _final_sell_qty <= Decimal("0"):
+        if _final_buy_qty <= DECIMAL_ZERO and _final_sell_qty <= DECIMAL_ZERO:
             self._last_global_trade_timestamp = 0.0
             return
 
         # Notional check: at least one leg must meet min_order_usd.
         # Use sell leg notional when sell is active, otherwise buy leg.
-        if _final_sell_qty > Decimal("0"):
+        if _final_sell_qty > DECIMAL_ZERO:
             volume_usd = float(_final_sell_qty) * sell_price
         else:
             volume_usd = float(_final_buy_qty) * buy_price
@@ -1714,7 +1721,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef double placement_latency
         cdef str dummy_order_id
 
-        if _final_buy_qty > Decimal("0") or _final_sell_qty > Decimal("0"):
+        if _final_buy_qty > DECIMAL_ZERO or _final_sell_qty > DECIMAL_ZERO:
             # Log timing for latency monitoring
             order_start_time = self._current_timestamp
 
@@ -1732,7 +1739,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Actual exchange failures are handled via MarketOrderFailureEvent -> c_did_fail_order
             # The try/except here only catches rare synchronous validation errors (e.g. TypeError)
             try:
-                if _final_buy_qty > Decimal("0"):
+                if _final_buy_qty > DECIMAL_ZERO:
                     buy_order_id = self.c_buy_with_specific_market(
                         buy_market_tuple, _final_buy_qty,
                         order_type=buy_order_type,
@@ -1751,7 +1758,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Immediately place the sell order - minimal delay
             try:
-                if _final_sell_qty > Decimal("0"):
+                if _final_sell_qty > DECIMAL_ZERO:
                     sell_order_id = self.c_sell_with_specific_market(
                         sell_market_tuple, _final_sell_qty,
                         order_type=sell_order_type,
@@ -1768,7 +1775,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 return
 
             # Track orders — only for legs that were actually placed
-            if _final_buy_qty > Decimal("0") and buy_order_id:
+            if _final_buy_qty > DECIMAL_ZERO and buy_order_id:
                 buy_id_str = self._to_cpp_str(buy_order_id)
                 self._order_timestamps[buy_id_str] = order_start_time
                 try:
@@ -1778,7 +1785,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 except Exception as e:
                     self.logger().warning(f"Failed to track pending buy order: {e}")
 
-            if _final_sell_qty > Decimal("0") and sell_order_id:
+            if _final_sell_qty > DECIMAL_ZERO and sell_order_id:
                 sell_id_str = self._to_cpp_str(sell_order_id)
                 self._order_timestamps[sell_id_str] = order_start_time
                 try:

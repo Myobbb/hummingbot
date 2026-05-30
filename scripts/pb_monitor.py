@@ -17,6 +17,7 @@ Exchanges covered (hardcoded to active pb pairs):
     BitMart  — IR_USDT, 我踏马来了_USDT  (spot/depth20, ~500ms snapshots)
     Gate.io  — MOODENGETH_USDT          (spot.order_book, 100ms snapshots)
     BingX    — ARTX-USDT                (@depth20, ~1s snapshots)
+    HTX      — QUICK-USDT               (mbp.refresh.20, ~100ms snapshots)
 
 Output: live terminal view — refreshes on every log event or OB update.
 
@@ -53,18 +54,22 @@ PAIRS = [
     ("bitmart", "我踏马来了_USDT",       "B2/BM",    "我踏马来了"),
     ("gate",    "MOODENGETH_USDT",      "MENG/GT",  "MOODENGETH"),
     ("bingx",   "ARTX-USDT",           "ARTX/BX",  "ARTX"),
+    ("htx",     "quickusdt",           "QUICK/HTX","QUICK"),
 ]
 
 # WS endpoints
 WS_BITMART = "wss://ws-manager-compress.bitmart.com/api?protocol=1.1"
 WS_GATE    = "wss://api.gateio.ws/ws/v4/"
 WS_BINGX   = "wss://open-api-ws.bingx.com/market"
+WS_HTX     = "wss://api-aws.huobi.pro/feed"
 
 # Log filter: lines we care about
 LOG_RE = re.compile(
     r"Position balancer: (Cancelled|Placed|buy completed|sell completed)|"
     r"Placed (buy|sell) limit order|"
-    r"streak=\d+"
+    r"streak=\d+|"
+    r"Buy-in check:|"
+    r"Canceling the limit order"
 )
 
 # Parse a cancel/place line into structured fields
@@ -74,6 +79,12 @@ CANCEL_RE = re.compile(
 )
 PLACE_RE = re.compile(
     r"Placed (buy|sell) limit order \S+ for ([\d.]+) (.+?) at ([\d.]+) \(spread: (.+?)\)"
+)
+ARB_CANCEL_RE = re.compile(
+    r"\((\S+)\) Canceling the limit order"
+)
+BUYIN_RE = re.compile(
+    r"Buy-in check: asset=(\S+) actual_base=([\d.]+) pending=([\d.]+) bid=([\d.]+) value=([\d.]+) target=([\d.]+) -> (\S+)"
 )
 
 
@@ -366,6 +377,83 @@ async def _bingx_ping(ws):
             break
 
 
+# ─── WS: HTX ─────────────────────────────────────────────────────────────────
+
+async def run_htx(symbols: List[str]):
+    """Subscribe to mbp.refresh.20 (100ms full snapshots) for given symbols.
+    HTX wire format: symbol = lowercase, no separator, e.g. "quickusdt".
+    Protocol: gzip-compressed binary frames. Ping: {"ping": ts_ms} → respond {"pong": ts_ms}.
+    Subscribe: {"sub": "market.<symbol>.mbp.refresh.20", "id": "<str>"}
+    Data: ch = "market.<symbol>.mbp.refresh.20", tick.bids/tick.asks = [[price, qty], ...]
+    """
+    htx_books = {b.symbol: b for b in books.values() if b.exchange == "htx"}
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(
+                    WS_HTX,
+                    headers={"Accept-Encoding": "gzip"},
+                    autoping=False,
+                    heartbeat=None,
+                    timeout=ClientWSTimeout(ws_receive=60, ws_close=15),
+                ) as ws:
+                    # Subscribe to mbp.refresh.20 for each symbol
+                    for idx, sym in enumerate(symbols):
+                        await ws.send_json({
+                            "sub": f"market.{sym}.mbp.refresh.20",
+                            "id": f"sub_{sym}_{idx}",
+                        })
+                        await asyncio.sleep(0.1)
+
+                    async for msg in ws:
+                        raw = None
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            try:
+                                raw = gzip.decompress(msg.data).decode("utf-8")
+                            except Exception:
+                                continue
+                        elif msg.type == aiohttp.WSMsgType.TEXT:
+                            raw = msg.data
+                        else:
+                            continue
+
+                        try:
+                            data = orjson.loads(raw)
+                        except Exception:
+                            continue
+
+                        # HTX server ping — respond with pong
+                        if "ping" in data:
+                            await ws.send_json({"pong": data["ping"]})
+                            continue
+
+                        # Orderbook snapshot: ch = "market.quickusdt.mbp.refresh.20"
+                        ch = data.get("ch", "")
+                        if ".mbp.refresh." not in ch:
+                            continue
+
+                        # Extract symbol: "market.quickusdt.mbp.refresh.20" → "quickusdt"
+                        parts = ch.split(".")
+                        if len(parts) < 2:
+                            continue
+                        sym_key = parts[1]  # e.g. "quickusdt"
+                        book = htx_books.get(sym_key)
+                        if book is None:
+                            continue
+
+                        tick = data.get("tick", {})
+                        bids = tick.get("bids", [])
+                        asks = tick.get("asks", [])
+                        if bids or asks:
+                            # HTX sends sorted: bids desc, asks asc
+                            book.apply_snapshot(bids, asks)
+
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+
 # ─── Log tailer ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -392,7 +480,7 @@ def parse_log_line(line: str) -> Optional[LogEvent]:
     ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
     ts = ts_match.group(1) if ts_match else ""
 
-    # Cancel
+    # Balancer cancel (with streak)
     m = CANCEL_RE.search(line)
     if m:
         side, asset, exchange, reason, cooldown, streak = m.groups()
@@ -405,6 +493,23 @@ def parse_log_line(line: str) -> Optional[LogEvent]:
         side, qty, asset, price, spread = m.groups()
         return LogEvent(ts=ts, kind="place", side=side, asset=asset.strip(),
                         qty=float(qty), price=float(price), reason=spread, raw=line.strip())
+
+    # Arb-timeout cancel: "(QUICK-USDT) Canceling the limit order ..."
+    m = ARB_CANCEL_RE.search(line)
+    if m:
+        pair = m.group(1)  # e.g. QUICK-USDT
+        asset = pair.split("-")[0] if "-" in pair else pair.split("_")[0]
+        return LogEvent(ts=ts, kind="arb_cancel", asset=asset.strip(),
+                        reason="arb order_timeout", raw=line.strip())
+
+    # Buy-in check line
+    m = BUYIN_RE.search(line)
+    if m:
+        asset, actual, pending, bid, value, target, status = m.groups()
+        return LogEvent(ts=ts, kind="buyin_check", asset=asset.strip(),
+                        price=float(bid), qty=float(pending),
+                        reason=f"val={float(value):.2f} tgt={float(target):.2f} pending={float(pending):.1f} → {status}",
+                        raw=line.strip())
 
     # Other interesting lines
     if "Position balancer:" in line:
@@ -445,11 +550,11 @@ async def tail_log_remote(log_path: str):
             # Update our order tracking
             if ev.kind == "place":
                 book.our_order = (ev.side, ev.price, ev.qty)
-            elif ev.kind == "cancel":
+            elif ev.kind in ("cancel", "arb_cancel"):
                 book.our_order = None
 
-            log_lines.appendleft(ev)
-
+        # Always append — even if no book yet (e.g. HTX before first OB snapshot)
+        log_lines.appendleft(ev)
         render()
 
 
@@ -643,6 +748,35 @@ def render():
                 f"{ob_info}{anomaly}"
             )
 
+        elif ev.kind == "arb_cancel":
+            lines.append(
+                f"  {DIM}{ev.ts[11:]}{RESET}  "
+                f"{YELLOW}TIMEOUT{RESET}        "
+                f"{CYAN}{ev.asset:15s}{RESET}  "
+                f"{'':8s}  "
+                f"{DIM}arb order_timeout cancel (order re-placed next tick){RESET}"
+            )
+
+        elif ev.kind == "buyin_check":
+            book = books.get(ev.asset)
+            dec = price_decimals(ev.price, book)
+            ob_ask = book.best_ask if book else None
+            gap_str = ""
+            if ob_ask and ev.price > 0:
+                gap_pct = (ob_ask - ev.price) / ob_ask * 100
+                if abs(gap_pct) > 0.15:
+                    gap_str = f"  {RED}⚠ bid={ev.price:.{dec}f} ask={ob_ask:.{dec}f} gap={gap_pct:.2f}%{RESET}"
+                else:
+                    gap_str = f"  {DIM}ask={ob_ask:.{dec}f}{RESET}"
+            lines.append(
+                f"  {DIM}{ev.ts[11:]}{RESET}  "
+                f"{BLUE}BUY-IN {RESET}        "
+                f"{CYAN}{ev.asset:15s}{RESET}  "
+                f"{'':8s}  "
+                f"{DIM}{ev.reason}{RESET}"
+                f"{gap_str}"
+            )
+
         else:
             # Other balancer messages (completions, etc.)
             lines.append(f"  {DIM}{ev.ts[11:]}{RESET}  {DIM}{ev.raw[60:120]}{RESET}")
@@ -676,8 +810,10 @@ async def main(log_path: str):
     bm_symbols = [b.symbol for b in books.values() if b.exchange == "bitmart"]
     gt_symbols = [b.symbol for b in books.values() if b.exchange == "gate"]
     bx_symbols = [b.symbol for b in books.values() if b.exchange == "bingx"]
+    htx_symbols = [b.symbol for b in books.values() if b.exchange == "htx"]
 
-    print(f"Connecting orderbook feeds: BitMart({bm_symbols}) Gate({gt_symbols}) BingX({bx_symbols})")
+    print(f"Connecting orderbook feeds: BitMart({bm_symbols}) Gate({gt_symbols}) "
+          f"BingX({bx_symbols}) HTX({htx_symbols})")
     print(f"Tailing log via SSH: {SSH_HOST}:{log_path}")
     print("Press Ctrl+C to exit.\n")
     await asyncio.sleep(1)
@@ -686,6 +822,7 @@ async def main(log_path: str):
         asyncio.create_task(run_bitmart(bm_symbols)),
         asyncio.create_task(run_gate(gt_symbols)),
         asyncio.create_task(run_bingx(bx_symbols)),
+        asyncio.create_task(run_htx(htx_symbols)),
         asyncio.create_task(tail_log_remote(log_path)),
         asyncio.create_task(_periodic_render()),
     ]
