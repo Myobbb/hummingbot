@@ -1611,16 +1611,6 @@ cdef class PositionBalancerHandler:
                                         order_price, ideal_order_price, self._buy_spread_is_min,
                                         min_price_increment, got_valid_second_level)
 
-                                # Periodic fallback (min-tick mode only): refresh if order drifted off
-                                # top-of-book. When our order IS the top, got_valid_second_level=False
-                                # so Conditions 2b/3 are skipped — this catches the residual case where
-                                # the market moved but all second-level checks were silent.
-                                # Not needed for percentage mode: Conditions 3 and 5 already cover drift
-                                # with the correct percentage-scaled thresholds.
-                                if not should_cancel and self._buy_spread_is_min:
-                                    if min_price_increment > 0 and abs(order_price - ideal_order_price) >= min_price_increment * 0.95:
-                                        should_cancel = True
-                                        cancel_reason = f"periodic refresh (price drift: order {order_price:.8f} vs ideal {ideal_order_price:.8f})"
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
                                 # On OB error, fall back to unconditional refresh so orders don't get stranded.
@@ -1787,16 +1777,6 @@ cdef class PositionBalancerHandler:
                                         order_price, ideal_order_price, self._sell_spread_is_min,
                                         min_price_increment, got_valid_second_level)
 
-                                # Periodic fallback (min-tick mode only): refresh if order drifted off
-                                # top-of-book. When our order IS the top, got_valid_second_level=False
-                                # so Conditions 2b/3 are skipped — this catches the residual case where
-                                # the market moved but all second-level checks were silent.
-                                # Not needed for percentage mode: Conditions 3 and 5 already cover drift
-                                # with the correct percentage-scaled thresholds.
-                                if not should_cancel and self._sell_spread_is_min:
-                                    if min_price_increment > 0 and abs(order_price - ideal_order_price) >= min_price_increment * 0.95:
-                                        should_cancel = True
-                                        cancel_reason = f"periodic refresh (price drift: order {order_price:.8f} vs ideal {ideal_order_price:.8f})"
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
                                 # On OB error, fall back to unconditional refresh so orders don't get stranded.
