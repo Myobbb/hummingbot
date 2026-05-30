@@ -1061,6 +1061,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """
         cdef:
             double cutoff = self._current_timestamp - (self._order_timeout * 2)
+            double pb_cutoff = self._current_timestamp - 600.0  # 10 min for position balancer orders
             list timestamps_to_remove = []
             list tombstones_to_remove = []
             string order_id_str
@@ -1070,9 +1071,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
             return
             
-        # Phase 1: Find old entries in order timestamps (based on creation time)
+        # Phase 1: Find old entries in order timestamps (based on creation time).
+        # Position balancer orders use a longer threshold (10 min) — the position balancer
+        # manages its own refresh cycle; this is just a backstop, not an error condition.
         for order_id_str, timestamp in self._order_timestamps:
-            if timestamp < cutoff:
+            oid_str = order_id_str.decode('utf-8')
+            effective_cutoff = pb_cutoff if oid_str in self._position_balancer_orders else cutoff
+            if timestamp < effective_cutoff:
                 timestamps_to_remove.append(order_id_str)
         
         # Phase 2: Find old entries in completed orders / tombstones (based on completion time)
@@ -1098,9 +1103,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     try:
                         self._timeout_cancelled_orders.add(oid)  # Mark to skip cooldown
                         self.c_cancel_order(market_pair, oid)
-                        self.logger().warning(
-                            f"Force cleaned up stuck order {oid} on {market_pair[0].name} "
-                            f"(older than {self._order_timeout * 2}s) - CANCEL SENT to exchange")
+                        is_pb_order = oid in self._position_balancer_orders
+                        if is_pb_order:
+                            self.logger().info(
+                                f"Position balancer order {oid} on {market_pair[0].name} "
+                                f"refreshed after 10 min - CANCEL SENT to exchange")
+                        else:
+                            self.logger().warning(
+                                f"Force cleaned up stuck order {oid} on {market_pair[0].name} "
+                                f"(older than {self._order_timeout * 2}s) - CANCEL SENT to exchange")
                     except Exception as cancel_error:
                         self.logger().warning(
                             f"Failed to cancel stuck order {oid} on exchange: {cancel_error} - "
