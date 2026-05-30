@@ -1841,7 +1841,7 @@ cdef class PositionBalancerHandler:
 
             self.strategy.logger().info(
                 f"Position balancer: Cancelled buy order {order_id} for {asset} on {market_tuple.market.name} "
-                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._buy_cancel_streak[canonical]}]")
+                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._buy_cancel_streak.get(canonical, 0)}]")
 
             # NOTE: Don't remove from _active_buy_orders here!
             # Let handle_order_cancellation() clean it up when cancel event arrives.
@@ -1907,7 +1907,7 @@ cdef class PositionBalancerHandler:
 
             self.strategy.logger().info(
                 f"Position balancer: Cancelled sell order {order_id} for {asset} on {market_tuple.market.name} "
-                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._sell_cancel_streak[canonical]}]")
+                f"({reason}) [cooldown={cooldown:.0f}s, streak={self._sell_cancel_streak.get(canonical, 0)}]")
 
             # NOTE: Don't remove from _active_sell_orders here!
             # Let handle_order_cancellation() clean it up when cancel event arrives.
