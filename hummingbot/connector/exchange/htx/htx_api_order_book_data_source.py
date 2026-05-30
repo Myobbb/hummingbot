@@ -110,16 +110,41 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         return ws
 
-    async def _subscribe_single_trading_pair(self, trading_pair: str):
+    async def _subscribe_single_trading_pair(self, ws: Optional[WSAssistant], trading_pair: str):
         """
-        Force a reconnection to include the new trading pair.
-        HTX override to disconnect both MBP and Trade connections.
+        Subscribe a new pair at runtime without disrupting existing connections.
+
+        Strategy:
+        - MBP connection: disconnect and let _manage_connection reconnect, which
+          calls _subscribe_mbp with the full updated _trading_pairs list including
+          the new pair.  The immediate `req` snapshot in _subscribe_mbp ensures the
+          C++ OB is seeded before the balancer fires.
+        - Trade connection: send a `sub` message on the existing open WS so we
+          receive trade events for the new pair without disrupting all other pairs.
+
+        Note: `ws` is ignored here; HTX manages its own _active_ws/_trade_ws refs.
         """
         self._reconnect_requested = True
+
+        # Subscribe the new pair on the Trade WS in-place (no reconnect needed)
+        if self._trade_ws is not None:
+            try:
+                exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(
+                    trading_pair=trading_pair
+                )
+                exchange_symbol = exchange_symbol.lower()
+                await self._trade_ws.send(WSJSONRequest({
+                    "sub": f"market.{exchange_symbol}.trade.detail",
+                    "id": str(uuid.uuid4())
+                }))
+                self.logger().debug(f"Sent trade.detail sub for {exchange_symbol} on existing Trade WS")
+            except Exception as e:
+                self.logger().warning(f"Could not subscribe {trading_pair} trade on existing WS: {e}")
+
+        # Disconnect MBP to force reconnect + re-subscribe all pairs (including new one)
         if self._active_ws:
             await self._active_ws.disconnect()
-        if self._trade_ws:
-            await self._trade_ws.disconnect()
+        # Do NOT disconnect _trade_ws: we already sent the sub inline above.
 
     async def listen_for_subscriptions(self):
         """
@@ -306,29 +331,48 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _subscribe_mbp(self, ws: WSAssistant):
-        """Subscribe to MBP Incremental (5) and Refresh (20) channels"""
+        """Subscribe to MBP Incremental (5) and Refresh (20) channels.
+
+        After sending `sub` messages (which start the 100ms periodic refresh stream),
+        we also send an immediate `req` snapshot request for each pair.  The `rep`
+        response arrives within ~1 RTT (~50ms from VPS) and seeds the C++ order book
+        before any incremental delta can corrupt it.  This is especially important for
+        thin/low-volume pairs (e.g. QUICK-USDT) where the first periodic `mbp.refresh`
+        message may be delayed and the balancer fires immediately on strategy resume.
+        """
         try:
             self._last_seq_num.clear()
-            
+
+            symbols_to_snapshot: List[str] = []
+
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 self._symbol_to_pair_cache[exchange_symbol.lower()] = trading_pair
                 exchange_symbol = exchange_symbol.lower()
-                
+
                 # Incremental mbp.5
                 await ws.send(WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_INCREMENTAL_DEPTH}",
                     "id": str(uuid.uuid4())
                 }))
-                
-                # Snapshot mbp.refresh.20
+
+                # Snapshot mbp.refresh.20 (starts 100ms periodic stream)
                 await ws.send(WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.mbp.refresh.{CONSTANTS.MBP_REFRESH_DEPTH}",
                     "id": str(uuid.uuid4())
                 }))
-                
+
+                symbols_to_snapshot.append(exchange_symbol)
+
             self.logger().info("Subscribed to MBP channels...")
-            
+
+            # Request an immediate snapshot for each symbol via `req`.
+            # The `rep` response (handled as SNAPSHOT in _parse_order_book_diff_message)
+            # seeds the C++ OB right away instead of waiting for the first periodic
+            # mbp.refresh message, eliminating the stale-book race on runtime strategy add.
+            for exchange_symbol in symbols_to_snapshot:
+                await self._request_mbp_snapshot(ws, exchange_symbol)
+
         except Exception as e:
             self.logger().error("Error subscribing to MBP channels", exc_info=True)
             raise
