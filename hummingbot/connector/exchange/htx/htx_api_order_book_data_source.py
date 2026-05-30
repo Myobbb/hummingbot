@@ -122,10 +122,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         - Trade connection: send a `sub` message on the existing open WS so we
           receive trade events for the new pair without disrupting all other pairs.
 
-        Note: `ws` is ignored here; HTX manages its own _active_ws/_trade_ws refs.
+        Note: the `ws` parameter (from the base class contract) is ignored here;
+        HTX manages its own _active_ws and _trade_ws references internally.
+        _reconnect_requested is NOT set — HTX uses explicit disconnect/reconnect
+        via _manage_connection rather than a polling flag.
         """
-        self._reconnect_requested = True
-
         # Subscribe the new pair on the Trade WS in-place (no reconnect needed)
         if self._trade_ws is not None:
             try:
@@ -214,6 +215,12 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().error(f"Unexpected error on {name} WS: {e}", exc_info=True)
                 await asyncio.sleep(2.0)  # Backoff
             finally:
+                # Clear the shared ws reference so callers (e.g. _subscribe_single_trading_pair)
+                # see None rather than a stale disconnected socket during the reconnect window.
+                if name == "MBP":
+                    self._active_ws = None
+                elif name == "Trade":
+                    self._trade_ws = None
                 if ws is not None:
                     await ws.disconnect()
 
