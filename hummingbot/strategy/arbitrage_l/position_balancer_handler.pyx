@@ -1832,8 +1832,12 @@ cdef class PositionBalancerHandler:
             canonical = self._get_canonical_asset(asset)
             cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_buy_cancel_cooldown[canonical] = cooldown
-            # Increment consecutive-cancel streak (reset on fill)
-            self._buy_cancel_streak[canonical] = self._buy_cancel_streak.get(canonical, 0) + 1
+            # Only increment streak for reactive (market-event) cancels.
+            # Proactive refreshes (periodic, better-market, divergence) are scheduled
+            # housekeeping — counting them would back off frontrun detection on thin
+            # markets that refresh often but are rarely frontrun.
+            if reactive:
+                self._buy_cancel_streak[canonical] = self._buy_cancel_streak.get(canonical, 0) + 1
 
             self.strategy.logger().info(
                 f"Position balancer: Cancelled buy order {order_id} for {asset} on {market_tuple.market.name} "
@@ -1894,8 +1898,12 @@ cdef class PositionBalancerHandler:
             canonical = self._get_canonical_asset(asset)
             cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_sell_cancel_cooldown[canonical] = cooldown
-            # Increment consecutive-cancel streak (reset on fill)
-            self._sell_cancel_streak[canonical] = self._sell_cancel_streak.get(canonical, 0) + 1
+            # Only increment streak for reactive (market-event) cancels.
+            # Proactive refreshes (periodic, better-market, divergence) are scheduled
+            # housekeeping — counting them would back off undercut detection on thin
+            # markets that refresh often but are rarely undercut.
+            if reactive:
+                self._sell_cancel_streak[canonical] = self._sell_cancel_streak.get(canonical, 0) + 1
 
             self.strategy.logger().info(
                 f"Position balancer: Cancelled sell order {order_id} for {asset} on {market_tuple.market.name} "
