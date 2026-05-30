@@ -1610,14 +1610,26 @@ cdef class PositionBalancerHandler:
                                     should_cancel, cancel_reason = self.c_check_price_divergence(
                                         order_price, ideal_order_price, self._buy_spread_is_min,
                                         min_price_increment, got_valid_second_level)
+
+                                # Periodic fallback: only refresh if price is wrong.
+                                # ideal_order_price uses top_price as reference (got_valid_second_level=False),
+                                # so this correctly detects when our order drifted off top-of-book.
+                                # If order is already at the right price, leave it — no churn.
+                                if not should_cancel:
+                                    if min_price_increment > 0 and abs(order_price - ideal_order_price) >= min_price_increment * 0.95:
+                                        should_cancel = True
+                                        cancel_reason = f"periodic refresh (price drift: order {order_price:.8f} vs ideal {ideal_order_price:.8f})"
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
+                                # On OB error, fall back to unconditional refresh so orders don't get stranded.
+                                if not should_cancel:
+                                    should_cancel = True
+                                    cancel_reason = "periodic refresh (OB error)"
 
-                        # Unconditional periodic refresh: if interval elapsed and no condition fired
-                        # (e.g. sparse book with no second level), still cancel and replace.
-                        if not should_cancel:
+                        else:
+                            # No order details — unknown state, refresh unconditionally.
                             should_cancel = True
-                            cancel_reason = "periodic refresh"
+                            cancel_reason = "periodic refresh (no order details)"
 
                     if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
@@ -1772,14 +1784,26 @@ cdef class PositionBalancerHandler:
                                     should_cancel, cancel_reason = self.c_check_price_divergence(
                                         order_price, ideal_order_price, self._sell_spread_is_min,
                                         min_price_increment, got_valid_second_level)
+
+                                # Periodic fallback: only refresh if price is wrong.
+                                # ideal_order_price uses top_price as reference (got_valid_second_level=False),
+                                # so this correctly detects when our order drifted off top-of-book.
+                                # If order is already at the right price, leave it — no churn.
+                                if not should_cancel:
+                                    if min_price_increment > 0 and abs(order_price - ideal_order_price) >= min_price_increment * 0.95:
+                                        should_cancel = True
+                                        cancel_reason = f"periodic refresh (price drift: order {order_price:.8f} vs ideal {ideal_order_price:.8f})"
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
+                                # On OB error, fall back to unconditional refresh so orders don't get stranded.
+                                if not should_cancel:
+                                    should_cancel = True
+                                    cancel_reason = "periodic refresh (OB error)"
 
-                        # Unconditional periodic refresh: if interval elapsed and no condition fired
-                        # (e.g. sparse book with no second level), still cancel and replace.
-                        if not should_cancel:
+                        else:
+                            # No order details — unknown state, refresh unconditionally.
                             should_cancel = True
-                            cancel_reason = "periodic refresh"
+                            cancel_reason = "periodic refresh (no order details)"
 
                     if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
