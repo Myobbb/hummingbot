@@ -1538,6 +1538,9 @@ cdef class PositionBalancerHandler:
                         #   3:  ideal-price gap (market moved down → can buy cheaper)
                         #   4:  aggressive mode — market moved to our price
                         #   5:  significant price divergence (c_check_price_divergence)
+                        # Unconditional fallback: always refresh after effective_interval regardless
+                        # of OB conditions (handles exchanges with sparse/stale books where no
+                        # condition ever fires, leaving orders stranded until force-cleanup at 2×timeout).
                         order_details = self._active_buy_order_details.get(asset)
                         if order_details is not None:
                             order_market_tuple, order_price = order_details
@@ -1622,6 +1625,12 @@ cdef class PositionBalancerHandler:
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
 
+                        # Unconditional periodic refresh: if interval elapsed and no condition fired
+                        # (e.g. sparse book with no second level), still cancel and replace.
+                        if not should_cancel:
+                            should_cancel = True
+                            cancel_reason = "periodic refresh"
+
                     if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
                         self._cancel_buy_order(asset, order_id, cancel_reason, reactive=is_reactive)
@@ -1694,6 +1703,9 @@ cdef class PositionBalancerHandler:
                         #   3:  ideal-price gap (market moved up → can sell higher)
                         #   4:  aggressive mode — market moved to our price
                         #   5:  significant price divergence (c_check_price_divergence)
+                        # Unconditional fallback: always refresh after effective_interval regardless
+                        # of OB conditions (handles exchanges with sparse/stale books where no
+                        # condition ever fires, leaving orders stranded until force-cleanup at 2×timeout).
                         order_details = self._active_sell_order_details.get(asset)
                         if order_details is not None:
                             order_market_tuple, order_price = order_details
@@ -1774,6 +1786,12 @@ cdef class PositionBalancerHandler:
                                         min_price_increment, got_valid_second_level)
                             except Exception as e:
                                 self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
+
+                        # Unconditional periodic refresh: if interval elapsed and no condition fired
+                        # (e.g. sparse book with no second level), still cancel and replace.
+                        if not should_cancel:
+                            should_cancel = True
+                            cancel_reason = "periodic refresh"
 
                     if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
@@ -1998,10 +2016,13 @@ cdef class PositionBalancerHandler:
                                 # Find the best market to buy on (lowest ask)
                                 selected_buy_market = self.c_find_best_buy_market(asset_key)
                                 if selected_buy_market is not None:
-                                    # Pre-check: ensure selected market has enough quote balance for min notional
+                                    # Pre-check: ensure selected market has enough quote balance for min notional.
+                                    # Subtract inflight buys (converted to quote) to handle stale balance cache.
                                     market_quote_bal = float(selected_buy_market.market.get_available_balance(
                                         selected_buy_market.quote_asset))
-                                    if market_quote_bal >= self.strategy._min_order_usd:
+                                    pending_buy_quote = self.c_get_pending_buy_base(asset_key) * last_bid if last_bid > 0 else 0.0
+                                    effective_quote_bal = max(0.0, market_quote_bal - pending_buy_quote)
+                                    if effective_quote_bal >= self.strategy._min_order_usd:
                                         # For sell market, just use the other market from the pair
                                         # (not critical since we're only buying)
                                         selected_sell_market = sell_market_tuple
@@ -2009,10 +2030,11 @@ cdef class PositionBalancerHandler:
                                         if placed:
                                             return True
                                     else:
+                                        pending_info = f", pending={pending_buy_quote:.2f}" if pending_buy_quote > 0 else ""
                                         self.strategy.logger().warning(
                                             f"Position balancer: {canonical_asset} buy skipped - "
                                             f"{selected_buy_market.market.name} insufficient quote "
-                                            f"({market_quote_bal:.2f} < min {self.strategy._min_order_usd:.2f})")
+                                            f"({effective_quote_bal:.2f}{pending_info} < min {self.strategy._min_order_usd:.2f})")
 
         # Check if we need to sell
         if self._sell_enabled and not self._sell_completed:
@@ -2082,15 +2104,22 @@ cdef class PositionBalancerHandler:
                                         # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
                                         market_base_bal = float(selected_sell_market.market.get_available_balance(
                                             selected_sell_market.base_asset))
-                                        if market_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
+                                        # Subtract any inflight sell orders from the cached balance.
+                                        # Exchange balance caches can lag by several seconds after order placement,
+                                        # so an order placed moments ago may not yet appear as "frozen".
+                                        # _pending_sell_by_asset tracks what we've already committed this session.
+                                        pending_sell_base = self.c_get_pending_sell_base(asset_key)
+                                        effective_base_bal = max(0.0, market_base_bal - pending_sell_base)
+                                        if effective_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
                                             # Best sell market has insufficient base balance — record timestamp so we
                                             # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
                                             self._last_sell_insuf_bal_time[canonical_asset] = self.strategy._current_timestamp
+                                            pending_info = f", pending={pending_sell_base:.4f}" if pending_sell_base > 0 else ""
                                             self.strategy.logger().warning(
                                                 f"Position balancer: {canonical_asset} sell skipped - "
                                                 f"{selected_sell_market.market.name} insufficient balance "
-                                                f"({market_base_bal:.4f} {selected_sell_market.base_asset} "
-                                                f"= ${market_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
+                                                f"({effective_base_bal:.4f} {selected_sell_market.base_asset}"
+                                                f"{pending_info} = ${effective_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
                                                 f"retry in {INSUF_BAL_RETRY_COOLDOWN:.0f}s")
                                         else:
                                             # For buy market, just use the other market from the pair
@@ -2230,9 +2259,13 @@ cdef class PositionBalancerHandler:
                     f"Using ask price (will pay taker fees instead of maker rebate).")
                 buy_price = top_ask  # Use taker price with clear warning
 
-        # Calculate amount based on shortfall, available quote, and order size limit
-        # Use ADJUSTED shortfall to account for pending orders and avoid over-ordering
-        max_affordable_base = quote_bal / buy_price if buy_price > 0 else 0.0
+        # Calculate amount based on shortfall, available quote, and order size limit.
+        # Use ADJUSTED shortfall to account for pending orders and avoid over-ordering.
+        # Also subtract inflight buy cost from quote_bal to handle stale balance cache.
+        pending_buy_base = self.c_get_pending_buy_base(asset_key)
+        pending_buy_quote = pending_buy_base * buy_price if buy_price > 0 else 0.0
+        effective_quote_bal = max(0.0, quote_bal - pending_buy_quote)
+        max_affordable_base = effective_quote_bal / buy_price if buy_price > 0 else 0.0
         max_order_base = self._order_size_usd / buy_price if buy_price > 0 else 0.0
         amount_to_buy = min(
             shortfall_adjusted / last_bid if last_bid > 0 else 0.0,
@@ -2476,12 +2509,16 @@ cdef class PositionBalancerHandler:
                     f"Using bid price (will pay taker fees instead of maker rebate).")
                 sell_price = top_bid  # Use taker price with clear warning
 
-        # Calculate amount based on excess, available base, and order size limit
-        # Use ADJUSTED excess to account for pending orders and avoid over-ordering
+        # Calculate amount based on excess, available base, and order size limit.
+        # Use ADJUSTED excess to account for pending orders and avoid over-ordering.
+        # Also cap against (base_bal_raw - pending) so that a stale exchange balance cache
+        # (which may not yet reflect recently placed orders) cannot cause over-ordering.
         max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
+        pending_sell_base = self.c_get_pending_sell_base(asset_key)
+        effective_raw = max(0.0, base_bal_raw - pending_sell_base)
         amount_to_sell = min(
             excess_adjusted / last_bid if last_bid > 0 else 0.0,
-            base_bal_raw,
+            effective_raw,
             max_order_base
         )
 
@@ -2490,6 +2527,7 @@ cdef class PositionBalancerHandler:
                 f"Position balancer: Sell order blocked - amount too small. "
                 f"amount_to_sell={amount_to_sell:.10f}, excess_adjusted={excess_adjusted:.6f}, "
                 f"last_bid={last_bid:.8f}, base_bal_raw={base_bal_raw:.8f}, "
+                f"pending_sell={pending_sell_base:.8f}, effective_raw={effective_raw:.8f}, "
                 f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8f}")
             return False
 
