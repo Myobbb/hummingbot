@@ -1074,40 +1074,24 @@ cdef class PositionBalancerHandler:
         
         return (bid, ask)
 
-    cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price, 
+    cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price,
                                                   double min_price_increment, bint is_buy):
         """
-        Calculate effective reference price (second level if top is our order).
-        
-        For buy orders: returns effective bid (second bid if top bid is our order)
-        For sell orders: returns effective ask (second ask if top ask is our order)
+        Returns top_price unchanged.
+
+        When our order IS the top (top_price ≈ order_price), effective_price == top_price
+        so callers compute got_valid_second_level = False and skip checks that need a real
+        external reference (conditions 2b and 3 in the periodic block).
+
+        When our order is NOT the top (undercut/frontrunned), CHECK 2 in
+        c_check_immediate_conditions fires before this is ever used for gap logic.
+
+        NOTE: do NOT return the second book level here. The large-gap check in
+        c_check_immediate_conditions uses this as reference: if we're at top and the
+        second level is many ticks away (common on thin markets), returning it would
+        compute a spurious gap and cancel every 5s.
         """
-        cdef double effective_price = top_price
-        
-        if min_price_increment <= 0:
-            return effective_price
-        
-        # Check if top price matches our order (within half-tick tolerance)
-        if abs(top_price - order_price) < min_price_increment * HALF_TICK_TOLERANCE:
-            try:
-                if is_buy:
-                    # Get second bid level (ask_entries/bid_entries are generators — must iterate)
-                    it = ob.bid_entries()
-                    next(it)  # skip first (our order)
-                    second = next(it, None)
-                    if second is not None:
-                        effective_price = float(second.price)
-                else:
-                    # Get second ask level
-                    it = ob.ask_entries()
-                    next(it)  # skip first (our order)
-                    second = next(it, None)
-                    if second is not None:
-                        effective_price = float(second.price)
-            except Exception:
-                pass  # Fall back to top price
-        
-        return effective_price
+        return top_price
 
     cdef tuple c_check_immediate_frontrun(self, double current_top_price, double order_price, bint is_buy):
         """
