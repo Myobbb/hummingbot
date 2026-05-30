@@ -1091,15 +1091,19 @@ cdef class PositionBalancerHandler:
         if abs(top_price - order_price) < min_price_increment * HALF_TICK_TOLERANCE:
             try:
                 if is_buy:
-                    # Get second bid level
-                    bid_entries = ob.bid_entries()
-                    if len(bid_entries) >= 2:
-                        effective_price = float(bid_entries[1].price)
+                    # Get second bid level (ask_entries/bid_entries are generators — must iterate)
+                    it = ob.bid_entries()
+                    next(it)  # skip first (our order)
+                    second = next(it, None)
+                    if second is not None:
+                        effective_price = float(second.price)
                 else:
                     # Get second ask level
-                    ask_entries = ob.ask_entries()
-                    if len(ask_entries) >= 2:
-                        effective_price = float(ask_entries[1].price)
+                    it = ob.ask_entries()
+                    next(it)  # skip first (our order)
+                    second = next(it, None)
+                    if second is not None:
+                        effective_price = float(second.price)
             except Exception:
                 pass  # Fall back to top price
         
