@@ -57,11 +57,6 @@ cdef class PositionBalancerHandler:
         # Second-level refuge state (per canonical asset) — True = resting under the wall (2nd-best), undercut suppressed
         dict _in_refuge_sell
         dict _in_refuge_buy
-        # Refuge situation sampling (10+10 confirmation debounce)
-        dict _refuge_last_check_time_sell
-        dict _refuge_last_check_time_buy
-        dict _refuge_change_seen_sell
-        dict _refuge_change_seen_buy
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset
@@ -91,7 +86,6 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_sell_market(self, str asset)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)
-    cdef bint c_refuge_situation_changed(self, str asset, bint is_buy)
     cdef tuple c_get_orderbook_prices(self, OrderBook ob)
     cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price, 
                                                   double min_price_increment, bint is_buy)
