@@ -40,6 +40,25 @@ cdef double DEFAULT_LIMIT_REFRESH_INTERVAL = 60.0       # Default refresh for mi
 cdef double DEFAULT_AGGRESSIVE_REFRESH_INTERVAL = 5.0   # Refresh for aggressive (0%) mode with partial fills
 cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
 
+# --- Fill-pressure adaptive post-fill wait ---
+# Mimics a trailing stop on the "min" (top-of-book) strategy. A single fill is noise;
+# a SECOND full completion arriving quickly after the first is direct evidence that
+# buy/sell pressure is hitting our side. When that happens we extend the post-fill
+# wait so we stop re-pinning the top of book every 2s and instead give price room to
+# move in our favour before placing the next tranche.
+#
+# Signal: time between two consecutive FULL completions on the same canonical asset
+# (recorded in c_record_fill_pressure, fired only from c_handle_order_completion —
+# never from cancels). Proportional: the faster the second fill, the longer the wait.
+#
+#   extra = clamp(FILL_PRESSURE_WINDOW - inter_fill, 0, MAX_POST_FILL_EXTRA)
+#   effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra   # 2s floor .. ~10s ceiling
+#
+# A gap larger than FILL_PRESSURE_WINDOW resets extra to 0 (pressure cooled).
+# The first fill (no prior timestamp) always yields extra=0.
+cdef double FILL_PRESSURE_WINDOW = 12.0   # seconds — second completion within this window = pressure
+cdef double MAX_POST_FILL_EXTRA  = 8.0    # seconds — cap on the added wait (2s base + 8s = 10s ceiling)
+
 # --- Minimum order age before immediate-cancel checks fire ---
 # Two thresholds because different events have different noise profiles:
 #
@@ -200,6 +219,9 @@ cdef class PositionBalancerHandler:
         # Consecutive-cancel backoff: count cancels without a fill to detect stuck-undercutter loops
         self._buy_cancel_streak = {}          # canonical_asset -> int, resets on fill
         self._sell_cancel_streak = {}         # canonical_asset -> int, resets on fill
+        # Fill-pressure adaptive post-fill wait (trailing-stop-like spacing on the top-of-book strategy)
+        self._last_fill_completion_time = {}  # canonical_asset -> timestamp of last FULL completion (fills only, not cancels)
+        self._post_fill_extra_wait = {}       # canonical_asset -> seconds added to DEFAULT_COMPLETION_COOLDOWN
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -696,6 +718,59 @@ cdef class PositionBalancerHandler:
                         self._last_sell_completion_time[self._get_canonical_asset(asset_key)] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
+
+    def c_record_fill_pressure(self, str order_id, bint is_buy):
+        """
+        Trailing-stop-like adaptive post-fill wait.
+
+        Fired ONLY from arbitrage.c_handle_order_completion (genuine fill completions,
+        never cancels — those route through handle_order_cancellation). One completion is
+        noise; a SECOND completion arriving quickly on the same canonical asset is direct
+        evidence of buy/sell pressure on our side. When that happens we extend the post-fill
+        wait so we stop re-pinning the top of book and give price room to move in our favour.
+
+        MUST run BEFORE handle_order_completion (which pops the pending dict) so the order is
+        still present here for the canonical-asset lookup.
+
+            extra = clamp(FILL_PRESSURE_WINDOW - inter_fill, 0, MAX_POST_FILL_EXTRA)
+            effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra   # 2s floor .. ~10s ceiling
+
+        First fill (no prior timestamp) -> extra=0. Gap > window -> extra=0 (pressure cooled).
+        """
+        cdef:
+            double now = self.strategy._current_timestamp
+            double prior
+            double inter_fill
+            double extra
+            str asset_key
+            str canonical
+        try:
+            if is_buy:
+                pend = self._pending_buy_orders.get(order_id)
+            else:
+                pend = self._pending_sell_orders.get(order_id)
+            if pend is None:
+                return
+            asset_key = pend[0]
+            canonical = self._get_canonical_asset(asset_key)
+
+            prior = self._last_fill_completion_time.get(canonical, 0.0)
+            if prior <= 0.0:
+                # First completion in this run for this asset — treat as noise.
+                extra = 0.0
+            else:
+                inter_fill = now - prior
+                # Proportional: the faster the second fill, the longer the added wait.
+                extra = FILL_PRESSURE_WINDOW - inter_fill
+                if extra < 0.0:
+                    extra = 0.0          # gap exceeded window — pressure cooled, reset
+                elif extra > MAX_POST_FILL_EXTRA:
+                    extra = MAX_POST_FILL_EXTRA
+
+            self._post_fill_extra_wait[canonical] = extra
+            self._last_fill_completion_time[canonical] = now
+        except Exception as e:
+            self.strategy.logger().warning(f"Position balancer: Failed to record fill pressure for {order_id}: {e}")
 
     def handle_order_cancellation(self, str order_id):
         """Clean up pending order tracking on order cancellation."""
@@ -2004,9 +2079,11 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Check 2-second cooldown after order completion (fill)
+                    # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
+                    # The extra grows when consecutive fills arrive quickly (trailing-stop-like
+                    # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN + self._post_fill_extra_wait.get(canonical_asset, 0.0):
                         # Check post-cancel cooldown — duration depends on why we cancelled:
                         #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
@@ -2079,9 +2156,11 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Check 2-second cooldown after order completion (fill)
+                    # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
+                    # The extra grows when consecutive fills arrive quickly (trailing-stop-like
+                    # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN + self._post_fill_extra_wait.get(canonical_asset, 0.0):
                         # Check post-cancel cooldown — duration depends on why we cancelled:
                         #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)

@@ -49,6 +49,9 @@ cdef class PositionBalancerHandler:
         dict _last_sell_insuf_bal_time
         dict _buy_cancel_streak
         dict _sell_cancel_streak
+        # Fill-pressure adaptive post-fill wait (trailing-stop-like spacing)
+        dict _last_fill_completion_time   # canonical_asset -> timestamp of last FULL completion (fills only)
+        dict _post_fill_extra_wait        # canonical_asset -> seconds to add to DEFAULT_COMPLETION_COOLDOWN
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset

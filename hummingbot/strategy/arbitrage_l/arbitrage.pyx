@@ -1870,8 +1870,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     logging.DEBUG,
                     f"{order_type} order completed on {market_pair_tuple[0].name}: {order_id}")
 
-            # Cleanup position balancer tracking (delegated to handler)
+            # Cleanup position balancer tracking (delegated to handler).
+            # Record fill-pressure FIRST — handle_order_completion pops the pending order,
+            # and the recorder needs it present to resolve the canonical asset.
             if self._position_balancer is not None:
+                self._position_balancer.c_record_fill_pressure(order_id, is_buy)
                 self._position_balancer.handle_order_completion(order_id, is_buy)
 
             # Refresh hold-band cache after each trade only while a correction is in progress.
