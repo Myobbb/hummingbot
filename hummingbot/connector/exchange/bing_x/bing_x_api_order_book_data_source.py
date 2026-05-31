@@ -234,26 +234,32 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     max_msg_size=16 * 1024 * 1024,
                 )
                 self._active_ws = ws
+                self._reconnect_attempts = 0
                 await self._subscribe_channels(ws)
                 self._last_ws_message_sent_timestamp = self._time()
                 await self._process_ws_messages(ws=ws)
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, Exception) as e:
-                # Handle transient WS close codes (1006 etc.) more gracefully
-                self._reconnect_attempts += 1
-                code = self._extract_close_code(e)
-                if self._is_transient_ws_close_exception(e):
-                    try:
-                        self.logger().warning(f"BingX public WS transient close (code={code or 'unknown'}). Reconnecting...")
-                    except Exception:
-                        pass
+                intentional = self.check_and_clear_reconnect_request()
+                if intentional:
+                    # Disconnect was triggered by subscribe_to_trading_pair — expected, not an error
+                    self._reconnect_attempts = 0
+                    self.logger().info(
+                        f"BingX public WS reconnecting to subscribe new pair "
+                        f"({len(self._trading_pairs)} pairs total)"
+                    )
+                    reconnect_delay = 0.0
+                elif self._is_transient_ws_close_exception(e):
+                    self._reconnect_attempts += 1
+                    code = self._extract_close_code(e)
+                    self.logger().warning(
+                        f"BingX public WS transient close (code={code or 'unknown'}). Reconnecting..."
+                    )
                     reconnect_delay = self._backoff_seconds(transient=True)
                 else:
-                    try:
-                        self.logger().error("Error in public WS loop; reconnecting...", exc_info=True)
-                    except Exception:
-                        pass
+                    self._reconnect_attempts += 1
+                    self.logger().error("Error in public WS loop; reconnecting...", exc_info=True)
                     reconnect_delay = self._backoff_seconds(transient=False)
             finally:
                 await self._sleep(reconnect_delay)
