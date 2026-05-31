@@ -627,12 +627,23 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return
                 
             if status == "error" or ("err-code" in event_message or "err-msg" in event_message):
-                self.logger().warning(
-                    f"WebSocket error: {event_message.get('err-msg', 'Unknown error')}",
-                    extra={"event": event_message}
-                )
+                err_msg = str(event_message.get("err-msg", "Unknown error"))
+                # Known-benign: alt pairs don't offer the tick-by-tick mbp.5 channel — only the
+                # ~9 major pairs do. We always send both mbp.5 and mbp.refresh.20; the refresh sub
+                # succeeds and feeds the book, so the rejected mbp.5 sub is expected, not an error.
+                # Log it at DEBUG to avoid flooding launch logs; keep all other WS errors at WARNING.
+                if "does not currently offer subscription services" in err_msg:
+                    self.logger().debug(
+                        f"WebSocket subscription declined (expected for non-major pairs): {err_msg}",
+                        extra={"event": event_message}
+                    )
+                else:
+                    self.logger().warning(
+                        f"WebSocket error: {err_msg}",
+                        extra={"event": event_message}
+                    )
                 # Disconnect to trigger clean resubscribe when server rejects channels
-                if "invalid" in str(event_message.get("err-msg", "")).lower():
+                if "invalid" in err_msg.lower():
                     await websocket_assistant.disconnect()
                 return
         except Exception:
