@@ -145,6 +145,12 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # refuge when there's a distinct level to hide under — see position-balancer.md. For now we
 # enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
 cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
+# While in refuge we suppress undercut, so we deliberately do NOT read the book each tick.
+# Instead we sample the situation once per REFUGE_CHECK_INTERVAL (10 min). To avoid jumping
+# back and forth on a transient book, a detected change must PERSIST across TWO consecutive
+# samples (10+10 confirmation) before we re-place. So a real change is acted on after ~20 min;
+# a transient one (gone by the next sample) is ignored.
+cdef double REFUGE_CHECK_INTERVAL = 600.0   # seconds between refuge situation samples (10 min)
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -272,6 +278,11 @@ cdef class PositionBalancerHandler:
         # the wall instead of top-of-book.
         self._in_refuge_sell = {}             # canonical_asset -> bint (in sell-side refuge)
         self._in_refuge_buy = {}              # canonical_asset -> bint (in buy-side refuge)
+        # Refuge situation sampling (10+10 confirmation, see REFUGE_CHECK_INTERVAL):
+        self._refuge_last_check_time_sell = {}  # canonical -> ts of last 10-min situation sample (sell)
+        self._refuge_last_check_time_buy = {}   # canonical -> ts of last 10-min situation sample (buy)
+        self._refuge_change_seen_sell = {}      # canonical -> bint: previous sample saw a change (awaiting 2nd confirm)
+        self._refuge_change_seen_buy = {}       # canonical -> bint: previous sample saw a change (awaiting 2nd confirm)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -699,8 +710,10 @@ cdef class PositionBalancerHandler:
                 canonical = self._get_canonical_asset(asset_key)
                 self._buy_cancel_streak.pop(canonical, None)
                 # Exit buy-side refuge: a fill means our 2nd-best tuck worked (or the frontrunner
-                # cleared). Resume normal best-of-book chasing.
+                # cleared). Resume normal best-of-book chasing. Clear the sampling latches too.
                 self._in_refuge_buy.pop(canonical, None)
+                self._refuge_change_seen_buy.pop(canonical, None)
+                self._refuge_last_check_time_buy.pop(canonical, None)
             # Check if this is a sell order
             elif order_id in self._pending_sell_orders:
                 asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
@@ -716,8 +729,10 @@ cdef class PositionBalancerHandler:
                 canonical = self._get_canonical_asset(asset_key)
                 self._sell_cancel_streak.pop(canonical, None)
                 # Exit sell-side refuge: a fill means our 2nd-best tuck worked (or the undercutter
-                # cleared). Resume normal best-of-book chasing.
+                # cleared). Resume normal best-of-book chasing. Clear the sampling latches too.
                 self._in_refuge_sell.pop(canonical, None)
+                self._refuge_change_seen_sell.pop(canonical, None)
+                self._refuge_last_check_time_sell.pop(canonical, None)
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle fill for {order_id}: {e}")
 
@@ -1193,10 +1208,92 @@ cdef class PositionBalancerHandler:
         
         return False
 
+    cdef bint c_refuge_situation_changed(self, str asset, bint is_buy):
+        """
+        Sampled (every REFUGE_CHECK_INTERVAL) while in refuge to decide if our 2nd-best perch
+        has gone stale. Returns True if EITHER:
+          • we SANK: more than one foreign order now sits between us and the top of book
+            (we're 3rd-from-top or deeper), or
+          • a GAP opened ABOVE us: the nearest foreign level above our order is > 1 tick away
+            (we could move up and still be 2nd-best).
+        Both resolve to the same fix (re-place under 2nd-from-top), so we only need a boolean.
+        Reads the order's OWN market book. Generators consumed via next(). Fail-safe: False on error.
+        """
+        cdef:
+            tuple order_details
+            object market_tuple
+            OrderBook ob
+            double min_tick = 0.0
+            double our_price = 0.0
+            double prev_price = 0.0
+            int below = 0          # foreign levels strictly more aggressive than us (below for sell)
+            int above_idx = 0      # how many foreign levels we've passed at/through our price going outward
+            double first_above = 0.0
+            str trading_pair
+        try:
+            if is_buy:
+                order_details = self._active_buy_order_details.get(asset)
+            else:
+                order_details = self._active_sell_order_details.get(asset)
+            if order_details is None:
+                return False
+            market_tuple, our_price = order_details
+            trading_pair = market_tuple.trading_pair
+            if trading_pair in self._min_price_increment_cache:
+                min_tick = self._min_price_increment_cache[trading_pair]
+            else:
+                trading_rule = market_tuple.market._trading_rules.get(trading_pair)
+                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                    min_tick = float(trading_rule.min_price_increment)
+                self._min_price_increment_cache[trading_pair] = min_tick
+            if min_tick <= 0:
+                return False
+            ob = (<ExchangeBase>market_tuple.market).c_get_order_book(trading_pair)
+            if is_buy:
+                it = ob.bid_entries()   # highest-first
+            else:
+                it = ob.ask_entries()   # lowest-first
+            # Walk from the top of book outward. Count foreign levels MORE aggressive than us
+            # (below for a sell = lower ask / for a buy = higher bid). Capture the first foreign
+            # level on the far side of us (= the level just above our perch).
+            while True:
+                row = next(it, None)
+                if row is None:
+                    break
+                p = float(row.price)
+                # skip our own order's level
+                if abs(p - our_price) < min_tick * 0.5:
+                    continue
+                if is_buy:
+                    more_aggressive = p > our_price      # higher bid = ahead of us
+                else:
+                    more_aggressive = p < our_price      # lower ask = ahead of us
+                if more_aggressive:
+                    below += 1
+                else:
+                    first_above = p                      # first foreign level past us
+                    break
+                if below > 1:
+                    break                                # already know we sank; no need to read more
+            # (a) sank: more than one order ahead of us
+            if below > 1:
+                return True
+            # (b) gap above: nearest foreign level past us is > 1 tick away
+            if first_above > 0.0:
+                if is_buy:
+                    if (our_price - first_above) > min_tick * 1.5:
+                        return True
+                else:
+                    if (first_above - our_price) > min_tick * 1.5:
+                        return True
+            return False
+        except Exception:
+            return False
+
     cdef tuple c_get_orderbook_prices(self, OrderBook ob):
         """
         Get bid/ask prices from orderbook with safety checks.
-        
+
         Returns: (bid, ask) tuple
         """
         cdef:
@@ -1711,12 +1808,32 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("frontrun")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_buy.get(refuge_canonical, False):
+                            # (a) HOLD by default. Sample once per REFUGE_CHECK_INTERVAL; a change
+                            # (sank >1 deep, or gap opened above) must persist across TWO samples
+                            # (10+10) before we re-place. Mirror of the sell side.
                             should_cancel = False
                             cancel_reason = ""
+                            if (current_time - self._refuge_last_check_time_buy.get(refuge_canonical, 0.0)) >= REFUGE_CHECK_INTERVAL:
+                                self._refuge_last_check_time_buy[refuge_canonical] = current_time
+                                if self.c_refuge_situation_changed(asset, True):
+                                    if self._refuge_change_seen_buy.get(refuge_canonical, False):
+                                        self._refuge_change_seen_buy.pop(refuge_canonical, None)
+                                        should_cancel = True
+                                        cancel_reason = "refuge (re-establish 2nd-best — change confirmed)"
+                                    else:
+                                        self._refuge_change_seen_buy[refuge_canonical] = True
+                                        self.strategy.logger().info(
+                                            f"Position balancer: BUY refuge change observed for {refuge_canonical} "
+                                            f"— awaiting 10-min confirmation before re-placing")
+                                else:
+                                    self._refuge_change_seen_buy.pop(refuge_canonical, None)
                         elif cancel_streak >= REFUGE_ARM_STREAK:
                             # If no real wall exists, placement reads the 2nd bid and falls back to
                             # normal top-of-book; a wall-distance entry gate is a future refinement.
                             self._in_refuge_buy[refuge_canonical] = True
+                            # Seed the sample clock NOW (first sample one full interval after entry).
+                            self._refuge_last_check_time_buy[refuge_canonical] = current_time
+                            self._refuge_change_seen_buy.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
@@ -1913,15 +2030,41 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("undercut")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_sell.get(refuge_canonical, False):
-                            # (a) hold position — ignore the undercut entirely
+                            # (a) HOLD by default (suppress the undercut). Sample the situation only
+                            # once per REFUGE_CHECK_INTERVAL (10 min) — we deliberately avoid reading
+                            # the book each tick while in refuge. A change (we SANK >1 deep, or a GAP
+                            # opened above) must PERSIST across TWO consecutive samples (10+10) before
+                            # we re-place — this debounces a transient book so we don't jump back and
+                            # forth. On confirm, re-place re-establishes us at 2nd-best from the top.
                             should_cancel = False
                             cancel_reason = ""
+                            if (current_time - self._refuge_last_check_time_sell.get(refuge_canonical, 0.0)) >= REFUGE_CHECK_INTERVAL:
+                                self._refuge_last_check_time_sell[refuge_canonical] = current_time
+                                if self.c_refuge_situation_changed(asset, False):
+                                    if self._refuge_change_seen_sell.get(refuge_canonical, False):
+                                        # 2nd consecutive sample confirms it -> act, reset the latch
+                                        self._refuge_change_seen_sell.pop(refuge_canonical, None)
+                                        should_cancel = True
+                                        cancel_reason = "refuge (re-establish 2nd-best — change confirmed)"
+                                    else:
+                                        # 1st observation -> wait for the next sample to confirm
+                                        self._refuge_change_seen_sell[refuge_canonical] = True
+                                        self.strategy.logger().info(
+                                            f"Position balancer: SELL refuge change observed for {refuge_canonical} "
+                                            f"— awaiting 10-min confirmation before re-placing")
+                                else:
+                                    # situation back to normal -> drop any pending confirmation
+                                    self._refuge_change_seen_sell.pop(refuge_canonical, None)
                         elif cancel_streak >= REFUGE_ARM_STREAK:
                             # (b) enter refuge — move up under the wall on this cancel.
                             # If no real wall exists, placement reads the 2nd ask and falls back to
                             # normal top-of-book; a "wall must be >= N ticks above jumper" entry gate
                             # is a future refinement (see position-balancer.md).
                             self._in_refuge_sell[refuge_canonical] = True
+                            # Seed the sample clock NOW so the first situation sample is a full
+                            # REFUGE_CHECK_INTERVAL after entry (not immediately on the next tick).
+                            self._refuge_last_check_time_sell[refuge_canonical] = current_time
+                            self._refuge_change_seen_sell.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
@@ -2535,14 +2678,25 @@ cdef class PositionBalancerHandler:
                     # is [frontrunner@L1, wall@L2, …] and the wall is simply the 2nd bid.
                     if self._in_refuge_buy.get(self._get_canonical_asset(asset_key), False):
                         try:
+                            _own = None
+                            _own_det = self._active_buy_order_details.get(asset_key)
+                            if _own_det is not None:
+                                _own = _own_det[1]                # our current order price
+                            _foreign = []
                             _it = ob.bid_entries()
-                            next(_it, None)               # L1 = frontrunner
-                            _wall = next(_it, None)       # L2 = wall
-                            if _wall is not None:
-                                reference_bid = float(_wall.price)
+                            while len(_foreign) < 2:
+                                _row = next(_it, None)
+                                if _row is None:
+                                    break
+                                _p = float(_row.price)
+                                if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
+                                    continue                      # skip our own order's level
+                                _foreign.append(_p)
+                            if len(_foreign) >= 2:                 # _foreign[0]=frontrunner, _foreign[1]=wall
+                                reference_bid = _foreign[1]
                                 self.strategy.logger().info(
                                     f"Position balancer: BUY refuge placement for {asset_key} — "
-                                    f"resting above wall {reference_bid:.8f}")
+                                    f"resting above wall {reference_bid:.8f} (frontrunner {_foreign[0]:.8f})")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (buy): {e}")
 
@@ -2801,21 +2955,31 @@ cdef class PositionBalancerHandler:
                                 except Exception as e:
                                     self.strategy.logger().debug(f"Could not get second ask level: {e}")
 
-                    # SECOND-LEVEL REFUGE: if active, rest under the WALL (2nd ask) instead of
-                    # re-undercutting down. Our cancel has confirmed by now (3s cooldown) so the
-                    # book is [jumper@L1, wall@L2, …] — the wall is simply the 2nd ask. (If our
-                    # stale order were still top, the self-replace block above already moved
-                    # reference_ask to L2, so this stays correct.)
+                    # SECOND-LEVEL REFUGE: if active, rest under the WALL = the 2nd FOREIGN ask
+                    # (next order regardless of size). Walk asks skipping our OWN resting order
+                    # (its cancel may not be reflected yet — that exact race put us back at the
+                    # jumper's tick in live testing): jumper = 1st foreign ask, wall = 2nd foreign ask.
                     if self._in_refuge_sell.get(self._get_canonical_asset(asset_key), False):
                         try:
+                            _own = None
+                            _own_det = self._active_sell_order_details.get(asset_key)
+                            if _own_det is not None:
+                                _own = _own_det[1]                # our current order price
+                            _foreign = []
                             _it = ob.ask_entries()
-                            next(_it, None)               # L1 = jumper
-                            _wall = next(_it, None)       # L2 = wall
-                            if _wall is not None:
-                                reference_ask = float(_wall.price)
+                            while len(_foreign) < 2:
+                                _row = next(_it, None)
+                                if _row is None:
+                                    break
+                                _p = float(_row.price)
+                                if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
+                                    continue                      # skip our own order's level
+                                _foreign.append(_p)
+                            if len(_foreign) >= 2:                 # _foreign[0]=jumper, _foreign[1]=wall
+                                reference_ask = _foreign[1]
                                 self.strategy.logger().info(
                                     f"Position balancer: SELL refuge placement for {asset_key} — "
-                                    f"resting under wall {reference_ask:.8f}")
+                                    f"resting under wall {reference_ask:.8f} (jumper {_foreign[0]:.8f})")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (sell): {e}")
 
@@ -3020,6 +3184,8 @@ cdef class PositionBalancerHandler:
             self._buy_completed = False
             # Fresh session must start in NORMAL mode (chase best bid), not stale refuge.
             self._in_refuge_buy.clear()
+            self._refuge_change_seen_buy.clear()
+            self._refuge_last_check_time_buy.clear()
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Buy-in mode enabled - position balancer will acquire assets to reach target")
@@ -3052,6 +3218,8 @@ cdef class PositionBalancerHandler:
             # completion dicts, a stale refuge flag would change behaviour — it would skip
             # L1-chasing and start passive — so we clear it explicitly here.)
             self._in_refuge_sell.clear()
+            self._refuge_change_seen_sell.clear()
+            self._refuge_last_check_time_sell.clear()
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Sell-off mode enabled - position balancer will reduce assets to reach target")
