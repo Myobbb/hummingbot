@@ -1640,7 +1640,10 @@ cdef class PositionBalancerHandler:
                     # frontrun (we are top): current_bid ~= order_price. Pre-detection throttle
                     # (STEP_UP_MIN_INTERVAL) is the API-spam guard. Proactive (reason prefixed
                     # "step-up …" → caller does NOT mark reactive / streak-bump).
+                    # DISABLED while in refuge (see sell CHECK 4): the refuge 10-min sampler owns
+                    # repositioning of a refuge order; step-up must not walk it around every 30s.
                     if (not should_cancel and spread_is_min and min_price_increment > 0
+                            and not self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
                             and current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE
                             and (self.strategy._current_timestamp
                                  - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
@@ -1686,7 +1689,12 @@ cdef class PositionBalancerHandler:
                     # Pre-detection throttle (STEP_UP_MIN_INTERVAL) is the API-spam guard.
                     # Proactive (reason prefixed "step-up …" → caller does NOT mark reactive,
                     # so it never feeds the undercut streak / bid-war backoff).
+                    # DISABLED while in refuge: a refuge order's "gap above" is expected (we're parked
+                    # deep), and step-up would walk it up the book every 30s, defeating refuge's
+                    # park-and-hold. The refuge 10-min sampler (c_refuge_situation_changed) owns BOTH
+                    # "sank" and "gap above" repositioning for a refuge order, under 10+10 confirmation.
                     if (not should_cancel and spread_is_min and min_price_increment > 0
+                            and not self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
                             and current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE
                             and (self.strategy._current_timestamp
                                  - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
