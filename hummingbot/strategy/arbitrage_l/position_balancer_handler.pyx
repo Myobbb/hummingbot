@@ -769,6 +769,12 @@ cdef class PositionBalancerHandler:
 
             self._post_fill_extra_wait[canonical] = extra
             self._last_fill_completion_time[canonical] = now
+
+            if extra > 0.0:
+                self.strategy.logger().info(
+                    f"Position balancer: fill-pressure armed [{canonical}] "
+                    f"{'buy' if is_buy else 'sell'} — inter-fill {inter_fill:.2f}s "
+                    f"-> +{extra:.2f}s wait (next placement gate {DEFAULT_COMPLETION_COOLDOWN + extra:.2f}s)")
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to record fill pressure for {order_id}: {e}")
 
@@ -2083,7 +2089,15 @@ cdef class PositionBalancerHandler:
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
                     # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN + self._post_fill_extra_wait.get(canonical_asset, 0.0):
+                    buy_extra_wait = self._post_fill_extra_wait.get(canonical_asset, 0.0)
+                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN + buy_extra_wait:
+                        # Log only when the adaptive extra is the binding constraint (base floor
+                        # already cleared) — confirms the armed wait is actively spacing placement.
+                        if buy_extra_wait > 0.0 and time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                            self.strategy.logger().debug(
+                                f"Position balancer: fill-pressure holding [{canonical_asset}] buy "
+                                f"({time_since_completion:.1f}s/{DEFAULT_COMPLETION_COOLDOWN + buy_extra_wait:.1f}s)")
+                    else:
                         # Check post-cancel cooldown — duration depends on why we cancelled:
                         #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
@@ -2160,7 +2174,15 @@ cdef class PositionBalancerHandler:
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
                     # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
-                    if time_since_completion >= DEFAULT_COMPLETION_COOLDOWN + self._post_fill_extra_wait.get(canonical_asset, 0.0):
+                    sell_extra_wait = self._post_fill_extra_wait.get(canonical_asset, 0.0)
+                    if time_since_completion < DEFAULT_COMPLETION_COOLDOWN + sell_extra_wait:
+                        # Log only when the adaptive extra is the binding constraint (base floor
+                        # already cleared) — confirms the armed wait is actively spacing placement.
+                        if sell_extra_wait > 0.0 and time_since_completion >= DEFAULT_COMPLETION_COOLDOWN:
+                            self.strategy.logger().debug(
+                                f"Position balancer: fill-pressure holding [{canonical_asset}] sell "
+                                f"({time_since_completion:.1f}s/{DEFAULT_COMPLETION_COOLDOWN + sell_extra_wait:.1f}s)")
+                    else:
                         # Check post-cancel cooldown — duration depends on why we cancelled:
                         #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
