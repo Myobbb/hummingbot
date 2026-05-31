@@ -740,7 +740,7 @@ cdef class PositionBalancerHandler:
         cdef:
             double now = self.strategy._current_timestamp
             double prior
-            double inter_fill
+            double inter_fill = 0.0   # init: silences -Wmaybe-uninitialized; the first-fill branch (prior<=0) skips the log anyway
             double extra
             str asset_key
             str canonical
