@@ -52,6 +52,8 @@ cdef class PositionBalancerHandler:
         # Fill-pressure adaptive post-fill wait (trailing-stop-like spacing)
         dict _last_fill_completion_time   # canonical_asset -> timestamp of last FULL completion (fills only)
         dict _post_fill_extra_wait        # canonical_asset -> seconds to add to DEFAULT_COMPLETION_COOLDOWN
+        # Step-up-into-gap throttle
+        dict _last_step_up_time           # canonical_asset -> timestamp of last step-up cancel (pre-detection throttle)
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset

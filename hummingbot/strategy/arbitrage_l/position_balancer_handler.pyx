@@ -104,6 +104,25 @@ cdef double TICK_TOLERANCE = 0.9            # Tolerance for detecting if order m
 cdef double HALF_TICK_TOLERANCE = 0.5       # Half-tick tolerance for price matching
 cdef double LARGE_GAP_THRESHOLD = 1.9       # Multi-tick gap threshold for immediate cancellation (2 ticks)
 cdef double AGGRESSIVE_MODE_TOLERANCE = 0.999  # Price tolerance for aggressive mode (0.1%)
+
+# --- Step-up-into-gap (min mode only) ---
+# When our order IS the top of book but the NEXT foreign level is far away (a big gap
+# above a sell / below a buy), we are leaving price on the table: we could move toward
+# that level and STILL be best-of-book. For sells we step the ask UP to (next_foreign_ask
+# - 1 tick); for buys we step the bid DOWN to (next_foreign_bid + 1 tick). Stepping toward
+# a gap is the ANTI-bid-war direction (we give counterparties a WORSE price), so it cannot
+# trigger an undercut war.
+#
+# Spam control is deliberately FRONT-LOADED (throttle BEFORE we act, then act fast):
+#   - STEP_UP_MIN_GAP_TICKS: only arm when the gap is at least this many ticks.
+#   - STEP_UP_MIN_INTERVAL: per-asset min seconds between step-ups (the API-spam guard).
+#     Checked *before* detection, so a flickering gap can't cause repeated cancels.
+#   - STEP_UP_COOLDOWN: SHORT post-cancel cooldown (vs the 10s proactive default) so we get
+#     back on the book quickly — the throttle already happened up front, no need to dwell off-book.
+# Tagged PROACTIVE: the step-up cancel does NOT increment the undercut/frontrun streak.
+cdef double STEP_UP_MIN_GAP_TICKS = 5.0     # min headroom (in ticks) to the next foreign level before stepping in
+cdef double STEP_UP_MIN_INTERVAL  = 30.0    # per-asset min seconds between step-ups (pre-detection API-spam throttle)
+cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a step-up (minimize off-book time)
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -222,6 +241,9 @@ cdef class PositionBalancerHandler:
         # Fill-pressure adaptive post-fill wait (trailing-stop-like spacing on the top-of-book strategy)
         self._last_fill_completion_time = {}  # canonical_asset -> timestamp of last FULL completion (fills only, not cancels)
         self._post_fill_extra_wait = {}       # canonical_asset -> seconds added to DEFAULT_COMPLETION_COOLDOWN
+        # Step-up-into-gap throttle: last time we stepped our order into a gap (per canonical asset).
+        # Pre-detection gate (STEP_UP_MIN_INTERVAL) so a flickering gap can't cause repeated cancels.
+        self._last_step_up_time = {}          # canonical_asset -> timestamp of last step-up cancel
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -1325,6 +1347,9 @@ cdef class PositionBalancerHandler:
             double expected_price = 0.0
             double min_price_increment = 0.0
             double gap_amount = 0.0
+            double next_ask = 0.0
+            double next_bid = 0.0
+            double headroom_ticks = 0.0
             tuple order_details
             OrderBook order_ob
             OrderBook best_ob
@@ -1477,6 +1502,36 @@ cdef class PositionBalancerHandler:
                         if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                             should_cancel = True
                             cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
+
+                    # CHECK 4: Step-down into gap (min mode only) — mirror of the sell step-up.
+                    # We ARE top bid but the next foreign bid is far below; move down to
+                    # (next_bid + 1 tick) and stay best bid, buying cheaper. Only when NOT
+                    # frontrun (we are top): current_bid ~= order_price. Pre-detection throttle
+                    # (STEP_UP_MIN_INTERVAL) is the API-spam guard. Proactive (reason prefixed
+                    # "step-up …" → caller does NOT mark reactive / streak-bump).
+                    if (not should_cancel and spread_is_min and min_price_increment > 0
+                            and current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE
+                            and (self.strategy._current_timestamp
+                                 - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
+                                >= STEP_UP_MIN_INTERVAL):
+                        # NOTE: bid_entries() is a GENERATOR (yields OrderBookRow), not a list.
+                        # entry[0] is our own order (top bid); entry[1] is the next foreign level.
+                        next_bid = 0.0
+                        try:
+                            bid_iter = order_ob.bid_entries()
+                            bid_lvl0 = next(bid_iter, None)
+                            bid_lvl1 = next(bid_iter, None)
+                            if bid_lvl1 is not None:
+                                next_bid = float(bid_lvl1.price)
+                        except Exception:
+                            next_bid = 0.0
+                        if next_bid > 0.0 and next_bid < order_price:
+                            headroom_ticks = (order_price - next_bid) / min_price_increment
+                            if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                                should_cancel = True
+                                cancel_reason = (f"step-up into gap (next bid {next_bid:.8f} is "
+                                                 f"{headroom_ticks:.1f} ticks below our {order_price:.8f})")
+                                self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
                 else:  # SELL
                     # CHECK 2: Undercut - someone placed LOWER ask than our order
                     if current_ask < order_price:
@@ -1493,7 +1548,39 @@ cdef class PositionBalancerHandler:
                         if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                             should_cancel = True
                             cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
-        
+
+                    # CHECK 4: Step-up into gap (min mode only) — we ARE top ask but the next
+                    # foreign ask is far above; move up to (next_ask - 1 tick) and stay best ask.
+                    # Only when NOT undercut (we are top): current_ask ~= order_price.
+                    # Pre-detection throttle (STEP_UP_MIN_INTERVAL) is the API-spam guard.
+                    # Proactive (reason prefixed "step-up …" → caller does NOT mark reactive,
+                    # so it never feeds the undercut streak / bid-war backoff).
+                    if (not should_cancel and spread_is_min and min_price_increment > 0
+                            and current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE
+                            and (self.strategy._current_timestamp
+                                 - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
+                                >= STEP_UP_MIN_INTERVAL):
+                        # We're at (or above) top — read the next foreign ask level.
+                        # NOTE: ask_entries() is a GENERATOR (yields OrderBookRow), not a list —
+                        # it is NOT subscriptable and has no len(). Pull the first two rows by
+                        # iterating. entry[0] is our own order (top); entry[1] is the next foreign level.
+                        next_ask = 0.0
+                        try:
+                            ask_iter = order_ob.ask_entries()
+                            ask_lvl0 = next(ask_iter, None)
+                            ask_lvl1 = next(ask_iter, None)
+                            if ask_lvl1 is not None:
+                                next_ask = float(ask_lvl1.price)
+                        except Exception:
+                            next_ask = 0.0
+                        if next_ask > order_price:
+                            headroom_ticks = (next_ask - order_price) / min_price_increment
+                            if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                                should_cancel = True
+                                cancel_reason = (f"step-up into gap (next ask {next_ask:.8f} is "
+                                                 f"{headroom_ticks:.1f} ticks above our {order_price:.8f})")
+                                self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
+
         except Exception as e:
             self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
         
@@ -1580,8 +1667,13 @@ cdef class PositionBalancerHandler:
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
-                    # Immediate-check cancels are always reactive (market event)
-                    if should_cancel and cancel_reason and not cancel_reason.startswith("mode disabled"):
+                    # Immediate-check cancels are reactive (market event) EXCEPT:
+                    #   - "mode disabled": housekeeping
+                    #   - "step-up …": we voluntarily reprice into a gap (no one beat us) — proactive,
+                    #     so it takes the 10s cooldown and does NOT bump the frontrun streak.
+                    if (should_cancel and cancel_reason
+                            and not cancel_reason.startswith("mode disabled")
+                            and not cancel_reason.startswith("step-up")):
                         is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
@@ -1749,8 +1841,13 @@ cdef class PositionBalancerHandler:
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
-                    # Immediate-check cancels are always reactive (market event)
-                    if should_cancel and cancel_reason and not cancel_reason.startswith("mode disabled"):
+                    # Immediate-check cancels are reactive (market event) EXCEPT:
+                    #   - "mode disabled": housekeeping
+                    #   - "step-up …": we voluntarily reprice into a gap (no one beat us) — proactive,
+                    #     so it takes the 10s cooldown and does NOT bump the undercut streak.
+                    if (should_cancel and cancel_reason
+                            and not cancel_reason.startswith("mode disabled")
+                            and not cancel_reason.startswith("step-up")):
                         is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
@@ -1919,10 +2016,16 @@ cdef class PositionBalancerHandler:
             # Record cooldown to apply under canonical key so handle_order_cancellation
             # (alias-aware) picks it up correctly.
             canonical = self._get_canonical_asset(asset)
-            cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
+            # Step-up cancels are proactive (reactive=False) but get a SHORT cooldown so we
+            # re-place into the gap fast — the API-spam throttle is the pre-detection
+            # STEP_UP_MIN_INTERVAL gate, not the post-cancel wait.
+            if reason.startswith("step-up"):
+                cooldown = STEP_UP_COOLDOWN
+            else:
+                cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_buy_cancel_cooldown[canonical] = cooldown
             # Only increment streak for reactive (market-event) cancels.
-            # Proactive refreshes (periodic, better-market, divergence) are scheduled
+            # Proactive refreshes (periodic, better-market, divergence, step-up) are scheduled
             # housekeeping — counting them would back off frontrun detection on thin
             # markets that refresh often but are rarely frontrun.
             if reactive:
@@ -1985,10 +2088,16 @@ cdef class PositionBalancerHandler:
             # Record cooldown to apply under canonical key so handle_order_cancellation
             # (alias-aware) picks it up correctly.
             canonical = self._get_canonical_asset(asset)
-            cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
+            # Step-up cancels are proactive (reactive=False) but get a SHORT cooldown so we
+            # re-place into the gap fast — the API-spam throttle is the pre-detection
+            # STEP_UP_MIN_INTERVAL gate, not the post-cancel wait.
+            if reason.startswith("step-up"):
+                cooldown = STEP_UP_COOLDOWN
+            else:
+                cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_sell_cancel_cooldown[canonical] = cooldown
             # Only increment streak for reactive (market-event) cancels.
-            # Proactive refreshes (periodic, better-market, divergence) are scheduled
+            # Proactive refreshes (periodic, better-market, divergence, step-up) are scheduled
             # housekeeping — counting them would back off undercut detection on thin
             # markets that refresh often but are rarely undercut.
             if reactive:
@@ -2314,12 +2423,17 @@ cdef class PositionBalancerHandler:
                         existing_order_details = self._active_buy_order_details.get(asset_key)
                         if existing_order_details is not None:
                             _, existing_price = existing_order_details
-                            # If top bid matches our existing order (within tolerance), use second bid
+                            # If top bid matches our existing order (within tolerance), use second bid.
+                            # NOTE: bid_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
+                            # and no len(). Previous code used len()/[1] which always threw and silently
+                            # fell back to top_bid (self-competing). Pull the second row via next().
                             if abs(top_bid - existing_price) < min_price_increment * 0.5:
                                 try:
-                                    bid_entries = ob.bid_entries()
-                                    if len(bid_entries) >= 2:
-                                        reference_bid = float(bid_entries[1].price)
+                                    _bid_iter = ob.bid_entries()
+                                    _ = next(_bid_iter, None)              # level 0 (our own top)
+                                    _bid_lvl1 = next(_bid_iter, None)      # level 1 (next foreign)
+                                    if _bid_lvl1 is not None:
+                                        reference_bid = float(_bid_lvl1.price)
                                         self.strategy.logger().debug(
                                             f"Position balancer: Top bid {top_bid:.8f} matches our existing order, "
                                             f"using second bid {reference_bid:.8f} for new order price")
@@ -2564,12 +2678,17 @@ cdef class PositionBalancerHandler:
                         existing_order_details = self._active_sell_order_details.get(asset_key)
                         if existing_order_details is not None:
                             _, existing_price = existing_order_details
-                            # If top ask matches our existing order (within tolerance), use second ask
+                            # If top ask matches our existing order (within tolerance), use second ask.
+                            # NOTE: ask_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
+                            # and no len(). Previous code used len()/[1] which always threw and silently
+                            # fell back to top_ask (self-competing). Pull the second row via next().
                             if abs(top_ask - existing_price) < min_price_increment * 0.5:
                                 try:
-                                    ask_entries = ob.ask_entries()
-                                    if len(ask_entries) >= 2:
-                                        reference_ask = float(ask_entries[1].price)
+                                    _ask_iter = ob.ask_entries()
+                                    _ = next(_ask_iter, None)              # level 0 (our own top)
+                                    _ask_lvl1 = next(_ask_iter, None)      # level 1 (next foreign)
+                                    if _ask_lvl1 is not None:
+                                        reference_ask = float(_ask_lvl1.price)
                                         self.strategy.logger().debug(
                                             f"Position balancer: Top ask {top_ask:.8f} matches our existing order, "
                                             f"using second ask {reference_ask:.8f} for new order price")
