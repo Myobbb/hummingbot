@@ -123,6 +123,28 @@ cdef double AGGRESSIVE_MODE_TOLERANCE = 0.999  # Price tolerance for aggressive 
 cdef double STEP_UP_MIN_GAP_TICKS = 5.0     # min headroom (in ticks) to the next foreign level before stepping in
 cdef double STEP_UP_MIN_INTERVAL  = 30.0    # per-asset min seconds between step-ups (pre-detection API-spam throttle)
 cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a step-up (minimize off-book time)
+
+# --- Second-level refuge against a persistent penny-jumper (min mode only) ---
+# Classic "don't chase the penny-jumper" problem: a reactive bot places exactly 1 tick
+# inside us every cycle, anchoring to OUR price. Re-pricing to reclaim best-of-book just
+# feeds the war — they re-anchor, and (worst case) price walks away from us with no fills.
+# Standard market-making practice is to STOP chasing optimal queue position and instead
+# accept a defined, passive position. Here: stop fighting for L1 and tuck in just under the
+# WALL — the next genuine resting level above the jumper (the 2nd foreign ask for a sell /
+# 2nd foreign bid for a buy). The jumper is left alone at the cheap top; the next organic
+# market order lifts THEM, not us. When they fill/leave we are best-of-book again at a
+# better price.
+#
+# State machine per canonical asset, with hysteresis to avoid flip-flop:
+#   NORMAL --(undercut fires AND streak >= REFUGE_ARM_STREAK)--> REFUGE
+#   REFUGE --(any fill -> streak resets, _in_refuge cleared in handle_order_fill)--> NORMAL
+# While in REFUGE we SUPPRESS the undercut trigger (we intend to sit 2nd-best) and place at
+# wall ∓ 1 tick instead of top ∓ 1 tick. Exiting only on a fill is safe: if the jumper simply
+# leaves, we are already at wall-1tick == correct top placement, so NORMAL resumes seamlessly.
+# (Future refinement: a "wall must be >= N ticks above the jumper" entry gate so we only take
+# refuge when there's a distinct level to hide under — see position-balancer.md. For now we
+# enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
+cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -244,6 +266,12 @@ cdef class PositionBalancerHandler:
         # Step-up-into-gap throttle: last time we stepped our order into a gap (per canonical asset).
         # Pre-detection gate (STEP_UP_MIN_INTERVAL) so a flickering gap can't cause repeated cancels.
         self._last_step_up_time = {}          # canonical_asset -> timestamp of last step-up cancel
+        # Second-level refuge state (per canonical asset). True = we have stopped chasing the
+        # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
+        # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
+        # the wall instead of top-of-book.
+        self._in_refuge_sell = {}             # canonical_asset -> bint (in sell-side refuge)
+        self._in_refuge_buy = {}              # canonical_asset -> bint (in buy-side refuge)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -670,6 +698,9 @@ cdef class PositionBalancerHandler:
                 # Reset consecutive-cancel streak — a fill means progress
                 canonical = self._get_canonical_asset(asset_key)
                 self._buy_cancel_streak.pop(canonical, None)
+                # Exit buy-side refuge: a fill means our 2nd-best tuck worked (or the frontrunner
+                # cleared). Resume normal best-of-book chasing.
+                self._in_refuge_buy.pop(canonical, None)
             # Check if this is a sell order
             elif order_id in self._pending_sell_orders:
                 asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
@@ -684,6 +715,9 @@ cdef class PositionBalancerHandler:
                 # Reset consecutive-cancel streak — a fill means progress
                 canonical = self._get_canonical_asset(asset_key)
                 self._sell_cancel_streak.pop(canonical, None)
+                # Exit sell-side refuge: a fill means our 2nd-best tuck worked (or the undercutter
+                # cleared). Resume normal best-of-book chasing.
+                self._in_refuge_sell.pop(canonical, None)
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle fill for {order_id}: {e}")
 
@@ -1171,10 +1205,10 @@ cdef class PositionBalancerHandler:
         
         if ob._bid_book.size() > 0:
             bid = float(deref(ob._bid_book.rbegin()).getPrice())
-        
+
         if ob._ask_book.size() > 0:
             ask = float(deref(ob._ask_book.begin()).getPrice())
-        
+
         return (bid, ask)
 
     cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price,
@@ -1667,19 +1701,42 @@ cdef class PositionBalancerHandler:
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
+
+                    # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
+                    # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
+                    # hold our wall order; (b) streak >= ARM and a valid wall (2nd foreign bid >= 2 ticks
+                    # BELOW the frontrunner) exists -> enter refuge, allow this cancel to move us DOWN
+                    # under the wall, retag "refuge". Cleared on any fill.
+                    if (should_cancel and self._buy_spread_is_min
+                            and cancel_reason.startswith("frontrun")):
+                        refuge_canonical = self._get_canonical_asset(asset)
+                        if self._in_refuge_buy.get(refuge_canonical, False):
+                            should_cancel = False
+                            cancel_reason = ""
+                        elif cancel_streak >= REFUGE_ARM_STREAK:
+                            # If no real wall exists, placement reads the 2nd bid and falls back to
+                            # normal top-of-book; a wall-distance entry gate is a future refinement.
+                            self._in_refuge_buy[refuge_canonical] = True
+                            cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
+                            self.strategy.logger().info(
+                                f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
+                                f"(streak={cancel_streak}) — retreating under the wall, frontrun now suppressed")
+
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
                     #   - "step-up …": we voluntarily reprice into a gap (no one beat us) — proactive,
                     #     so it takes the 10s cooldown and does NOT bump the frontrun streak.
+                    #   - "refuge …": deliberate move under the wall — proactive, no streak bump.
                     if (should_cancel and cancel_reason
                             and not cancel_reason.startswith("mode disabled")
-                            and not cancel_reason.startswith("step-up")):
+                            and not cancel_reason.startswith("step-up")
+                            and not cancel_reason.startswith("refuge")):
                         is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
                     effective_interval = self._limit_refresh_interval
-                    
+
                     # Aggressive mode (0% spread) and partial fill -> use aggressive interval
                     if (not self._buy_spread_is_min and self._buy_spread_pct == 0.0):
                         if order_id in self._pending_buy_orders:
@@ -1841,19 +1898,50 @@ cdef class PositionBalancerHandler:
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
+
+                    # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
+                    # When the immediate check says "undercut", decide between chasing (normal) and
+                    # taking refuge under the wall. Two cases:
+                    #   (a) ALREADY in refuge -> SUPPRESS the undercut (we intend to sit 2nd-best;
+                    #       the jumper is below us by design). Hold our wall order.
+                    #   (b) NOT in refuge yet, but the jumper has undercut us REFUGE_ARM_STREAK times
+                    #       in a row AND a valid wall exists -> ENTER refuge: allow this cancel (so the
+                    #       order can move UP), retag it "refuge" (proactive), and let placement put us
+                    #       at wall-1tick. Subsequent cycles hit case (a).
+                    # Refuge is cleared on any fill (handle_order_fill).
+                    if (should_cancel and self._sell_spread_is_min
+                            and cancel_reason.startswith("undercut")):
+                        refuge_canonical = self._get_canonical_asset(asset)
+                        if self._in_refuge_sell.get(refuge_canonical, False):
+                            # (a) hold position — ignore the undercut entirely
+                            should_cancel = False
+                            cancel_reason = ""
+                        elif cancel_streak >= REFUGE_ARM_STREAK:
+                            # (b) enter refuge — move up under the wall on this cancel.
+                            # If no real wall exists, placement reads the 2nd ask and falls back to
+                            # normal top-of-book; a "wall must be >= N ticks above jumper" entry gate
+                            # is a future refinement (see position-balancer.md).
+                            self._in_refuge_sell[refuge_canonical] = True
+                            cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
+                            self.strategy.logger().info(
+                                f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
+                                f"(streak={cancel_streak}) — retreating under the wall, undercut now suppressed")
+
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
                     #   - "step-up …": we voluntarily reprice into a gap (no one beat us) — proactive,
                     #     so it takes the 10s cooldown and does NOT bump the undercut streak.
+                    #   - "refuge …": deliberate move under the wall — proactive, no streak bump.
                     if (should_cancel and cancel_reason
                             and not cancel_reason.startswith("mode disabled")
-                            and not cancel_reason.startswith("step-up")):
+                            and not cancel_reason.startswith("step-up")
+                            and not cancel_reason.startswith("refuge")):
                         is_reactive = True
 
                     # Check if refresh interval passed AND conditions changed
                     # Determine effective refresh interval (shorter for aggressive partial fills)
                     effective_interval = self._limit_refresh_interval
-                    
+
                     # Aggressive mode (0% spread) and partial fill -> use aggressive interval
                     if (not self._sell_spread_is_min and self._sell_spread_pct == 0.0):
                         if order_id in self._pending_sell_orders:
@@ -2016,10 +2104,11 @@ cdef class PositionBalancerHandler:
             # Record cooldown to apply under canonical key so handle_order_cancellation
             # (alias-aware) picks it up correctly.
             canonical = self._get_canonical_asset(asset)
-            # Step-up cancels are proactive (reactive=False) but get a SHORT cooldown so we
-            # re-place into the gap fast — the API-spam throttle is the pre-detection
-            # STEP_UP_MIN_INTERVAL gate, not the post-cancel wait.
-            if reason.startswith("step-up"):
+            # Step-up and refuge cancels are proactive (reactive=False) but get a SHORT cooldown
+            # so we re-place quickly (into the gap / under the wall). For step-up the API-spam
+            # throttle is the pre-detection STEP_UP_MIN_INTERVAL gate; for refuge it is a one-shot
+            # transition (we then SUPPRESS undercut), so neither needs a long post-cancel wait.
+            if reason.startswith("step-up") or reason.startswith("refuge"):
                 cooldown = STEP_UP_COOLDOWN
             else:
                 cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
@@ -2088,10 +2177,11 @@ cdef class PositionBalancerHandler:
             # Record cooldown to apply under canonical key so handle_order_cancellation
             # (alias-aware) picks it up correctly.
             canonical = self._get_canonical_asset(asset)
-            # Step-up cancels are proactive (reactive=False) but get a SHORT cooldown so we
-            # re-place into the gap fast — the API-spam throttle is the pre-detection
-            # STEP_UP_MIN_INTERVAL gate, not the post-cancel wait.
-            if reason.startswith("step-up"):
+            # Step-up and refuge cancels are proactive (reactive=False) but get a SHORT cooldown
+            # so we re-place quickly (into the gap / under the wall). For step-up the API-spam
+            # throttle is the pre-detection STEP_UP_MIN_INTERVAL gate; for refuge it is a one-shot
+            # transition (we then SUPPRESS undercut), so neither needs a long post-cancel wait.
+            if reason.startswith("step-up") or reason.startswith("refuge"):
                 cooldown = STEP_UP_COOLDOWN
             else:
                 cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
@@ -2440,6 +2530,22 @@ cdef class PositionBalancerHandler:
                                 except Exception as e:
                                     self.strategy.logger().debug(f"Could not get second bid level: {e}")
 
+                    # SECOND-LEVEL REFUGE (buy mirror): rest under the WALL (2nd bid) — below the
+                    # frontrunner — instead of re-overbidding up. Cancel has confirmed, so the book
+                    # is [frontrunner@L1, wall@L2, …] and the wall is simply the 2nd bid.
+                    if self._in_refuge_buy.get(self._get_canonical_asset(asset_key), False):
+                        try:
+                            _it = ob.bid_entries()
+                            next(_it, None)               # L1 = frontrunner
+                            _wall = next(_it, None)       # L2 = wall
+                            if _wall is not None:
+                                reference_bid = float(_wall.price)
+                                self.strategy.logger().info(
+                                    f"Position balancer: BUY refuge placement for {asset_key} — "
+                                    f"resting above wall {reference_bid:.8f}")
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Refuge wall read failed (buy): {e}")
+
                     buy_price = reference_bid + min_price_increment
                     # Check if maker price would cross the spread (become taker)
                     if buy_price >= top_ask:
@@ -2695,6 +2801,24 @@ cdef class PositionBalancerHandler:
                                 except Exception as e:
                                     self.strategy.logger().debug(f"Could not get second ask level: {e}")
 
+                    # SECOND-LEVEL REFUGE: if active, rest under the WALL (2nd ask) instead of
+                    # re-undercutting down. Our cancel has confirmed by now (3s cooldown) so the
+                    # book is [jumper@L1, wall@L2, …] — the wall is simply the 2nd ask. (If our
+                    # stale order were still top, the self-replace block above already moved
+                    # reference_ask to L2, so this stays correct.)
+                    if self._in_refuge_sell.get(self._get_canonical_asset(asset_key), False):
+                        try:
+                            _it = ob.ask_entries()
+                            next(_it, None)               # L1 = jumper
+                            _wall = next(_it, None)       # L2 = wall
+                            if _wall is not None:
+                                reference_ask = float(_wall.price)
+                                self.strategy.logger().info(
+                                    f"Position balancer: SELL refuge placement for {asset_key} — "
+                                    f"resting under wall {reference_ask:.8f}")
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Refuge wall read failed (sell): {e}")
+
                     sell_price = reference_ask - min_price_increment
                     # Check if maker price would cross the spread (become taker)
                     if sell_price <= top_bid:
@@ -2894,6 +3018,8 @@ cdef class PositionBalancerHandler:
         if not self._buy_enabled:
             self._buy_enabled = True
             self._buy_completed = False
+            # Fresh session must start in NORMAL mode (chase best bid), not stale refuge.
+            self._in_refuge_buy.clear()
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Buy-in mode enabled - position balancer will acquire assets to reach target")
@@ -2921,6 +3047,11 @@ cdef class PositionBalancerHandler:
         if not self._sell_enabled:
             self._sell_enabled = True
             self._sell_completed = False
+            # Fresh session must start in NORMAL mode (chase best ask), not stale refuge.
+            # Refuge is only re-armed by a fresh streak of undercuts. (Unlike the streak/
+            # completion dicts, a stale refuge flag would change behaviour — it would skip
+            # L1-chasing and start passive — so we clear it explicitly here.)
+            self._in_refuge_sell.clear()
             self.strategy.log_with_clock(
                 logging.INFO,
                 "Sell-off mode enabled - position balancer will reduce assets to reach target")
