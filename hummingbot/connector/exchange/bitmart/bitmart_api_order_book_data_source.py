@@ -629,6 +629,7 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._subscribe_channels(ws)
                 self._last_ping_sent_time = time.time()
                 self._active_ws = ws
+                self._reconnect_attempts = 0
                 
                 # Create message consumer task
                 if self._ws_consumer_task is None or self._ws_consumer_task.done():
@@ -667,23 +668,32 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, Exception) as e:
-                # Inspect close codes to decide transient backoff
-                text = str(e)
-                code = None
-                try:
-                    if "Close code" in text:
-                        code = text.split("Close code =")[1].split()[0]
-                except Exception:
-                    pass
-                is_transient = any(tok in text for tok in ["1000", "1001", "1005", "1006", "1012", "1013"])
-                if is_transient:
-                    self.logger().warning(f"BitMart public WS transient close ({code or 'unknown'}). Reconnecting...")
-                    reconnect_delay = 1.0
+                if self.check_and_clear_reconnect_request():
+                    # Disconnect was triggered by subscribe_to_trading_pair — expected, not an error
+                    self._reconnect_attempts = 0
+                    self.logger().info(
+                        f"BitMart public WS reconnecting to subscribe new pair "
+                        f"({len(self._trading_pairs)} pairs total)"
+                    )
+                    reconnect_delay = 0.0
                 else:
-                    self.logger().error("BitMart public WS error; reconnecting...", exc_info=True)
-                    self._reconnect_attempts += 1
-                    exponent = min(self._reconnect_attempts, 5)
-                    reconnect_delay = float(min(30, 2 ** max(1, exponent)))
+                    # Inspect close codes to decide transient backoff
+                    text = str(e)
+                    code = None
+                    try:
+                        if "Close code" in text:
+                            code = text.split("Close code =")[1].split()[0]
+                    except Exception:
+                        pass
+                    is_transient = any(tok in text for tok in ["1000", "1001", "1005", "1006", "1012", "1013"])
+                    if is_transient:
+                        self.logger().warning(f"BitMart public WS transient close ({code or 'unknown'}). Reconnecting...")
+                        reconnect_delay = 1.0
+                    else:
+                        self.logger().error("BitMart public WS error; reconnecting...", exc_info=True)
+                        self._reconnect_attempts += 1
+                        exponent = min(self._reconnect_attempts, 5)
+                        reconnect_delay = float(min(30, 2 ** max(1, exponent)))
             finally:
                 # Clean up websocket resources
                 self._active_ws = None

@@ -355,12 +355,13 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # Disable protocol-level heartbeat; rely on JSON ping/pong and watchdogs
                     ping_timeout=None,
                 )
+                self._reconnect_attempts = 0
                 await self._subscribe_channels(ws)
                 # Wait briefly to allow subscribe acks without consuming messages
                 await self._wait_for_initial_subscribe_acks(ws, timeout=5.0)
                 self._last_ws_message_sent_timestamp = self._time()
                 self._conn_start_time = self._time()
-                self._last_ws_recv_ts = self._time() 
+                self._last_ws_recv_ts = self._time()
 
                 self._last_any_recv_ts = self._time()
                 self._last_data_recv_ts = self._time()

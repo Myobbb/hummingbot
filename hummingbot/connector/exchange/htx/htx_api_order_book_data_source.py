@@ -124,8 +124,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         Note: the `ws` parameter (from the base class contract) is ignored here;
         HTX manages its own _active_ws and _trade_ws references internally.
-        _reconnect_requested is NOT set — HTX uses explicit disconnect/reconnect
-        via _manage_connection rather than a polling flag.
+        _reconnect_requested is set before disconnecting MBP so _manage_connection
+        can recognise the close as intentional and log INFO instead of ERROR.
         """
         # Subscribe the new pair on the Trade WS in-place (no reconnect needed)
         if self._trade_ws is not None:
@@ -142,6 +142,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception as e:
                 self.logger().warning(f"Could not subscribe {trading_pair} trade on existing WS: {e}")
 
+        # Signal that the upcoming MBP disconnect is intentional before triggering it
+        self._reconnect_requested = True
         # Disconnect MBP to force reconnect + re-subscribe all pairs (including new one)
         if self._active_ws:
             await self._active_ws.disconnect()
@@ -176,9 +178,10 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self._active_ws = ws
                 elif name == "Trade":
                     self._trade_ws = ws
-                    
+
+                self._reconnect_attempts = 0
                 await subscribe_func(ws)
-                
+
                 # Create tasks for message processing and keep-alive
                 message_processor_task = asyncio.create_task(
                     self._process_websocket_messages(ws, name)
@@ -208,10 +211,18 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self._reconnect_attempts += 1
-                if self._is_transient_ws_close_exception(e):
+                if name == "MBP" and self.check_and_clear_reconnect_request():
+                    # Disconnect was triggered by _subscribe_single_trading_pair — expected
+                    self._reconnect_attempts = 0
+                    self.logger().info(
+                        f"HTX MBP WS reconnecting to subscribe new pair "
+                        f"({len(self._trading_pairs)} pairs total)"
+                    )
+                elif self._is_transient_ws_close_exception(e):
+                    self._reconnect_attempts += 1
                     self.logger().debug(f"Transient close on {name} WS: {e}. Reconnecting...")
                 else:
+                    self._reconnect_attempts += 1
                     self.logger().error(f"Unexpected error on {name} WS: {e}", exc_info=True)
                 await asyncio.sleep(2.0)  # Backoff
             finally:
