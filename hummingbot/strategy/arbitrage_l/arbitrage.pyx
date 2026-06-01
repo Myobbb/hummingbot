@@ -1061,7 +1061,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """
         cdef:
             double cutoff = self._current_timestamp - (self._order_timeout * 2)
-            double pb_cutoff = self._current_timestamp - 600.0  # 10 min for position balancer orders
+            double pb_cutoff = self._current_timestamp - 300.0  # 5 min for position balancer orders (refuge re-park / drift backstop)
             list timestamps_to_remove = []
             list tombstones_to_remove = []
             string order_id_str
@@ -1072,7 +1072,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
             
         # Phase 1: Find old entries in order timestamps (based on creation time).
-        # Position balancer orders use a longer threshold (10 min) — the position balancer
+        # Position balancer orders use a longer threshold (5 min) — the position balancer
         # manages its own refresh cycle; this is just a backstop, not an error condition.
         for order_id_str, timestamp in self._order_timestamps:
             oid_str = order_id_str.decode('utf-8')
@@ -1087,12 +1087,30 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Phase 3: Clean up old order timestamps and check for stuck orders
         for order_id_str in timestamps_to_remove:
+            # Backstop skip for position-balancer orders that are STILL correctly placed.
+            # The 300s expiry is purely age-based; for a healthy top-of-book min order on a
+            # stale book this would cancel + re-place at the SAME price, losing FIFO queue
+            # position for nothing. Ask the PB whether a refresh is actually warranted.
+            # (Refuge orders always return True — the backstop is their only reposition.)
+            # On skip: leave the order/tracker untouched and RESET the timestamp so it
+            # re-evaluates at the next ~300s boundary, not every tick.
+            oid_pre = order_id_str.decode('utf-8')
+            if (self._position_balancer is not None
+                    and oid_pre in self._position_balancer_orders):
+                try:
+                    if not self._position_balancer.should_backstop_refresh(oid_pre):
+                        self._order_timestamps[order_id_str] = self._current_timestamp
+                        continue
+                except Exception:
+                    # On error, fall through to the normal refresh (preserve old behaviour).
+                    pass
+
             self._order_timestamps.erase(order_id_str)
 
             # Check for and cleanup stuck orders (still in tracker when they shouldn't be)
             try:
                 oid = order_id_str.decode('utf-8')
-                
+
                 # Attempt to find market pair for the order
                 market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(oid)
                 
@@ -1107,7 +1125,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         if is_pb_order:
                             self.logger().info(
                                 f"Position balancer order {oid} on {market_pair[0].name} "
-                                f"refreshed after 10 min - CANCEL SENT to exchange")
+                                f"refreshed by backstop (5 min) - CANCEL SENT to exchange")
                         else:
                             self.logger().warning(
                                 f"Force cleaned up stuck order {oid} on {market_pair[0].name} "

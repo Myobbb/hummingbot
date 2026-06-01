@@ -56,7 +56,7 @@ cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order 
 #
 # A gap larger than FILL_PRESSURE_WINDOW resets extra to 0 (pressure cooled).
 # The first fill (no prior timestamp) always yields extra=0.
-cdef double FILL_PRESSURE_WINDOW = 12.0   # seconds — second completion within this window = pressure
+cdef double FILL_PRESSURE_WINDOW = 30.0   # seconds — second completion within this window = pressure
 cdef double MAX_POST_FILL_EXTRA  = 8.0    # seconds — cap on the added wait (2s base + 8s = 10s ceiling)
 
 # --- Minimum order age before immediate-cancel checks fire ---
@@ -146,10 +146,12 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
 cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
 # While in refuge we SUPPRESS undercut and simply HOLD. Repositioning (re-establish 2nd-best
-# under the current wall) is handled by the 600s arb backstop (c_cleanup_old_orders), which
-# cancels the order every ~10-11 min; the next placement is still in refuge so it re-reads the
+# under the current wall) is handled by the 300s arb backstop (c_cleanup_old_orders), which
+# cancels the order every ~5-6 min; the next placement is still in refuge so it re-reads the
 # wall and re-parks. We do NOT run a separate in-refuge situation sampler — the backstop already
-# refreshes faster than any debounce could complete, so a sampler would be redundant.
+# refreshes faster than any debounce could complete. Refuge EXITS (resume normal chasing) on:
+# a fill, a session re-enable, a better-market relocation, OR the per-tick "jumper gone" check
+# (c_refuge_jumper_gone — no foreign order at/below us anymore). See position-balancer.md.
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -704,8 +706,10 @@ cdef class PositionBalancerHandler:
                 canonical = self._get_canonical_asset(asset_key)
                 self._buy_cancel_streak.pop(canonical, None)
                 # Exit buy-side refuge: a fill means our 2nd-best tuck worked (or the frontrunner
-                # cleared). Resume normal best-of-book chasing.
-                self._in_refuge_buy.pop(canonical, None)
+                # cleared). Resume normal best-of-book chasing. Log only if we WERE in refuge.
+                if self._in_refuge_buy.pop(canonical, None):
+                    self.strategy.logger().info(
+                        f"Position balancer: BUY refuge EXITED for {canonical} (fill) — resuming normal best-bid chasing")
             # Check if this is a sell order
             elif order_id in self._pending_sell_orders:
                 asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
@@ -721,8 +725,10 @@ cdef class PositionBalancerHandler:
                 canonical = self._get_canonical_asset(asset_key)
                 self._sell_cancel_streak.pop(canonical, None)
                 # Exit sell-side refuge: a fill means our 2nd-best tuck worked (or the undercutter
-                # cleared). Resume normal best-of-book chasing.
-                self._in_refuge_sell.pop(canonical, None)
+                # cleared). Resume normal best-of-book chasing. Log only if we WERE in refuge.
+                if self._in_refuge_sell.pop(canonical, None):
+                    self.strategy.logger().info(
+                        f"Position balancer: SELL refuge EXITED for {canonical} (fill) — resuming normal best-ask chasing")
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle fill for {order_id}: {e}")
 
@@ -743,9 +749,12 @@ cdef class PositionBalancerHandler:
                     # Exit refuge on a FILL-driven completion (belt-and-suspenders alongside
                     # handle_order_fill). filled_amt > 0 means this completion involved a fill, so
                     # it's a genuine trade, not a pure cancel. A pure cancel (filled_amt == 0 —
-                    # refuge entry / 600s backstop refresh) MUST NOT clear refuge.
-                    if filled_amt > 0:
-                        self._in_refuge_buy.pop(self._get_canonical_asset(asset_key), None)
+                    # refuge entry / 300s backstop refresh) MUST NOT clear refuge.
+                    # (handle_order_fill usually clears it first on the OrderFilledEvent; this only
+                    # logs if it hadn't — e.g. a Completed event with no preceding Filled event.)
+                    if filled_amt > 0 and self._in_refuge_buy.pop(self._get_canonical_asset(asset_key), None):
+                        self.strategy.logger().info(
+                            f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset_key)} (completion) — resuming normal best-bid chasing")
                     # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
                     if unfilled_amt > 0:
                         self._pending_buy_by_asset[asset_key] = max(
@@ -769,9 +778,11 @@ cdef class PositionBalancerHandler:
                     unfilled_amt = total_amt - filled_amt
                     # Exit refuge on a FILL-driven completion (belt-and-suspenders alongside
                     # handle_order_fill). filled_amt > 0 => a genuine trade, not a pure cancel.
-                    # A pure cancel (filled_amt == 0 — refuge entry / 600s backstop) MUST NOT clear refuge.
-                    if filled_amt > 0:
-                        self._in_refuge_sell.pop(self._get_canonical_asset(asset_key), None)
+                    # A pure cancel (filled_amt == 0 — refuge entry / 300s backstop) MUST NOT clear refuge.
+                    # (handle_order_fill usually clears it first; this only logs if it hadn't.)
+                    if filled_amt > 0 and self._in_refuge_sell.pop(self._get_canonical_asset(asset_key), None):
+                        self.strategy.logger().info(
+                            f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset_key)} (completion) — resuming normal best-ask chasing")
                     # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
                     if unfilled_amt > 0:
                         self._pending_sell_by_asset[asset_key] = max(
@@ -890,6 +901,88 @@ cdef class PositionBalancerHandler:
         """Clean up pending order tracking during old order cleanup."""
         self.handle_order_completion(order_id, True)
         self.handle_order_completion(order_id, False)
+
+    def should_backstop_refresh(self, str order_id):
+        """
+        Decide whether the arb-layer 300s backstop (c_cleanup_old_orders) should actually
+        cancel/re-place this position-balancer order, or leave it in place.
+
+        The backstop is purely age-based: it fires every ~10 min regardless of whether the
+        order still needs repricing. For a healthy top-of-book min order on a stale book
+        (e.g. ARTX on bing_x) this is pure churn — we cancel and re-place at the SAME price,
+        losing FIFO queue position for nothing.
+
+        Returns True  -> let the backstop refresh (cancel + re-place).
+        Returns False -> order is still correctly placed; skip the refresh (keep queue position).
+
+        Refuge orders ALWAYS refresh (return True): the backstop is their only reposition
+        mechanism (in refuge we suppress the undercut and never reprice on tick), so they
+        must re-read the wall every cycle.
+
+        Otherwise we reuse the SAME oracle as the per-tick chase logic
+        (c_check_immediate_conditions) with a large order_age so every check is active
+        (better-market 60s gate included — the order is 10 min old). If it reports a cancel
+        condition (undercut / gap / better-market), the order is no longer correctly placed
+        -> refresh. If it reports nothing, the order is still at the right price -> skip.
+
+        Fail-safe: on any error, or if the order is unknown / has no details, return True
+        (preserve the original always-refresh behaviour).
+        """
+        cdef:
+            str asset = None
+            bint is_buy = False
+            bint should_cancel = False
+            str canonical
+            tuple order_details
+        try:
+            # Reverse-map order_id -> (asset, side). PB tracks asset -> order_id.
+            for a, oid in self._active_sell_orders.items():
+                if oid == order_id:
+                    asset = a
+                    is_buy = False
+                    break
+            if asset is None:
+                for a, oid in self._active_buy_orders.items():
+                    if oid == order_id:
+                        asset = a
+                        is_buy = True
+                        break
+
+            # Unknown order (already gone from active tracking) — let the backstop clean up.
+            if asset is None:
+                return True
+
+            # Refuge orders must always refresh — the backstop is their sole reposition.
+            canonical = self._get_canonical_asset(asset)
+            if is_buy:
+                if self._in_refuge_buy.get(canonical, False):
+                    return True
+            else:
+                if self._in_refuge_sell.get(canonical, False):
+                    return True
+
+            # No stored details -> unknown price state -> refresh to be safe.
+            if is_buy:
+                order_details = self._active_buy_order_details.get(asset)
+            else:
+                order_details = self._active_sell_order_details.get(asset)
+            if order_details is None:
+                return True
+
+            # Reuse the per-tick "is this order still correctly placed?" oracle.
+            # Large order_age (1e9) ensures the 60s better-market gate is also active.
+            should_cancel, _ = self.c_check_immediate_conditions(
+                asset, is_buy, 1.0e9, MIN_FRONTRUN_CHECK_DELAY)
+            # should_cancel True  -> needs repricing -> refresh.
+            # should_cancel False -> still correctly placed -> skip refresh.
+            return bool(should_cancel)
+        except Exception as e:
+            try:
+                self.strategy.logger().warning(
+                    f"Position balancer: should_backstop_refresh error for {order_id}: {e} — refreshing")
+            except Exception:
+                pass
+            return True
 
     def get_status_lines(self, list unique_tuples, dict balance_map):
         """Get position balancer status lines for format_status()."""
@@ -1610,7 +1703,7 @@ cdef class PositionBalancerHandler:
                     # so it never feeds the undercut streak / bid-war backoff).
                     # DISABLED while in refuge: a refuge order's "gap above" is expected (we're parked
                     # deep), and step-up would walk it up the book every 30s, defeating refuge's
-                    # park-and-hold. A refuge order is repositioned only by the 600s arb backstop
+                    # park-and-hold. A refuge order is repositioned only by the 300s arb backstop
                     # (which re-reads the wall on the next placement while still in refuge).
                     if (not should_cancel and spread_is_min and min_price_increment > 0
                             and not self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
@@ -1641,10 +1734,82 @@ cdef class PositionBalancerHandler:
 
         except Exception as e:
             self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
-        
+
         return (should_cancel, cancel_reason)
 
+    cdef bint c_refuge_jumper_gone(self, str asset, bint is_buy):
+        """
+        While in refuge, decide whether the penny-jumper we're hiding from has LEFT — i.e. there
+        is no longer ANY foreign order at or below our price (sell) / at or above (buy). If so, the
+        refuge posture is pointless and we should EXIT refuge and resume normal best-of-book chasing.
 
+        This is the safe place to detect "jumper gone": the order is LIVE in the book, so we know
+        our own price (order_price from details) and can walk the book skipping our own level. (At
+        re-park time we could NOT do this — details are popped, _own is None — which is why the
+        gap-based re-park promote was rejected; see position-balancer.md Weakness #2.)
+
+        Definition (sell): jumper gone == every FOREIGN ask is STRICTLY above our price. A foreign
+        order sharing our exact tick counts as NOT gone (it's tied with us, the jumping dynamic could
+        resume) — this avoids flapping in/out of refuge when a jumper sits at our level. Mirror for buy.
+
+        Returns True only when genuinely alone at top. Fail-safe: False on any error / missing details
+        (stay in refuge — conservative, no spurious exit).
+        """
+        cdef:
+            tuple order_details
+            object market_tuple
+            OrderBook ob
+            double order_price = 0.0
+            double min_tick = 0.0
+            double p = 0.0
+            str trading_pair
+            bint skipped_own = False
+        try:
+            if is_buy:
+                order_details = self._active_buy_order_details.get(asset)
+            else:
+                order_details = self._active_sell_order_details.get(asset)
+            if order_details is None:
+                return False
+            market_tuple, order_price = order_details
+            trading_pair = market_tuple.trading_pair
+            if trading_pair in self._min_price_increment_cache:
+                min_tick = self._min_price_increment_cache[trading_pair]
+            else:
+                trading_rule = market_tuple.market._trading_rules.get(trading_pair)
+                if trading_rule is not None and trading_rule.min_price_increment is not None:
+                    min_tick = float(trading_rule.min_price_increment)
+                self._min_price_increment_cache[trading_pair] = min_tick
+            if min_tick <= 0:
+                return False
+            ob = (<ExchangeBase>market_tuple.market).c_get_order_book(trading_pair)
+            if is_buy:
+                it = ob.bid_entries()    # highest-first
+            else:
+                it = ob.ask_entries()    # lowest-first
+            # Walk from the top of book. Skip our OWN order's level — but only ONCE (we have a single
+            # order). If a SECOND level sits at our exact tick, it is a FOREIGN order sharing our tick
+            # → jumper not gone (tied with us; avoids flapping). The first foreign level then decides:
+            # for a sell, a foreign ask at or below our price → jumper still there → NOT gone; strictly
+            # above (or no foreign level at all) → gone. Mirror for buy.
+            while True:
+                row = next(it, None)
+                if row is None:
+                    break                                  # no foreign level at all → gone
+                p = float(row.price)
+                if (not skipped_own) and abs(p - order_price) < min_tick * 0.5:
+                    skipped_own = True
+                    continue                               # skip our own order's level (once only)
+                # first foreign level reached (a 2nd level at our tick lands here → foreign, tied)
+                if is_buy:
+                    # buy: a foreign bid at or above us means a frontrunner is still there
+                    return not (p >= order_price - min_tick * 0.5)
+                else:
+                    # sell: a foreign ask at or below us means a jumper is still there
+                    return not (p <= order_price + min_tick * 0.5)
+            return True                                    # walked the whole side, no foreign level → gone
+        except Exception:
+            return False
 
     cdef void c_cancel_stale_orders(self, str asset):
         """
@@ -1726,6 +1891,20 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
 
+                    # ---- FRONTRUNNER-GONE exits refuge (buy, mirror of sell jumper-gone) ----
+                    # While in refuge, if NO foreign bid is at/above our price anymore (the frontrunner
+                    # left), EXIT refuge and reset the streak so normal best-bid chasing + live step-down
+                    # take over. Runs regardless of should_cancel (frontrunner gone → CHECK 2 doesn't
+                    # fire). Safe: order is LIVE (we know order_price). Skip during mode-disabled cancel.
+                    if (self._buy_spread_is_min and not cancel_reason.startswith("mode disabled")
+                            and self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
+                            and self.c_refuge_jumper_gone(asset, True)):
+                        self._in_refuge_buy.pop(self._get_canonical_asset(asset), None)
+                        self._buy_cancel_streak.pop(self._get_canonical_asset(asset), None)
+                        self.strategy.logger().info(
+                            f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset)} "
+                            f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
+
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
                     # hold our wall order; (b) streak >= ARM and a valid wall (2nd foreign bid >= 2 ticks
@@ -1735,8 +1914,8 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("frontrun")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_buy.get(refuge_canonical, False):
-                            # (a) HOLD — suppress the frontrun and sit above the wall. The 600s arb
-                            # backstop refreshes the order every ~10-11 min (next placement re-reads
+                            # (a) HOLD — suppress the frontrun and sit above the wall. The 300s arb
+                            # backstop refreshes the order every ~5-6 min (next placement re-reads
                             # the wall while still in refuge). Mirror of the sell side.
                             should_cancel = False
                             cancel_reason = ""
@@ -1748,6 +1927,19 @@ cdef class PositionBalancerHandler:
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
                                 f"(streak={cancel_streak}) — retreating under the wall, frontrun now suppressed")
+
+                    # ---- BETTER-MARKET exits refuge (buy) ----
+                    # A "better market" cancel relocates us to a DIFFERENT exchange. The refuge posture
+                    # (parked under THIS exchange's wall, hiding from THIS exchange's frontrunner) is
+                    # meaningless on the new venue. Clear refuge AND reset the streak so the next
+                    # placement uses the NORMAL top-of-book branch on the new market, and refuge can
+                    # only re-arm after 10 fresh frontruns there. (Mirror of the fill-driven exit.)
+                    if (should_cancel and cancel_reason.startswith("better market")
+                            and self._in_refuge_buy.pop(self._get_canonical_asset(asset), None)):
+                        self._buy_cancel_streak.pop(self._get_canonical_asset(asset), None)
+                        self.strategy.logger().info(
+                            f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset)} "
+                            f"(better market) — relocating to a better venue, resuming normal best-bid chasing")
 
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
@@ -1926,6 +2118,23 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
 
+                    # ---- JUMPER-GONE exits refuge (sell) ----
+                    # While in refuge, if NO foreign ask is at/below our price anymore (the jumper left),
+                    # the refuge posture is pointless — EXIT refuge and reset the streak so normal
+                    # best-ask chasing + live step-up take over. Runs regardless of should_cancel: when
+                    # the jumper is gone CHECK 2 (undercut) does NOT fire, so this is the ONLY signal.
+                    # Safe here because the order is LIVE (we know order_price) — unlike re-park time
+                    # (see Weakness #2). Skip during a mode-disabled shutdown cancel. Runs before the
+                    # suppress block below so a freshly-exited order isn't re-suppressed this tick.
+                    if (self._sell_spread_is_min and not cancel_reason.startswith("mode disabled")
+                            and self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
+                            and self.c_refuge_jumper_gone(asset, False)):
+                        self._in_refuge_sell.pop(self._get_canonical_asset(asset), None)
+                        self._sell_cancel_streak.pop(self._get_canonical_asset(asset), None)
+                        self.strategy.logger().info(
+                            f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset)} "
+                            f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
+
                     # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
                     # When the immediate check says "undercut", decide between chasing (normal) and
                     # taking refuge under the wall. Two cases:
@@ -1941,8 +2150,8 @@ cdef class PositionBalancerHandler:
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_sell.get(refuge_canonical, False):
                             # (a) HOLD — suppress the undercut and sit under the wall. We do NOT
-                            # reposition here: the 600s arb backstop (c_cleanup_old_orders) cancels
-                            # the order every ~10-11 min, and the next placement (still in refuge)
+                            # reposition here: the 300s arb backstop (c_cleanup_old_orders) cancels
+                            # the order every ~5-6 min, and the next placement (still in refuge)
                             # re-reads the current wall and re-parks. That hard refresh is faster than
                             # any in-refuge debounce could complete, so no separate sampler is needed.
                             should_cancel = False
@@ -1957,6 +2166,19 @@ cdef class PositionBalancerHandler:
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
                                 f"(streak={cancel_streak}) — retreating under the wall, undercut now suppressed")
+
+                    # ---- BETTER-MARKET exits refuge (sell) ----
+                    # A "better market" cancel relocates us to a DIFFERENT exchange. The refuge posture
+                    # (parked under THIS exchange's wall, hiding from THIS exchange's jumper) is
+                    # meaningless on the new venue. Clear refuge AND reset the streak so the next
+                    # placement uses the NORMAL top-of-book branch on the new market, and refuge can
+                    # only re-arm after 10 fresh undercuts there. (Mirror of the fill-driven exit.)
+                    if (should_cancel and cancel_reason.startswith("better market")
+                            and self._in_refuge_sell.pop(self._get_canonical_asset(asset), None)):
+                        self._sell_cancel_streak.pop(self._get_canonical_asset(asset), None)
+                        self.strategy.logger().info(
+                            f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset)} "
+                            f"(better market) — relocating to a better venue, resuming normal best-ask chasing")
 
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
