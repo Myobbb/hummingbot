@@ -1274,13 +1274,13 @@ cdef class PositionBalancerHandler:
                                 # DEBUG: Log when a new best is found
                                 if use_effective_price:
                                     self.strategy.logger().debug(
-                                        f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.10f} > prev_best={best_price:.10f}, now best")
+                                        f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.8g} > prev_best={best_price:.8g}, now best")
                                 best_price = current_price
                                 best_market = market_tuple
                             elif use_effective_price:
                                 # Log when market is NOT selected
                                 self.strategy.logger().debug(
-                                    f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.10f} <= best={best_price:.10f}, skipped")
+                                    f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.8g} <= best={best_price:.8g}, skipped")
                         except Exception:
                             continue
         except Exception as e:
@@ -1406,12 +1406,12 @@ cdef class PositionBalancerHandler:
             # For buy orders: frontrun if someone bid higher
             if current_top_price > order_price:
                 should_cancel = True
-                cancel_reason = f"frontrun (immediate) - top bid {current_top_price:.8f} > our {order_price:.8f}"
+                cancel_reason = f"frontrun (immediate) - top bid {current_top_price:.8g} > our {order_price:.8g}"
         else:
             # For sell orders: undercut if someone asked lower
             if current_top_price < order_price:
                 should_cancel = True
-                cancel_reason = f"undercut (immediate) - top ask {current_top_price:.8f} < our {order_price:.8f}"
+                cancel_reason = f"undercut (immediate) - top ask {current_top_price:.8g} < our {order_price:.8g}"
         
         return (should_cancel, cancel_reason)
 
@@ -1437,17 +1437,17 @@ cdef class PositionBalancerHandler:
             if is_buy:
                 if order_price > expected_price:
                     should_cancel = True
-                    cancel_reason = f"large gap (immediate) - order {order_price:.8f} vs optimal {expected_price:.8f}, gap {price_gap:.8f}"
+                    cancel_reason = f"large gap (immediate) - order {order_price:.8g} vs optimal {expected_price:.8g}, gap {price_gap:.8g}"
                 else:
                     should_cancel = True
-                    cancel_reason = f"large gap down (immediate) - can buy cheaper at {expected_price:.8f} vs {order_price:.8f}"
+                    cancel_reason = f"large gap down (immediate) - can buy cheaper at {expected_price:.8g} vs {order_price:.8g}"
             else:
                 if order_price < expected_price:
                     should_cancel = True
-                    cancel_reason = f"large gap (immediate) - order {order_price:.8f} vs optimal {expected_price:.8f}, gap {price_gap:.8f}"
+                    cancel_reason = f"large gap (immediate) - order {order_price:.8g} vs optimal {expected_price:.8g}, gap {price_gap:.8g}"
                 else:
                     should_cancel = True
-                    cancel_reason = f"large gap up (immediate) - can sell higher at {expected_price:.8f} vs {order_price:.8f}"
+                    cancel_reason = f"large gap up (immediate) - can sell higher at {expected_price:.8g} vs {order_price:.8g}"
         
         return (should_cancel, cancel_reason)
 
@@ -1503,12 +1503,12 @@ cdef class PositionBalancerHandler:
             cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
             if got_valid_second_level and price_diff_abs > cancel_threshold_abs:
                 should_cancel = True
-                cancel_reason = f"price diverged {price_diff_abs:.8f} (ideal {ideal_price:.8f} vs order {order_price:.8f})"
+                cancel_reason = f"price diverged {price_diff_abs:.8g} (ideal {ideal_price:.8g} vs order {order_price:.8g})"
         else:
             # Percentage mode: use percentage threshold
             if price_diff_pct > cancel_threshold_pct:
                 should_cancel = True
-                cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_price:.8f} vs order {order_price:.8f})"
+                cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_price:.8g} vs order {order_price:.8g})"
         
         return (should_cancel, cancel_reason)
 
@@ -1631,7 +1631,7 @@ cdef class PositionBalancerHandler:
                             improvement = (current_effective - best_effective) / current_effective if current_effective > 0 else 0
                             if improvement > MIN_MODE_SWITCH_HYSTERESIS:
                                 should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8f} vs current={current_effective:.8f} ({improvement*100:.2f}% better)"
+                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8g} vs current={current_effective:.8g} ({improvement*100:.2f}% better)"
                     else:
                         if best_ob._ask_book.size() > 0 and best_min_tick > 0:
                             best_effective = float(deref(best_ob._ask_book.begin()).getPrice()) - best_min_tick
@@ -1640,7 +1640,7 @@ cdef class PositionBalancerHandler:
                             improvement = (best_effective - current_effective) / current_effective if current_effective > 0 else 0
                             if improvement > MIN_MODE_SWITCH_HYSTERESIS:
                                 should_cancel = True
-                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8f} vs current={current_effective:.8f} ({improvement*100:.2f}% better)"
+                                cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8g} vs current={current_effective:.8g} ({improvement*100:.2f}% better)"
                 else:
                     best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
                     
@@ -1651,14 +1651,14 @@ cdef class PositionBalancerHandler:
                                 best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
                                 if best_market_price < current_ask * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
                                     should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} < {order_market_tuple.market.name} ask {current_ask:.8f}"
+                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8g} < {order_market_tuple.market.name} ask {current_ask:.8g}"
                         else:
                             # Percentage maker mode: compare bids (we place above)
                             if best_ob._bid_book.size() > 0 and current_bid > 0:
                                 best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
                                 if best_market_price < current_bid * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
                                     should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} < {order_market_tuple.market.name} bid {current_bid:.8f}"
+                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8g} < {order_market_tuple.market.name} bid {current_bid:.8g}"
                     else:  # SELL
                         if not is_maker_mode:
                             # Aggressive mode: compare bids (taker)
@@ -1666,14 +1666,14 @@ cdef class PositionBalancerHandler:
                                 best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
                                 if best_market_price > current_bid * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
                                     should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8f} > {order_market_tuple.market.name} bid {current_bid:.8f}"
+                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8g} > {order_market_tuple.market.name} bid {current_bid:.8g}"
                         else:
                             # Percentage maker mode: compare asks (we place below)
                             if best_ob._ask_book.size() > 0 and current_ask > 0:
                                 best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
                                 if best_market_price > current_ask * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
                                     should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8f} > {order_market_tuple.market.name} ask {current_ask:.8f}"
+                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8g} > {order_market_tuple.market.name} ask {current_ask:.8g}"
             
             # ================================================================
             # CHECK 2 & 3: Frontrun + Large Gap (MAKER MODES ONLY)
@@ -1686,7 +1686,7 @@ cdef class PositionBalancerHandler:
                     # CHECK 2: Frontrun - someone placed HIGHER bid than our order
                     if current_bid > order_price:
                         should_cancel = True
-                        cancel_reason = f"frontrun (top bid {current_bid:.8f} > our {order_price:.8f})"
+                        cancel_reason = f"frontrun (top bid {current_bid:.8g} > our {order_price:.8g})"
                     
                     # CHECK 3: Large gap detection (min mode only)
                     if not should_cancel and spread_is_min and min_price_increment > 0:
@@ -1697,7 +1697,7 @@ cdef class PositionBalancerHandler:
                         gap_amount = abs(order_price - expected_price)
                         if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                             should_cancel = True
-                            cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
+                            cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
 
                     # CHECK 4: Step-down into gap (min mode only) — mirror of the sell step-up.
                     # We ARE top bid but the next foreign bid is far below; move down to
@@ -1728,14 +1728,14 @@ cdef class PositionBalancerHandler:
                             headroom_ticks = (order_price - next_bid) / min_price_increment
                             if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
                                 should_cancel = True
-                                cancel_reason = (f"step-up into gap (next bid {next_bid:.8f} is "
-                                                 f"{headroom_ticks:.1f} ticks below our {order_price:.8f})")
+                                cancel_reason = (f"step-up into gap (next bid {next_bid:.8g} is "
+                                                 f"{headroom_ticks:.1f} ticks below our {order_price:.8g})")
                                 self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
                 else:  # SELL
                     # CHECK 2: Undercut - someone placed LOWER ask than our order
                     if current_ask < order_price:
                         should_cancel = True
-                        cancel_reason = f"undercut (top ask {current_ask:.8f} < our {order_price:.8f})"
+                        cancel_reason = f"undercut (top ask {current_ask:.8g} < our {order_price:.8g})"
                     
                     # CHECK 3: Large gap detection (min mode only)
                     if not should_cancel and spread_is_min and min_price_increment > 0:
@@ -1746,7 +1746,7 @@ cdef class PositionBalancerHandler:
                         gap_amount = abs(order_price - expected_price)
                         if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                             should_cancel = True
-                            cancel_reason = f"large gap {gap_amount:.8f} > {min_price_increment * LARGE_GAP_THRESHOLD:.8f}"
+                            cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
 
                     # CHECK 4: Step-up into gap (min mode only) — we ARE top ask but the next
                     # foreign ask is far above; move up to (next_ask - 1 tick) and stay best ask.
@@ -1781,8 +1781,8 @@ cdef class PositionBalancerHandler:
                             headroom_ticks = (next_ask - order_price) / min_price_increment
                             if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
                                 should_cancel = True
-                                cancel_reason = (f"step-up into gap (next ask {next_ask:.8f} is "
-                                                 f"{headroom_ticks:.1f} ticks above our {order_price:.8f})")
+                                cancel_reason = (f"step-up into gap (next ask {next_ask:.8g} is "
+                                                 f"{headroom_ticks:.1f} ticks above our {order_price:.8g})")
                                 self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
 
         except Exception as e:
@@ -2075,9 +2075,9 @@ cdef class PositionBalancerHandler:
                                         if abs(price_misalignment) >= min_price_increment * 0.95:
                                             should_cancel = True
                                             if price_misalignment > 0:
-                                                cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
                                             else:
-                                                cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
 
                                 # CONDITION 3: Market moved DOWN — can buy cheaper
                                 # Skip in aggressive mode (0%): ideal_order_price = effective_bid,
@@ -2090,13 +2090,13 @@ cdef class PositionBalancerHandler:
                                         cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
                                         if got_valid_second_level and gap_down > cancel_threshold_abs:
                                             should_cancel = True
-                                            cancel_reason = f"gap down {gap_down:.8f} > threshold {cancel_threshold_abs:.8f} (can buy cheaper)"
+                                            cancel_reason = f"gap down {gap_down:.8g} > threshold {cancel_threshold_abs:.8g} (can buy cheaper)"
                                     else:
                                         cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
                                         gap_pct = gap_down / order_price if order_price > 0 else 0.0
                                         if gap_pct > cancel_threshold_pct:
                                             should_cancel = True
-                                            cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8f} vs {order_price:.8f})"
+                                            cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8g} vs {order_price:.8g})"
 
                                 # CONDITION 4: Aggressive mode — market moved to our price
                                 if not should_cancel and self._buy_spread_pct == 0.0:
@@ -2301,9 +2301,9 @@ cdef class PositionBalancerHandler:
                                         if abs(price_misalignment) >= min_price_increment * 0.95:
                                             should_cancel = True
                                             if price_misalignment > 0:
-                                                cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
                                             else:
-                                                cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8f}, expected {expected_price:.8f}, actual {order_price:.8f})"
+                                                cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
 
                                 # CONDITION 3: Market moved UP — can sell higher
                                 # Skip in aggressive mode (0%): ideal_order_price = effective_ask,
@@ -2316,13 +2316,13 @@ cdef class PositionBalancerHandler:
                                         cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
                                         if got_valid_second_level and gap_up > cancel_threshold_abs:
                                             should_cancel = True
-                                            cancel_reason = f"gap up {gap_up:.8f} > threshold {cancel_threshold_abs:.8f} (can sell higher)"
+                                            cancel_reason = f"gap up {gap_up:.8g} > threshold {cancel_threshold_abs:.8g} (can sell higher)"
                                     else:
                                         cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
                                         gap_pct = gap_up / order_price if order_price > 0 else 0.0
                                         if gap_pct > cancel_threshold_pct:
                                             should_cancel = True
-                                            cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8f} vs {order_price:.8f})"
+                                            cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8g} vs {order_price:.8g})"
 
                                 # CONDITION 4: Aggressive mode — market moved to our price
                                 if not should_cancel and self._sell_spread_pct == 0.0:
@@ -2821,8 +2821,8 @@ cdef class PositionBalancerHandler:
                                     if _bid_lvl1 is not None:
                                         reference_bid = float(_bid_lvl1.price)
                                         self.strategy.logger().debug(
-                                            f"Position balancer: Top bid {top_bid:.8f} matches our existing order, "
-                                            f"using second bid {reference_bid:.8f} for new order price")
+                                            f"Position balancer: Top bid {top_bid:.8g} matches our existing order, "
+                                            f"using second bid {reference_bid:.8g} for new order price")
                                 except Exception as e:
                                     self.strategy.logger().debug(f"Could not get second bid level: {e}")
 
@@ -2849,7 +2849,7 @@ cdef class PositionBalancerHandler:
                                 reference_bid = _foreign[1]
                                 self.strategy.logger().info(
                                     f"Position balancer: BUY refuge placement for {asset_key} — "
-                                    f"resting above wall {reference_bid:.8f} (frontrunner {_foreign[0]:.8f})")
+                                    f"resting above wall {reference_bid:.8g} (frontrunner {_foreign[0]:.8g})")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (buy): {e}")
 
@@ -2860,7 +2860,7 @@ cdef class PositionBalancerHandler:
                         # Log clear warning so user understands why using taker price
                         self.strategy.logger().warning(
                             f"Position balancer: Spread too tight for 'min' tick mode on {buy_market_tuple.trading_pair}. "
-                            f"Calculated maker price {buy_price:.8f} >= ask {top_ask:.8f}. "
+                            f"Calculated maker price {buy_price:.8g} >= ask {top_ask:.8g}. "
                             f"Using ask price (will pay taker fees instead of maker rebate).")
                         buy_price = top_ask  # Use taker price with clear warning
                 else:
@@ -2887,7 +2887,7 @@ cdef class PositionBalancerHandler:
                 # Log clear warning so user understands why using taker price
                 self.strategy.logger().warning(
                     f"Position balancer: Spread too tight for {self._buy_spread_pct*100:.2f}% spread on {buy_market_tuple.trading_pair}. "
-                    f"Calculated maker price {buy_price:.8f} >= ask {top_ask:.8f}. "
+                    f"Calculated maker price {buy_price:.8g} >= ask {top_ask:.8g}. "
                     f"Using ask price (will pay taker fees instead of maker rebate).")
                 buy_price = top_ask  # Use taker price with clear warning
 
@@ -2997,11 +2997,11 @@ cdef class PositionBalancerHandler:
         if self._buy_spread_is_min:
             self.strategy.logger().info(
                 f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {buy_price:.10f} (spread: min tick)")
+                f"at {buy_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
                 f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {buy_price:.10f} (spread: {self._buy_spread_pct * 100:.2f}%)")
+                f"at {buy_price:.8g} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
@@ -3103,8 +3103,8 @@ cdef class PositionBalancerHandler:
                                     if _ask_lvl1 is not None:
                                         reference_ask = float(_ask_lvl1.price)
                                         self.strategy.logger().debug(
-                                            f"Position balancer: Top ask {top_ask:.8f} matches our existing order, "
-                                            f"using second ask {reference_ask:.8f} for new order price")
+                                            f"Position balancer: Top ask {top_ask:.8g} matches our existing order, "
+                                            f"using second ask {reference_ask:.8g} for new order price")
                                 except Exception as e:
                                     self.strategy.logger().debug(f"Could not get second ask level: {e}")
 
@@ -3132,7 +3132,7 @@ cdef class PositionBalancerHandler:
                                 reference_ask = _foreign[1]
                                 self.strategy.logger().info(
                                     f"Position balancer: SELL refuge placement for {asset_key} — "
-                                    f"resting under wall {reference_ask:.8f} (jumper {_foreign[0]:.8f})")
+                                    f"resting under wall {reference_ask:.8g} (jumper {_foreign[0]:.8g})")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (sell): {e}")
 
@@ -3143,7 +3143,7 @@ cdef class PositionBalancerHandler:
                         # Log clear warning so user understands why using taker price
                         self.strategy.logger().warning(
                             f"Position balancer: Spread too tight for 'min' tick mode on {sell_market_tuple.trading_pair}. "
-                            f"Calculated maker price {sell_price:.8f} <= bid {top_bid:.8f}. "
+                            f"Calculated maker price {sell_price:.8g} <= bid {top_bid:.8g}. "
                             f"Using bid price (will pay taker fees instead of maker rebate).")
                         sell_price = top_bid  # Use taker price with clear warning
                 else:
@@ -3170,7 +3170,7 @@ cdef class PositionBalancerHandler:
                 # Log clear warning so user understands why using taker price
                 self.strategy.logger().warning(
                     f"Position balancer: Spread too tight for {self._sell_spread_pct*100:.2f}% spread on {sell_market_tuple.trading_pair}. "
-                    f"Calculated maker price {sell_price:.8f} <= bid {top_bid:.8f}. "
+                    f"Calculated maker price {sell_price:.8g} <= bid {top_bid:.8g}. "
                     f"Using bid price (will pay taker fees instead of maker rebate).")
                 sell_price = top_bid  # Use taker price with clear warning
 
@@ -3190,10 +3190,10 @@ cdef class PositionBalancerHandler:
         if amount_to_sell <= EPSILON:
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - amount too small. "
-                f"amount_to_sell={amount_to_sell:.10f}, excess_adjusted={excess_adjusted:.6f}, "
-                f"last_bid={last_bid:.8f}, base_bal_raw={base_bal_raw:.8f}, "
-                f"pending_sell={pending_sell_base:.8f}, effective_raw={effective_raw:.8f}, "
-                f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8f}")
+                f"amount_to_sell={amount_to_sell:.8g}, excess_adjusted={excess_adjusted:.6f}, "
+                f"last_bid={last_bid:.8g}, base_bal_raw={base_bal_raw:.8g}, "
+                f"pending_sell={pending_sell_base:.8g}, effective_raw={effective_raw:.8g}, "
+                f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8g}")
             return False
 
         # Quantize
@@ -3206,7 +3206,7 @@ cdef class PositionBalancerHandler:
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - quantized to zero. "
                 f"{sell_market_tuple.base_asset} on {market.name} "
-                f"pre_quantize={amount_to_sell:.10f}, quantized={quantized_amount}")
+                f"pre_quantize={amount_to_sell:.8g}, quantized={quantized_amount}")
             # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
             # Declare completion so the balancer doesn't spin forever on unsellable residue.
             if self._sell_target_usd == 0.0:
@@ -3240,7 +3240,7 @@ cdef class PositionBalancerHandler:
                 self.strategy.logger().warning(
                     f"Position balancer: Sell order blocked - below min notional. "
                     f"volume_usd={volume_usd:.6f} < min_order_usd={self.strategy._min_order_usd:.6f}, "
-                    f"quantized_amount={quantized_amount}, sell_price={sell_price:.8f}")
+                    f"quantized_amount={quantized_amount}, sell_price={sell_price:.8g}")
                 # Too small, mark complete
                 if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
                     return False
@@ -3307,11 +3307,11 @@ cdef class PositionBalancerHandler:
         if self._sell_spread_is_min:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.10f} (spread: min tick)")
+                f"at {sell_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.10f} (spread: {self._sell_spread_pct * 100:.2f}%)")
+                f"at {sell_price:.8g} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
