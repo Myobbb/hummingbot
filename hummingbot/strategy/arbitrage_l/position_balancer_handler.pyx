@@ -152,17 +152,16 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # refuge when there's a distinct level to hide under — see position-balancer.md. For now we
 # enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
 cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
-cdef double REFUGE_JUMPGONE_CHECK_INTERVAL = 300.0  # per-asset throttle: re-evaluate "jumper gone" at most once / 5 min (anti-flap vs a flickering jumper)
-# While in refuge we SUPPRESS undercut and simply HOLD. Repositioning (re-establish 2nd-best
-# under the current wall) is handled by the 300s arb backstop (c_cleanup_old_orders), which
-# cancels the order every ~5-6 min; the next placement is still in refuge so it re-reads the
-# wall and re-parks. We do NOT run a separate in-refuge situation sampler — the backstop already
-# refreshes faster than any debounce could complete. Refuge EXITS (resume normal chasing) on:
-# a fill, a session re-enable, a better-market relocation, OR the throttled refuge re-evaluation
-# (c_refuge_foreign_below counts foreign orders beating us: 0 = jumper gone / alone at top;
-# >= 2 = we sank below more than one order so the 2nd-best premise is broken — exit either way).
-# Throttled to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset so a flickering jumper can't cause
-# exit/re-arm thrash; first check after arming is NOT delayed (clock starts unset). See position-balancer.md.
+# While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
+# ONCE PER 5-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 300s-age mark
+# — the order is still live there so order_price is known). At that single re-evaluation we count
+# foreign orders beating us (c_refuge_foreign_below):
+#   0  -> jumper gone (alone at top)            -> EXIT refuge, re-place NORMAL
+#   >=2 -> sank below more than one order        -> EXIT refuge (2nd-best premise broken), re-place NORMAL
+#   1  -> normal hold                            -> stay in refuge, re-park under the wall
+# Doing this only at the backstop (not per tick) means refuge decisions happen on the deliberate
+# ~5-6 min cadence, never on a stray tick. Refuge also EXITS on a fill, a session re-enable, or a
+# better-market relocation (those ARE per-tick, in c_cancel_stale_orders). See position-balancer.md.
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -290,7 +289,6 @@ cdef class PositionBalancerHandler:
         # the wall instead of top-of-book.
         self._in_refuge_sell = {}             # canonical_asset -> bint (in sell-side refuge)
         self._in_refuge_buy = {}              # canonical_asset -> bint (in buy-side refuge)
-        self._last_jumpgone_check_time = {}   # canonical_asset -> timestamp of last jumper-gone evaluation (throttle, anti-flap)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -939,13 +937,19 @@ cdef class PositionBalancerHandler:
         Returns True  -> let the backstop refresh (cancel + re-place).
         Returns False -> order is still correctly placed; skip the refresh (keep queue position).
 
-        Refuge orders ALWAYS refresh (return True): the backstop is their only reposition
-        mechanism (in refuge we suppress the undercut and never reprice on tick), so they
-        must re-read the wall every cycle.
+        Refuge orders: this is the ONE 5-min periodic re-evaluation point for them (called by the
+        backstop at the 300s-age mark — NOT per tick). We count foreign orders beating us
+        (c_refuge_foreign_below) and decide:
+          • count == 0 -> jumper gone (alone at top)   -> EXIT refuge, then refresh (re-place NORMAL).
+          • count >= 2 -> sank below >1 order (premise broken) -> EXIT refuge, then refresh (NORMAL).
+          • count == 1 -> normal refuge hold -> stay in refuge, refresh (re-park under the wall).
+        Either way we return True (the backstop always re-places a refuge order); the only question
+        is whether the flag survives into the re-place (count 1 -> refuge re-park; 0/≥2 -> normal).
+        The check lives HERE so it fires exactly once per 5-min backstop cycle, never on a stray tick.
 
-        Otherwise we reuse the SAME oracle as the per-tick chase logic
+        Otherwise (non-refuge) we reuse the SAME oracle as the per-tick chase logic
         (c_check_immediate_conditions) with a large order_age so every check is active
-        (better-market 60s gate included — the order is 10 min old). If it reports a cancel
+        (better-market 60s gate included — the order is 5 min old). If it reports a cancel
         condition (undercut / gap / better-market), the order is no longer correctly placed
         -> refresh. If it reports nothing, the order is still at the right price -> skip.
 
@@ -958,6 +962,7 @@ cdef class PositionBalancerHandler:
             bint should_cancel = False
             str canonical
             tuple order_details
+            int foreign_below
         try:
             # Reverse-map order_id -> (asset, side). PB tracks asset -> order_id.
             for a, oid in self._active_sell_orders.items():
@@ -976,14 +981,38 @@ cdef class PositionBalancerHandler:
             if asset is None:
                 return True
 
-            # Refuge orders must always refresh — the backstop is their sole reposition.
+            # Refuge orders — the 5-min periodic re-evaluation (count orders below us).
             canonical = self._get_canonical_asset(asset)
-            if is_buy:
-                if self._in_refuge_buy.get(canonical, False):
-                    return True
-            else:
-                if self._in_refuge_sell.get(canonical, False):
-                    return True
+            if (is_buy and self._in_refuge_buy.get(canonical, False)) or \
+               ((not is_buy) and self._in_refuge_sell.get(canonical, False)):
+                foreign_below = self.c_refuge_foreign_below(asset, is_buy)
+                if foreign_below == 0 or foreign_below >= 2:
+                    # EXIT refuge: jumper gone (0) or sank below >1 order (>=2). Clear flag + streak
+                    # so the imminent re-place takes the NORMAL top-of-book branch, not the wall re-park.
+                    if is_buy:
+                        self._in_refuge_buy.pop(canonical, None)
+                        self._buy_cancel_streak.pop(canonical, None)
+                        if foreign_below == 0:
+                            self.strategy.logger().info(
+                                f"Position balancer: BUY refuge EXITED for {canonical} (frontrunner gone) "
+                                f"— no bids over us, resuming normal best-bid chasing")
+                        else:
+                            self.strategy.logger().info(
+                                f"Position balancer: BUY refuge EXITED for {canonical} (sank below {foreign_below} orders) "
+                                f"— refuge premise broken, resuming normal best-bid chasing")
+                    else:
+                        self._in_refuge_sell.pop(canonical, None)
+                        self._sell_cancel_streak.pop(canonical, None)
+                        if foreign_below == 0:
+                            self.strategy.logger().info(
+                                f"Position balancer: SELL refuge EXITED for {canonical} (jumper gone) "
+                                f"— no asks under us, resuming normal best-ask chasing")
+                        else:
+                            self.strategy.logger().info(
+                                f"Position balancer: SELL refuge EXITED for {canonical} (sank below {foreign_below} orders) "
+                                f"— refuge premise broken, resuming normal best-ask chasing")
+                # count == 1 -> stay in refuge (re-park under wall). Either way, always refresh.
+                return True
 
             # No stored details -> unknown price state -> refresh to be safe.
             if is_buy:
@@ -1881,7 +1910,6 @@ cdef class PositionBalancerHandler:
             str cancel_reason
             str order_id
             int cancel_streak
-            int foreign_below   # refuge re-eval: count of foreign orders beating us (0=jumper gone, >=2=sank deep)
             double effective_frontrun_delay
 
         # ========================================================================
@@ -1926,31 +1954,9 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
 
-                    # ---- REFUGE RE-EVALUATION exits (buy, mirror of sell) ----
-                    # Count foreign bids at/above us (c_refuge_foreign_below). EXIT refuge if:
-                    #   • count == 0  -> FRONTRUNNER GONE (alone at top bid).
-                    #   • count >= 2  -> SANK below MORE THAN ONE order (refuge premise broken — just exit,
-                    #                    don't re-park). count == 1 -> normal hold.
-                    # Safe (order LIVE). Skip during mode-disabled. Throttled once per interval (anti-flap).
-                    if (self._buy_spread_is_min and not cancel_reason.startswith("mode disabled")
-                            and self._in_refuge_buy.get(self._get_canonical_asset(asset), False)):
-                        jg_canonical = self._get_canonical_asset(asset)
-                        if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
-                                >= REFUGE_JUMPGONE_CHECK_INTERVAL):
-                            self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
-                            foreign_below = self.c_refuge_foreign_below(asset, True)
-                            if foreign_below == 0 or foreign_below >= 2:
-                                self._in_refuge_buy.pop(jg_canonical, None)
-                                self._buy_cancel_streak.pop(jg_canonical, None)
-                                self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit
-                                if foreign_below == 0:
-                                    self.strategy.logger().info(
-                                        f"Position balancer: BUY refuge EXITED for {jg_canonical} "
-                                        f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
-                                else:
-                                    self.strategy.logger().info(
-                                        f"Position balancer: BUY refuge EXITED for {jg_canonical} "
-                                        f"(sank below {foreign_below} orders) — refuge premise broken, resuming normal best-bid chasing")
+                    # NOTE: refuge re-evaluation (count foreign orders above us → EXIT if 0=frontrunner
+                    # gone or >=2=sank below >1 order) is done once per 5-min backstop cycle in
+                    # should_backstop_refresh, NOT here per-tick. On tick we only SUPPRESS + HOLD (below).
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
@@ -1961,17 +1967,15 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("frontrun")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_buy.get(refuge_canonical, False):
-                            # (a) HOLD — suppress the frontrun and sit above the wall. The 300s arb
-                            # backstop refreshes the order every ~5-6 min (next placement re-reads
-                            # the wall while still in refuge). Mirror of the sell side.
+                            # (a) HOLD — suppress the frontrun and sit above the wall. Per-tick does NOT
+                            # reposition/re-evaluate; the 300s backstop (should_backstop_refresh) does the
+                            # ~5-6 min count-based re-eval (re-park under wall / exit on 0 or >=2). Mirror of sell.
                             should_cancel = False
                             cancel_reason = ""
                         elif cancel_streak >= REFUGE_ARM_STREAK:
                             # If no real wall exists, placement reads the 2nd bid and falls back to
                             # normal top-of-book; a wall-distance entry gate is a future refinement.
                             self._in_refuge_buy[refuge_canonical] = True
-                            # Fresh episode → clear the jumper-gone throttle clock (mirror of sell).
-                            self._last_jumpgone_check_time.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
@@ -2167,41 +2171,12 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
 
-                    # ---- REFUGE RE-EVALUATION exits (sell) ----
-                    # While in refuge, count foreign asks at/below us (c_refuge_foreign_below). Two
-                    # EXIT conditions — both mean refuge is pointless, so leave and resume normal chasing:
-                    #   • count == 0  -> JUMPER GONE: alone at top (CHECK 2/undercut won't fire, so this
-                    #                    is the only signal that the jumper left).
-                    #   • count >= 2  -> SANK DEEP: more than one order is now under us. Refuge's premise
-                    #                    is "sit one above a SINGLE jumper at 2nd-best"; if several piled
-                    #                    in below us we've sunk to 3rd+ and that premise is broken. We do
-                    #                    NOT try to re-park under a wall (the 2nd-foreign re-park can't
-                    #                    represent N stacked jumpers) — just exit (per Pavel 2026-06-01).
-                    #   • count == 1  -> normal hold; stay.
-                    # Safe here because the order is LIVE (we know order_price) — unlike re-park time.
-                    # Skip during a mode-disabled cancel. Runs before the suppress block so a freshly-
-                    # exited order isn't re-suppressed this tick. THROTTLED once per
-                    # REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap): stamp on every evaluation;
-                    # clock starts unset so the first check after arming is immediate.
-                    if (self._sell_spread_is_min and not cancel_reason.startswith("mode disabled")
-                            and self._in_refuge_sell.get(self._get_canonical_asset(asset), False)):
-                        jg_canonical = self._get_canonical_asset(asset)
-                        if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
-                                >= REFUGE_JUMPGONE_CHECK_INTERVAL):
-                            self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
-                            foreign_below = self.c_refuge_foreign_below(asset, False)
-                            if foreign_below == 0 or foreign_below >= 2:
-                                self._in_refuge_sell.pop(jg_canonical, None)
-                                self._sell_cancel_streak.pop(jg_canonical, None)
-                                self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit (fresh start if it re-arms)
-                                if foreign_below == 0:
-                                    self.strategy.logger().info(
-                                        f"Position balancer: SELL refuge EXITED for {jg_canonical} "
-                                        f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
-                                else:
-                                    self.strategy.logger().info(
-                                        f"Position balancer: SELL refuge EXITED for {jg_canonical} "
-                                        f"(sank below {foreign_below} orders) — refuge premise broken, resuming normal best-ask chasing")
+                    # NOTE: the refuge re-evaluation (count foreign orders below us → EXIT refuge if
+                    # 0 = jumper gone, or >=2 = sank below >1 order so the 2nd-best premise is broken)
+                    # is NOT done here per-tick. It runs once per 5-min backstop cycle in
+                    # should_backstop_refresh (the order is still live there, so order_price is known).
+                    # On tick we only SUPPRESS undercut + HOLD (below); repositioning/exit is the
+                    # backstop's job. See should_backstop_refresh + position-balancer.md Exit conditions.
 
                     # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
                     # When the immediate check says "undercut", decide between chasing (normal) and
@@ -2217,11 +2192,11 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("undercut")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_sell.get(refuge_canonical, False):
-                            # (a) HOLD — suppress the undercut and sit under the wall. We do NOT
-                            # reposition here: the 300s arb backstop (c_cleanup_old_orders) cancels
-                            # the order every ~5-6 min, and the next placement (still in refuge)
-                            # re-reads the current wall and re-parks. That hard refresh is faster than
-                            # any in-refuge debounce could complete, so no separate sampler is needed.
+                            # (a) HOLD — suppress the undercut and sit under the wall. Per-tick does
+                            # NOT reposition or re-evaluate a refuge order; that is the 300s backstop's
+                            # job (should_backstop_refresh): every ~5-6 min it counts orders below us
+                            # and either re-parks under the current wall (1 jumper) or EXITS refuge
+                            # (0 = jumper gone, >=2 = sank below >1 order). On tick we only suppress + hold.
                             should_cancel = False
                             cancel_reason = ""
                         elif cancel_streak >= REFUGE_ARM_STREAK:
@@ -2230,10 +2205,6 @@ cdef class PositionBalancerHandler:
                             # normal top-of-book; a "wall must be >= N ticks above jumper" entry gate
                             # is a future refinement (see position-balancer.md).
                             self._in_refuge_sell[refuge_canonical] = True
-                            # Fresh episode → clear the jumper-gone throttle clock so the first
-                            # jumper-gone check in this episode is immediate (not blocked by a stale
-                            # stamp from a previous refuge episode on this asset).
-                            self._last_jumpgone_check_time.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
