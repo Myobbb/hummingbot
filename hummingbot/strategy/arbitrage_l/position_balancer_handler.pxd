@@ -57,6 +57,7 @@ cdef class PositionBalancerHandler:
         # Second-level refuge state (per canonical asset) — True = resting under the wall (2nd-best), undercut suppressed
         dict _in_refuge_sell
         dict _in_refuge_buy
+        dict _last_jumpgone_check_time
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset

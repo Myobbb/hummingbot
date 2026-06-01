@@ -145,13 +145,17 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # refuge when there's a distinct level to hide under — see position-balancer.md. For now we
 # enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
 cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
+cdef double REFUGE_JUMPGONE_CHECK_INTERVAL = 300.0  # per-asset throttle: re-evaluate "jumper gone" at most once / 5 min (anti-flap vs a flickering jumper)
 # While in refuge we SUPPRESS undercut and simply HOLD. Repositioning (re-establish 2nd-best
 # under the current wall) is handled by the 300s arb backstop (c_cleanup_old_orders), which
 # cancels the order every ~5-6 min; the next placement is still in refuge so it re-reads the
 # wall and re-parks. We do NOT run a separate in-refuge situation sampler — the backstop already
 # refreshes faster than any debounce could complete. Refuge EXITS (resume normal chasing) on:
-# a fill, a session re-enable, a better-market relocation, OR the per-tick "jumper gone" check
-# (c_refuge_jumper_gone — no foreign order at/below us anymore). See position-balancer.md.
+# a fill, a session re-enable, a better-market relocation, OR the "jumper gone" check
+# (c_refuge_jumper_gone — no foreign order at/below us anymore), throttled to once per
+# REFUGE_JUMPGONE_CHECK_INTERVAL per asset so a flickering jumper can't cause exit/re-arm thrash.
+# First check after arming is NOT delayed (clock starts unset); subsequent re-checks wait the
+# interval. See position-balancer.md.
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -279,6 +283,7 @@ cdef class PositionBalancerHandler:
         # the wall instead of top-of-book.
         self._in_refuge_sell = {}             # canonical_asset -> bint (in sell-side refuge)
         self._in_refuge_buy = {}              # canonical_asset -> bint (in buy-side refuge)
+        self._last_jumpgone_check_time = {}   # canonical_asset -> timestamp of last jumper-gone evaluation (throttle, anti-flap)
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -1896,14 +1901,21 @@ cdef class PositionBalancerHandler:
                     # left), EXIT refuge and reset the streak so normal best-bid chasing + live step-down
                     # take over. Runs regardless of should_cancel (frontrunner gone → CHECK 2 doesn't
                     # fire). Safe: order is LIVE (we know order_price). Skip during mode-disabled cancel.
+                    # THROTTLED to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap; mirror
+                    # of sell): stamp on every evaluation; clock starts unset so the first check is prompt.
                     if (self._buy_spread_is_min and not cancel_reason.startswith("mode disabled")
-                            and self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
-                            and self.c_refuge_jumper_gone(asset, True)):
-                        self._in_refuge_buy.pop(self._get_canonical_asset(asset), None)
-                        self._buy_cancel_streak.pop(self._get_canonical_asset(asset), None)
-                        self.strategy.logger().info(
-                            f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset)} "
-                            f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
+                            and self._in_refuge_buy.get(self._get_canonical_asset(asset), False)):
+                        jg_canonical = self._get_canonical_asset(asset)
+                        if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
+                                >= REFUGE_JUMPGONE_CHECK_INTERVAL):
+                            self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
+                            if self.c_refuge_jumper_gone(asset, True):
+                                self._in_refuge_buy.pop(jg_canonical, None)
+                                self._buy_cancel_streak.pop(jg_canonical, None)
+                                self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit
+                                self.strategy.logger().info(
+                                    f"Position balancer: BUY refuge EXITED for {jg_canonical} "
+                                    f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
@@ -1923,6 +1935,8 @@ cdef class PositionBalancerHandler:
                             # If no real wall exists, placement reads the 2nd bid and falls back to
                             # normal top-of-book; a wall-distance entry gate is a future refinement.
                             self._in_refuge_buy[refuge_canonical] = True
+                            # Fresh episode → clear the jumper-gone throttle clock (mirror of sell).
+                            self._last_jumpgone_check_time.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
@@ -2126,14 +2140,23 @@ cdef class PositionBalancerHandler:
                     # Safe here because the order is LIVE (we know order_price) — unlike re-park time
                     # (see Weakness #2). Skip during a mode-disabled shutdown cancel. Runs before the
                     # suppress block below so a freshly-exited order isn't re-suppressed this tick.
+                    # THROTTLED to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap vs a
+                    # flickering jumper): we stamp the clock on every EVALUATION (gone or not), so the
+                    # next re-check waits the interval regardless of outcome. The clock starts unset, so
+                    # the FIRST check after arming is immediate (prompt exit if the jumper already left).
                     if (self._sell_spread_is_min and not cancel_reason.startswith("mode disabled")
-                            and self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
-                            and self.c_refuge_jumper_gone(asset, False)):
-                        self._in_refuge_sell.pop(self._get_canonical_asset(asset), None)
-                        self._sell_cancel_streak.pop(self._get_canonical_asset(asset), None)
-                        self.strategy.logger().info(
-                            f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset)} "
-                            f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
+                            and self._in_refuge_sell.get(self._get_canonical_asset(asset), False)):
+                        jg_canonical = self._get_canonical_asset(asset)
+                        if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
+                                >= REFUGE_JUMPGONE_CHECK_INTERVAL):
+                            self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
+                            if self.c_refuge_jumper_gone(asset, False):
+                                self._in_refuge_sell.pop(jg_canonical, None)
+                                self._sell_cancel_streak.pop(jg_canonical, None)
+                                self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit (fresh start if it re-arms)
+                                self.strategy.logger().info(
+                                    f"Position balancer: SELL refuge EXITED for {jg_canonical} "
+                                    f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
 
                     # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
                     # When the immediate check says "undercut", decide between chasing (normal) and
@@ -2162,6 +2185,10 @@ cdef class PositionBalancerHandler:
                             # normal top-of-book; a "wall must be >= N ticks above jumper" entry gate
                             # is a future refinement (see position-balancer.md).
                             self._in_refuge_sell[refuge_canonical] = True
+                            # Fresh episode → clear the jumper-gone throttle clock so the first
+                            # jumper-gone check in this episode is immediate (not blocked by a stale
+                            # stamp from a previous refuge episode on this asset).
+                            self._last_jumpgone_check_time.pop(refuge_canonical, None)
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
