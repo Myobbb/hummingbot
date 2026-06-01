@@ -61,8 +61,12 @@ class BitmartExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = True
-        # Track MARKET orders that have received at least one fill (to suppress cancel-after-fill and finalize early)
-        self._market_orders_with_fill = set()
+        # Track MARKET orders that have received at least one fill. Used only for the MARKET-specific
+        # quirks: a fully-filled MARKET BUY can report "partially_canceled", and a filled MARKET order
+        # can emit a trailing CANCELED — both are forced to FILLED. NOT used for LIMIT (a LIMIT
+        # partial-fill-then-cancel is a legitimate CANCELED). LIMIT fills are recorded as TradeUpdates
+        # in _user_stream_event_listener and finalize through HB's normal state machine.
+        self._orders_with_fill = set()
 
     @property
     def authenticator(self):
@@ -326,9 +330,11 @@ class BitmartExchange(ExchangePyBase):
                 all_fills_response = await self._request_order_fills(order=order)
                 updates = self._create_order_fill_updates(order=order, fill_update=all_fills_response)
                 trade_updates.extend(updates)
-                # If MARKET order has any fills, record for early finalization
+                # MARKET-only: mark for the fully-filled-MARKET early-finalize / trailing-CANCELED
+                # suppression. (LIMIT orders must NOT be force-FILLED — a partial-fill-then-cancel
+                # is a legitimate CANCELED state.)
                 if updates and order.order_type == OrderType.MARKET:
-                    self._market_orders_with_fill.add(order.client_order_id)
+                    self._orders_with_fill.add(order.client_order_id)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
@@ -345,10 +351,11 @@ class BitmartExchange(ExchangePyBase):
         Bitmart WebSocket provides real-time order state updates via spot/user/orders channel.
         HTTP polling for fills was causing 429 rate limit errors (limit: 30 req/5s).
         
-        The WebSocket events provide: order_state, filled_size, and other aggregate data.
-        Individual trade details (trade_id, fee per fill) are not available via WS,
-        but order completion/state tracking works correctly without them.
-        
+        The WebSocket order-progress events carry full per-fill detail (last_fill_count,
+        last_fill_price, last_fill_time, dealFee, deal_fee_coin_name, detail_id), which
+        `_user_stream_event_listener` turns into TradeUpdates via `_create_trade_update_from_ws`.
+        So HTTP fill polling is unnecessary AND was the cause of 429s / hung orders.
+
         To re-enable HTTP fill polling selectively in the future, call:
             await super()._update_orders_fills(orders)
         """
@@ -359,9 +366,11 @@ class BitmartExchange(ExchangePyBase):
 
         order_update = self._create_order_update(order=tracked_order, order_update=updated_order_data)
 
-        # Force FILLED for MARKET orders that already had any fills (ignore subsequent cancel-after-fill)
+        # Force FILLED for fully-filled MARKET orders that report a trailing cancel-after-fill
+        # state via the HTTP order-status reconciliation path. MARKET-only by design: a LIMIT
+        # partial-fill-then-cancel is a real CANCELED and must not be forced to FILLED.
         try:
-            if tracked_order.order_type == OrderType.MARKET and tracked_order.client_order_id in self._market_orders_with_fill:
+            if tracked_order.order_type == OrderType.MARKET and tracked_order.client_order_id in self._orders_with_fill:
                 order_update = OrderUpdate(
                     client_order_id=order_update.client_order_id,
                     exchange_order_id=order_update.exchange_order_id,
@@ -400,6 +409,61 @@ class BitmartExchange(ExchangePyBase):
             updates.append(trade_update)
 
         return updates
+
+    def _create_trade_update_from_ws(self, order: InFlightOrder, each_event: Dict[str, Any]) -> Optional[TradeUpdate]:
+        """
+        Build a per-fill TradeUpdate directly from a BitMart WS order-progress event.
+
+        Upstream HB fetches per-fill detail via an HTTP call on every fill event; that endpoint
+        rate-limits hard (~30 req/5s) and under multi-strategy load it 429s, the TradeUpdate is
+        dropped, and orders "hang" (the fill is never confirmed). We avoid HTTP entirely: the WS
+        message already carries everything needed (verified against the live payload and the
+        official API — developer-pro.bitmart.com/en/spot/#private-order-progress):
+            last_fill_count  -> this fill's base size
+            last_fill_price  -> this fill's price
+            last_fill_time   -> this fill's timestamp (ms)
+            dealFee          -> this fill's fee (PER-FILL, verified: dealFee/(count*price) is constant)
+            deal_fee_coin_name -> fee token
+            detail_id        -> per-fill trade id (used as TradeUpdate.trade_id)
+        fill_quote_amount is derived as count*price (WS exposes only the CUMULATIVE filled_notional);
+        this matches InFlightOrder.update_with_trade_update which simply accumulates fill_quote_amount.
+
+        Dedup is handled by HB itself: InFlightOrder.update_with_trade_update ignores a TradeUpdate
+        whose trade_id is already in order_fills, so a re-delivered WS message is a no-op. We just
+        return None when there's no fill yet (the order's first WS message has last_fill_count == 0).
+        """
+        try:
+            last_fill_count = Decimal(str(each_event.get("last_fill_count", "0") or "0"))
+            if last_fill_count <= 0:
+                return None
+            detail_id = str(each_event.get("detail_id", "") or "")
+            # trade_id = detail_id (per-fill). Fall back to a synthetic key if BitMart omits it.
+            trade_id = detail_id or f'{each_event.get("order_id")}|{each_event.get("last_fill_time")}|{last_fill_count}'
+
+            last_fill_price = Decimal(str(each_event.get("last_fill_price", "0") or "0"))
+            fee_amount = Decimal(str(each_event.get("dealFee", "0") or "0"))
+            fee_token = each_event.get("deal_fee_coin_name") or order.quote_asset
+            fee = TradeFeeBase.new_spot_fee(
+                fee_schema=self.trade_fee_schema(),
+                trade_type=order.trade_type,
+                percent_token=fee_token,
+                flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)],
+            )
+            return TradeUpdate(
+                trade_id=trade_id,
+                client_order_id=order.client_order_id,
+                exchange_order_id=str(each_event.get("order_id")),
+                trading_pair=order.trading_pair,
+                fee=fee,
+                fill_base_amount=last_fill_count,
+                fill_quote_amount=last_fill_count * last_fill_price,
+                fill_price=last_fill_price,
+                fill_timestamp=int(each_event.get("last_fill_time", each_event.get("ms_t", 0))) * 1e-3,
+            )
+        except Exception:
+            self.logger().exception(
+                f"Failed to build TradeUpdate from BitMart WS fill event for {order.client_order_id}")
+            return None
 
     def _create_order_update(self, order: InFlightOrder, order_update: Dict[str, Any]) -> OrderUpdate:
         order_data = order_update["data"]
@@ -460,36 +524,28 @@ class BitmartExchange(ExchangePyBase):
                                 is_fill_candidate_by_amount = fillable_order.executed_amount_base < Decimal(
                                     each_event["filled_size"])
                                 if is_fill_candidate_by_state and is_fill_candidate_by_amount:
-                                    # For MARKET orders: finalize immediately on first fill and record indicator
-                                    try:
-                                        if fillable_order.order_type == OrderType.MARKET:
-                                            self._market_orders_with_fill.add(fillable_order.client_order_id)
-                                            forced_update = OrderUpdate(
-                                                trading_pair=fillable_order.trading_pair,
-                                                update_timestamp=event_timestamp,
-                                                new_state=OrderState.FILLED,
-                                                client_order_id=fillable_order.client_order_id,
-                                                exchange_order_id=each_event["order_id"],
-                                            )
-                                            self._order_tracker.process_order_update(order_update=forced_update)
-                                    except Exception:
-                                        pass
-                                    # NOTE: HTTP fill request removed to avoid 429 rate limit errors.
-                                    # WebSocket order progress events provide sufficient data for order state tracking.
-                                    # To re-enable HTTP fills for detailed trade data, uncomment below:
-                                    # try:
-                                    #     trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
-                                    #     trade_updates = self._create_order_fill_updates(
-                                    #         order=fillable_order,
-                                    #         fill_update=trade_fills)
-                                    #     for trade_update in trade_updates:
-                                    #         self._order_tracker.process_trade_update(trade_update)
-                                    # except asyncio.CancelledError:
-                                    #     raise
-                                    # except Exception:
-                                    #     self.logger().exception("Unexpected error requesting order fills for "
-                                    #                             f"{fillable_order.client_order_id}")
-                                    pass
+                                    # Record the fill straight from the WS event — no HTTP. (Upstream
+                                    # HB fetches per-fill detail via an HTTP call here; under our
+                                    # multi-strategy load that endpoint 429s, the TradeUpdate is dropped,
+                                    # executed_amount never reaches the order amount, and the order
+                                    # "hangs"/completes with zero amount. The WS message already carries
+                                    # full per-fill detail.) Applies to BOTH LIMIT and MARKET.
+                                    trade_update = self._create_trade_update_from_ws(fillable_order, each_event)
+                                    if trade_update is not None:
+                                        self._order_tracker.process_trade_update(trade_update)
+                                    # MARKET orders: BitMart reports the terminal state confusingly
+                                    # (e.g. "partially_canceled" for a fully-filled MARKET BUY), so finalize
+                                    # FILLED immediately on first fill — preserves upstream MARKET behavior.
+                                    if fillable_order.order_type == OrderType.MARKET:
+                                        self._orders_with_fill.add(fillable_order.client_order_id)
+                                        forced_update = OrderUpdate(
+                                            trading_pair=fillable_order.trading_pair,
+                                            update_timestamp=event_timestamp,
+                                            new_state=OrderState.FILLED,
+                                            client_order_id=fillable_order.client_order_id,
+                                            exchange_order_id=each_event["order_id"],
+                                        )
+                                        self._order_tracker.process_order_update(order_update=forced_update)
                             if updatable_order is not None:
                                 order_update = OrderUpdate(
                                     trading_pair=updatable_order.trading_pair,
@@ -498,10 +554,17 @@ class BitmartExchange(ExchangePyBase):
                                     client_order_id=client_order_id,
                                     exchange_order_id=each_event["order_id"],
                                 )
-                                # For MARKET orders with any fills, suppress cancel-after-fill and finalize immediately
+                                # MARKET cancel-after-fill suppression (upstream behavior, MARKET-only):
+                                # a fully-filled MARKET order can report a trailing CANCELED — finalize
+                                # FILLED. We do NOT generalize this to LIMIT: a LIMIT order can be
+                                # genuinely partial-filled-then-canceled (state "partially_canceled",
+                                # filled_size < size), which must stay CANCELED — the recorded partial
+                                # fills already booked the executed portion, and HB finalizes it correctly.
+                                # The `50031 "already completed"` cancel race needs no special handling:
+                                # the order finalizes via its own WS "filled" message once fills are recorded.
                                 if (updatable_order.order_type == OrderType.MARKET
                                         and new_state == OrderState.CANCELED
-                                        and updatable_order.client_order_id in getattr(self, "_market_orders_with_fill", set())):
+                                        and updatable_order.client_order_id in self._orders_with_fill):
                                     forced_update = OrderUpdate(
                                         trading_pair=updatable_order.trading_pair,
                                         update_timestamp=event_timestamp,
