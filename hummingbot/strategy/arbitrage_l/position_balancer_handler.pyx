@@ -49,15 +49,22 @@ cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order 
 #
 # Signal: time between two consecutive FULL completions on the same canonical asset
 # (recorded in c_record_fill_pressure, fired only from c_handle_order_completion —
-# never from cancels). Proportional: the faster the second fill, the longer the wait.
+# never from cancels). Step-back scales with PRESSURE INTENSITY: the faster the second
+# fill, the more directional flow is hitting us, the longer we stay off-book.
 #
-#   extra = clamp(FILL_PRESSURE_WINDOW - inter_fill, 0, MAX_POST_FILL_EXTRA)
-#   effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra   # 2s floor .. ~10s ceiling
+#   frac  = max(0, 1 - inter_fill / FILL_PRESSURE_WINDOW)   # 1 at inter_fill=0, 0 at the window
+#   extra = MAX_POST_FILL_EXTRA * frac * frac               # QUADRATIC taper (not linear)
+#   effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra    # 2s floor .. (2 + MAX) ceiling
 #
-# A gap larger than FILL_PRESSURE_WINDOW resets extra to 0 (pressure cooled).
-# The first fill (no prior timestamp) always yields extra=0.
+# Why quadratic, not linear: real inter-fills cluster in 2-15s. A linear `WINDOW - inter_fill`
+# with an 8s cap saturated the ENTIRE 0-22s band to +8s (flat — no resolution where fills
+# actually live; the taper only existed in the unused 22-30s sliver). The quadratic shape
+# (×MAX, decaying to 0 at the window) gives strong, DISTINGUISHABLE values across the fast
+# band — e.g. @WINDOW=30,MAX=25: 2s→~22s, 10s→~11s, 15s→~6s, 22s→~2s, ≥30s→0. Fast fills
+# (hard sweep) → long step-back to let the move run; slow fills → near-zero; cooled → 0.
+# A gap larger than FILL_PRESSURE_WINDOW resets extra to 0. First fill always yields extra=0.
 cdef double FILL_PRESSURE_WINDOW = 30.0   # seconds — second completion within this window = pressure
-cdef double MAX_POST_FILL_EXTRA  = 8.0    # seconds — cap on the added wait (2s base + 8s = 10s ceiling)
+cdef double MAX_POST_FILL_EXTRA  = 25.0   # seconds — cap on the added wait (2s base + 25s = 27s ceiling on a violent fill flurry)
 
 # --- Minimum order age before immediate-cancel checks fire ---
 # Two thresholds because different events have different noise profiles:
@@ -151,11 +158,11 @@ cdef double REFUGE_JUMPGONE_CHECK_INTERVAL = 300.0  # per-asset throttle: re-eva
 # cancels the order every ~5-6 min; the next placement is still in refuge so it re-reads the
 # wall and re-parks. We do NOT run a separate in-refuge situation sampler — the backstop already
 # refreshes faster than any debounce could complete. Refuge EXITS (resume normal chasing) on:
-# a fill, a session re-enable, a better-market relocation, OR the "jumper gone" check
-# (c_refuge_jumper_gone — no foreign order at/below us anymore), throttled to once per
-# REFUGE_JUMPGONE_CHECK_INTERVAL per asset so a flickering jumper can't cause exit/re-arm thrash.
-# First check after arming is NOT delayed (clock starts unset); subsequent re-checks wait the
-# interval. See position-balancer.md.
+# a fill, a session re-enable, a better-market relocation, OR the throttled refuge re-evaluation
+# (c_refuge_foreign_below counts foreign orders beating us: 0 = jumper gone / alone at top;
+# >= 2 = we sank below more than one order so the 2nd-best premise is broken — exit either way).
+# Throttled to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset so a flickering jumper can't cause
+# exit/re-arm thrash; first check after arming is NOT delayed (clock starts unset). See position-balancer.md.
 cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
@@ -820,16 +827,20 @@ cdef class PositionBalancerHandler:
         MUST run BEFORE handle_order_completion (which pops the pending dict) so the order is
         still present here for the canonical-asset lookup.
 
-            extra = clamp(FILL_PRESSURE_WINDOW - inter_fill, 0, MAX_POST_FILL_EXTRA)
-            effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra   # 2s floor .. ~10s ceiling
+            frac  = max(0, 1 - inter_fill / FILL_PRESSURE_WINDOW)
+            extra = MAX_POST_FILL_EXTRA * frac^2                    # quadratic taper
+            effective_wait = DEFAULT_COMPLETION_COOLDOWN + extra   # 2s floor .. (2+MAX) ceiling
 
-        First fill (no prior timestamp) -> extra=0. Gap > window -> extra=0 (pressure cooled).
+        First fill (no prior timestamp) -> extra=0. Gap >= window -> extra=0 (pressure cooled).
+        Quadratic (not linear) so the fast band where fills cluster (2-15s) gets real resolution
+        instead of saturating at the cap; see the constants-block note for the rationale + a table.
         """
         cdef:
             double now = self.strategy._current_timestamp
             double prior
             double inter_fill = 0.0   # init: silences -Wmaybe-uninitialized; the first-fill branch (prior<=0) skips the log anyway
             double extra
+            double frac = 0.0
             str asset_key
             str canonical
         try:
@@ -848,12 +859,20 @@ cdef class PositionBalancerHandler:
                 extra = 0.0
             else:
                 inter_fill = now - prior
-                # Proportional: the faster the second fill, the longer the added wait.
-                extra = FILL_PRESSURE_WINDOW - inter_fill
-                if extra < 0.0:
+                # Step-back scales with pressure intensity via a QUADRATIC taper:
+                #   frac  = 1 - inter_fill/WINDOW   (1 at inter_fill=0, 0 at the window)
+                #   extra = MAX * frac^2
+                # Fast fills (hard directional flow) → near-MAX step-back; slow → near-0;
+                # gap beyond the window → 0 (pressure cooled). Quadratic (not linear) so the
+                # fast band where fills actually live (2-15s) gets real resolution instead of
+                # saturating flat at the cap. See the constants-block note.
+                if inter_fill >= FILL_PRESSURE_WINDOW:
                     extra = 0.0          # gap exceeded window — pressure cooled, reset
-                elif extra > MAX_POST_FILL_EXTRA:
-                    extra = MAX_POST_FILL_EXTRA
+                else:
+                    frac = 1.0 - inter_fill / FILL_PRESSURE_WINDOW
+                    extra = MAX_POST_FILL_EXTRA * frac * frac
+                    if extra > MAX_POST_FILL_EXTRA:   # belt-and-suspenders (frac≤1 so this can't exceed)
+                        extra = MAX_POST_FILL_EXTRA
 
             self._post_fill_extra_wait[canonical] = extra
             self._last_fill_completion_time[canonical] = now
@@ -1742,23 +1761,28 @@ cdef class PositionBalancerHandler:
 
         return (should_cancel, cancel_reason)
 
-    cdef bint c_refuge_jumper_gone(self, str asset, bint is_buy):
+    cdef int c_refuge_foreign_below(self, str asset, bint is_buy):
         """
-        While in refuge, decide whether the penny-jumper we're hiding from has LEFT — i.e. there
-        is no longer ANY foreign order at or below our price (sell) / at or above (buy). If so, the
-        refuge posture is pointless and we should EXIT refuge and resume normal best-of-book chasing.
+        While in refuge, count FOREIGN orders strictly more aggressive than us (asks at/below our
+        price for a sell; bids at/above for a buy) — i.e. how many orders are currently beating us.
+        Drives both refuge exit conditions: count 0 = jumper gone (alone at top); count >= 2 = we
+        sank below more than one order (refuge premise broken); count 1 = normal refuge hold.
 
-        This is the safe place to detect "jumper gone": the order is LIVE in the book, so we know
+        This is the safe place to inspect refuge position: the order is LIVE in the book, so we know
         our own price (order_price from details) and can walk the book skipping our own level. (At
         re-park time we could NOT do this — details are popped, _own is None — which is why the
         gap-based re-park promote was rejected; see position-balancer.md Weakness #2.)
 
-        Definition (sell): jumper gone == every FOREIGN ask is STRICTLY above our price. A foreign
-        order sharing our exact tick counts as NOT gone (it's tied with us, the jumping dynamic could
-        resume) — this avoids flapping in/out of refuge when a jumper sits at our level. Mirror for buy.
-
-        Returns True only when genuinely alone at top. Fail-safe: False on any error / missing details
-        (stay in refuge — conservative, no spurious exit).
+        Counts FOREIGN levels strictly MORE AGGRESSIVE than us — i.e. ASKS at/below our price (sell)
+        or BIDS at/above our price (buy). A foreign order sharing our exact tick counts (it's beating
+        us in queue / could resume jumping). Skips our OWN order's level exactly once. Used by the
+        two refuge exit checks in c_cancel_stale_orders:
+          • count == 0  -> "jumper gone" (we're alone at top) -> EXIT refuge, resume chasing.
+          • count >= 2  -> we SANK below MORE THAN ONE order (refuge failed to hold 2nd-best — the
+                           premise "sit one above a single jumper" is broken) -> EXIT refuge.
+          • count == 1  -> normal refuge state (one jumper below us, holding) -> stay.
+        Returns the count. Fail-safe: returns 1 on any error / missing details (the neutral "stay in
+        refuge" value — neither exit condition fires).
         """
         cdef:
             tuple order_details
@@ -1769,13 +1793,14 @@ cdef class PositionBalancerHandler:
             double p = 0.0
             str trading_pair
             bint skipped_own = False
+            int below = 0
         try:
             if is_buy:
                 order_details = self._active_buy_order_details.get(asset)
             else:
                 order_details = self._active_sell_order_details.get(asset)
             if order_details is None:
-                return False
+                return 1                                   # neutral: stay in refuge
             market_tuple, order_price = order_details
             trading_pair = market_tuple.trading_pair
             if trading_pair in self._min_price_increment_cache:
@@ -1786,35 +1811,39 @@ cdef class PositionBalancerHandler:
                     min_tick = float(trading_rule.min_price_increment)
                 self._min_price_increment_cache[trading_pair] = min_tick
             if min_tick <= 0:
-                return False
+                return 1                                   # neutral
             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(trading_pair)
             if is_buy:
                 it = ob.bid_entries()    # highest-first
             else:
                 it = ob.ask_entries()    # lowest-first
-            # Walk from the top of book. Skip our OWN order's level — but only ONCE (we have a single
-            # order). If a SECOND level sits at our exact tick, it is a FOREIGN order sharing our tick
-            # → jumper not gone (tied with us; avoids flapping). The first foreign level then decides:
-            # for a sell, a foreign ask at or below our price → jumper still there → NOT gone; strictly
-            # above (or no foreign level at all) → gone. Mirror for buy.
+            # Walk from the top of book, counting FOREIGN levels strictly more aggressive than us.
+            # Skip our OWN order's level exactly ONCE (we have a single order); a 2nd level at our tick
+            # is a foreign order tied with us and IS counted. Stop once we pass our price (book is
+            # sorted), capping the walk at a few levels.
             while True:
                 row = next(it, None)
                 if row is None:
-                    break                                  # no foreign level at all → gone
+                    break
                 p = float(row.price)
                 if (not skipped_own) and abs(p - order_price) < min_tick * 0.5:
                     skipped_own = True
                     continue                               # skip our own order's level (once only)
-                # first foreign level reached (a 2nd level at our tick lands here → foreign, tied)
                 if is_buy:
-                    # buy: a foreign bid at or above us means a frontrunner is still there
-                    return not (p >= order_price - min_tick * 0.5)
+                    # buy: a foreign bid at or above our price beats us
+                    if p >= order_price - min_tick * 0.5:
+                        below += 1
+                    else:
+                        break                              # past our price; rest are below us
                 else:
-                    # sell: a foreign ask at or below us means a jumper is still there
-                    return not (p <= order_price + min_tick * 0.5)
-            return True                                    # walked the whole side, no foreign level → gone
+                    # sell: a foreign ask at or below our price beats us
+                    if p <= order_price + min_tick * 0.5:
+                        below += 1
+                    else:
+                        break                              # past our price; rest are above us
+            return below
         except Exception:
-            return False
+            return 1                                       # neutral: stay in refuge
 
     cdef void c_cancel_stale_orders(self, str asset):
         """
@@ -1852,6 +1881,7 @@ cdef class PositionBalancerHandler:
             str cancel_reason
             str order_id
             int cancel_streak
+            int foreign_below   # refuge re-eval: count of foreign orders beating us (0=jumper gone, >=2=sank deep)
             double effective_frontrun_delay
 
         # ========================================================================
@@ -1896,26 +1926,31 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
 
-                    # ---- FRONTRUNNER-GONE exits refuge (buy, mirror of sell jumper-gone) ----
-                    # While in refuge, if NO foreign bid is at/above our price anymore (the frontrunner
-                    # left), EXIT refuge and reset the streak so normal best-bid chasing + live step-down
-                    # take over. Runs regardless of should_cancel (frontrunner gone → CHECK 2 doesn't
-                    # fire). Safe: order is LIVE (we know order_price). Skip during mode-disabled cancel.
-                    # THROTTLED to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap; mirror
-                    # of sell): stamp on every evaluation; clock starts unset so the first check is prompt.
+                    # ---- REFUGE RE-EVALUATION exits (buy, mirror of sell) ----
+                    # Count foreign bids at/above us (c_refuge_foreign_below). EXIT refuge if:
+                    #   • count == 0  -> FRONTRUNNER GONE (alone at top bid).
+                    #   • count >= 2  -> SANK below MORE THAN ONE order (refuge premise broken — just exit,
+                    #                    don't re-park). count == 1 -> normal hold.
+                    # Safe (order LIVE). Skip during mode-disabled. Throttled once per interval (anti-flap).
                     if (self._buy_spread_is_min and not cancel_reason.startswith("mode disabled")
                             and self._in_refuge_buy.get(self._get_canonical_asset(asset), False)):
                         jg_canonical = self._get_canonical_asset(asset)
                         if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
                                 >= REFUGE_JUMPGONE_CHECK_INTERVAL):
                             self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
-                            if self.c_refuge_jumper_gone(asset, True):
+                            foreign_below = self.c_refuge_foreign_below(asset, True)
+                            if foreign_below == 0 or foreign_below >= 2:
                                 self._in_refuge_buy.pop(jg_canonical, None)
                                 self._buy_cancel_streak.pop(jg_canonical, None)
                                 self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit
-                                self.strategy.logger().info(
-                                    f"Position balancer: BUY refuge EXITED for {jg_canonical} "
-                                    f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
+                                if foreign_below == 0:
+                                    self.strategy.logger().info(
+                                        f"Position balancer: BUY refuge EXITED for {jg_canonical} "
+                                        f"(frontrunner gone) — no bids over us, resuming normal best-bid chasing")
+                                else:
+                                    self.strategy.logger().info(
+                                        f"Position balancer: BUY refuge EXITED for {jg_canonical} "
+                                        f"(sank below {foreign_below} orders) — refuge premise broken, resuming normal best-bid chasing")
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
@@ -2132,31 +2167,41 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
 
-                    # ---- JUMPER-GONE exits refuge (sell) ----
-                    # While in refuge, if NO foreign ask is at/below our price anymore (the jumper left),
-                    # the refuge posture is pointless — EXIT refuge and reset the streak so normal
-                    # best-ask chasing + live step-up take over. Runs regardless of should_cancel: when
-                    # the jumper is gone CHECK 2 (undercut) does NOT fire, so this is the ONLY signal.
-                    # Safe here because the order is LIVE (we know order_price) — unlike re-park time
-                    # (see Weakness #2). Skip during a mode-disabled shutdown cancel. Runs before the
-                    # suppress block below so a freshly-exited order isn't re-suppressed this tick.
-                    # THROTTLED to once per REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap vs a
-                    # flickering jumper): we stamp the clock on every EVALUATION (gone or not), so the
-                    # next re-check waits the interval regardless of outcome. The clock starts unset, so
-                    # the FIRST check after arming is immediate (prompt exit if the jumper already left).
+                    # ---- REFUGE RE-EVALUATION exits (sell) ----
+                    # While in refuge, count foreign asks at/below us (c_refuge_foreign_below). Two
+                    # EXIT conditions — both mean refuge is pointless, so leave and resume normal chasing:
+                    #   • count == 0  -> JUMPER GONE: alone at top (CHECK 2/undercut won't fire, so this
+                    #                    is the only signal that the jumper left).
+                    #   • count >= 2  -> SANK DEEP: more than one order is now under us. Refuge's premise
+                    #                    is "sit one above a SINGLE jumper at 2nd-best"; if several piled
+                    #                    in below us we've sunk to 3rd+ and that premise is broken. We do
+                    #                    NOT try to re-park under a wall (the 2nd-foreign re-park can't
+                    #                    represent N stacked jumpers) — just exit (per Pavel 2026-06-01).
+                    #   • count == 1  -> normal hold; stay.
+                    # Safe here because the order is LIVE (we know order_price) — unlike re-park time.
+                    # Skip during a mode-disabled cancel. Runs before the suppress block so a freshly-
+                    # exited order isn't re-suppressed this tick. THROTTLED once per
+                    # REFUGE_JUMPGONE_CHECK_INTERVAL per asset (anti-flap): stamp on every evaluation;
+                    # clock starts unset so the first check after arming is immediate.
                     if (self._sell_spread_is_min and not cancel_reason.startswith("mode disabled")
                             and self._in_refuge_sell.get(self._get_canonical_asset(asset), False)):
                         jg_canonical = self._get_canonical_asset(asset)
                         if (current_time - self._last_jumpgone_check_time.get(jg_canonical, 0.0)
                                 >= REFUGE_JUMPGONE_CHECK_INTERVAL):
                             self._last_jumpgone_check_time[jg_canonical] = current_time   # stamp on evaluation
-                            if self.c_refuge_jumper_gone(asset, False):
+                            foreign_below = self.c_refuge_foreign_below(asset, False)
+                            if foreign_below == 0 or foreign_below >= 2:
                                 self._in_refuge_sell.pop(jg_canonical, None)
                                 self._sell_cancel_streak.pop(jg_canonical, None)
                                 self._last_jumpgone_check_time.pop(jg_canonical, None)   # clear on exit (fresh start if it re-arms)
-                                self.strategy.logger().info(
-                                    f"Position balancer: SELL refuge EXITED for {jg_canonical} "
-                                    f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
+                                if foreign_below == 0:
+                                    self.strategy.logger().info(
+                                        f"Position balancer: SELL refuge EXITED for {jg_canonical} "
+                                        f"(jumper gone) — no asks under us, resuming normal best-ask chasing")
+                                else:
+                                    self.strategy.logger().info(
+                                        f"Position balancer: SELL refuge EXITED for {jg_canonical} "
+                                        f"(sank below {foreign_below} orders) — refuge premise broken, resuming normal best-ask chasing")
 
                     # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
                     # When the immediate check says "undercut", decide between chasing (normal) and
