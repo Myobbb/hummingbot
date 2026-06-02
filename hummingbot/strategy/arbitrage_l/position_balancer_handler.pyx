@@ -151,7 +151,16 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # (Future refinement: a "wall must be >= N ticks above the jumper" entry gate so we only take
 # refuge when there's a distinct level to hide under — see position-balancer.md. For now we
 # enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
-cdef double REFUGE_ARM_STREAK = 10.0   # consecutive reactive undercuts before we stop chasing and take refuge
+cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before we stop chasing and take refuge.
+                                       # Lowered 10->5 (2026-06-01): the OB-grounded audit showed contested legs
+                                       # holding L1 only ~20-34% of the time, burning the streak-5..10 chase
+                                       # (already on the 20s slow cadence) with near-zero fills. Arming at 5
+                                       # retreats to a held 2nd-best slot sooner; refuge re-parks were 12/12
+                                       # correct in testing. Note `cancel_streak >= 5` ALSO triggers the
+                                       # frontrun-delay x4 (5s->20s), so 5 is where the slow-chase already begins.
+                                       # FUTURE: make this PER-PAIR (aggressive legs chase longer, hopeless legs
+                                       # retreat early) + add a price-floor/taker terminal for the `sank below N`
+                                       # exits the audit sees routinely — see position-balancer-notes.md.
 # While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
 # ONCE PER 5-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 300s-age mark
 # — the order is still live there so order_price is known). At that single re-evaluation we count
