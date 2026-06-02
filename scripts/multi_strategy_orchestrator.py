@@ -3349,6 +3349,15 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 # - _conv_rate() fast-path returns 1.0 when both market tuples have identical
                 #   base_asset and quote_asset (which they will since both slots are the same market)
                 # - No oracle lookup is ever triggered for same-asset pairs
+        else:
+            # Plain additional-market removal (not primary/secondary): keep the runtime
+            # config dict in sync with market_pairs. Without this, a later primary/secondary
+            # removal reads a stale additional_markets, picks the promotion branch for a
+            # market that no longer exists, and fails the "at least 2 markets" check.
+            config['additional_markets'] = [
+                m for m in config.get('additional_markets', [])
+                if m.lower() != target_spec
+            ]
 
         # Update strategy's market_pairs list
         strategy_instance.market_pairs = new_market_pairs
