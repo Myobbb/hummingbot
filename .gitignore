@@ -97,5 +97,8 @@ coverage.xml
 
 **/.claude/settings.local.json
 
-# Local-only tool — runs from the Mac, never deployed to the VPS
+# Local-only PB dev tools — live in ~/Documents/VS_code_projects/hmb_local_tools/,
+# NOT in this repo (run from the Mac, never deployed to the VPS). These ignore
+# entries are a safety net in case a copy is ever recreated under scripts/.
 scripts/pb_monitor.py
+scripts/bitmart_ob_test.py
