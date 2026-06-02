@@ -686,6 +686,13 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Half-width of the band in USD (target ± band = acceptable range, e.g. 150 → [950, 1250])"
     )
 
+    # Runtime pause state — persisted so a paused strategy stays paused across restarts.
+    # Disabled by default so existing configs load unpaused.
+    paused: bool = Field(
+        default=False,
+        description="Whether this strategy starts paused (skips ticking until resumed)"
+    )
+
     # Timing parameters
     status_report_interval: float = Field(
         default=60.0,
@@ -725,6 +732,15 @@ class MultiStrategyOrchestratorConfig(BaseClientModel):
     arbitrage_m_strategies: List[ArbitrageMInstanceConfig] = Field(
         default_factory=list,
         description="List of arbitrage_m strategy configurations to run"
+    )
+
+    # Exchanges to skip entirely at startup — no connector is built, so no WS connection,
+    # no subscriptions and no balance polling for these. Strategies that reference a
+    # disabled exchange fail-and-skip gracefully (logged to _init_errors). Use for a
+    # temporary exchange outage/maintenance; clear the list to bring the exchange back.
+    disabled_exchanges: List[str] = Field(
+        default_factory=list,
+        description="Exchange names to skip building connectors for, e.g. ['bybit']"
     )
 
     # Config file path (for runtime editing)
@@ -775,8 +791,23 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: MultiStrategyOrchestratorConfig):
-        """Initialize markets from config"""
-        cls.markets = config.markets
+        """Initialize markets from config.
+
+        Exchanges listed in `disabled_exchanges` are filtered out here so the framework
+        (TradingCore) never builds a connector for them — no WS, no subscriptions, no
+        balance polling. This is the single funnel TradingCore reads to decide which
+        connectors to create, so filtering here cleanly disables an exchange end-to-end.
+        """
+        disabled = {e.lower() for e in (getattr(config, 'disabled_exchanges', None) or [])}
+        if disabled:
+            cls.markets = {ex: pairs for ex, pairs in config.markets.items()
+                           if ex.lower() not in disabled}
+            cls.logger().info(
+                f"Disabled exchanges (no connector built): {sorted(disabled)}. "
+                f"Active exchanges: {sorted(cls.markets.keys())}"
+            )
+        else:
+            cls.markets = config.markets
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: MultiStrategyOrchestratorConfig):
         """
@@ -974,13 +1005,32 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"Configuration issue: {issue}")
             return
         
+        # Exchanges with no connector built (see init_markets). Strategies that need any
+        # of these are skipped up-front with a single clean log line — no retry, no
+        # sleep, no traceback — instead of letting them fail 3× through the retry loop.
+        disabled = {e.lower() for e in (getattr(self.config, 'disabled_exchanges', None) or [])}
+        skipped_disabled = []
+
         for strategy_config in self.config.arbitrage_m_strategies:
+            if disabled:
+                needed = {strategy_config.primary_market.lower(),
+                          strategy_config.secondary_market.lower()}
+                for am in (strategy_config.additional_markets or []):
+                    if ":" in am:
+                        needed.add(am.split(":", 1)[0].lower())
+                blocked = needed & disabled
+                if blocked:
+                    skipped_disabled.append(strategy_config.name)
+                    self._init_errors.append(
+                        (strategy_config.name, f"skipped: requires disabled exchange(s) {sorted(blocked)}"))
+                    continue
+
             max_retries = 3
             success = False
-            
+
             for attempt in range(max_retries):
                 try:
-                    self._add_arbitrage_m_strategy(strategy_config)
+                    self._add_arbitrage_m_strategy(strategy_config, paused=strategy_config.paused)
                     success = True
                     break  # Success, move to next strategy
                 except Exception as e:
@@ -1002,6 +1052,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             f"Failed to initialize strategy '{strategy_config.name}' after {max_retries} attempts: {e}",
                             exc_info=True
                         )
+
+        if skipped_disabled:
+            self.logger().info(
+                f"Skipped {len(skipped_disabled)} strateg{'y' if len(skipped_disabled) == 1 else 'ies'} "
+                f"requiring disabled exchange(s) {sorted(disabled)}: {skipped_disabled}"
+            )
 
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
@@ -1433,12 +1489,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 strategy_instance.last_exception_msg = str(e)[:200]  # Truncate long messages
                 
                 # Auto-pause after 10 consecutive failures to prevent runaway issues
-                if strategy_instance.exception_count >= 10:
+                if strategy_instance.exception_count >= 10 and not strategy_instance.paused:
                     self.logger().error(
                         f"Strategy '{strategy_instance.name}' auto-paused after {strategy_instance.exception_count} consecutive exceptions. "
                         f"Last error: {strategy_instance.last_exception_msg}"
                     )
                     strategy_instance.paused = True
+                    strategy_instance.config['paused'] = True
+                    self._persist_pause_state(strategy_instance.name, True)
                 
                 self.logger().error(
                     f"Error ticking strategy '{strategy_instance.name}' (failure #{strategy_instance.exception_count}): {e}",
@@ -1652,6 +1710,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         self.logger().info(f"Pausing strategy: {strategy_name}")
         strategy_instance.paused = True
+        strategy_instance.config['paused'] = True
+        self._persist_pause_state(strategy_name, True)
 
         # Note: We do NOT cancel open orders on pause
         # Let the strategy's timeout logic handle any pending orders
@@ -1800,6 +1860,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         strategy_instance.last_exception_msg = None
         
         strategy_instance.paused = False
+        strategy_instance.config['paused'] = False
+        self._persist_pause_state(strategy_name, False)
         self.logger().info(f"Strategy '{strategy_name}' resumed successfully")
         return True
 
@@ -2332,6 +2394,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
     # ── Hold-band guardrail control ───────────────────────────────────────────
+
+    def _persist_pause_state(self, strategy_name: str, paused: bool):
+        """Write the runtime pause flag to the YAML config file so it survives restarts."""
+        self._persist_hold_config(strategy_name, {'paused': paused})
 
     def _persist_hold_config(self, strategy_name: str, updates: dict):
         """Write hold-band field updates to the YAML config file."""

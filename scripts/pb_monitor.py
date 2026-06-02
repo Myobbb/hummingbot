@@ -59,8 +59,11 @@ import orjson
 # foreign datacenter IPs (see wiki tools/vpn-bypass-russia). Measured per venue
 # (BTC-USDT, 2026-06-01):
 #   • DIRECT-broken, proxy-fixed → gate (direct: 2.5M WSMsgType.ERROR + 15 upd
-#     in 25s; via SOCKS5: 232 upd, 0 err), bitmart (direct: "No PONG within 15s"
-#     churn; via SOCKS5: stable).
+#     in 25s; via SOCKS5: 232 upd, 0 err), bitmart (direct: "No PONG" reconnect
+#     churn + persistent STALE; via SOCKS5: 0 reconnects, ~4× the update rate —
+#     measured 2026-06-02 on BTCUSDT/IRUSDT, see bitmart_ob_test.py). NB: bitmart
+#     only truly tunnels because patched_init now REPLACES its hardcoded
+#     TCPConnector (see enable_socks_proxy) — before that it was silently direct.
 #   • DIRECT-fine → kucoin, mexc, bingx, bybit, bitget, coinex, binance.
 #   • htx: works DIRECT (slow — genuine low-freq mbp.refresh.20 snapshots, 5–20s
 #     gaps), but FREEZES after ~6 snapshots THROUGH the proxy (gzip/reconnect
@@ -96,7 +99,19 @@ def _socks_port_open(url: str) -> bool:
 def enable_socks_proxy(proxy_url: str):
     """Install the per-exchange ClientSession patch. A session created while the
     _use_proxy_ctx flag is True (i.e. inside a PROXY_EXCHANGES adapter's connect)
-    gets a SOCKS5 ProxyConnector; all others connect direct."""
+    gets a SOCKS5 ProxyConnector; all others connect direct.
+
+    NOTE — we REPLACE a passed connector, not only inject when None. BitmartWS
+    hardcodes its own aiohttp.TCPConnector (exchanges/bitmart.py L110-118) and
+    passes it to ClientSession(connector=…). The old `connector is None` guard
+    therefore silently skipped bitmart → it connected DIRECT and got ISP-throttled
+    (the "No PONG within 45s" reconnect churn / persistent STALE seen in long
+    runs), even though PROXY_EXCHANGES claimed it was proxied. This is the SAME
+    class of bug that forces HTX onto a custom feed. We now swap a hardcoded
+    connector for the ProxyConnector (closing the orphaned one) so bitmart truly
+    tunnels — and because the contextvar is captured by the bg reconnect task,
+    every reconnect is covered too. gate uses a bare ClientSession() (no
+    connector), so its behaviour is unchanged by this generalisation."""
     try:
         from aiohttp_socks import ProxyConnector
     except ImportError:
@@ -107,10 +122,18 @@ def enable_socks_proxy(proxy_url: str):
     _proxy_url_holder["url"] = proxy_url
 
     def patched_init(self, *args, **kwargs):
-        if _use_proxy_ctx.get() and kwargs.get("connector") is None:
+        if _use_proxy_ctx.get():
             try:
+                existing = kwargs.get("connector")
                 kwargs["connector"] = ProxyConnector.from_url(_proxy_url_holder["url"])
                 kwargs.pop("trust_env", None)  # connector + trust_env can conflict
+                # Close the connector the adapter built (e.g. bitmart's TCPConnector)
+                # so it doesn't leak now that we've replaced it.
+                if existing is not None:
+                    try:
+                        existing.close()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         return _orig_session_init(self, *args, **kwargs)
@@ -175,7 +198,7 @@ DEFAULT_LOG = "~/hummingbot/logs/logs_test_multi.log"
 # Log filter: lines we care about for the event feed
 LOG_RE = re.compile(
     r"Position balancer: (Cancelled|Placed|buy completed|sell completed|"
-    r"SELL refuge|BUY refuge)|"
+    r"SELL refuge|BUY refuge|Spread too tight|Stuck cancel)|"
     r"Placed (buy|sell) limit order|"
     r"refreshed by backstop|"
     r"streak=\d+|"
@@ -212,6 +235,17 @@ UNDERCUT_RE = re.compile(r"(?:undercut|frontrun) \(top (?:ask|bid) ([\d.eE+-]+) 
 STEPUP_RE   = re.compile(r"step-up into gap \(next (?:ask|bid) [\d.eE+-]+ is ([\d.]+) ticks")
 BACKSTOP_RE = re.compile(
     r"Position balancer order \S+ on (\S+) refreshed by backstop"
+)
+# Maker→taker fallback: a "min" order whose maker price would cross the spread is
+# placed at the taker price instead (a real COST event — we pay taker, not maker).
+# PB emits the trading_pair (BASE-USDT / BASE_USDT), not a bare base.
+TAKER_FALLBACK_RE = re.compile(
+    r"Spread too tight for .+? on ([A-Za-z0-9]+)[-_/]USDT\b"
+)
+# Stuck cancel: a cancel that didn't confirm within the timeout → force-cleanup
+# (an anomaly worth surfacing). PB logs the order side as "{order_type} order".
+STUCK_CANCEL_RE = re.compile(
+    r"Stuck cancel detected for (\S+) order"
 )
 
 # Simple, robust discovery: "for <ASSET> on <exch>" + side from place lines.
@@ -334,6 +368,19 @@ log_lines: deque = deque(maxlen=60)       # recent structured log events
 DEPTH = 5
 LIVE_MODE = False                         # False = audit-summary mode; True = live dashboard
 STALE_MS = {"bingx": 15000, "htx": 20000, "bitmart": 12000}  # per-exchange; default 10000
+
+# ── PB spec constants (MUST mirror position_balancer_handler.pyx) ──────────────
+# The audit's PART A correctness checks compare against these. Keep them in sync
+# with the .pyx module-level cdefs, or PART A silently mis-judges (e.g. a correct
+# refuge arm flagged "premature"). We treat REFUGE_ARM_STREAK as a LOWER BOUND:
+# the .pyx value was lowered 10→5 (the pending strategy change), and the VPS may
+# run either 5 (after push) or 10 (before). A correct arm fires at streak ≥ the
+# deployed value, which is ≥5 under BOTH — so flagging only `arm < 5` never
+# false-flags a correct arm on either build, while still catching a genuinely
+# premature arm. (Was hardcoded `< 10` inline — false-flagged every arm 5–9 once
+# the .pyx ran 5.)
+REFUGE_ARM_STREAK = 5          # .pyx: cdef double REFUGE_ARM_STREAK (lowered 10→5 2026-06-01)
+STEP_UP_MIN_GAP_TICKS = 5.0    # .pyx: cdef double STEP_UP_MIN_GAP_TICKS
 
 
 def stale_threshold_ms(exchange: str) -> int:
@@ -847,6 +894,22 @@ def parse_log_line(line: str) -> Optional[LogEvent]:
                                f"pending={float(pending):.1f} → {status}",
                         raw=line.strip())
 
+    m = TAKER_FALLBACK_RE.search(line)
+    if m:
+        # base asset only; venue resolved by the audit via _asset_venue (PB logs the
+        # pair, not the venue). side from "bid"/"ask" wording in the same line.
+        side = "sell" if "<= bid" in line or "Using bid" in line else "buy"
+        return LogEvent(ts=ts, kind="taker_fallback", side=side,
+                        asset=m.group(1).strip(), reason="spread too tight → taker",
+                        raw=line.strip())
+
+    m = STUCK_CANCEL_RE.search(line)
+    if m:
+        side = m.group(1).lower()
+        side = side if side in ("buy", "sell") else ""
+        return LogEvent(ts=ts, kind="stuck_cancel", side=side,
+                        reason="stuck cancel → force-cleanup", raw=line.strip())
+
     if "Position balancer:" in line:
         return LogEvent(ts=ts, kind="other", raw=line.strip())
 
@@ -960,9 +1023,29 @@ class LegAudit:
     refuge_sink_samples: List[int] = field(default_factory=list)   # per re-park: 0=2nd-best, 1=mis-parked
     _expect_refuge_place: bool = False   # set on a "refuge placement" line; consumed by next place
     _refuge_target: Optional[Tuple[float, float]] = None   # (wall, jumper) from the refuge line
+    # INDEPENDENT refuge wall/jumper cross-check: at each "refuge placement" line,
+    # verify PB's LOGGED wall/jumper against OUR live book ladder (does jumper = the
+    # real L1 foreign level and wall = the real 2nd foreign level?). This catches PB
+    # MIS-IDENTIFYING the wall/jumper itself — which the [jumper,wall]-zone re-park
+    # check above CANNOT (it trusts PB's own numbers). Sparse-book-safe: matches
+    # logged prices to actual book levels by proximity, not by naive level-rank.
+    refuge_xcheck_ok:    int = 0         # logged wall/jumper matched the live book
+    refuge_xcheck_bad:   int = 0         # mismatch (PB's wall/jumper ≠ real book front)
+    refuge_xcheck_noob:  int = 0         # book stale/too-thin to cross-check
+    # secondary PB events (cost / anomaly): maker→taker fallback + stuck-cancel
+    taker_fallbacks: int = 0             # "spread too tight" → placed at taker price (paid taker)
+    stuck_cancels:   int = 0             # cancel didn't confirm → force-cleanup (anomaly)
     # price drift over the window (first/last placement price)
     first_price: float = 0.0
     last_price: float = 0.0
+    # max adverse excursion (MAE): the worst placement price vs the most-favourable
+    # one this session, on the side that hurts. Sell-off wants HIGH prices → MAE =
+    # how far BELOW the best (max) placement the worst (min) fell. Buy-in mirrors.
+    # This quantifies the notes-MD's #1 real-money exposure (refuge bails via
+    # `sank below N` then chases the book DOWN with no floor) — `drift` (first→last)
+    # missed it because a sell-off that dips 14% mid-window then recovers looks flat.
+    min_place_price: float = 0.0
+    max_place_price: float = 0.0
     # spread context (sampled): fraction of samples where spread ≤ ~1 tick
     spread_samples: int = 0
     tight_spread_samples: int = 0
@@ -982,10 +1065,27 @@ class LegAudit:
         if len(self.violations) < 12 and msg not in self.violations:
             self.violations.append(msg)
 
+    def mae_pct(self) -> Optional[float]:
+        """Max adverse excursion as a % — how far the placement price travelled in
+        the UNfavourable direction across the session. Sell-off: chased DOWN from
+        the best (max) to the worst (min) → (max−min)/max. Buy-in: chased UP →
+        (max−min)/min. Always ≥0; None if <2 distinct placements. Quantifies how
+        far down/up the book PB followed an undercutter (the price-floor exposure)."""
+        lo, hi = self.min_place_price, self.max_place_price
+        if lo <= 0 or hi <= 0 or hi == lo:
+            return None
+        span = hi - lo
+        if self.side == "sell":
+            return span / hi * 100.0      # dropped this far below the high
+        elif self.side == "buy":
+            return span / lo * 100.0      # rose this far above the low
+        return None
+
 
 audit: Dict[str, LegAudit] = {}          # key = "ASSET@exchange" (same as books)
 audit_start: float = 0.0
 _asset_venue: Dict[str, str] = {}        # asset → the venue PB's live order is on (from cancels)
+_global_stuck_cancels: int = 0           # stuck-cancel force-cleanups (no asset in the line)
 
 
 def _audit_leg(asset: str, exchange: str) -> Optional[LegAudit]:
@@ -999,9 +1099,109 @@ def _audit_leg(asset: str, exchange: str) -> Optional[LegAudit]:
     return a
 
 
+def _refuge_xcheck(a: "LegAudit", book: Optional["LocalOrderBook"], fresh: bool,
+                   tk: float, wall: float, jumper: float):
+    """INDEPENDENT verification that PB's LOGGED (wall, jumper) actually describe the
+    live book front — i.e. PB identified the right levels, not just placed
+    consistently with its own (possibly wrong) read.
+
+    Sparse-book-safe by construction: we match PB's logged prices to ACTUAL book
+    levels by price proximity and check ORDERING, never level-rank counts (the thing
+    that false-flagged correct re-parks on MANYU@htx's irregular grid).
+    For a sell (mirror for buy — bids descending, "more aggressive" = higher):
+      (1) jumper is genuinely L1: no foreign ask is MATERIALLY cheaper than the
+          logged jumper;
+      (2) the logged jumper matches the real best foreign ask;
+      (3) the logged wall matches the next DISTINCT foreign level above the jumper.
+    Records ok/bad/noob on the leg; flags a human-readable mismatch on failure.
+    Tolerant: if the book is stale or has <2 foreign levels we can't judge → noob
+    (no penalty), exactly like the placement-on-grid check.
+
+    TWO tolerances, deliberately distinct (conflating them false-flagged a benign
+    1-tick read-vs-snapshot drift in live testing):
+      • level_tol (tight, ½ tick) — for STRUCTURE: collapsing duplicate levels and
+        skipping our own resting order. About ladder shape.
+      • match_tol (loose, ≥3 ticks AND a real % gap) — for MATCHING PB's logged
+        price to a real level. PB reads the book then logs/places ~ms-to-seconds
+        later; on a hot book the front legitimately moves a tick or three between
+        PB's read and our snapshot. We mirror the placement-on-grid convention
+        (≤3 ticks = still a match; only a sustained, >0.3% deviation is a real
+        mis-ID). So only a foreign order sitting MATERIALLY ahead of PB's jumper —
+        a genuine "PB picked the wrong front" — flags; a 1-tick boundary race does
+        not.
+    """
+    if book is None or not fresh:
+        a.refuge_xcheck_noob += 1
+        return
+    levels = book.asks if a.side == "sell" else book.bids
+    if not levels:
+        a.refuge_xcheck_noob += 1
+        return
+    ref = jumper if jumper > 0 else (book.best_ask or book.best_bid or 1.0)
+    level_tol = (tk * 0.5) if tk > 0 else (ref * 1e-9)
+    # latency-tolerant price-match window: ≥3 ticks, and at least a real price gap
+    # so a sparse-book min-tick can't make it absurdly tight (mirrors the on-grid
+    # check's dual gate). A mismatch must exceed BOTH to flag.
+    match_tol = max((tk * 3.0) if tk > 0 else 0.0, ref * 0.003)
+
+    # Build the FOREIGN ladder: skip our own resting order's level once (at re-park
+    # our just-cancelled order may still be in the book — PB's own walk skips it).
+    own_price = book.our_order[1] if book.our_order else None
+    foreign: List[float] = []
+    skipped_own = False
+    for lv in levels:
+        if (own_price is not None and not skipped_own
+                and abs(lv.price - own_price) <= level_tol):
+            skipped_own = True
+            continue
+        # collapse duplicate/near-equal prices into distinct levels
+        if not foreign or abs(lv.price - foreign[-1]) > level_tol:
+            foreign.append(lv.price)
+        if len(foreign) >= 6:
+            break
+    if len(foreign) < 2:
+        a.refuge_xcheck_noob += 1
+        return
+
+    best_foreign = foreign[0]          # real L1 foreign
+    second_foreign = foreign[1]        # real 2nd foreign (the true wall)
+
+    if a.side == "sell":
+        # (1) nothing MATERIALLY cheaper than PB's jumper (jumper really is the front)
+        none_cheaper = best_foreign >= jumper - match_tol
+        # (2) logged jumper ≈ real best foreign (latency-tolerant)
+        jumper_matches = abs(jumper - best_foreign) <= match_tol
+        # (3) logged wall ≈ real 2nd foreign (latency-tolerant)
+        wall_matches = abs(wall - second_foreign) <= match_tol
+    else:
+        none_cheaper = best_foreign <= jumper + match_tol    # nothing higher than jumper
+        jumper_matches = abs(jumper - best_foreign) <= match_tol
+        wall_matches = abs(wall - second_foreign) <= match_tol
+
+    if none_cheaper and jumper_matches and wall_matches:
+        a.refuge_xcheck_ok += 1
+        a.checks_seen.add("refuge-wall/jumper-match-book")
+    else:
+        a.refuge_xcheck_bad += 1
+        why = []
+        if not none_cheaper:
+            why.append(f"a foreign level ({fmt_price(best_foreign)}) is ahead of PB's "
+                       f"jumper {fmt_price(jumper)}")
+        elif not jumper_matches:
+            why.append(f"PB's jumper {fmt_price(jumper)} ≠ real L1 {fmt_price(best_foreign)}")
+        if not wall_matches:
+            why.append(f"PB's wall {fmt_price(wall)} ≠ real 2nd level {fmt_price(second_foreign)}")
+        a.flag("refuge wall/jumper mis-ID vs live book: " + "; ".join(why))
+
+
 def audit_record_event(ev: "LogEvent"):
     """Fold one PB log event into the per-leg audit, reading the live book for
     OB-grounded correctness + performance metrics."""
+    global _global_stuck_cancels
+    # stuck-cancel carries no asset (PB logs only the order id/side) → global count.
+    if ev.kind == "stuck_cancel":
+        _global_stuck_cancels += 1
+        return
     if not ev.asset:
         return
     # Resolve the venue. PB has ONE live order per asset, on ONE venue at a time.
@@ -1040,6 +1240,9 @@ def audit_record_event(ev: "LogEvent"):
         if a.first_price == 0.0:
             a.first_price = ev.price
         a.last_price = ev.price
+        if ev.price > 0:
+            a.min_place_price = ev.price if a.min_place_price == 0.0 else min(a.min_place_price, ev.price)
+            a.max_place_price = max(a.max_place_price, ev.price)
         # REFUGE RE-PARK correctness — verified against PB's OWN stated wall/jumper
         # (from the preceding "refuge placement" line, stashed in _refuge_target),
         # NOT re-derived from book rank. PB's spec is "place at wall∓1tick, between
@@ -1115,10 +1318,11 @@ def audit_record_event(ev: "LogEvent"):
             a.in_refuge = True
             a.refuge_armed_at = time.time()
             m = REFUGE_ARM_RE.search(ev.raw)
-            if m and int(m.group(1)) < 10:
-                a.flag(f"refuge ARMED at streak {m.group(1)} (<10 — premature)")
+            if m and int(m.group(1)) < REFUGE_ARM_STREAK:
+                a.flag(f"refuge ARMED at streak {m.group(1)} "
+                       f"(<{REFUGE_ARM_STREAK:.0f} — premature)")
             else:
-                a.checks_seen.add("refuge-arm@streak≥10")
+                a.checks_seen.add("refuge-arm@streak")
         elif ev.reason == "EXITED":
             if a.in_refuge and a.refuge_armed_at:
                 a.refuge_secs += time.time() - a.refuge_armed_at
@@ -1145,18 +1349,37 @@ def audit_record_event(ev: "LogEvent"):
                 # verify it landed in the [jumper, wall] zone (PB's own definition
                 # of 2nd-best), immune to sparse-book level-rank divergence.
                 a._refuge_target = (wall, jumper)
+                # INDEPENDENT cross-check of PB's wall/jumper against the LIVE book.
+                # The zone check above trusts PB's own numbers; this one asks whether
+                # those numbers actually describe the real book front. Sparse-book-
+                # safe: we match logged prices to ACTUAL levels by proximity (a tick
+                # tolerance), never by level-rank counting (which false-flags on
+                # MANYU@htx's irregular grid). We verify three things on the foreign
+                # ladder (skipping our own just-cancelled level once):
+                #   (1) the jumper is genuinely L1 — no foreign order is cheaper
+                #       (sell) / higher (buy) than PB's logged jumper;
+                #   (2) PB's logged jumper price matches the real best foreign level;
+                #   (3) PB's logged wall price matches the NEXT distinct foreign
+                #       level above the jumper.
+                _refuge_xcheck(a, book, fresh, tk, wall, jumper)
             a._expect_refuge_place = True
 
     elif ev.kind == "backstop":
         a.backstops += 1
         a.checks_seen.add("backstop-fired")
 
+    elif ev.kind == "taker_fallback":
+        # maker price would have crossed → PB placed at the taker price. A real cost
+        # event for a maker-only strategy (paid taker, not maker rebate).
+        a.taker_fallbacks += 1
+
     # step-up count + gap correctness (cancel reason carries the gap)
     if ev.kind == "cancel" and _reason_head(ev.reason) == "step-up":
         a.stepups += 1
         sm = STEPUP_RE.search(ev.reason)
-        if sm and float(sm.group(1)) < 5.0:
-            a.flag(f"step-up at {sm.group(1)} ticks (<5 — below STEP_UP_MIN_GAP_TICKS)")
+        if sm and float(sm.group(1)) < STEP_UP_MIN_GAP_TICKS:
+            a.flag(f"step-up at {sm.group(1)} ticks "
+                   f"(<{STEP_UP_MIN_GAP_TICKS:.0f} — below STEP_UP_MIN_GAP_TICKS)")
         else:
             a.checks_seen.add("step-up-gap≥5t")
 
@@ -1307,11 +1530,21 @@ def print_summary(elapsed: float):
     tot_plc = sum(a.places for a in audit.values())
     tot_cxl = sum(a.cancels for a in audit.values())
     tot_ref = sum(a.refuge_arms for a in audit.values())
+    tot_taker = sum(a.taker_fallbacks for a in audit.values())
     print("\n" + "=" * 100)
     print(f"  POSITION BALANCER AUDIT   ·   {mins:.1f} min window   ·   "
           f"{len(legs)} active / {len(audit)} total legs   ·   grounded in live local orderbooks")
     print(f"  Captured live (every PB event correlated with the book at that instant): "
           f"{tot_plc} places · {tot_cxl} cancels · {tot_ref} refuge episodes.")
+    # Secondary cost/anomaly events (maker-only strategy crossing the spread, or a
+    # cancel that had to be force-cleaned). 0 is the healthy expectation.
+    if tot_taker or _global_stuck_cancels:
+        bits = []
+        if tot_taker:
+            bits.append(f"⚠ {tot_taker} taker-fallback place(s) (maker would cross → paid taker)")
+        if _global_stuck_cancels:
+            bits.append(f"⚠ {_global_stuck_cancels} stuck-cancel force-cleanup(s)")
+        print("  " + " · ".join(bits))
     print("=" * 100)
     if not legs:
         print("\n  No PB decisions captured in the window. Either the balancer is idle, or run longer.")
@@ -1329,9 +1562,10 @@ def print_summary(elapsed: float):
     total_viol = 0
     CHECK_LABEL = {
         "placement-on-grid":    "placement on-grid (top∓1t)",
-        "refuge-arm@streak≥10": "refuge arms @streak≥10",
+        "refuge-arm@streak":    f"refuge arms @streak≥{REFUGE_ARM_STREAK:.0f}",
         "refuge-park-under-wall": "refuge parks under wall",
         "refuge-exit":          "refuge exits cleanly",
+        "refuge-wall/jumper-match-book": "refuge wall/jumper match live book",
         "step-up-gap≥5t":       "step-up gap≥5t",
         "backstop-fired":       "backstop fired",
     }
@@ -1339,8 +1573,9 @@ def print_summary(elapsed: float):
         a = audit[key]
         # positive checks observed this window
         seen = [CHECK_LABEL[c] for c in
-                ("placement-on-grid", "refuge-arm@streak≥10", "refuge-park-under-wall",
-                 "refuge-exit", "step-up-gap≥5t", "backstop-fired") if c in a.checks_seen]
+                ("placement-on-grid", "refuge-arm@streak", "refuge-park-under-wall",
+                 "refuge-wall/jumper-match-book", "refuge-exit", "step-up-gap≥5t",
+                 "backstop-fired") if c in a.checks_seen]
         # REFUGE RE-PARK correctness (the real "sink" check): of the re-parks
         # measured against the live book, how many landed us correctly 2nd-best
         # (exactly 1 order ahead)? A re-park leaving ≥2 ahead is flagged in the
@@ -1350,6 +1585,10 @@ def print_summary(elapsed: float):
         if a.refuge_sink_samples:
             ok2 = sum(1 for c in a.refuge_sink_samples if c == 0)
             seen.append(f"refuge re-parked 2nd-best {ok2}/{len(a.refuge_sink_samples)}")
+        # INDEPENDENT cross-check: PB's logged wall/jumper vs the live book front
+        xj = a.refuge_xcheck_ok + a.refuge_xcheck_bad
+        if xj:
+            seen.append(f"wall/jumper vs book {a.refuge_xcheck_ok}/{xj}")
         plc_judged = a.place_correct + a.place_offbook
         if plc_judged:
             seen.append(f"placed-on-grid {_pct(a.place_correct, plc_judged)} (n={plc_judged})")
@@ -1363,7 +1602,7 @@ def print_summary(elapsed: float):
     print()
     if total_viol == 0:
         print("  VERDICT: ✓ workflow CORRECT — every PB decision in the window matched its spec")
-        print("  (placements on-grid, refuge armed@streak≥10 & parked under the wall & exited on a")
+        print(f"  (placements on-grid, refuge armed@streak≥{REFUGE_ARM_STREAK:.0f} & parked under the wall & exited on a")
         print("   valid condition, step-ups gap≥5t & never in refuge, backstop behaving).")
     else:
         print(f"  VERDICT: ⚠ {total_viol} spec deviation(s) flagged above — investigate before trusting perf numbers.")
@@ -1375,7 +1614,7 @@ def print_summary(elapsed: float):
     print("  PART B — REAL-WORLD PERFORMANCE   (how the PB logic fares against the live orderbook)")
     print("─" * 100)
     print(f"  {'leg':18s} {'side':4s} {'plc':>4s} {'cxl':>4s} {'cxl/m':>5s} {'fill':>4s} "
-          f"{'top%':>5s} {'refuge':>8s} {'undercut(t)':>11s} {'tight':>5s} {'drift':>7s}")
+          f"{'top%':>5s} {'refuge':>8s} {'undercut(t)':>11s} {'tight':>5s} {'MAE%':>6s}")
     print("  " + "-" * 96)
     for key in legs:
         a = audit[key]
@@ -1386,13 +1625,15 @@ def print_summary(elapsed: float):
                   else ("in" if a.in_refuge else "—"))
         ucd = f"{sorted(a.undercut_depths)[len(a.undercut_depths)//2]:.0f}" if a.undercut_depths else "—"
         tight = _pct(a.tight_spread_samples, a.spread_samples)
-        drift = (f"{(a.last_price-a.first_price)/a.first_price*100:+.2f}%"
-                 if a.first_price and a.last_price and a.first_price > 0 else "—")
+        mae = a.mae_pct()
+        mae_s = f"{mae:.2f}%" if mae is not None else "—"
         print(f"  {key:18s} {side:4s} {a.places:>4d} {a.cancels:>4d} {cxl_min:>5s} {a.fills:>4d} "
-              f"{top:>5s} {refuge:>8s} {ucd:>11s} {tight:>5s} {drift:>7s}")
+              f"{top:>5s} {refuge:>8s} {ucd:>11s} {tight:>5s} {mae_s:>6s}")
     print("\n  Columns: top% = of fresh-book samples we held the correct spot (L1, or 2nd-best in")
     print("  refuge) ON the venue PB is using · cxl/m = cancel rate · undercut(t) = median ticks a")
-    print("  competitor came inside us · tight = % of time spread ≤1 tick (low room to capture).")
+    print("  competitor came inside us · tight = % of time spread ≤1 tick · MAE% = max adverse")
+    print("  excursion: how far placements travelled the WRONG way (sell: below the session high /")
+    print("  buy: above the low) — the price-floor exposure (refuge bails, then chases the book down).")
 
     # refuge effectiveness detail (only legs that entered refuge)
     ref_legs = [k for k in legs if audit[k].refuge_arms]
@@ -1442,8 +1683,19 @@ def _focus_areas(mins: float) -> List[Tuple[str, str]]:
             continue
         ucd_med = (sorted(a.undercut_depths)[len(a.undercut_depths)//2]
                    if a.undercut_depths else 0)
-        # 1. losing the L1 fight: low top% + heavy churn
-        if a.samples > 30 and a.at_top_samples / a.samples < 0.4 and a.cancels > 10:
+        # 0. price-floor exposure: large max-adverse-excursion. The notes-MD #1
+        #    real-money risk — PB chased the book far the wrong way (refuge bails
+        #    via `sank below N`, then chases down with no floor). Ranks ABOVE the
+        #    L1 fight (it's a realized-loss signal, not just a positioning one).
+        mae = a.mae_pct()
+        if mae is not None and mae >= 5.0:
+            out.append((-1, "‼", f"{key}: placements travelled {mae:.1f}% the wrong way (max adverse "
+                        f"excursion, {a.side}-side) — chased the book {'down' if a.side=='sell' else 'up'} "
+                        f"with no price floor. A per-session floor / taker punch-through would cap this."))
+        # 1. losing the L1 fight: low top% + heavy churn. Threshold relaxed from
+        #    samples>30 to >12 so a thin-but-contested leg (e.g. MANYU@mexc n=12)
+        #    isn't silently exempt; still requires real churn (>10 cancels).
+        if a.samples > 12 and a.at_top_samples / a.samples < 0.4 and a.cancels > 10:
             out.append((0, "‼", f"{key}: held the correct spot only {_pct(a.at_top_samples, a.samples)} "
                         f"despite {a.cancels} cancels ({a.cancels/mins:.1f}/min) — losing the L1 fight. "
                         f"Arm refuge sooner (lower REFUGE_ARM_STREAK) or chase slower."))
@@ -1468,12 +1720,14 @@ def _focus_areas(mins: float) -> List[Tuple[str, str]]:
         if a.spread_samples > 40 and a.tight_spread_samples / a.spread_samples > 0.8 and a.cancels > 10:
             out.append((4, "•", f"{key}: spread ≤1 tick {_pct(a.tight_spread_samples, a.spread_samples)} "
                         f"of the time — repricing captures almost nothing; widen chase cadence to cut churn."))
-        # 6. price ran against us during the session
-        if a.first_price and a.last_price and a.first_price > 0:
+        # 6. net directional move against us — complements #0 (MAE/peak). Only
+        #    fires when MAE didn't already flag this leg (avoid a near-duplicate
+        #    line): a steady adverse grind whose peak excursion stayed <5%.
+        if a.first_price and a.last_price and a.first_price > 0 and not (mae is not None and mae >= 5.0):
             d = (a.last_price - a.first_price) / a.first_price * 100
             adverse = d < -3 if a.side == "sell" else d > 3
             if adverse:
-                out.append((5, "•", f"{key}: price moved {d:+.1f}% against the {a.side}-side over the "
+                out.append((5, "•", f"{key}: net price moved {d:+.1f}% against the {a.side}-side over the "
                             f"window — fills weren't captured before the move; check fill-pressure / cadence."))
     out.sort(key=lambda x: x[0])
     return [(m, msg) for _, m, msg in out]
