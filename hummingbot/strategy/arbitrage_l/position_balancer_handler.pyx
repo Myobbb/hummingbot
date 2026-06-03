@@ -306,8 +306,24 @@ cdef class PositionBalancerHandler:
         self._canonical_asset = {}
         self._build_asset_aliases()
         
-        # Cache for invariant trading rules
-        self._min_price_increment_cache = {}
+    cdef double c_get_min_tick(self, object market_tuple):
+        """Min price increment (tick) for THIS specific market — read fresh per market,
+        exactly like the parent arb_l strategy (arbitrage.pyx: `market._trading_rules.get(
+        trading_pair).min_price_increment`). `_trading_rules` is an in-memory dict (O(1),
+        no network), so no cache is needed. NOTE: we deliberately do NOT cache by
+        trading_pair — a multi-venue asset shares the SAME pair string (e.g. 'PANTHER-USDT')
+        across exchanges with DIFFERENT ticks (htx 1e-5 vs mexc 1e-6), so a pair-keyed cache
+        returned the first venue's tick for all of them. Returns 0.0 if unavailable."""
+        cdef object tr
+        if market_tuple is None:
+            return 0.0
+        try:
+            tr = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
+            if tr is not None and tr.min_price_increment is not None:
+                return float(tr.min_price_increment)
+        except Exception:
+            pass
+        return 0.0
 
     @property
     def is_buy_active(self):
@@ -1589,16 +1605,9 @@ cdef class PositionBalancerHandler:
             if order_ob._ask_book.size() > 0:
                 current_ask = float(deref(order_ob._ask_book.begin()).getPrice())
 
-            # Get min_price_increment (cached)
+            # Get this market's min_price_increment (per-market, fresh — no shared cache).
             trading_pair = order_market_tuple.trading_pair
-            if trading_pair in self._min_price_increment_cache:
-                min_price_increment = self._min_price_increment_cache[trading_pair]
-            else:
-                trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
-                min_price_increment = 0.0
-                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                    min_price_increment = float(trading_rule.min_price_increment)
-                self._min_price_increment_cache[trading_pair] = min_price_increment
+            min_price_increment = self.c_get_min_tick(order_market_tuple)
 
             # ================================================================
             # CHECK 1: Better market available (ALL MODES)
@@ -1620,17 +1629,10 @@ cdef class PositionBalancerHandler:
                 # For 'min' mode: compare effective frontrun prices with hysteresis
                 # Only switch if new market is significantly better (0.1%) to prevent flip-flopping
                 if spread_is_min:
-                    # Get effective price of new best market
+                    # Get effective price of new best market (its OWN per-market tick).
                     best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                    best_min_tick = 0.0
                     best_trading_pair = current_best_market.trading_pair
-                    if best_trading_pair in self._min_price_increment_cache:
-                        best_min_tick = self._min_price_increment_cache[best_trading_pair]
-                    else:
-                        best_trading_rule = current_best_market.market._trading_rules.get(best_trading_pair)
-                        if best_trading_rule is not None and best_trading_rule.min_price_increment is not None:
-                            best_min_tick = float(best_trading_rule.min_price_increment)
-                        self._min_price_increment_cache[best_trading_pair] = best_min_tick
+                    best_min_tick = self.c_get_min_tick(current_best_market)
                     
                     if is_buy:
                         if best_ob._bid_book.size() > 0 and best_min_tick > 0:
@@ -1841,13 +1843,7 @@ cdef class PositionBalancerHandler:
                 return 1                                   # neutral: stay in refuge
             market_tuple, order_price = order_details
             trading_pair = market_tuple.trading_pair
-            if trading_pair in self._min_price_increment_cache:
-                min_tick = self._min_price_increment_cache[trading_pair]
-            else:
-                trading_rule = market_tuple.market._trading_rules.get(trading_pair)
-                if trading_rule is not None and trading_rule.min_price_increment is not None:
-                    min_tick = float(trading_rule.min_price_increment)
-                self._min_price_increment_cache[trading_pair] = min_tick
+            min_tick = self.c_get_min_tick(market_tuple)   # THIS market's tick (per-market)
             if min_tick <= 0:
                 return 1                                   # neutral
             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(trading_pair)
@@ -2051,16 +2047,9 @@ cdef class PositionBalancerHandler:
                                 else:
                                     current_bid = 0.0
 
-                                # Get min_price_increment (cached)
+                                # This market's min_price_increment (per-market, fresh).
                                 trading_pair = order_market_tuple.trading_pair
-                                if trading_pair in self._min_price_increment_cache:
-                                    min_price_increment = self._min_price_increment_cache[trading_pair]
-                                else:
-                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
-                                    min_price_increment = 0.0
-                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                        min_price_increment = float(trading_rule.min_price_increment)
-                                    self._min_price_increment_cache[trading_pair] = min_price_increment
+                                min_price_increment = self.c_get_min_tick(order_market_tuple)
 
                                 # Calculate effective_bid (second level if top is OUR order)
                                 effective_bid = self.c_get_effective_reference_price(
@@ -2277,16 +2266,9 @@ cdef class PositionBalancerHandler:
 
                                 current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
 
-                                # Get min_price_increment (cached)
+                                # This market's min_price_increment (per-market, fresh).
                                 trading_pair = order_market_tuple.trading_pair
-                                if trading_pair in self._min_price_increment_cache:
-                                    min_price_increment = self._min_price_increment_cache[trading_pair]
-                                else:
-                                    trading_rule = order_market_tuple.market._trading_rules.get(trading_pair)
-                                    min_price_increment = 0.0
-                                    if trading_rule is not None and trading_rule.min_price_increment is not None:
-                                        min_price_increment = float(trading_rule.min_price_increment)
-                                    self._min_price_increment_cache[trading_pair] = min_price_increment
+                                min_price_increment = self.c_get_min_tick(order_market_tuple)
 
                                 # Calculate effective_ask (second level if top is OUR order)
                                 effective_ask = self.c_get_effective_reference_price(

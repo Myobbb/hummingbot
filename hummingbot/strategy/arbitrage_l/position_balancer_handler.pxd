@@ -60,11 +60,9 @@ cdef class PositionBalancerHandler:
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset
-        
-        # Cache for invariant trading rules
-        dict _min_price_increment_cache
 
     # Core methods
+    cdef double c_get_min_tick(self, object market_tuple)
     cdef void _build_asset_aliases(self)
     cdef str _get_canonical_asset(self, str asset)
     cdef list _get_all_asset_aliases(self, str asset)
