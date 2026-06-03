@@ -162,7 +162,7 @@ cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before w
                                        # retreat early) + add a price-floor/taker terminal for the `sank below N`
                                        # exits the audit sees routinely — see position-balancer-notes.md.
 # While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
-# ONCE PER 5-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 300s-age mark
+# ONCE PER ~2-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 120s-age mark
 # — the order is still live there so order_price is known). At that single re-evaluation we count
 # foreign orders beating us (c_refuge_foreign_below):
 #   0  -> jumper gone (alone at top)            -> EXIT refuge, re-place NORMAL
@@ -768,7 +768,7 @@ cdef class PositionBalancerHandler:
                     # Exit refuge on a FILL-driven completion (belt-and-suspenders alongside
                     # handle_order_fill). filled_amt > 0 means this completion involved a fill, so
                     # it's a genuine trade, not a pure cancel. A pure cancel (filled_amt == 0 —
-                    # refuge entry / 300s backstop refresh) MUST NOT clear refuge.
+                    # refuge entry / 120s backstop refresh) MUST NOT clear refuge.
                     # (handle_order_fill usually clears it first on the OrderFilledEvent; this only
                     # logs if it hadn't — e.g. a Completed event with no preceding Filled event.)
                     if filled_amt > 0 and self._in_refuge_buy.pop(self._get_canonical_asset(asset_key), None):
@@ -797,7 +797,7 @@ cdef class PositionBalancerHandler:
                     unfilled_amt = total_amt - filled_amt
                     # Exit refuge on a FILL-driven completion (belt-and-suspenders alongside
                     # handle_order_fill). filled_amt > 0 => a genuine trade, not a pure cancel.
-                    # A pure cancel (filled_amt == 0 — refuge entry / 300s backstop) MUST NOT clear refuge.
+                    # A pure cancel (filled_amt == 0 — refuge entry / 120s backstop) MUST NOT clear refuge.
                     # (handle_order_fill usually clears it first; this only logs if it hadn't.)
                     if filled_amt > 0 and self._in_refuge_sell.pop(self._get_canonical_asset(asset_key), None):
                         self.strategy.logger().info(
@@ -935,7 +935,7 @@ cdef class PositionBalancerHandler:
 
     def should_backstop_refresh(self, str order_id):
         """
-        Decide whether the arb-layer 300s backstop (c_cleanup_old_orders) should actually
+        Decide whether the arb-layer 120s backstop (c_cleanup_old_orders) should actually
         cancel/re-place this position-balancer order, or leave it in place.
 
         The backstop is purely age-based: it fires every ~10 min regardless of whether the
@@ -946,19 +946,19 @@ cdef class PositionBalancerHandler:
         Returns True  -> let the backstop refresh (cancel + re-place).
         Returns False -> order is still correctly placed; skip the refresh (keep queue position).
 
-        Refuge orders: this is the ONE 5-min periodic re-evaluation point for them (called by the
-        backstop at the 300s-age mark — NOT per tick). We count foreign orders beating us
+        Refuge orders: this is the ONE ~2-min periodic re-evaluation point for them (called by the
+        backstop at the 120s-age mark — NOT per tick). We count foreign orders beating us
         (c_refuge_foreign_below) and decide:
           • count == 0 -> jumper gone (alone at top)   -> EXIT refuge, then refresh (re-place NORMAL).
           • count >= 2 -> sank below >1 order (premise broken) -> EXIT refuge, then refresh (NORMAL).
           • count == 1 -> normal refuge hold -> stay in refuge, refresh (re-park under the wall).
         Either way we return True (the backstop always re-places a refuge order); the only question
         is whether the flag survives into the re-place (count 1 -> refuge re-park; 0/≥2 -> normal).
-        The check lives HERE so it fires exactly once per 5-min backstop cycle, never on a stray tick.
+        The check lives HERE so it fires exactly once per ~2-min backstop cycle, never on a stray tick.
 
         Otherwise (non-refuge) we reuse the SAME oracle as the per-tick chase logic
         (c_check_immediate_conditions) with a large order_age so every check is active
-        (better-market 60s gate included — the order is 5 min old). If it reports a cancel
+        (better-market 60s gate included — the order is 2 min old). If it reports a cancel
         condition (undercut / gap / better-market), the order is no longer correctly placed
         -> refresh. If it reports nothing, the order is still at the right price -> skip.
 
@@ -990,7 +990,7 @@ cdef class PositionBalancerHandler:
             if asset is None:
                 return True
 
-            # Refuge orders — the 5-min periodic re-evaluation (count orders below us).
+            # Refuge orders — the ~2-min periodic re-evaluation (count orders below us).
             canonical = self._get_canonical_asset(asset)
             if (is_buy and self._in_refuge_buy.get(canonical, False)) or \
                ((not is_buy) and self._in_refuge_sell.get(canonical, False)):
@@ -1765,7 +1765,7 @@ cdef class PositionBalancerHandler:
                     # so it never feeds the undercut streak / bid-war backoff).
                     # DISABLED while in refuge: a refuge order's "gap above" is expected (we're parked
                     # deep), and step-up would walk it up the book every 30s, defeating refuge's
-                    # park-and-hold. A refuge order is repositioned only by the 300s arb backstop
+                    # park-and-hold. A refuge order is repositioned only by the 120s arb backstop
                     # (which re-reads the wall on the next placement while still in refuge).
                     if (not should_cancel and spread_is_min and min_price_increment > 0
                             and not self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
@@ -1964,7 +1964,7 @@ cdef class PositionBalancerHandler:
                             asset, True, current_time - last_time, effective_frontrun_delay)
 
                     # NOTE: refuge re-evaluation (count foreign orders above us → EXIT if 0=frontrunner
-                    # gone or >=2=sank below >1 order) is done once per 5-min backstop cycle in
+                    # gone or >=2=sank below >1 order) is done once per ~2-min backstop cycle in
                     # should_backstop_refresh, NOT here per-tick. On tick we only SUPPRESS + HOLD (below).
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
@@ -1977,7 +1977,7 @@ cdef class PositionBalancerHandler:
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_buy.get(refuge_canonical, False):
                             # (a) HOLD — suppress the frontrun and sit above the wall. Per-tick does NOT
-                            # reposition/re-evaluate; the 300s backstop (should_backstop_refresh) does the
+                            # reposition/re-evaluate; the 120s backstop (should_backstop_refresh) does the
                             # ~5-6 min count-based re-eval (re-park under wall / exit on 0 or >=2). Mirror of sell.
                             should_cancel = False
                             cancel_reason = ""
@@ -2182,7 +2182,7 @@ cdef class PositionBalancerHandler:
 
                     # NOTE: the refuge re-evaluation (count foreign orders below us → EXIT refuge if
                     # 0 = jumper gone, or >=2 = sank below >1 order so the 2nd-best premise is broken)
-                    # is NOT done here per-tick. It runs once per 5-min backstop cycle in
+                    # is NOT done here per-tick. It runs once per ~2-min backstop cycle in
                     # should_backstop_refresh (the order is still live there, so order_price is known).
                     # On tick we only SUPPRESS undercut + HOLD (below); repositioning/exit is the
                     # backstop's job. See should_backstop_refresh + position-balancer.md Exit conditions.
@@ -2202,7 +2202,7 @@ cdef class PositionBalancerHandler:
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_sell.get(refuge_canonical, False):
                             # (a) HOLD — suppress the undercut and sit under the wall. Per-tick does
-                            # NOT reposition or re-evaluate a refuge order; that is the 300s backstop's
+                            # NOT reposition or re-evaluate a refuge order; that is the 120s backstop's
                             # job (should_backstop_refresh): every ~5-6 min it counts orders below us
                             # and either re-parks under the current wall (1 jumper) or EXITS refuge
                             # (0 = jumper gone, >=2 = sank below >1 order). On tick we only suppress + hold.
