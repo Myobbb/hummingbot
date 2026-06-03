@@ -2984,15 +2984,18 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id}: {e}")
 
-        # Log order placement
+        # Log order placement. Includes `on {venue}` (symmetric with the Cancelled line)
+        # so the placed venue is explicit — a multi-venue asset (e.g. PANTHER htx↔mexc)
+        # picks its best market per place via c_find_best_buy_market, and without the
+        # venue here the place line couldn't be attributed to a leg from the log alone.
         if self._buy_spread_is_min:
             self.strategy.logger().info(
                 f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {buy_price:.8g} (spread: min tick)")
+                f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
                 f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {buy_price:.8g} (spread: {self._buy_spread_pct * 100:.2f}%)")
+                f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
@@ -3294,15 +3297,18 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id}: {e}")
 
-        # Log order placement
+        # Log order placement. Includes `on {venue}` (symmetric with the Cancelled line)
+        # so the placed venue is explicit — a multi-venue asset picks its best market per
+        # place via c_find_best_sell_market, and without the venue here the place line
+        # couldn't be attributed to a leg from the log alone.
         if self._sell_spread_is_min:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.8g} (spread: min tick)")
+                f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
                 f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
-                f"at {sell_price:.8g} (spread: {self._sell_spread_pct * 100:.2f}%)")
+                f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
