@@ -54,6 +54,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # MBP sequence tracking per symbol for gap detection
         # Key: exchange symbol (lowercase), Value: last received seqNum
         self._last_seq_num: Dict[str, int] = {}
+
+        # Flash-order (ghost-wall) suppression state, per exchange symbol (lowercase).
+        # Maintained only from raw mbp.refresh.20 snapshots; see _apply_flash_filter and
+        # htx_constants.FLASH_FILTER_*. Each entry:
+        #   {"bid_px", "bid_cnt", "ask_px", "ask_cnt", "spread_ema"}
+        # Cleared alongside _last_seq_num on (re)subscribe so a reconnect starts clean.
+        self._flash_state: Dict[str, Dict[str, float]] = {}
         
         # Track active WebSocket for snapshot requests
         self._active_ws: Optional[WSAssistant] = None
@@ -360,6 +367,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         try:
             self._last_seq_num.clear()
+            self._flash_state.clear()
 
             symbols_to_snapshot: List[str] = []
 
@@ -538,15 +546,27 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self._symbol_to_pair_cache[order_book_symbol] = trading_pair
                 
                 msg_ts = raw_message.get("ts", time.time() * 1000) * 1e-3
+                bids = tick.get("bids", [])
+                asks = tick.get("asks", [])
+
+                # Flash-order (ghost-wall) suppression. Applied ONLY here, on the
+                # raw 100ms mbp.refresh.20 full snapshot — never on mbp.5 diffs or
+                # `req` responses (those leave the seqNum machinery untouched). Off
+                # the hot path; fail-open. See _apply_flash_filter + htx_constants.
+                if CONSTANTS.FLASH_FILTER_ENABLED:
+                    bids, asks = self._apply_flash_filter(
+                        order_book_symbol, trading_pair, bids, asks
+                    )
+
                 content = {
                     "trading_pair": trading_pair,
                     "update_id": seq_num,
-                    "bids": tick.get("bids", []),
-                    "asks": tick.get("asks", [])
+                    "bids": bids,
+                    "asks": asks
                 }
                 snapshot_msg = OrderBookMessage(OrderBookMessageType.SNAPSHOT, content, timestamp=msg_ts)
                 message_queue.put_nowait(snapshot_msg)
-                
+
             else:
                 # mbp.X - tick-by-tick incremental update
                 prev_seq_num = tick.get("prevSeqNum", 0)
@@ -590,6 +610,159 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }
                 diff_msg = OrderBookMessage(OrderBookMessageType.DIFF, content, timestamp=msg_ts)
                 message_queue.put_nowait(diff_msg)
+
+    def _pair_flash_filtered(self, trading_pair: str) -> bool:
+        """Whether the flash filter applies to this pair (master switch already checked)."""
+        return CONSTANTS.FLASH_FILTER_ALL_PAIRS or (trading_pair in CONSTANTS.FLASH_FILTER_PAIRS)
+
+    def _apply_flash_filter(self,
+                            symbol: str,
+                            trading_pair: str,
+                            bids: List[Any],
+                            asks: List[Any]):
+        """
+        Withhold an *improving* inside level until it persists across N consecutive raw
+        mbp.refresh.20 snapshots (L2), with a stricter gate on chronically-wide,
+        flash-prone books (L4). Returns possibly-trimmed (bids, asks).
+
+        Runs in the async MBP parse coroutine — OFF the Cython hot path. The strategy's
+        c_tick reads the already-trimmed C++ book, so the fire path pays zero added cost.
+        Mirrors the empirically-validated ws_book_checker HTX filter (L2 raw-snapshot
+        persistence + L4 wide-gap); L1/L3 are deferred (clean seams).
+
+        Contract / safety:
+          - Only invoked from the mbp.refresh.20 SNAPSHOT branch (full-book reset every
+            ~100ms), so withholding a level is self-healing: a genuine level re-enters on
+            the next refresh once confirmed.
+          - Only *improving* inside levels are ever withheld; a receding/worse top is
+            always passed through (never clip a real market move).
+          - Per-side, price-keyed (wide-book lesson: never mid-keyed).
+          - Fail-open: any exception returns the original (bids, asks) untouched.
+        """
+        try:
+            if not self._pair_flash_filtered(trading_pair):
+                return bids, asks
+
+            best_bid = self._best_price(bids, want_max=True)
+            best_ask = self._best_price(asks, want_max=False)
+            # Need a two-sided book to reason about the inside and the spread.
+            if best_bid is None or best_ask is None or best_bid <= 0.0 or best_ask <= 0.0:
+                return bids, asks
+
+            st = self._flash_state.get(symbol)
+            if st is None:
+                # First refresh for this symbol: seed baselines, suppress nothing
+                # (no prior to compare against — avoid a cold-start false drop).
+                mid = 0.5 * (best_bid + best_ask)
+                st = {
+                    "bid_px": best_bid, "bid_cnt": 1,
+                    "ask_px": best_ask, "ask_cnt": 1,
+                    "spread_ema": ((best_ask - best_bid) / mid * 100.0) if mid > 0 else 0.0,
+                }
+                self._flash_state[symbol] = st
+                return bids, asks
+
+            eps = CONSTANTS.FLASH_FILTER_PRICE_EPS
+            need = CONSTANTS.FLASH_FILTER_PERSIST_RAW_SNAPS
+
+            # --- L2 persistence counters (per side, on raw snapshots) ---
+            # Same inside price (within eps) => increment confirmation; else this is a
+            # new inside level => reset to 1 and remember it.
+            if self._prices_equal(best_bid, st["bid_px"], eps):
+                st["bid_cnt"] += 1
+            else:
+                st["bid_cnt"] = 1
+            prev_bid = st["bid_px"]
+            st["bid_px"] = best_bid
+
+            if self._prices_equal(best_ask, st["ask_px"], eps):
+                st["ask_cnt"] += 1
+            else:
+                st["ask_cnt"] = 1
+            prev_ask = st["ask_px"]
+            st["ask_px"] = best_ask
+
+            # --- L4 baseline spread (EMA) ---
+            mid = 0.5 * (best_bid + best_ask)
+            spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid > 0 else 0.0
+            a = CONSTANTS.FLASH_FILTER_SPREAD_EMA_ALPHA
+            st["spread_ema"] = (1.0 - a) * st["spread_ema"] + a * spread_pct
+            wide = st["spread_ema"] >= CONSTANTS.FLASH_FILTER_WIDE_SPREAD_PCT
+
+            # A side is a suppression candidate when its inside level is NEW this snapshot
+            # (cnt == 1) and not yet confirmed (need > 1). On normal books we only withhold
+            # an *improving* inside (better bid / better ask) — a receding top is a real
+            # market move and is always kept. On chronically-wide (flash-prone) books we
+            # also withhold a brand-new inside that closes the gap, regardless of direction,
+            # since that is exactly the flash gap-fill pattern.
+            bid_improves = best_bid > prev_bid * (1.0 + eps)
+            ask_improves = best_ask < prev_ask * (1.0 - eps)
+
+            drop_bid = (st["bid_cnt"] < need) and (bid_improves or wide)
+            drop_ask = (st["ask_cnt"] < need) and (ask_improves or wide)
+
+            if not drop_bid and not drop_ask:
+                return bids, asks
+
+            new_bids = self._drop_inside(bids, best_bid, eps) if drop_bid else bids
+            new_asks = self._drop_inside(asks, best_ask, eps) if drop_ask else asks
+
+            if CONSTANTS.FLASH_FILTER_LOG_SUPPRESSIONS:
+                self.logger().debug(
+                    "HTX flash-filter withheld inside level on %s "
+                    "(bid=%s drop=%s cnt=%s | ask=%s drop=%s cnt=%s | "
+                    "spread_ema=%.3f%% wide=%s need=%s)",
+                    trading_pair, best_bid, drop_bid, st["bid_cnt"],
+                    best_ask, drop_ask, st["ask_cnt"], st["spread_ema"], wide, need,
+                )
+            return new_bids, new_asks
+
+        except Exception:
+            # Fail-open: never lose a real book update to a filter bug.
+            self.logger().debug("HTX flash-filter error; passing snapshot through", exc_info=True)
+            return bids, asks
+
+    @staticmethod
+    def _best_price(levels: List[Any], want_max: bool) -> Optional[float]:
+        """Best (max for bids / min for asks) positive price over [[price, amount], ...].
+        Robust to input ordering and to string-encoded numbers."""
+        best: Optional[float] = None
+        for lvl in levels:
+            try:
+                px = float(lvl[0])
+                amt = float(lvl[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if px <= 0.0 or amt <= 0.0:
+                continue
+            if best is None or (px > best if want_max else px < best):
+                best = px
+        return best
+
+    @staticmethod
+    def _prices_equal(a: float, b: float, eps: float) -> bool:
+        if b == 0.0:
+            return a == 0.0
+        return abs(a - b) <= eps * abs(b)
+
+    @classmethod
+    def _drop_inside(cls, levels: List[Any], inside_px: float, eps: float) -> List[Any]:
+        """Return levels with the single inside price (within eps) removed. The book then
+        falls back to the next-best confirmed level on that side; the next refresh restores
+        the level if it persists."""
+        out = []
+        removed = False
+        for lvl in levels:
+            try:
+                px = float(lvl[0])
+            except (TypeError, ValueError, IndexError):
+                out.append(lvl)
+                continue
+            if not removed and cls._prices_equal(px, inside_px, eps):
+                removed = True
+                continue
+            out.append(lvl)
+        return out
 
     async def _process_message_for_unknown_channel(self, event_message: Dict[str, Any], websocket_assistant: WSAssistant, name: str):
         # Server may send ping - respond immediately

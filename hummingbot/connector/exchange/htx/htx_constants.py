@@ -88,3 +88,59 @@ ORDER_STATE = {
 # Timeout (seconds) after last partial-filled update to auto-finalize as FILLED
 # Keeps strategies from hanging when HTX never emits a final filled state.
 PARTIAL_FINALIZE_TIMEOUT_S = 6.0
+
+
+# ---------------------------------------------------------------------------
+# HTX flash-order (ghost-wall) suppression — orderbook parse-path filter
+# ---------------------------------------------------------------------------
+# HTX spot books are dominated by colocated/in-house bot activity that produces
+# untradeable false inside-quotes: (a) FLASH GHOST WALLS — a level placed+pulled
+# between snapshots (gone next refresh, never fills); (b) FLASH GAP-FILLS on
+# chronically-wide illiquid books (a normally-wide spread momentarily closed by a
+# flash, faking a tight cross). arb_l fires on a single top-of-book read in the
+# Cython hot path, so a flash that survives one mbp.refresh.20 snapshot can trigger
+# a spurious arb leg that never fills on the HTX side.
+#
+# This filter runs in the connector's async MBP-parse path (OFF the hot path) and
+# withholds an *improving* inside level until it has been confirmed across N
+# consecutive raw mbp.refresh.20 snapshots (L2 persistence), with a stricter gate on
+# chronically-wide (flash-prone) books (L4 wide-gap). Because mbp.refresh.20 fully
+# resets the book every ~100ms, a genuine level re-enters within ~100ms once
+# confirmed; the hot path then reads an already-clean book at zero added cost.
+#
+# Empirical basis + the validated multi-signal design it mirrors: the ws_book_checker
+# (monitor) HTX 4-signal classifier — see Tracker_cex_cex/ws_book_checker/HTX_GHOST_FILTER.md
+# and wiki trading/tracker-cex-cex/ws-book-checker.md. L1 (per-side dislocation) and
+# L3 (trade.detail takeout/wash) are intentionally deferred; clean seams are left for them.
+#
+# DEFAULT OFF and per-pair gated so it ships dark and is enabled deliberately.
+
+# Master switch. When False, the parse path is byte-for-byte the prior behavior.
+FLASH_FILTER_ENABLED = True
+
+# Per-trading-pair allowlist (e.g. {"BTC-USDT"}). Empty + ALL_PAIRS False => no pair
+# is filtered even if FLASH_FILTER_ENABLED is True (extra safety belt).
+FLASH_FILTER_PAIRS: set = set()
+# If True, apply to every HTX pair (ignores FLASH_FILTER_PAIRS). Use once validated.
+FLASH_FILTER_ALL_PAIRS = True
+
+# L2 — min consecutive RAW mbp.refresh.20 snapshots an improving inside level must
+# persist before it is allowed into the book. 2 => ~100ms of confirmation. The monitor
+# uses 6 (it is a reporter; the connector clipping a real level is costlier, so start
+# conservative). Receding/worse tops are NEVER withheld — only newly-improving ones.
+FLASH_FILTER_PERSIST_RAW_SNAPS = 2
+
+# L4 — baseline (EMA) HTX spread % at/above which a book is treated as chronically
+# illiquid/flash-prone; on such books the persistence requirement is enforced even
+# when not strictly "improving" (these are where flash gap-fills do the most damage).
+FLASH_FILTER_WIDE_SPREAD_PCT = 3.0
+
+# EMA smoothing for the rolling baseline-spread estimate (L4). Small => slow baseline.
+FLASH_FILTER_SPREAD_EMA_ALPHA = 0.1
+
+# Price-equality tolerance (fraction of price) for "same level persisted" comparisons,
+# absorbing float noise. 0.0005 = 0.05%.
+FLASH_FILTER_PRICE_EPS = 0.0005
+
+# Emit a DEBUG line each time a level is withheld (audit trail; no hot-path cost).
+FLASH_FILTER_LOG_SUPPRESSIONS = True
