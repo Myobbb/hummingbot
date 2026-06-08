@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import time
@@ -55,7 +56,11 @@ class AscendExAuth(AuthBase):
 
         timestamp = str(int(self._time() * 1e3))
         message = timestamp + path_url
-        signature = hmac.new(self.secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+        # AscendEX requires a base64-encoded HMAC-SHA256 signature (not hex). Prehash = <timestamp>+<api-path>.
+        # https://ascendex.github.io/ascendex-pro-api/#sign-a-request
+        signature = base64.b64encode(
+            hmac.new(self.secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("utf-8")
 
         return {
             "x-auth-key": self.api_key,

@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -27,9 +27,6 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class AscendExExchange(ExchangePyBase):
     """
@@ -43,15 +40,15 @@ class AscendExExchange(ExchangePyBase):
 
     def __init__(
         self,
-        client_config_map: "ClientConfigAdapter",
         ascend_ex_api_key: str,
         ascend_ex_secret_key: str,
         ascend_ex_group_id: str,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
     ):
         """
-        :param client_config_map: The config map of the client instance.
         :param ascend_ex_api_key: The API key to connect to private AscendEx APIs.
         :param ascend_ex_secret_key: The API secret.
         :param trading_pairs: The market trading pairs which to track order book data.
@@ -62,7 +59,7 @@ class AscendExExchange(ExchangePyBase):
         self.ascend_ex_group_id = ascend_ex_group_id
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        super().__init__(client_config_map=client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
         self._last_known_sequence_number = 0
 
@@ -356,7 +353,7 @@ class AscendExExchange(ExchangePyBase):
                             trading_pair=updatable_order.trading_pair,
                             update_timestamp=event_timestamp,
                             new_state=updated_status,
-                            client_order_id=fillable_order.client_order_id,
+                            client_order_id=updatable_order.client_order_id,
                             exchange_order_id=order_id,
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
@@ -424,7 +421,9 @@ class AscendExExchange(ExchangePyBase):
             path_url=CONSTANTS.FEE_PATH_URL,
             is_auth_required=True,
         )
-        fees_json = resp.get("data", {}).get("fees", [])
+        # spot/fee returns {"data": {"productFee": [{"symbol": ..., "fee": {"maker": ..., "taker": ...}}, ...]}}
+        # https://ascendex.github.io/ascendex-pro-api/#fee-schedule-by-symbol
+        fees_json = resp.get("data", {}).get("productFee", [])
         for fee_json in fees_json:
             try:
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=fee_json["symbol"])
@@ -551,6 +550,11 @@ class AscendExExchange(ExchangePyBase):
 
         if updated_order_data.get("code") == 0:
             order_update_data = updated_order_data["data"]
+            # The order/status endpoint returns `data` as a list (one entry per queried orderId);
+            # we query a single id. Older code assumed a bare object, so tolerate both shapes.
+            # (Sibling endpoints order/open, order/hist/current all return lists — verified live 2026-06-08.)
+            if isinstance(order_update_data, list):
+                order_update_data = order_update_data[0]
             ordered_state = order_update_data["status"]
             new_state = CONSTANTS.ORDER_STATE[ordered_state]
 
