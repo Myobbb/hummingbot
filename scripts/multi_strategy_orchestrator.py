@@ -3116,6 +3116,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Add to strategy's market_pairs list
         strategy_instance.market_pairs.append(new_tuple)
 
+        # Keep the runtime config dict's additional_markets in sync with market_pairs.
+        # Without this, a later primary/secondary remove_market reads a stale (empty)
+        # additional_markets, finds nothing to promote, and refuses to remove a leg that
+        # is actually live in market_pairs. _add_market_to_config only touches the YAML
+        # file, not this in-memory dict, so the desync would otherwise persist until restart.
+        config = strategy_instance.config
+        existing_additional_lower = [m.lower() for m in config.get('additional_markets', [])]
+        if market_spec.lower() not in existing_additional_lower:
+            config.setdefault('additional_markets', []).append(market_spec)
+
         # Register the connector in the V1 strategy's _sb_markets set.
         # strategy.init_params() calls c_add_markets() at startup, but when a market is added
         # at runtime the connector may already exist in the pool (e.g. MEXC already running other
