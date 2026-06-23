@@ -904,8 +904,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         conv_rate = gate_res.second
 
         # Fetch balances only after passing the gate
-        # SAFETY BUFFER: Subtract 25 quote units to account for 2-tick buy price increase applied later.
-        # This prevents overshooting available balance when buy_price += 2 * min_price_increment.
+        # SAFETY BUFFER: Subtract 25 quote units as headroom against price/fee/quantization
+        # rounding so the buy leg never overshoots available quote balance.
         buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset)) - 25.0
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
@@ -1614,22 +1614,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # ─────────────────────────────────────────────────────────────────────────
 
-        # PRICE TICK ADJUSTMENT: Make orders more aggressive for better fills
-        # Adjusts float prices BEFORE balance checks so calculations are correct
-        # Buy orders: increase price by 2 ticks (bid higher to fill faster)
-        # Sell orders: decrease price by 2 ticks (ask lower to fill faster)
-        # NOTE: _trading_rules is an in-memory dict (O(1) lookup, no network call)
+        # Fetch per-leg trading rules (reused below for max_order_size caps — single dict lookup).
+        # NOTE: _trading_rules is an in-memory dict (O(1) lookup, no network call).
         cdef object buy_tr = buy_market._trading_rules.get(buy_market_tuple.trading_pair)
         cdef object sell_tr = sell_market._trading_rules.get(sell_market_tuple.trading_pair)
-        cdef double buy_tick = 0.0
-        cdef double sell_tick = 0.0
-        if buy_tr is not None and buy_tr.min_price_increment is not None:
-            buy_tick = float(buy_tr.min_price_increment)
-            buy_price = buy_price + (buy_tick * 2.0)
-        if sell_tr is not None and sell_tr.min_price_increment is not None:
-            sell_tick = float(sell_tr.min_price_increment)
-            sell_price = sell_price - (sell_tick * 2.0)
-        
+        # No price aggression: orders are placed at the worst scanned price (the touch).
+        # A previous "+2 ticks" bump (buy up, sell down) for faster fills could place a
+        # CROSSED pair (sell_limit < buy_limit) when the two venues have mismatched tick
+        # sizes — 2*tick on a 10x-coarser-tick venue (e.g. HTX vs Bitget) is a large %
+        # move that can exceed the scanned profit margin. Removed: a missed fill costs
+        # nothing; a crossed fill is a guaranteed loss. (buy_price/sell_price are the
+        # worst scanned prices from c_find_best_profitable_amount, already >= min_profit.)
+
         # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API
         # OPTIMIZATION: Use Decimal.from_float() instead of Decimal(str()) to avoid expensive string formatting.
         # This is safe because quantization handles small precision noise.
@@ -1690,7 +1686,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         quantized_amount_sell = min(quantized_amount_sell, q_sell2)
 
         # Apply max_order_size cap from trading rules (per-leg, same reasoning).
-        # Reuses buy_tr / sell_tr already fetched above for tick adjustment — no second dict lookup.
+        # Reuses buy_tr / sell_tr already fetched above — no second dict lookup.
         try:
             if buy_tr is not None and buy_tr.max_order_size > DECIMAL_ZERO:
                 quantized_amount_buy  = min(quantized_amount_buy,  buy_tr.max_order_size)
