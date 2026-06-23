@@ -839,6 +839,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._strategies_started: bool = False
         self._strategy_clock = None
 
+        # Periodic stale-order-book watchdog (recovers books that go stale mid-run,
+        # not just at resume). perf_counter timestamp of the last sweep.
+        self._last_stale_sweep: float = 0.0
+
         # Track initialization errors for diagnostics
         self._init_errors: List[Tuple[str, str]] = []  # (strategy_name, error_message)
         self._available_connectors: Set[str] = set(connectors.keys()) if connectors else set()
@@ -1523,6 +1527,79 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 )
                 self.remove_strategy(strategy_name)
 
+        # Periodic stale-order-book watchdog. The per-pair freshness check + active
+        # recovery already exist but only run at resume() time, so a book that goes
+        # stale WHILE running (e.g. a silently dropped OKX subscription on the shared
+        # WS) would otherwise rot indefinitely. Run the same recovery on a throttle.
+        self._maybe_run_stale_book_sweep()
+
+    STALE_SWEEP_INTERVAL_SECONDS = 60.0     # how often the watchdog scans (perf_counter)
+    STALE_SWEEP_THRESHOLD_SECONDS = 120.0   # book considered stale after this many seconds
+    STALE_RECOVERY_COOLDOWN_SECONDS = 300.0  # don't re-recover the same connector within this window
+
+    def _maybe_run_stale_book_sweep(self):
+        """
+        Throttled per-pair staleness sweep over all RUNNING strategies.
+
+        For any non-paused strategy whose order book has not applied a diff in
+        STALE_SWEEP_THRESHOLD_SECONDS, trigger the existing active recovery
+        (_trigger_stale_book_recovery), which forces a WS reconnection / fresh
+        snapshot. This closes the gap where the resume-only stale check let a
+        running pair's book stay frozen forever.
+
+        Recovery is deduped + cooled-down PER CONNECTOR: forcing a reconnect on a
+        shared WS (e.g. OKX) re-subscribes every pair on that connector at once, so
+        firing once per connector per cooldown is sufficient and avoids a reconnect
+        storm when a book is genuinely dead (delisted) and never comes back.
+        """
+        import time as _time
+        now = _time.perf_counter()
+        if (now - self._last_stale_sweep) < self.STALE_SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_stale_sweep = now
+
+        # connector_name -> last recovery perf_counter (cooldown gate)
+        cooldown = getattr(self, '_stale_recovery_cooldown', None)
+        if cooldown is None:
+            cooldown = {}
+            self._stale_recovery_cooldown = cooldown
+
+        recovered_connectors: Set[str] = set()
+        for si in self.strategies:
+            if si.paused:
+                continue
+            stale_pairs: List[str] = []
+            stale_connectors: Set[str] = set()
+            for mt in si.market_pairs:
+                try:
+                    ex_name = getattr(mt.market, "name", "?")
+                    ob = mt.market.get_order_book(mt.trading_pair)
+                    last_diff = getattr(ob, 'last_applied_diff', -1000.0)
+                    if last_diff > 0 and (now - last_diff) > self.STALE_SWEEP_THRESHOLD_SECONDS:
+                        stale_pairs.append(f"{ex_name}:{mt.trading_pair} (stale {int(now - last_diff)}s)")
+                        stale_connectors.add(ex_name)
+                except Exception:
+                    # Missing/uninitialized book — leave to the resume-time/missing path
+                    continue
+            if not stale_pairs:
+                continue
+            # Only act if at least one stale connector is off cooldown and not already handled this sweep.
+            actionable = [
+                c for c in stale_connectors
+                if c not in recovered_connectors
+                and (now - cooldown.get(c, -1e9)) > self.STALE_RECOVERY_COOLDOWN_SECONDS
+            ]
+            if not actionable:
+                continue
+            self.logger().warning(
+                f"Stale-book watchdog: '{si.name}' has stale books, triggering recovery: "
+                f"{', '.join(stale_pairs[:3])}{'...' if len(stale_pairs) > 3 else ''}"
+            )
+            self._trigger_stale_book_recovery(si)
+            for c in actionable:
+                cooldown[c] = now
+                recovered_connectors.add(c)
+
     async def on_stop(self):
         """
         Clean shutdown of all strategies.
@@ -1920,13 +1997,37 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                         self.logger().warning(f"Failed to request recovery for {tp}: {e}")
                                 asyncio.ensure_future(_do_refresh_cached(ds, trading_pair, symbol))
                         
-                        # Method 2: Generic - trigger reconnection to re-subscribe all channels
-                        elif hasattr(ds, 'trigger_reconnection'):
-                            self.logger().info(
-                                f"Triggering WS reconnection for {ex_name} to recover stale {trading_pair}"
-                            )
-                            ds.trigger_reconnection()
-                            
+                        # Method 2: Generic - force a real WS reconnection to re-subscribe all channels.
+                        # NOTE: trigger_reconnection() alone only sets the _reconnect_requested flag,
+                        # which the default listen_for_subscriptions loop never checks (it only reconnects
+                        # on an exception from _process_websocket_messages). For connectors that share one
+                        # WS across all pairs (e.g. OKX) the connection stays fed by other pairs, so the
+                        # flag is never consumed and the stale pair is never recovered. We therefore also
+                        # disconnect the active websocket directly, which is the primitive that actually
+                        # forces the loop to reconnect and re-run _subscribe_channels for ALL pairs.
+                        else:
+                            if hasattr(ds, 'trigger_reconnection'):
+                                ds.trigger_reconnection()
+                            if hasattr(ds, 'has_active_websocket') and ds.has_active_websocket:
+                                async def _do_force_reconnect(ds_ref, ex, tp):
+                                    try:
+                                        active_ws = getattr(ds_ref, '_active_ws', None)
+                                        if active_ws is not None:
+                                            await active_ws.disconnect()
+                                            self.logger().info(
+                                                f"Forced WS reconnection for {ex} to recover stale {tp}"
+                                            )
+                                    except Exception as e:
+                                        self.logger().warning(
+                                            f"Failed to force WS reconnection for {ex} ({tp}): {e}"
+                                        )
+                                asyncio.ensure_future(_do_force_reconnect(ds, ex_name, trading_pair))
+                            else:
+                                self.logger().info(
+                                    f"Requested WS reconnection for {ex_name} to recover stale {trading_pair} "
+                                    f"(no active websocket to disconnect; will re-subscribe on next reconnect)"
+                                )
+
             except Exception as e:
                 self.logger().warning(f"Error triggering recovery for market pair: {e}")
 
