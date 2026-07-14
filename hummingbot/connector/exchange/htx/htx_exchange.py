@@ -480,11 +480,23 @@ class HtxExchange(ExchangePyBase):
         async def _finalize_later():
             try:
                 await asyncio.sleep(CONSTANTS.PARTIAL_FINALIZE_TIMEOUT_S)
-                # Double-check order still exists and remains partial/open
+                # Double-check order still exists
                 order = self._order_tracker.all_updatable_orders.get(client_order_id)
                 if order is None:
                     return
-                # Synthesize a filled update to unblock strategies
+                # GUARD: only synthesize FILLED when the order is GENUINELY fully filled.
+                # Previously this fired for ANY still-tracked order after 6s of silence,
+                # force-marking a partially-filled *still-open* order as FILLED. That made
+                # the strategy believe the order was done → it stopped tracking it and never
+                # cancelled the resting remainder → the order hung open on HTX indefinitely
+                # (HTX-only; other connectors leave it PARTIALLY_FILLED so the strategy's
+                # timeout/backstop cancels it). A stale, not-fully-filled order must stay
+                # PARTIALLY_FILLED so the strategy can cancel it — do NOT fabricate a fill.
+                if not (order.amount > s_decimal_0
+                        and order.executed_amount_base >= order.amount):
+                    return
+                # Synthesize a filled update to unblock strategies (order is truly filled;
+                # HTX just hasn't delivered the terminal WS frame — the original purpose).
                 update = OrderUpdate(
                     trading_pair=order.trading_pair,
                     update_timestamp=self.current_timestamp,
