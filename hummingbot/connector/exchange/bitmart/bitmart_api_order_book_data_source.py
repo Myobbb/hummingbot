@@ -62,6 +62,13 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_asks_update_ts: Dict[str, float] = {}
         # Per-trading_pair last full snapshot refresh time
         self._last_snapshot_refresh_ts: Dict[str, float] = {}
+        # Bounded versionless-REST fallback re-arm (prevents the 429 storm):
+        #   - count consecutive versionless REST snapshots per pair
+        #   - min spacing between re-requests
+        #   - after N cycles, escalate to a full WS reconnect instead of looping REST forever
+        self._versionless_rest_cycles: Dict[str, int] = {}
+        self._REST_REARM_MIN_INTERVAL: float = 1.0        # seconds between REST re-requests per pair
+        self._REST_REARM_MAX_CYCLES: int = 5             # after this many, escalate to WS reconnect
         self._active_ws: Optional[WSAssistant] = None
         self._ws_consumer_task: Optional[asyncio.Task] = None
         self._watchdog_check_interval: float = 5.0  # Check watchdogs every 5s
@@ -307,6 +314,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     new_version = int(version_value)
                     old_version = self._last_depth_version.get(trading_pair)
                     self._last_depth_version[trading_pair] = new_version
+                    # Versioned WS snapshot arrived → version tracking resumed; clear the
+                    # versionless-REST re-arm counter (recovery succeeded).
+                    self._versionless_rest_cycles.pop(trading_pair, None)
                     self.logger().info(
                         f"BitMart {trading_pair}: snapshot v{new_version} received"
                         f"{f' (was waiting, prev v{old_version})' if was_waiting else f' (prev v{old_version})'}"
@@ -328,7 +338,33 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # next WS snapshot (which will carry a proper version).
                     self._waiting_for_snapshot[trading_pair] = True
                     self._waiting_for_snapshot_since[trading_pair] = current_time
-                    asyncio.create_task(self._refresh_snapshot_for_pair(trading_pair, symbol))
+                    # BOUNDED re-arm: a versionless REST snapshot never clears the
+                    # waiting state (only a versioned WS snapshot does), so re-requesting
+                    # unconditionally is a self-perpetuating loop that 429s the REST endpoint.
+                    # Count consecutive cycles; once we've retried enough, the WS clearly
+                    # isn't delivering a versioned snapshot for this pair — escalate to a full
+                    # WS reconnect (re-subscribes all pairs, should re-provoke the versioned
+                    # snapshot) instead of hammering REST forever.
+                    cycles = self._versionless_rest_cycles.get(trading_pair, 0) + 1
+                    self._versionless_rest_cycles[trading_pair] = cycles
+                    if cycles >= self._REST_REARM_MAX_CYCLES:
+                        self.logger().warning(
+                            f"BitMart {trading_pair}: {cycles} consecutive versionless REST "
+                            f"snapshots — WS not delivering a versioned snapshot; escalating to "
+                            f"full WS reconnect instead of re-requesting REST."
+                        )
+                        # trigger_reconnection() sets _reconnect_requested; the watchdog in
+                        # listen_for_subscriptions honors it and forces a reconnect+resubscribe.
+                        self.trigger_reconnection()
+                    else:
+                        # Space out the REST re-request (prevents the task-per-snapshot burst
+                        # that overruns BitMart's rate limit → 429).
+                        async def _spaced_refresh(tp: str, sym: str, delay: float):
+                            await asyncio.sleep(delay)
+                            await self._refresh_snapshot_for_pair(tp, sym)
+                        asyncio.create_task(
+                            _spaced_refresh(trading_pair, symbol, self._REST_REARM_MIN_INTERVAL)
+                        )
 
             message_queue.put_nowait(OrderBookMessage(
                 OrderBookMessageType.SNAPSHOT,
@@ -660,6 +696,20 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     
                     # Watchdog timer expired -> run checks
                     if watchdog_timer in done:
+                        # A runtime pair-add (subscribe_to_trading_pair) sets _reconnect_requested
+                        # and disconnects _active_ws to force a reconnect+resubscribe. But if the
+                        # disconnect was a no-op (e.g. _active_ws was None/stale at that instant)
+                        # the consumer never errors, so the flag alone would sit inert and the new
+                        # pair would never join the WS subscription. Actively honor the flag here:
+                        # peek it (do NOT clear — the except handler clears it via
+                        # check_and_clear_reconnect_request) and raise to break the loop, which
+                        # reconnects with zero backoff and re-subscribes ALL pairs incl. the new one.
+                        if self._reconnect_requested:
+                            self.logger().info(
+                                "BitMart public WS: reconnect requested (runtime pair-add); "
+                                "forcing reconnect+resubscribe"
+                            )
+                            raise ConnectionError("BitMart reconnect requested for runtime pair-add")
                         # Send ping if needed
                         await self._check_and_send_ping_if_needed(ws)
                         # Check for staleness and connection health
@@ -703,6 +753,9 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._last_depth_version.clear()
                 self._waiting_for_snapshot.clear()
                 self._waiting_for_snapshot_since.clear()
+                # Reset the versionless-REST re-arm counter — a fresh connection gets a fresh
+                # chance to deliver versioned snapshots before we'd escalate again.
+                self._versionless_rest_cycles.clear()
                 
                 # Clear timestamp trackers to prevent immediate staleness warnings after reconnect
                 # All pairs will get fresh timestamps when new data arrives

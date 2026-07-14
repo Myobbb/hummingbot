@@ -673,11 +673,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         StrategyBase.c_tick(self, timestamp)
 
         cdef:
-            int64_t current_tick = <int64_t>(timestamp // self._status_report_interval)
-            int64_t last_tick = <int64_t>(self._last_timestamp // self._status_report_interval)
-            bint should_report = ((current_tick > last_tick) and
-                                  (self._logging_options & self.OPTION_LOG_STATUS_REPORT) and
-                                  (timestamp >= self._status_debounce_until))
+            # should_report is only consumed by the non-orchestrated readiness path below.
+            # In orchestrated mode (all strategies under the orchestrator) it is never read,
+            # so it is NOT computed here on the per-strategy-per-tick hot path — it is computed
+            # lazily inside the non-orchestrated branch only.
+            bint should_report = False
+            int64_t current_tick
+            int64_t last_tick
             object best_buy = None
             object best_sell = None
             tuple best_result = None
@@ -687,7 +689,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         try:
             # Check market readiness
             if not self._orchestrated_mode:
-                # Normal mode: full readiness check with logging
+                # Normal mode: full readiness check with logging.
+                # Compute should_report here (off the orchestrated hot path).
+                current_tick = <int64_t>(timestamp // self._status_report_interval)
+                last_tick = <int64_t>(self._last_timestamp // self._status_report_interval)
+                should_report = ((current_tick > last_tick) and
+                                 (self._logging_options & self.OPTION_LOG_STATUS_REPORT) and
+                                 (timestamp >= self._status_debounce_until))
                 if not self.c_check_markets_ready(should_report):
                     return
             else:
@@ -904,8 +912,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
         conv_rate = gate_res.second
 
         # Fetch balances only after passing the gate
-        # SAFETY BUFFER: Subtract 25 quote units as headroom against price/fee/quantization
-        # rounding so the buy leg never overshoots available quote balance.
+        # SAFETY BUFFER: Reserve 25 quote units so the buy leg doesn't size up to the full
+        # reported balance and then get REJECTED when some of that quote is actually on-hold /
+        # unavailable (pending settlement, locked in another order). Rare, but the reserve is
+        # free and prevents a failed order. (Not a hot-path cost — one float subtract.)
         buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset)) - 25.0
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
