@@ -19,6 +19,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -48,6 +49,42 @@ class BingXExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        # BingX WS balance frames are unusable as available balance (ACCOUNT_UPDATE only fires on
+        # cancels, cw/wb both mean total-after-change, lk is always 0, stale-twin frames replay old
+        # totals).  Balances come from REST only; WS events just trigger a debounced refresh.
+        # With real_time_balance_update False the base class compensates available balance with
+        # in-flight order deltas since the last REST snapshot (same pattern as bitstamp/vertex).
+        self.real_time_balance_update = False
+        self._ws_balance_refresh_task: Optional[asyncio.Task] = None
+        self._last_ws_balance_refresh_ts: float = 0.0
+        self._ws_balance_refresh_requested: bool = False
+
+    # Debounce so cancel-frame bursts coalesce into one REST call; min interval caps call rate.
+    WS_BALANCE_REFRESH_DEBOUNCE = 1.5
+    WS_BALANCE_REFRESH_MIN_INTERVAL = 3.0
+
+    def _trigger_balance_refresh(self):
+        """Schedule a debounced REST balance refresh; safe to call per WS event."""
+        self._ws_balance_refresh_requested = True
+        if self._ws_balance_refresh_task is None or self._ws_balance_refresh_task.done():
+            self._ws_balance_refresh_task = safe_ensure_future(self._debounced_balance_refresh())
+
+    async def _debounced_balance_refresh(self):
+        try:
+            while self._ws_balance_refresh_requested:
+                self._ws_balance_refresh_requested = False
+                await self._sleep(self.WS_BALANCE_REFRESH_DEBOUNCE)
+                since_last = time.time() - self._last_ws_balance_refresh_ts
+                if since_last < self.WS_BALANCE_REFRESH_MIN_INTERVAL:
+                    await self._sleep(self.WS_BALANCE_REFRESH_MIN_INTERVAL - since_last)
+                self._last_ws_balance_refresh_ts = time.time()
+                # _update_all_balances (not _update_balances) so the in-flight orders snapshot used by
+                # apply_balance_update_since_snapshot is re-based together with the fresh balances.
+                await self._update_all_balances()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().warning("WS-triggered balance refresh failed.", exc_info=True)
 
     @staticmethod
     def bingx_order_type(order_type: OrderType) -> str:
@@ -341,6 +378,11 @@ class BingXExchange(ExchangePyBase):
                     data = event_message.get('data')
                     execution_type = data.get('X')
 
+                    # BingX pushes no ACCOUNT_UPDATE on trade executions — fills and terminal
+                    # states must trigger the REST balance refresh themselves.
+                    if execution_type in ("PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"):
+                        self._trigger_balance_refresh()
+
                     client_order_id = data.get('C')
                     # exchange_order_id = data.get('i')
 
@@ -396,24 +438,13 @@ class BingXExchange(ExchangePyBase):
 
                         continue
                 elif event_message.get("e") == "ACCOUNT_UPDATE":
-                    balances = event_message["a"]["B"]
-                    for balance_entry in balances:
-                        asset_name = balance_entry["a"]
-                        free_balance = Decimal(str(balance_entry["cw"]))
-                        total_balance = Decimal(str(balance_entry["wb"]))
-                        # BingX sends two simultaneous ACCOUNT_UPDATE frames on every order
-                        # event: one for the spot account (correct balances) and one for the
-                        # perpetual/funding account (cw=0, wb=0).  Whichever frame arrives last
-                        # wins, so the perp frame can silently zero out the known spot balance.
-                        # Guard: if the incoming frame reports zero for both fields but we already
-                        # hold a positive balance for this asset, the frame is the perp snapshot —
-                        # skip it to preserve the correct spot value.
-                        if free_balance == Decimal("0") and total_balance == Decimal("0"):
-                            if self._account_available_balances.get(asset_name, Decimal("0")) > Decimal("0"):
-                                continue
-                        self._account_available_balances[asset_name] = free_balance
-                        self._account_balances[asset_name] = total_balance
-
+                    # BingX WS balance values must never be applied (proven 2026-07-18):
+                    # ACCOUNT_UPDATE fires only on order cancel (never on fills), cw and wb both
+                    # mean total-after-change (official docs — neither is an available balance),
+                    # lk is always 0 even with resting limit orders, and each cancel emits
+                    # stale-twin frame pairs replaying hours-old totals in random order.
+                    # REST free/locked is the only correct source — use the frame as a trigger.
+                    self._trigger_balance_refresh()
                     continue
             except asyncio.CancelledError:
                 raise
