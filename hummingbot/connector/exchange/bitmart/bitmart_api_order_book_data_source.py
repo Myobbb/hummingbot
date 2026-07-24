@@ -27,9 +27,19 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # (docs: send ping ~10s, treat "no data <20s" as dead → reconnect).
     _PING_INTERVAL_SECONDS: float = 10.0           # BitMart-recommended ping cadence (must be < 20s)
     _FORCE_RECONNECT_IDLE_SECONDS: float = 18.0    # reconnect BEFORE BitMart's 20s server-side drop (no dead window)
-    _DEPTH_STALENESS_SECONDS: float = 25.0         # per-pair: a single sub can freeze while the shared conn stays up;
-                                                   # detect+snapshot-refresh a stalled pair in ~25s (was 60s). Recovery is
-                                                   # non-disruptive (snapshot only) and bounded (_REST_REARM_MAX_CYCLES).
+    _DEPTH_STALENESS_SECONDS: float = 60.0         # per-pair DEAD-SUB detector — catches a single sub silently frozen
+                                                   # while the shared conn stays up. Short-term liveness is already covered
+                                                   # by ping/pong (_PING_INTERVAL 10s / _FORCE_RECONNECT_IDLE 18s): if BitMart
+                                                   # answers pings the connection is alive, so a briefly-quiet pair is just
+                                                   # slow, not broken. Low-vol books (e.g. $DMC, ARX) naturally breathe at
+                                                   # ~25–30s — a tighter 25s over-fired on all of them (verified 2026-07-24:
+                                                   # 12 STALE events in ~7min, ALL recovered <2s = false positives, 0 real
+                                                   # freezes, 0 connection drops). 60s sits well clear of the natural gap.
+                                                   # Recovery for a SINGLE stale pair is a non-disruptive WS snapshot REQUEST
+                                                   # (does NOT set _waiting_for_snapshot, so live diffs keep applying — the
+                                                   # snapshot reconciles/confirms the existing book, never blanks it); a full
+                                                   # reconnect fires ONLY when ALL pairs are stale (true subscription death).
+                                                   # Bounded by _REST_REARM_MAX_CYCLES.
     _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0
     # Shared-connection subscription guard. BitMart's public per-connection cap is unpublished;
     # the private limit is 100 channels/conn (used as a safe proxy). Warn before the soft cap so a
@@ -85,8 +95,11 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_to_pair_cache: Dict[str, str] = {}
         # Cache for trading pair -> symbol (for recovery operations)
         self._pair_to_symbol_cache: Dict[str, str] = {}
-        # Pairs currently flagged stale (for one-shot warn + explicit recovery logging)
+        # Pairs currently flagged stale (for one-shot probe + explicit recovery logging)
         self._stale_pairs_flagged: set = set()
+        # Per-pair last depth version at the moment we started probing (to grade the probe's
+        # snapshot: version advanced = real staleness → WARN; unchanged = book was accurate → quiet)
+        self._stale_probe_version: Dict[str, Optional[int]] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -333,6 +346,23 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         f"{f' (was waiting, prev v{old_version})' if was_waiting else f' (prev v{old_version})'}"
                         f" — {len(bids_list)} bids / {len(asks_list)} asks"
                     )
+                    # If this snapshot answers a staleness PROBE, grade it: a version ahead of what we
+                    # held at probe time means we genuinely missed updates (dropped diffs) → WARN. An
+                    # unchanged version means the book was already accurate, the pair was just quiet →
+                    # no warning (the STALE detection is downgraded on confirmation).
+                    if trading_pair in self._stale_pairs_flagged:
+                        probe_ver = self._stale_probe_version.pop(trading_pair, None)
+                        if probe_ver is not None and new_version > probe_ver:
+                            self.logger().warning(
+                                f"BitMart {trading_pair}: depth was genuinely STALE — snapshot v{new_version} "
+                                f"is ahead of last-applied v{probe_ver} (missed {new_version - probe_ver} version(s)); "
+                                f"book resynced."
+                            )
+                        else:
+                            self.logger().info(
+                                f"BitMart {trading_pair}: staleness probe confirmed book accurate "
+                                f"(snapshot v{new_version} == last-applied v{probe_ver}); was just quiet."
+                            )
                 else:
                     # REST fallback: no WS version. Use ms_t as the version anchor so
                     # restore_from_snapshot_and_diffs can bisect diffs correctly.
@@ -638,12 +668,16 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
                     stale_pairs.append(trading_pair)
 
-        # Recovery logging: any pair previously flagged stale that is now fresh again.
+        # Clear the stale flag for any pair that's fresh again. If a probe snapshot already
+        # resolved it, _parse_order_book_snapshot_message logged the graded outcome (accurate /
+        # genuinely-stale) and consumed _stale_probe_version — so only emit a generic RECOVERED
+        # line for pairs that recovered via a normal frame (probe-version still pending).
         recovered = self._stale_pairs_flagged - set(stale_pairs)
         for tp in recovered:
-            last_any_ts = float(self._last_any_message_ts.get(tp, 0.0) or 0.0)
-            age = int(now - last_any_ts) if last_any_ts > 0 else -1
-            self.logger().info(f"BitMart {tp}: depth stream RECOVERED (last frame {age}s ago).")
+            if self._stale_probe_version.pop(tp, "unset") != "unset":
+                last_any_ts = float(self._last_any_message_ts.get(tp, 0.0) or 0.0)
+                age = int(now - last_any_ts) if last_any_ts > 0 else -1
+                self.logger().info(f"BitMart {tp}: depth stream recovered via live frame (last frame {age}s ago).")
         self._stale_pairs_flagged.intersection_update(stale_pairs)
 
         if not stale_pairs:
@@ -676,16 +710,21 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
                 stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
 
-                # Warn once per stale episode (the recovery INFO closes it); the snapshot request
-                # itself still fires every tick until the pair recovers (bounded via _REST_REARM).
+                # Do NOT warn on suspicion. A silent low-vol pair usually just has no book changes.
+                # Probe with a snapshot request first, then let the snapshot's version decide:
+                #   - snapshot version ADVANCED past our last applied version  → we genuinely missed
+                #     updates → WARN (real dropped-diff staleness), raised in _parse_..._snapshot_message.
+                #   - snapshot version == our last version → book was already accurate, just quiet →
+                #     no warning (downgraded), cleared quietly.
+                # Flag as "probing" and record the version we had at probe time for that comparison.
                 if trading_pair not in self._stale_pairs_flagged:
                     self._stale_pairs_flagged.add(trading_pair)
-                    self.logger().warning(
-                        f"BitMart {trading_pair}: depth STALE — no frames for {stale_duration}s on the shared "
-                        f"connection (threshold {self._DEPTH_STALENESS_SECONDS:.0f}s) while the socket is alive; "
-                        f"requesting snapshot to provoke the exchange."
+                    self._stale_probe_version[trading_pair] = self._last_depth_version.get(trading_pair)
+                    self.logger().info(
+                        f"BitMart {trading_pair}: depth quiet {stale_duration}s (>= {self._DEPTH_STALENESS_SECONDS:.0f}s) "
+                        f"on the shared connection — probing with a snapshot to confirm the local book."
                     )
-                
+
                 # Do NOT set _waiting_for_snapshot (would filter updates)
                 # Just fire the request; the response (snapshot) will update timestamps and clear staleness
                 await self._refresh_snapshot_for_pair(trading_pair, symbol)
