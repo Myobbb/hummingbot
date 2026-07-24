@@ -60,7 +60,20 @@ class BitmartExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         super().__init__(balance_asset_limit, rate_limits_share_pct)
-        self.real_time_balance_update = True
+        # BitMart's private balance WS (spot/user/balance) is NOT reliable as the sole source of
+        # truth: it silently drops balance events. Verified 2026-07-24 against raw frames — during a
+        # PIVX balance change (3136 → 2.65) the WS emitted ZERO PIVX balance frames for 30+ min, so a
+        # WS-authoritative connector stayed stale at the pre-change value and sized/placed sell legs
+        # against a balance it no longer held (→ one-sided arb overbuy). Only the REST wallet poll saw
+        # the drop. asset_manager independently reached the same conclusion (its Bitmart balances are
+        # HTTP-authoritative). So make REST authoritative here too: the status-polling loop already
+        # calls _update_balances() every cycle unconditionally (no extra API calls), and with this flag
+        # False the base class also keeps the in-flight-orders snapshot for correct between-poll
+        # reconciliation. WS frames still arrive and update `available` as an advisory overlay; the
+        # periodic REST poll (which also deletes assets BitMart omits at ~0 balance) is the authority
+        # that corrects whatever WS drops. NOTE: BitMart's REST wallet omits zero/dust-balance assets
+        # entirely — _update_balances() already handles that by deleting absent assets.
+        self.real_time_balance_update = False
         # Track MARKET orders that have received at least one fill. Used only for the MARKET-specific
         # quirks: a fully-filled MARKET BUY can report "partially_canceled", and a filled MARKET order
         # can emit a trailing CANCELED — both are forced to FILLED. NOT used for LIMIT (a LIMIT

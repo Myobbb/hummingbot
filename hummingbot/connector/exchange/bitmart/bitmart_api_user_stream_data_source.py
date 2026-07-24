@@ -18,8 +18,11 @@ if TYPE_CHECKING:
 class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
-    _PING_INTERVAL_SECONDS: float = 15.0  # < 20s per BitMart docs
-    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0  # Increased margin beyond BitMart's 20s threshold
+    # Keepalive tuned to BitMart's documented 20s idle-disconnect window (docs: ping ~10s,
+    # treat "no data <20s" as dead). The private stream carries order/fill/balance events, so a
+    # missed keepalive that drops the socket = missed fills — react before BitMart's 20s drop.
+    _PING_INTERVAL_SECONDS: float = 10.0  # BitMart-recommended ping cadence (must be < 20s)
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 18.0  # reconnect BEFORE BitMart's 20s server-side drop
     # Public attribute used by ExchangePyBase._is_user_stream_initialized()
     # Updated whenever we receive any frame on the private WS (including pongs)
     last_recv_time: float = 0.0
@@ -211,9 +214,13 @@ class BitmartAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     except Exception:
                         # Force reconnect
                         raise
-                # Force reconnect on prolonged idle (no messages at all, including pongs)
+                # Force reconnect on prolonged idle (no messages at all, including pongs).
+                # Fires before BitMart's ~20s server-side drop so we don't miss order/fill events.
                 if (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
-                    self.logger().warning("BitMart private WS: no messages for 30s, forcing reconnect")
+                    self.logger().warning(
+                        f"BitMart private WS: no frames for {int(now - last_recv)}s "
+                        f"(threshold {self._FORCE_RECONNECT_IDLE_SECONDS:.0f}s, before BitMart's ~20s drop), forcing reconnect"
+                    )
                     # Force close the WS to ensure main loop exits
                     try:
                         await ws.disconnect()

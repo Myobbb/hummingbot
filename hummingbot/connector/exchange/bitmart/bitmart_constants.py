@@ -7,7 +7,9 @@ EXCHANGE_NAME = "bitmart"
 REST_URL = "https://api-cloud.bitmart.com"
 WSS_PUBLIC_URL = "wss://ws-manager-compress.bitmart.com/api?protocol=1.1"
 WSS_PRIVATE_URL = "wss://ws-manager-compress.bitmart.com/user?protocol=1.1"
-WS_PING_TIMEOUT = 20 * 0.8
+# NOTE: WS keepalive is owned by each data source's _PING_INTERVAL_SECONDS / _FORCE_RECONNECT_IDLE_SECONDS
+# (10s / 18s, tuned to BitMart's 20s idle-disconnect). The old module-level WS_PING_TIMEOUT was unused
+# and removed 2026-07-24 to avoid a misleading second source of truth.
 
 DEFAULT_DOMAIN = ""
 MAX_ORDER_ID_LEN = 32

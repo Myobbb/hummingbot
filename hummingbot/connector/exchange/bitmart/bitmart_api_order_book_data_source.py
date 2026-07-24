@@ -23,10 +23,19 @@ if TYPE_CHECKING:
 class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
-    _PING_INTERVAL_SECONDS: float = 15.0           # < 20s per BitMart docs
-    _FORCE_RECONNECT_IDLE_SECONDS: float = 30.0    # disconnect if no frames (including pong) for 30s
-    _DEPTH_STALENESS_SECONDS: float = 60.0         # trigger per-pair snapshot refresh after 60s of silence
+    # Keepalive tuned to BitMart's documented 20s idle-disconnect window
+    # (docs: send ping ~10s, treat "no data <20s" as dead → reconnect).
+    _PING_INTERVAL_SECONDS: float = 10.0           # BitMart-recommended ping cadence (must be < 20s)
+    _FORCE_RECONNECT_IDLE_SECONDS: float = 18.0    # reconnect BEFORE BitMart's 20s server-side drop (no dead window)
+    _DEPTH_STALENESS_SECONDS: float = 25.0         # per-pair: a single sub can freeze while the shared conn stays up;
+                                                   # detect+snapshot-refresh a stalled pair in ~25s (was 60s). Recovery is
+                                                   # non-disruptive (snapshot only) and bounded (_REST_REARM_MAX_CYCLES).
     _PERIODIC_SNAPSHOT_REFRESH_SECONDS: float = 180.0
+    # Shared-connection subscription guard. BitMart's public per-connection cap is unpublished;
+    # the private limit is 100 channels/conn (used as a safe proxy). Warn before the soft cap so a
+    # future scale-up (more BitMart strategies) can't silently exceed it and lose subscriptions.
+    _SUBSCRIPTION_SOFT_CAP: int = 100
+    _SUBSCRIPTION_WARN_THRESHOLD: int = 80
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -76,6 +85,8 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._symbol_to_pair_cache: Dict[str, str] = {}
         # Cache for trading pair -> symbol (for recovery operations)
         self._pair_to_symbol_cache: Dict[str, str] = {}
+        # Pairs currently flagged stale (for one-shot warn + explicit recovery logging)
+        self._stale_pairs_flagged: set = set()
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -446,7 +457,24 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await send_chunked(trade_topics)
             await send_chunked(depth_topics)
 
-            self.logger().info("Subscribed to public order book and trade channels...")
+            # This is a SHARED single connection: every BitMart strategy in the orchestrator
+            # adds its pair here (one depth topic per pair; trades off by default). BitMart has
+            # no multi-connection splitter (unlike MEXC), so all pairs ride one socket. Public
+            # per-connection sub cap is unpublished; the private limit is 100 channels/conn, used
+            # here as a safe proxy. Warn well before it so a scale-up can't silently drop subs
+            # (BitMart signals an over-subscribe with WS error code 90005).
+            total_topics = len(trade_topics) + len(depth_topics)
+            if total_topics >= self._SUBSCRIPTION_WARN_THRESHOLD:
+                self.logger().warning(
+                    f"BitMart: {total_topics} topics on ONE shared WS connection "
+                    f"({len(self._trading_pairs)} pairs) — approaching the safe per-connection cap "
+                    f"(~{self._SUBSCRIPTION_SOFT_CAP}). BitMart has no connection-splitting; at the cap "
+                    f"subscriptions may be rejected (err 90005). Consider sharding pairs across connections."
+                )
+            self.logger().info(
+                f"Subscribed to public order book channels — {len(depth_topics)} depth "
+                f"+ {len(trade_topics)} trade topic(s) on the shared BitMart connection."
+            )
 
             # After every (re)connect: all version state is invalid.
             # Mark each pair as waiting for its first versioned snapshot before
@@ -573,9 +601,14 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
         last_recv = getattr(ws, "last_recv_time", 0) or 0
         now = time.time()
         
-        # Check for complete silence (no messages at all, including pongs)
+        # Check for complete silence (no messages at all, including pongs).
+        # Fires before BitMart's ~20s server-side idle disconnect so we reconnect proactively
+        # rather than serving a frozen book in the gap between their drop and our detection.
         if last_recv > 0 and (now - last_recv) >= self._FORCE_RECONNECT_IDLE_SECONDS:
-            self.logger().warning("BitMart public WS: no messages for 30s, forcing reconnect")
+            self.logger().warning(
+                f"BitMart public WS: no frames for {int(now - last_recv)}s "
+                f"(threshold {self._FORCE_RECONNECT_IDLE_SECONDS:.0f}s, before BitMart's ~20s drop), forcing reconnect"
+            )
             raise ConnectionError("BitMart WS idle exceeded threshold; forcing reconnect")
         
         # Check for stale orderbook data per trading pair
@@ -604,7 +637,15 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 total_initialized += 1
                 if (now - last_any_ts) >= self._DEPTH_STALENESS_SECONDS:
                     stale_pairs.append(trading_pair)
-        
+
+        # Recovery logging: any pair previously flagged stale that is now fresh again.
+        recovered = self._stale_pairs_flagged - set(stale_pairs)
+        for tp in recovered:
+            last_any_ts = float(self._last_any_message_ts.get(tp, 0.0) or 0.0)
+            age = int(now - last_any_ts) if last_any_ts > 0 else -1
+            self.logger().info(f"BitMart {tp}: depth stream RECOVERED (last frame {age}s ago).")
+        self._stale_pairs_flagged.intersection_update(stale_pairs)
+
         if not stale_pairs:
             return
         
@@ -634,12 +675,16 @@ class BitmartAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
                 last_any_msg = self._last_any_message_ts.get(trading_pair, 0)
                 stale_duration = int(now - last_any_msg) if last_any_msg > 0 else 0
-                
-                # Log warning but ONLY request snapshot (non-disruptive)
-                self.logger().warning(
-                    f"BitMart {trading_pair}: No messages for {stale_duration}s "
-                    f"(threshold: {self._DEPTH_STALENESS_SECONDS}s), requesting snapshot to provoke exchange"
-                )
+
+                # Warn once per stale episode (the recovery INFO closes it); the snapshot request
+                # itself still fires every tick until the pair recovers (bounded via _REST_REARM).
+                if trading_pair not in self._stale_pairs_flagged:
+                    self._stale_pairs_flagged.add(trading_pair)
+                    self.logger().warning(
+                        f"BitMart {trading_pair}: depth STALE — no frames for {stale_duration}s on the shared "
+                        f"connection (threshold {self._DEPTH_STALENESS_SECONDS:.0f}s) while the socket is alive; "
+                        f"requesting snapshot to provoke the exchange."
+                    )
                 
                 # Do NOT set _waiting_for_snapshot (would filter updates)
                 # Just fire the request; the response (snapshot) will update timestamps and clear staleness
