@@ -774,6 +774,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
                 self.c_cleanup_old_orders()
+                # Hold-band refresh is INDEPENDENT of order cleanup and must run every cycle
+                # even when the strategy holds no orders. It used to live at the end of
+                # c_cleanup_old_orders, which returns early when _order_timestamps AND
+                # _completed_orders are both empty — so a strategy that stopped trading never
+                # re-evaluated the hysteresis. (2026-07-26: DEXE sat ~$550 over its $1550
+                # ceiling for 61 min unflagged, then placed a full-size unguarded arb pair on
+                # waking, because activation needs 2 cycles it had not been running.)
+                self.c_refresh_hold_cache()
                 self._last_cleanup_timestamp = timestamp
            # Log conversion rates periodically if using oracle
             if (self._use_oracle_conversion_rate and 
@@ -1178,19 +1186,20 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             pass
 
-        # Refresh hold-band cache (once per cleanup cycle = once per ~60 s).
-        # Always refresh — even when currently disabled — so that runtime enable_hold
-        # activates immediately with a warm cache rather than waiting up to 60 s.
-        self.c_refresh_hold_cache()
+        # NOTE: the hold-band cache refresh used to be called here. It was moved to the
+        # caller's periodic-maintenance block (c_tick) because this function returns early
+        # when there are no orders and no tombstones to clean, which silently starved the
+        # guardrail on any idle strategy. Do not re-add it here.
 
     cdef void c_refresh_hold_cache(self):
         """
         Refresh cached total base quantity and mid-price used by the hold-band guardrail.
         Also updates the hysteresis flag (_hold_correction_active).
 
-        Called from c_cleanup_old_orders (~60 s interval, handles activation) and
-        c_handle_order_completion (only while _hold_correction_active, handles fast deactivation).
-        Never on the hot arb path.
+        Called from the periodic-maintenance block in c_tick (~60 s interval, handles
+        activation — unconditional, independent of whether any orders are tracked) and from
+        c_handle_order_completion (only while _hold_correction_active, handles fast
+        deactivation). Never on the hot arb path.
         Uses the same balance-aggregation pattern as PositionBalancerHandler so the two
         systems see a consistent view of holdings.
 
@@ -1210,6 +1219,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             str base_asset
             str min_venue_name   # exchange name where min balance was observed
             set checked
+            list venue_split     # [(exchange, available_base)] — diagnostic breakdown
+            str venue_detail     # rendered per-venue split for log lines
 
         if not self._market_pairs:
             return
@@ -1225,6 +1236,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # When position balancer is present, it also aggregates (handles aliases), but
             # we still need the per-venue pass for the low-balance check.
             checked = set()
+            venue_split = []
             min_venue_base = 1e18  # sentinel — overwritten on first venue seen
             min_venue_name = ""
             for mp in self._market_pairs:
@@ -1235,6 +1247,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             checked.add(key)
                             venue_bal = float((<object>mt).market.get_available_balance(base_asset))
                             total += venue_bal
+                            venue_split.append(((<object>mt).market.name, venue_bal))
                             if venue_bal < min_venue_base:
                                 min_venue_base = venue_bal
                                 min_venue_name = (<object>mt).market.name
@@ -1252,6 +1265,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if bid > 0.0:
                 self._cached_mid_price_usd = bid
             # If bid == 0 (no order book yet) keep previous cached value — do not zero out.
+
+            # Per-venue diagnostic breakdown. These are AVAILABLE balances, so base locked in
+            # a resting order is excluded — the split is what makes a "total looks too low"
+            # reading explainable (locked vs genuinely absent vs not yet credited).
+            venue_detail = " ".join([f"{n}={q:.6g}" for n, q in venue_split])
+            if self._hold_target_usd > 0.0:
+                self.logger().debug(
+                    f"Hold-band [{base_asset}]: total={self._cached_total_base_qty:.6g} "
+                    f"bid=${self._cached_mid_price_usd:.8g} "
+                    f"value=${self._cached_total_base_qty * self._cached_mid_price_usd:.0f} "
+                    f"avail-by-venue: {venue_detail}")
 
             # ── Low-balance guardrail suspend ────────────────────────────────────
             # If any single venue holds < LOW_BALANCE_SUSPEND_USD of base (in USD terms),
@@ -1305,13 +1329,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             self._hold_correction_oversold = True
                             self._hold_breach_count = 0
                             self.logger().info(
-                                f"Hold-band: correction activated (oversold) — total ${total_usd:.0f} "
-                                f"below band floor ${hold_lower:.0f}")
+                                f"Hold-band [{base_asset}]: correction activated (oversold) — total ${total_usd:.0f} "
+                                f"below band floor ${hold_lower:.0f} | avail-by-venue: {venue_detail}")
                         else:
                             self.logger().info(
-                                f"Hold-band: breach pending confirmation (oversold) — "
+                                f"Hold-band [{base_asset}]: breach pending confirmation (oversold) — "
                                 f"total ${total_usd:.0f} below floor ${hold_lower:.0f} "
-                                f"({self._hold_breach_count}/2)")
+                                f"({self._hold_breach_count}/2) | avail-by-venue: {venue_detail}")
                     elif total_usd > hold_upper:
                         self._hold_breach_count += 1
                         if self._hold_breach_count >= 2:
@@ -1319,13 +1343,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             self._hold_correction_oversold = False
                             self._hold_breach_count = 0
                             self.logger().info(
-                                f"Hold-band: correction activated (overbought) — total ${total_usd:.0f} "
-                                f"above band ceiling ${hold_upper:.0f}")
+                                f"Hold-band [{base_asset}]: correction activated (overbought) — total ${total_usd:.0f} "
+                                f"above band ceiling ${hold_upper:.0f} | avail-by-venue: {venue_detail}")
                         else:
                             self.logger().info(
-                                f"Hold-band: breach pending confirmation (overbought) — "
+                                f"Hold-band [{base_asset}]: breach pending confirmation (overbought) — "
                                 f"total ${total_usd:.0f} above ceiling ${hold_upper:.0f} "
-                                f"({self._hold_breach_count}/2)")
+                                f"({self._hold_breach_count}/2) | avail-by-venue: {venue_detail}")
                     else:
                         # Back inside band — reset counter so a brief spike doesn't accumulate.
                         self._hold_breach_count = 0
@@ -1337,12 +1361,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if total_usd < hold_lower and not self._hold_correction_oversold:
                         self._hold_correction_oversold = True
                         self.logger().info(
-                            f"Hold-band: direction switched to oversold — total ${total_usd:.0f} "
+                            f"Hold-band [{base_asset}]: direction switched to oversold — total ${total_usd:.0f} "
                             f"below new band floor ${hold_lower:.0f}")
                     elif total_usd > hold_upper and self._hold_correction_oversold:
                         self._hold_correction_oversold = False
                         self.logger().info(
-                            f"Hold-band: direction switched to overbought — total ${total_usd:.0f} "
+                            f"Hold-band [{base_asset}]: direction switched to overbought — total ${total_usd:.0f} "
                             f"above new band ceiling ${hold_upper:.0f}")
                     # Deactivate once inside band AND crossed back through target center.
                     # Oversold correction: total must reach [target, upper] — i.e. $1100–$1250.
@@ -1353,8 +1377,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                              (not self._hold_correction_oversold and total_usd <= self._hold_target_usd))):
                         self._hold_correction_active = False
                         self.logger().info(
-                            f"Hold-band: correction complete — total ${total_usd:.0f} "
-                            f"reached target ${self._hold_target_usd:.0f}")
+                            f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
+                            f"reached target ${self._hold_target_usd:.0f} | avail-by-venue: {venue_detail}")
 
         except Exception as e:
             self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
