@@ -54,6 +54,8 @@ cdef class PositionBalancerHandler:
         dict _post_fill_extra_wait        # canonical_asset -> seconds to add to DEFAULT_COMPLETION_COOLDOWN
         # Step-up-into-gap throttle
         dict _last_step_up_time           # canonical_asset -> timestamp of last step-up cancel (pre-detection throttle)
+        # Log throttle for the per-tick min_tick=0 warning ("exchange:pair" -> last-logged timestamp)
+        dict _last_min_tick_warn_time
         # Second-level refuge state (per canonical asset) — True = resting under the wall (2nd-best), undercut suppressed
         dict _in_refuge_sell
         dict _in_refuge_buy

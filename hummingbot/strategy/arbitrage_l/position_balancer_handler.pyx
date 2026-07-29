@@ -106,6 +106,13 @@ cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detecti
 # This prevents orphaned orders on exchanges with slow cancel confirmations (e.g., BitMart)
 cdef double PENDING_CANCEL_WAIT_SECONDS = 10.0  # Wait at least 10s for cancel confirmation
 
+# --- Log throttle ---
+# The min_tick=0 warning lives inside the per-tick market scan, so a pair whose trading_rules
+# are missing/zero emits it at TICK RATE (100 Hz). PIVX:bitmart produced 1,200,308 lines in ~3h
+# on 2026-07-29. The condition is persistent, not transient, so one line per pair per 5 min is
+# ample to notice it; the fallback behaviour itself is unchanged.
+cdef double MIN_TICK_WARN_INTERVAL = 300.0  # seconds between min_tick=0 warnings per exchange:pair
+
 # --- Price Threshold Constants ---
 cdef double TICK_TOLERANCE = 0.9            # Tolerance for detecting if order matches top of book (90% of tick)
 cdef double HALF_TICK_TOLERANCE = 0.5       # Half-tick tolerance for price matching
@@ -292,6 +299,10 @@ cdef class PositionBalancerHandler:
         # Step-up-into-gap throttle: last time we stepped our order into a gap (per canonical asset).
         # Pre-detection gate (STEP_UP_MIN_INTERVAL) so a flickering gap can't cause repeated cancels.
         self._last_step_up_time = {}          # canonical_asset -> timestamp of last step-up cancel
+        # Throttle for the min_tick=0 warning. It sits inside the per-tick market scan, so a pair
+        # with broken trading_rules emits it at tick rate — PIVX/bitmart logged 1,200,308 lines in
+        # ~3h on 2026-07-29. Keyed "exchange:pair" -> last-logged timestamp.
+        self._last_min_tick_warn_time = {}
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
@@ -949,6 +960,42 @@ cdef class PositionBalancerHandler:
         self.handle_order_completion(order_id, True)
         self.handle_order_completion(order_id, False)
 
+    def handle_order_failure(self, str order_id):
+        """
+        Clean up tracking for an order the exchange REJECTED at placement.
+
+        The PB registers its tracking dicts (_active_*_orders, _active_*_order_details,
+        _pending_*_orders, _pending_*_by_asset) BEFORE the order is sent, so a rejected
+        placement leaves a phantom "active order" for that asset. Placement gate step 3
+        ("no active order for any alias") then blocks EVERY future order for that asset,
+        permanently: no cancel event will ever arrive to clean it up, and the arb backstop
+        cannot reach it either (its handle_old_order_cleanup call is gated on the order still
+        being resolvable in _sb_order_tracker, which c_did_fail_order has already cleared).
+
+        Witnessed 2026-07-29 on PIVX: BitMart returned HTTP 500 (code 59002) on a 2934-token
+        sell. The PB never placed another PIVX sell — and `control clean`, pause/resume and
+        disable_selloff all failed to clear it, because none of them touch _active_sell_orders
+        (c_cancel_all_sell_orders deliberately waits for a cancel event that cannot come).
+        Only a process restart recovered it.
+
+        Reuses handle_order_completion for the pops. A rejected order has filled_amt == 0, so
+        it is treated exactly like a pure cancel — refuge is correctly NOT cleared.
+        """
+        try:
+            was_buy = order_id in self._pending_buy_orders
+            was_sell = order_id in self._pending_sell_orders
+            if not (was_buy or was_sell):
+                return  # not a live PB order (arb order, or already cleaned up) — no-op
+            self.strategy.logger().warning(
+                f"Position balancer: order {order_id} REJECTED at placement — clearing "
+                f"{'buy' if was_buy else 'sell'} tracking so the asset is not blocked")
+            # Drop any stuck-cancel marker first; the order never reached the exchange.
+            self.strategy._timeout_cancelled_orders.discard(order_id)
+            self.handle_order_completion(order_id, was_buy)
+        except Exception as e:
+            self.strategy.logger().warning(
+                f"Position balancer: Failed to handle placement failure for {order_id}: {e}")
+
     def should_backstop_refresh(self, str order_id):
         """
         Decide whether the arb-layer 120s backstop (c_cleanup_old_orders) should actually
@@ -1281,10 +1328,18 @@ cdef class PositionBalancerHandler:
                                         else:
                                             current_price = current_bid  # Spread too tight, would be taker
                                     else:
-                                        # WARNING: min_tick lookup failed - using raw ask
-                                        self.strategy.logger().warning(
-                                            f"Position balancer: min_tick=0 for {market_tuple.market.name}:{market_tuple.trading_pair} - "
-                                            f"falling back to raw ask. Check trading_rules!")
+                                        # WARNING: min_tick lookup failed - using raw ask.
+                                        # Throttled: this branch is evaluated on every tick, so an
+                                        # unthrottled warning floods the log (see MIN_TICK_WARN_INTERVAL).
+                                        warn_key = f"{market_tuple.market.name}:{market_tuple.trading_pair}"
+                                        if (self.strategy._current_timestamp
+                                                - float(self._last_min_tick_warn_time.get(warn_key, 0.0))
+                                                >= MIN_TICK_WARN_INTERVAL):
+                                            self._last_min_tick_warn_time[warn_key] = self.strategy._current_timestamp
+                                            self.strategy.logger().warning(
+                                                f"Position balancer: min_tick=0 for {warn_key} - "
+                                                f"falling back to raw ask. Check trading_rules! "
+                                                f"(further warnings for this pair suppressed for {MIN_TICK_WARN_INTERVAL:.0f}s)")
                                         current_price = current_ask
                                 else:
                                     continue

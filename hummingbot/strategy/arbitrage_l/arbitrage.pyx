@@ -2087,7 +2087,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Always clean up tracking for failed orders to prevent stuck state
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair_tuple, order_id)
         self.c_remove_pending_order(market_pair_tuple, order_id, "failed")
-        
+
+        # The position balancer registers its own tracking dicts BEFORE sending an order, so a
+        # rejected placement leaves a phantom "active order" that blocks placement gate step 3
+        # for that asset FOREVER (no cancel event can arrive; the backstop's PB cleanup is gated
+        # on the order still being in _sb_order_tracker, which the line above just cleared).
+        # Must run BEFORE the `market_pair_tuple is None` return — a failed order is frequently
+        # already untracked, which is exactly the case that used to leak. (PIVX/BitMart HTTP 500,
+        # 2026-07-29 — see PositionBalancerHandler.handle_order_failure.)
+        if self._position_balancer is not None:
+            self._position_balancer.handle_order_failure(order_id)
+
         if market_pair_tuple is None:
             return
 
