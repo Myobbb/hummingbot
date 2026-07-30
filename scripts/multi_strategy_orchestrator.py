@@ -182,7 +182,9 @@ logger = None
 # appears. An asset can therefore sit outside its band indefinitely. After HOLD_ESCALATION_AFTER
 # seconds of CONTINUOUS correction we hand the job to the position balancer, which places its own
 # orders, targeting the hold target itself so both systems converge on the same number.
-HOLD_ESCALATION_AFTER = 4 * 60 * 60.0        # 4 h of continuous correction before escalating
+# ⚠️ TEMPORARY TEST VALUE 2026-07-30 — 10 min instead of the intended 4 h, to exercise the
+# escalation path on live assets without waiting. REVERT TO `4 * 60 * 60.0` AFTER TESTING.
+HOLD_ESCALATION_AFTER = 10 * 60.0            # PRODUCTION VALUE: 4 * 60 * 60.0 (4 h)
 HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_hold_cache's own 60 s
 HOLD_ESCALATION_SKIP_LOG_INTERVAL = 3600.0   # re-state a "ripe but skipped" reason at most hourly
 
