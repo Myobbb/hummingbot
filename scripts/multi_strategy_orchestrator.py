@@ -177,6 +177,15 @@ from hummingbot.strategy.strategy_base import StrategyBase
 
 logger = None
 
+# --- Stuck hold-band correction escalation ---
+# A hold-band correction only caps arb leg sizes; it cannot act on its own if no profitable arb
+# appears. An asset can therefore sit outside its band indefinitely. After HOLD_ESCALATION_AFTER
+# seconds of CONTINUOUS correction we hand the job to the position balancer, which places its own
+# orders, targeting the hold target itself so both systems converge on the same number.
+HOLD_ESCALATION_AFTER = 4 * 60 * 60.0        # 4 h of continuous correction before escalating
+HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_hold_cache's own 60 s
+HOLD_ESCALATION_SKIP_LOG_INTERVAL = 3600.0   # re-state a "ripe but skipped" reason at most hourly
+
 # Export convenience functions for easy import
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
@@ -854,6 +863,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Populated by clean(); drained in on_tick() when sell is no longer active.
         self._pending_auto_remove: Set[str] = set()
 
+        # Throttle clock for the stuck-hold-correction sweep (see _check_hold_escalations).
+        self._last_hold_escalation_check: float = 0.0
+        # strategy_name -> last time we logged why a ripe correction was NOT escalated.
+        self._hold_escalation_skip_logged: Dict[str, float] = {}
+
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
 
@@ -1403,6 +1417,90 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
         return connector.ready and connector.network_status == NetworkStatus.CONNECTED
 
+    def _check_hold_escalations(self, current_timestamp: float):
+        """
+        Hand a long-stuck hold-band correction over to the position balancer.
+
+        The guardrail can only shrink an arb leg, so it makes no progress while no profitable arb
+        appears — an asset can sit outside its band indefinitely. After HOLD_ESCALATION_AFTER of
+        CONTINUOUS correction, arm the matching PB side at the hold target so it places real
+        orders. Both systems then target the same number and finish together: the PB marks its
+        side complete and self-disables, and the guardrail logs "correction complete".
+
+        Cost: one property read per strategy, once a minute. Every value comes from the cache
+        c_refresh_hold_cache already maintains on its own 60 s cycle — no balance reads, no
+        order-book reads, no I/O — so this cannot delay a tick or stale the local books.
+        """
+        for instance in self.strategies:
+            if instance.paused:
+                continue
+            strategy = instance.strategy
+            try:
+                active, oversold, since, target_usd, total_usd, escalated = strategy.hold_correction_state
+            except AttributeError:
+                continue  # not an arb_l strategy — no hold-band guardrail
+            # Not correcting / already escalated this episode / clock not yet armed.
+            if not active or escalated or since <= 0.0:
+                continue
+            if current_timestamp - since < HOLD_ESCALATION_AFTER:
+                continue
+            if target_usd <= 0.0:
+                continue  # guardrail disabled underneath us — nothing meaningful to target
+
+            # Past this point the correction is RIPE (active, unescalated, older than the
+            # threshold). Anything that stops us now is worth one throttled line — silence here
+            # is what makes "why did nothing happen after 4h?" undiagnosable.
+            position_balancer = getattr(strategy, '_position_balancer', None)
+            skip_reason = None
+            if position_balancer is None:
+                skip_reason = "strategy has no position balancer"
+            elif position_balancer.is_buy_enabled or position_balancer.is_sell_enabled:
+                # Never arm a second side: their targets differ, so two armed sides would churn
+                # between them. Deliberately does NOT latch — we retry once the side finishes.
+                skip_reason = (
+                    f"position balancer already active "
+                    f"(buy_in={position_balancer.is_buy_enabled}, sell_off={position_balancer.is_sell_enabled})"
+                )
+            if skip_reason is not None:
+                last_logged = self._hold_escalation_skip_logged.get(instance.name, 0.0)
+                if current_timestamp - last_logged >= HOLD_ESCALATION_SKIP_LOG_INTERVAL:
+                    self._hold_escalation_skip_logged[instance.name] = current_timestamp
+                    self.logger().info(
+                        f"Hold-band escalation SKIPPED for '{instance.name}': {skip_reason} — "
+                        f"correcting ({'oversold' if oversold else 'overbought'}) for "
+                        f"{(current_timestamp - since) / 3600.0:.1f}h, target ${target_usd:.0f}, "
+                        f"current ${total_usd:.0f}"
+                    )
+                continue
+
+            try:
+                # ORDER IS LOAD-BEARING: set the target BEFORE enabling. enable_*() runs
+                # c_scan_and_mark_completion() immediately, so enabling against the OLD target
+                # (defaults: buy-in 1100 / sell-off 3000) would mark the side complete and
+                # disable it before the new target ever took effect. clean() uses this order too.
+                if oversold:
+                    position_balancer.set_buy_target(target_usd)
+                    position_balancer.enable_buy_in()
+                    action = "buy-in"
+                else:
+                    position_balancer.set_sell_target(target_usd)
+                    position_balancer.enable_sell_off()
+                    action = "sell-off"
+                # Latch AFTER success; it is cleared by c_set_hold_correction when the episode
+                # ends, so the next episode gets a fresh escalation.
+                strategy._hold_escalated = True
+                self._hold_escalation_skip_logged.pop(instance.name, None)
+                self.logger().info(
+                    f"Hold-band escalation: '{instance.name}' has been correcting "
+                    f"({'oversold' if oversold else 'overbought'}) for "
+                    f"{(current_timestamp - since) / 3600.0:.1f}h — enabling position balancer "
+                    f"{action} at the hold target ${target_usd:.0f} (current ${total_usd:.0f})"
+                )
+            except Exception as e:
+                self.logger().error(
+                    f"Hold-band escalation failed for '{instance.name}': {e}", exc_info=True
+                )
+
     def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
         """
         Check if a strategy's specific connectors are ready.
@@ -1522,6 +1620,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     f"Clean sell-off complete for '{strategy_name}' — auto-removing strategy"
                 )
                 self.remove_strategy(strategy_name)
+
+        # Escalate hold-band corrections that have been stuck too long (throttled to 60 s).
+        # One float compare per tick when not due — nothing measurable on the hot path.
+        if current_timestamp - self._last_hold_escalation_check >= HOLD_ESCALATION_CHECK_INTERVAL:
+            self._last_hold_escalation_check = current_timestamp
+            self._check_hold_escalations(current_timestamp)
 
     async def on_stop(self):
         """

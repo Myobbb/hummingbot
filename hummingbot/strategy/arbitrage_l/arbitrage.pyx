@@ -135,6 +135,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
         self._hold_low_balance_suspend = False
+        # Escalation state is in-memory only and starts clean on every (re)start by design.
+        self._hold_correction_since = 0.0
+        self._hold_escalated = False
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -278,6 +281,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
         self._hold_low_balance_suspend = False
+        # Escalation state is in-memory only and starts clean on every (re)start by design.
+        self._hold_correction_since = 0.0
+        self._hold_escalated = False
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -1297,7 +1303,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD and cond_is_oversold:
                     if not self._hold_low_balance_suspend:
                         self._hold_low_balance_suspend = True
-                        self._hold_correction_active = False
+                        # Ends the episode: a mid-transfer reading must not keep an aging clock
+                        # (it would escalate on a balance we already know is unreliable).
+                        self.c_set_hold_correction(False, self._hold_correction_oversold)
                         self._hold_breach_count = 0
                         self.logger().info(
                             f"Hold-band [{base_asset}]: guardrail suspended (oversold direction) — {min_venue_name} balance ${min_venue_usd_val:.2f} "
@@ -1325,8 +1333,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if total_usd < hold_lower:
                         self._hold_breach_count += 1
                         if self._hold_breach_count >= 2:
-                            self._hold_correction_active = True
-                            self._hold_correction_oversold = True
+                            self.c_set_hold_correction(True, True)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (oversold) — total ${total_usd:.0f} "
@@ -1339,8 +1346,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     elif total_usd > hold_upper:
                         self._hold_breach_count += 1
                         if self._hold_breach_count >= 2:
-                            self._hold_correction_active = True
-                            self._hold_correction_oversold = False
+                            self.c_set_hold_correction(True, False)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (overbought) — total ${total_usd:.0f} "
@@ -1359,12 +1365,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # to 2100 making $1321 < floor $1950 → now oversold), switch direction so the
                     # guardrail corrects correctly instead of staying stuck.
                     if total_usd < hold_lower and not self._hold_correction_oversold:
-                        self._hold_correction_oversold = True
+                        # Flip = new episode (clock + latch reset) — the new direction gets its
+                        # own full escalation window instead of inheriting the old one.
+                        self.c_set_hold_correction(True, True)
                         self.logger().info(
                             f"Hold-band [{base_asset}]: direction switched to oversold — total ${total_usd:.0f} "
                             f"below new band floor ${hold_lower:.0f}")
                     elif total_usd > hold_upper and self._hold_correction_oversold:
-                        self._hold_correction_oversold = False
+                        # Flip = new episode (see above).
+                        self.c_set_hold_correction(True, False)
                         self.logger().info(
                             f"Hold-band [{base_asset}]: direction switched to overbought — total ${total_usd:.0f} "
                             f"above new band ceiling ${hold_upper:.0f}")
@@ -1375,13 +1384,56 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     elif (hold_lower <= total_usd <= hold_upper and
                             ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
                              (not self._hold_correction_oversold and total_usd <= self._hold_target_usd))):
-                        self._hold_correction_active = False
+                        self.c_set_hold_correction(False, self._hold_correction_oversold)
                         self.logger().info(
                             f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
                             f"reached target ${self._hold_target_usd:.0f} | avail-by-venue: {venue_detail}")
 
         except Exception as e:
             self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
+
+    cdef void c_set_hold_correction(self, bint active, bint oversold):
+        """
+        The SINGLE owner of correction-episode state: the flag, its start timestamp, and the
+        one-shot escalation latch. Every transition of _hold_correction_active/_oversold goes
+        through here so the three can never desync — there are several such sites (two
+        activations, the deactivation, the low-balance suspend, and both direction flips), and
+        maintaining a timestamp by hand at each is exactly how this rots.
+
+        A "new episode" is either a fresh activation OR a direction flip: both re-stamp the
+        clock and clear the latch, so the new direction gets its own full escalation window
+        rather than inheriting a stale one. Ending an episode zeroes both.
+
+        Off the hot path entirely — only ever called from c_refresh_hold_cache transitions.
+        """
+        if active:
+            if (not self._hold_correction_active) or (self._hold_correction_oversold != oversold):
+                self._hold_correction_since = self._current_timestamp
+                self._hold_escalated = False
+            self._hold_correction_oversold = oversold
+        else:
+            self._hold_correction_since = 0.0
+            self._hold_escalated = False
+        self._hold_correction_active = active
+
+    @property
+    def hold_correction_state(self):
+        """
+        Read-only snapshot for the orchestrator's stuck-correction sweep:
+            (active, oversold, since_ts, target_usd, total_usd, escalated)
+
+        Cheap by construction — every field is already maintained by c_refresh_hold_cache on its
+        own 60 s cadence. NO balance reads, NO order-book reads, no I/O of any kind, so polling
+        this can neither slow a tick nor stale the local books.
+        """
+        return (
+            self._hold_correction_active,
+            self._hold_correction_oversold,
+            self._hold_correction_since,
+            self._hold_target_usd,
+            self._cached_total_base_qty * self._cached_mid_price_usd,
+            self._hold_escalated,
+        )
 
     def refresh_hold_cache(self):
         """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
