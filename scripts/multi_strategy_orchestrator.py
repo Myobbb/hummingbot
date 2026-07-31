@@ -182,9 +182,7 @@ logger = None
 # appears. An asset can therefore sit outside its band indefinitely. After HOLD_ESCALATION_AFTER
 # seconds of CONTINUOUS correction we hand the job to the position balancer, which places its own
 # orders, targeting the hold target itself so both systems converge on the same number.
-# ⚠️ TEMPORARY TEST VALUE 2026-07-30 — 10 min instead of the intended 4 h, to exercise the
-# escalation path on live assets without waiting. REVERT TO `4 * 60 * 60.0` AFTER TESTING.
-HOLD_ESCALATION_AFTER = 10 * 60.0            # PRODUCTION VALUE: 4 * 60 * 60.0 (4 h)
+HOLD_ESCALATION_AFTER = 4 * 60 * 60.0        # 4 h of continuous correction before escalating
 HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_hold_cache's own 60 s
 HOLD_ESCALATION_SKIP_LOG_INTERVAL = 3600.0   # re-state a "ripe but skipped" reason at most hourly
 
@@ -1449,6 +1447,17 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if target_usd <= 0.0:
                 continue  # guardrail disabled underneath us — nothing meaningful to target
 
+            # Every hold-band line is tagged with the BASE ASSET, while this sweep only knows the
+            # STRATEGY NAME — and they differ whenever a strategy is named for its venues
+            # (tnk_gate_mexc/TNK, AIC_gate_htx/AIC, QORPO_bb_kc_mexc/QORPO). Log both so the two
+            # sides can be grepped together; without it a per-asset join silently mis-reports
+            # those strategies as "never converged" (seen in the 2026-07-31 audit).
+            try:
+                base_asset = instance.market_pairs[0].base_asset
+            except Exception:
+                base_asset = instance.name
+            label = instance.name if base_asset == instance.name else f"{instance.name} [{base_asset}]"
+
             # Past this point the correction is RIPE (active, unescalated, older than the
             # threshold). Anything that stops us now is worth one throttled line — silence here
             # is what makes "why did nothing happen after 4h?" undiagnosable.
@@ -1468,7 +1477,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if current_timestamp - last_logged >= HOLD_ESCALATION_SKIP_LOG_INTERVAL:
                     self._hold_escalation_skip_logged[instance.name] = current_timestamp
                     self.logger().info(
-                        f"Hold-band escalation SKIPPED for '{instance.name}': {skip_reason} — "
+                        f"Hold-band escalation SKIPPED for '{label}': {skip_reason} — "
                         f"correcting ({'oversold' if oversold else 'overbought'}) for "
                         f"{(current_timestamp - since) / 3600.0:.1f}h, target ${target_usd:.0f}, "
                         f"current ${total_usd:.0f}"
@@ -1493,14 +1502,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 strategy._hold_escalated = True
                 self._hold_escalation_skip_logged.pop(instance.name, None)
                 self.logger().info(
-                    f"Hold-band escalation: '{instance.name}' has been correcting "
+                    f"Hold-band escalation: '{label}' has been correcting "
                     f"({'oversold' if oversold else 'overbought'}) for "
                     f"{(current_timestamp - since) / 3600.0:.1f}h — enabling position balancer "
-                    f"{action} at the hold target ${target_usd:.0f} (current ${total_usd:.0f})"
+                    f"{action} at the hold target ${target_usd:.0f} (current ${total_usd:.0f}). "
+                    f"PB {'buy-in' if oversold else 'sell-off'} target is now ${target_usd:.0f} "
+                    f"and stays there after the episode ends."
                 )
             except Exception as e:
                 self.logger().error(
-                    f"Hold-band escalation failed for '{instance.name}': {e}", exc_info=True
+                    f"Hold-band escalation failed for '{label}': {e}", exc_info=True
                 )
 
     def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
@@ -2948,6 +2959,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Step 3: Remove from in-memory list and index
         self.strategies = [s for s in self.strategies if s.name != strategy_name]
         self._strategy_by_name.pop(strategy_name, None)  # Remove from index
+        self._hold_escalation_skip_logged.pop(strategy_name, None)  # Drop escalation log throttle
         self.logger().info(f"Strategy '{strategy_name}' removed from memory")
 
         # Step 4: Update the config file
@@ -4364,9 +4376,29 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except Exception:
                 pass
 
+            # Position-balancer live state. Surfaced because the hold-band escalation can arm a
+            # side on its own — without this, `control list` gives no hint that a strategy is
+            # mid buy-in/sell-off, and `escalated` marks the ones that were armed automatically.
+            # NOTE: only `is_buy_enabled` / `is_sell_enabled` (properties) and `_hold_escalated`
+            # (public bint) are reachable from Python — `_buy_target_usd` / `_sell_target_usd` are
+            # non-public cdef fields, so reading them raises and would be swallowed by the except
+            # below, silently blanking this whole block. Keep to the exposed surface.
+            pb_state = None
+            try:
+                pb = getattr(strategy_instance.strategy, '_position_balancer', None)
+                if pb is not None:
+                    pb_state = {
+                        "buy_enabled": bool(pb.is_buy_enabled),
+                        "sell_enabled": bool(pb.is_sell_enabled),
+                        "escalated": bool(getattr(strategy_instance.strategy, '_hold_escalated', False)),
+                    }
+            except Exception:
+                pass
+
             strategy_summary[strategy_instance.name] = {
                 "status": status,
                 "paused": strategy_instance.paused,
+                "pb": pb_state,
                 "primary_market": strategy_instance.config.get('primary_market', 'N/A'),
                 "secondary_market": strategy_instance.config.get('secondary_market', 'N/A'),
                 "primary_pair": strategy_instance.config.get('primary_trading_pair', 'N/A'),

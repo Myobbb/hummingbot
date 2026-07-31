@@ -291,6 +291,19 @@ class StrategyControlCommand:
                     else:
                         self.notify(f"   Hold: disabled")
 
+                # Position balancer — shown only when a side is actually armed. The hold-band
+                # escalation can arm one automatically, so without this there is no indication
+                # in `control list` that a strategy is mid buy-in/sell-off.
+                pb = info.get('pb')
+                if pb and (pb.get('buy_enabled') or pb.get('sell_enabled')):
+                    sides = []
+                    if pb.get('buy_enabled'):
+                        sides.append("buy-in")
+                    if pb.get('sell_enabled'):
+                        sides.append("sell-off")
+                    origin = " (auto-armed by hold-band escalation)" if pb.get('escalated') else ""
+                    self.notify(f"   PB: {' + '.join(sides)} ACTIVE{origin}")
+
             self.notify("\n" + "=" * 80)
             self.notify("\nCommands:")
             self.notify("  control pause <name_or_token>                    - Pause a strategy")
