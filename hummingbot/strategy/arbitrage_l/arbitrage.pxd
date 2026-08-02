@@ -94,7 +94,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Hold-band guardrail: keeps total asset value near a target by capping arb order size.
         # hold_target_usd == 0.0 means disabled (default).
         public double _hold_target_usd   # centre of acceptable band, e.g. 1100.0
-        public double _hold_band_usd     # half-width, e.g. 150.0 → band is [950, 1250]
+        public double _hold_band_usd     # half-width, e.g. 100.0 → band is [1000, 1200]
         double _cached_total_base_qty    # sum of base across all venues; refreshed every 60 s
         double _cached_mid_price_usd     # top-of-book bid (same source as position balancer); refreshed every 60 s
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)

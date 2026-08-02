@@ -691,8 +691,10 @@ class ArbitrageMInstanceConfig(BaseModel):
         description="Centre of the acceptable holding band in USD (e.g. 1100 → aim to hold ~$1100 worth)"
     )
     hold_band_usd: float = Field(
-        default=150.0,
-        description="Half-width of the band in USD (target ± band = acceptable range, e.g. 150 → [950, 1250])"
+        default=100.0,
+        description="Half-width of the band in USD (target ± band = acceptable range, e.g. 100 → [1000, 1200]). "
+                    "Kept equal to asset_manager's hold-grade margin so both sides agree on "
+                    "what counts as 'already at target'."
     )
 
     # Runtime pause state — persisted so a paused strategy stays paused across restarts.
@@ -3712,10 +3714,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 secondary_trading_pair=secondary_pair,
                 min_profitability=Decimal(str(min_profitability)),
                 buy_in_enabled=True,
-                buy_in_target_usd=750.0,
+                buy_in_target_usd=500.0,
                 hold_target_enabled=True,
-                hold_target_usd=750.0,
-                hold_band_usd=150.0,
+                hold_target_usd=500.0,
+                hold_band_usd=100.0,
                 additional_markets=additional_list
             )
 
@@ -3811,7 +3813,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Always persist hold-band fields when enabled so they survive restart.
         # Without this, a restart would reload defaults (enabled=False, target=1100)
-        # and the guardrail would be silently off even though create() sets it to 750/True.
+        # and the guardrail would be silently off even though create() sets it to 500/True.
         if config.hold_target_enabled and config.hold_target_usd > 0:
             strategy_dict['hold_target_enabled'] = True
             strategy_dict['hold_target_usd'] = float(config.hold_target_usd)

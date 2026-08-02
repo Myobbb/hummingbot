@@ -128,7 +128,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._total_trades = 0
         # Hold-band guardrail (disabled by default)
         self._hold_target_usd = 0.0
-        self._hold_band_usd = 150.0
+        self._hold_band_usd = 100.0
         self._cached_total_base_qty = 0.0
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
@@ -170,7 +170,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     orchestrated_mode: bool = False,
                     # Hold-band guardrail
                     hold_target_usd: float = 0.0,
-                    hold_band_usd: float = 150.0):
+                    hold_band_usd: float = 100.0):
         """Initialize arbitrage strategy with configurable parameters"""
         
         if not market_pairs:
