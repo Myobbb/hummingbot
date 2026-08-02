@@ -189,6 +189,21 @@ cdef double BETTER_MARKET_SWITCH_TOLERANCE = 0.0001  # 0.01% - switch immediatel
 # This prevents flip-flopping between markets with nearly identical effective prices
 cdef double MIN_MODE_SWITCH_HYSTERESIS = 0.001  # 0.1% - require meaningful improvement before switching
 
+# --- Sell-off venue balance preference ---
+# When SELLING OFF and several venues hold the asset, prefer the venue holding the MOST base
+# among those priced within this fraction of the best. Without it every sell-off goes to
+# whichever venue is momentarily best, draining one venue to zero while another stays full —
+# which makes the asset manager shuttle inventory back and forth (withdraw fee + transfer time
+# each way, and an in-transit aggregate dip the hold-band guardrail can misread as oversold).
+#
+# ⚠️ MUST NOT EXCEED MIN_MODE_SWITCH_HYSTERESIS. CHECK 1 relocates a resting order as soon as
+# another venue is better by more than that hysteresis; a wider preference here would pick the
+# fuller venue at placement and then CHECK 1 would cancel and move it straight back to the
+# best-price venue, undoing the preference and paying a cancel/replace cycle for nothing.
+# Equal values make the two agree: a venue good enough to be preferred is, by construction,
+# never enough better to trigger a relocation.
+cdef double SELL_BALANCE_PREFERENCE_PCT = MIN_MODE_SWITCH_HYSTERESIS  # 0.1%
+
 # --- Insufficient balance retry cooldown ---
 # When the best sell market has insufficient base balance to meet min_order_usd,
 # suppress retries for this many seconds to avoid spamming every 2s tick.
@@ -1262,7 +1277,7 @@ cdef class PositionBalancerHandler:
 
         return best_market
 
-    cdef object c_find_best_sell_market(self, str asset):
+    cdef object c_find_best_sell_market(self, str asset, bint prefer_fuller_venue=False):
         """
         Find the best market to place a sell order for the given asset.
         For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
@@ -1272,6 +1287,12 @@ cdef class PositionBalancerHandler:
         - Percentage (>0%): Select market with HIGHEST ASK (maker below ask)
         - 'min' mode: Select market with HIGHEST EFFECTIVE SELL PRICE (ask - min_tick)
           This accounts for different min_price_increment across markets.
+
+        `prefer_fuller_venue` (sell-off only, PLACEMENT only): among venues priced within
+        SELL_BALANCE_PREFERENCE_PCT of the best, pick the one holding the MOST base. Stops the
+        sell-off draining whichever venue is momentarily best down to zero and making the asset
+        manager shuttle inventory back and forth. Off by default so the per-tick better-market
+        scan (CHECK 1) stays a pure price comparison and pays no balance reads.
         """
         cdef:
             object best_market = None
@@ -1287,6 +1308,12 @@ cdef class PositionBalancerHandler:
             bint use_bid_price = (not self._sell_spread_is_min and self._sell_spread_pct == 0.0)
             bint use_effective_price = self._sell_spread_is_min  # 'min' mode needs effective price
             object trading_rule
+            list candidates = []      # [(market_tuple, price)] — only used when prefer_fuller_venue
+            double price_floor
+            double cand_bal
+            double best_bal
+            double orig_bal
+            object chosen
 
         # Get all aliases for this asset (includes asset itself)
         asset_aliases = self._get_all_asset_aliases(asset)
@@ -1350,6 +1377,9 @@ cdef class PositionBalancerHandler:
                                 else:
                                     continue
 
+                            if prefer_fuller_venue:
+                                candidates.append((market_tuple, current_price))
+
                             if current_price > best_price:
                                 # DEBUG: Log when a new best is found
                                 if use_effective_price:
@@ -1363,6 +1393,30 @@ cdef class PositionBalancerHandler:
                                     f"[SELL EVAL] {market_tuple.market.name}: eff={current_price:.8g} <= best={best_price:.8g}, skipped")
                         except Exception:
                             continue
+
+            # ── Sell-off venue balance preference (placement only) ────────────────────────
+            # Start from the best-priced venue and move only if another venue is BOTH within
+            # SELL_BALANCE_PREFERENCE_PCT of that price AND holds strictly more base. Starting
+            # from the best price means ties keep the best price, and a single-venue asset is
+            # untouched. Balance reads happen here and nowhere else in this function.
+            if prefer_fuller_venue and best_market is not None and len(candidates) > 1 and best_price > 0.0:
+                price_floor = best_price * (1.0 - SELL_BALANCE_PREFERENCE_PCT)
+                chosen = best_market
+                orig_bal = float(best_market.market.get_available_balance(best_market.base_asset))
+                best_bal = orig_bal
+                for market_tuple, current_price in candidates:
+                    if market_tuple is chosen or current_price < price_floor:
+                        continue
+                    cand_bal = float(market_tuple.market.get_available_balance(market_tuple.base_asset))
+                    if cand_bal > best_bal:
+                        best_bal = cand_bal
+                        chosen = market_tuple
+                if chosen is not best_market:
+                    self.strategy.logger().info(
+                        f"Position balancer: sell venue {best_market.market.name} -> {chosen.market.name} for {asset} "
+                        f"— within {SELL_BALANCE_PREFERENCE_PCT*100:.2f}% on price but holds more base "
+                        f"({best_bal:.8g} vs {orig_bal:.8g}); avoids draining one venue to zero")
+                    best_market = chosen
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Error finding best sell market for {asset} (aliases: {asset_aliases}): {e}")
 
@@ -2743,8 +2797,11 @@ cdef class PositionBalancerHandler:
                                 base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                                 val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
                                 if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
-                                    # Find the best market to sell on (highest bid)
-                                    selected_sell_market = self.c_find_best_sell_market(asset_key)
+                                    # Find the best market to sell on (highest bid). prefer_fuller_venue
+                                    # is set ONLY here: at placement we choose where the inventory
+                                    # leaves from, so spreading the drain across venues matters. The
+                                    # per-tick CHECK 1 scan keeps the plain price comparison.
+                                    selected_sell_market = self.c_find_best_sell_market(asset_key, True)
                                     if selected_sell_market is not None:
                                         # Pre-check: ensure selected market has enough base balance for min notional.
                                         # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
