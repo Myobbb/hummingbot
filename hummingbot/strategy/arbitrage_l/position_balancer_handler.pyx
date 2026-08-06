@@ -2647,6 +2647,25 @@ cdef class PositionBalancerHandler:
             current_value = val_result.first
             shortfall_or_excess = val_result.second
 
+            # TARGET REACHED — close the buy-in out.
+            # c_try_mark_buy_complete's first branch (`value >= target`) exists for exactly this,
+            # but it used to be reachable ONLY from inside the `shortfall > 0` path below — and
+            # c_compute_value_and_buy_shortfall returns shortfall = 0 the moment value >= target,
+            # so that branch could never fire from the tick loop. A buy-in that reached or
+            # overshot its target therefore stayed `active` forever, re-buying on every dip below
+            # target, until some config command happened to run c_scan_and_mark_completion.
+            # (Observed on 2U2: buy_target=2500, value oscillating 2383↔2537, never completing.)
+            # It also kept `is_buy_enabled` True, which blocks the hold-band escalation's
+            # one-side guard from ever arming the opposite side.
+            #
+            # Guarded on nothing being in flight: `base_bal` is the ADJUSTED balance, so while a
+            # buy order rests it already counts toward the target and `actual` legitimately lags.
+            # With zero pending, adjusted == actual, so this completes on the values already
+            # computed — no extra balance reads, and once _buy_completed is set the enclosing
+            # `not self._buy_completed` stops it re-running.
+            if shortfall_or_excess <= 0.0 and self.c_get_pending_buy_base(canonical_asset) <= 0.0:
+                self.c_try_mark_buy_complete(canonical_asset, current_value, shortfall_or_excess)
+
             if shortfall_or_excess > 0:
                 # Check if already have pending buy order for ANY alias
                 # Only place new order if no aliases have active orders
@@ -2731,6 +2750,16 @@ cdef class PositionBalancerHandler:
             val_result = self.c_compute_value_and_sell_excess(base_bal, last_bid)
             current_value = val_result.first
             shortfall_or_excess = val_result.second
+
+            # TARGET REACHED — exact mirror of the buy-in close-out above, same root cause:
+            # c_compute_value_and_sell_excess returns excess = 0 once value <= target, so
+            # c_try_mark_sell_complete's `value <= target` branch was unreachable from the tick
+            # loop. This is what left a sell-off armed BELOW its target indefinitely — the stale
+            # `_sell_enabled` flag that blocked EDGE's oversold escalation on 2026-07-30.
+            # Sell-to-zero (`control clean`, target 0) is unaffected: excess stays > 0 until the
+            # balance is actually gone, so this branch does not fire early.
+            if shortfall_or_excess <= 0.0 and self.c_get_pending_sell_base(canonical_asset) <= 0.0:
+                self.c_try_mark_sell_complete(canonical_asset, current_value, shortfall_or_excess)
 
             if shortfall_or_excess > 0:
                 # Check if already have pending sell order for ANY alias
