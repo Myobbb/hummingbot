@@ -2613,8 +2613,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 strategy._hold_correction_active = False
             if hasattr(strategy, '_hold_breach_count'):
                 strategy._hold_breach_count = 0
-            if hasattr(strategy, '_hold_low_balance_suspend'):
-                strategy._hold_low_balance_suspend = False
             self._persist_hold_config(strategy_name, {'hold_target_enabled': False})
             self.logger().info(f"Hold-band disabled for '{strategy_name}'")
             return True
@@ -2654,8 +2652,6 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     strategy._hold_correction_active = False
                 if hasattr(strategy, '_hold_breach_count'):
                     strategy._hold_breach_count = 0
-                if hasattr(strategy, '_hold_low_balance_suspend'):
-                    strategy._hold_low_balance_suspend = False
             enabled_str = "enabled" if target_usd > 0.0 else "disabled (target=0)"
             self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' ({enabled_str})")
             return True

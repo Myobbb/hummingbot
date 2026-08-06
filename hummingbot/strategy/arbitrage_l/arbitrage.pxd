@@ -100,7 +100,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
         int  _hold_breach_count          # consecutive 60s-cycle readings outside band before activation
-        bint _hold_low_balance_suspend   # True when any single venue has < LOW_BALANCE_SUSPEND_USD of base
+        bint _hold_breach_oversold       # direction of the pending breach (resets the window on a flip)
         # Stuck-correction escalation (orchestrator-driven; see c_set_hold_correction)
         double _hold_correction_since    # timestamp the current correction episode began (0.0 = not correcting)
         public bint _hold_escalated      # True once this episode has been escalated to a PB buy-in/sell-off

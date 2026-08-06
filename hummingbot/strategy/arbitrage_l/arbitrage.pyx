@@ -47,6 +47,23 @@ cdef:
     double DEFAULT_RATE_CACHE_DURATION = 10.0
 
     size_t DEFAULT_MAX_TRACKED_ORDERS = 1000
+    # Consecutive 60s-cycle readings outside the band required before the correction activates.
+    # This is a DURATION filter, and it replaced the per-venue $20 low-balance suspend (removed
+    # 2026-08-06): a balance threshold guesses at "is this a transfer?" from a number that price
+    # noise alone can flip, and it failed in both directions. A duration cannot flap — a real
+    # transfer resolves and the counter resets; genuine drift persists and confirms.
+    # 15 cycles = ~15 min, which covers the bulk of observed transfers (25s-17min). The asset
+    # manager remains the PRIMARY signal via `control disable_hold`/`enable_hold` (it holds
+    # authoritative in-transfer state); this delay is the BACKUP for when no signal arrives.
+    # NOTE: the escalation clock starts at ACTIVATION, so time-to-buy-in = this delay + 1h.
+    # UNITS: these are REAL MINUTES, not ticks. c_refresh_hold_cache is gated on
+    # `timestamp - _last_cleanup_timestamp > 60.0` where timestamp is Unix SECONDS from the HB
+    # clock — the 0.01s tick rate only decides how often that comparison is evaluated, so the
+    # refresh still runs once per ~60 wall-clock seconds. No drift: _last_cleanup_timestamp is
+    # set to the current time, not incremented. Caveat: the counter advances per EXECUTED
+    # refresh, so a paused strategy or a connector outage freezes the window mid-count rather
+    # than ageing it — deliberate, a breach should not confirm on readings from before an outage.
+    int HOLD_BREACH_CONFIRM_CYCLES = 15
     double DEFAULT_ORDER_TIMEOUT = 600.0  # 10 minutes timeout for unfilled orders
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
@@ -55,7 +72,6 @@ cdef:
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
     double PARTIAL_FILL_COOLOFF = 5.0  # Cooldown for orders with partial fills
-    double LOW_BALANCE_SUSPEND_USD = 20.0  # Suspend hold-band guardrail when any single venue has < this USD of base
     # NOTE: AGGRESSIVE_REFRESH_INTERVAL is defined in position_balancer_handler.pyx (5.0s default)
 
 # Pre-allocated Decimal constants — avoids string parse + Decimal construction on every hot-path call
@@ -134,7 +150,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_active = False
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
-        self._hold_low_balance_suspend = False
+        self._hold_breach_oversold = False
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
@@ -280,7 +296,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_active = False
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
-        self._hold_low_balance_suspend = False
+        self._hold_breach_oversold = False
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
@@ -1219,11 +1235,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double bid = 0.0
             double total_usd = 0.0
             double venue_bal = 0.0
-            double min_venue_base = 0.0   # minimum single-venue base balance (base token units)
-            double min_venue_usd_val = 0.0  # min_venue_base converted to USD for threshold check
             object mp, mt, key
             str base_asset
-            str min_venue_name   # exchange name where min balance was observed
             set checked
             list venue_split     # [(exchange, available_base)] — diagnostic breakdown
             str venue_detail     # rendered per-venue split for log lines
@@ -1237,14 +1250,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # ── Per-venue balance scan ────────────────────────────────────────────
             # Always do the direct scan (O(market_pairs), typically 2–4 items).
             # Two purposes:
-            #   1. Per-venue low-balance detection (suspend guardrail when any venue < $20).
-            #   2. Aggregate total when no position balancer is present.
-            # When position balancer is present, it also aggregates (handles aliases), but
-            # we still need the per-venue pass for the low-balance check.
+            #   1. Aggregate total when no position balancer is present.
+            #   2. The `avail-by-venue` breakdown on the hysteresis log lines.
+            # When position balancer is present, it also aggregates (handles aliases); the
+            # per-venue pass still feeds the `avail-by-venue` diagnostic on the hysteresis logs.
             checked = set()
             venue_split = []
-            min_venue_base = 1e18  # sentinel — overwritten on first venue seen
-            min_venue_name = ""
             for mp in self._market_pairs:
                 for mt in [(<object>mp).first, (<object>mp).second]:
                     if (<object>mt).base_asset == base_asset:
@@ -1254,13 +1265,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             venue_bal = float((<object>mt).market.get_available_balance(base_asset))
                             total += venue_bal
                             venue_split.append(((<object>mt).market.name, venue_bal))
-                            if venue_bal < min_venue_base:
-                                min_venue_base = venue_bal
-                                min_venue_name = (<object>mt).market.name
 
             if self._position_balancer is not None:
                 # Delegate aggregate to position balancer (alias-aware, de-duped).
-                # Per-venue min computed above is still valid — balancer uses same underlying balances.
                 total = self._position_balancer.c_get_aggregated_base_balance(base_asset)
             self._cached_total_base_qty = total
 
@@ -1283,40 +1290,25 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     f"value=${self._cached_total_base_qty * self._cached_mid_price_usd:.0f} "
                     f"avail-by-venue: {venue_detail}")
 
-            # ── Low-balance guardrail suspend ────────────────────────────────────
-            # If any single venue holds < LOW_BALANCE_SUSPEND_USD of base (in USD terms),
-            # the aggregate total is unreliable for the oversold direction only (funds in
-            # transit show near-zero on the sending exchange, making total look artificially
-            # low). Suspend only blocks oversold activation/correction — overbought correction
-            # is real regardless of per-venue balance and must continue unimpeded.
-            # The suspend flag clears automatically the next cycle when all venues recover.
-            # Zero cost on the hot arb path — only the cached bint is read there.
-            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0 and min_venue_base < 1e18:
-                # Convert minimum venue base quantity to USD using cached bid (USDT/base).
-                # All strategies trade XXX-USDT pairs so bid is directly in USDT.
-                min_venue_usd_val = min_venue_base * self._cached_mid_price_usd
-                total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
-                hold_upper = self._hold_target_usd + self._hold_band_usd
-                # Overbought: low venue balance is irrelevant — skip suspend entirely.
-                # Oversold: a low venue is the likely cause of the false reading — suspend.
-                cond_is_oversold = total_usd <= hold_upper
-                if min_venue_usd_val < LOW_BALANCE_SUSPEND_USD and cond_is_oversold:
-                    if not self._hold_low_balance_suspend:
-                        self._hold_low_balance_suspend = True
-                        # Ends the episode: a mid-transfer reading must not keep an aging clock
-                        # (it would escalate on a balance we already know is unreliable).
-                        self.c_set_hold_correction(False, self._hold_correction_oversold)
-                        self._hold_breach_count = 0
-                        self.logger().info(
-                            f"Hold-band [{base_asset}]: guardrail suspended (oversold direction) — {min_venue_name} balance ${min_venue_usd_val:.2f} "
-                            f"< threshold ${LOW_BALANCE_SUSPEND_USD:.0f} (transfer in progress or dust)")
-                    return  # Skip hysteresis entirely this cycle
-                elif self._hold_low_balance_suspend:
-                    # All venues recovered, or condition is now overbought — lift suspend
-                    self._hold_low_balance_suspend = False
-                    self.logger().info(
-                        f"Hold-band [{base_asset}]: low-balance suspend lifted — min venue ${min_venue_usd_val:.2f} "
-                        f">= threshold ${LOW_BALANCE_SUSPEND_USD:.0f}")
+            # ── NOTE: the low-balance suspend was REMOVED 2026-08-06 ─────────────
+            # It suspended the guardrail whenever any single venue held < $20 of base, on the
+            # theory that a near-empty venue meant funds were in transit and the aggregate was
+            # therefore untrustworthy in the oversold direction.
+            #
+            # It was structurally unstable and failed CLOSED. The suspend cleared the correction
+            # AND reset _hold_breach_count, so any asset whose smallest venue sat near $20 had
+            # its escalation clock wiped every time price noise crossed the line. Witnessed on
+            # LA (2026-08-06): htx held a CONSTANT 430.077 LA worth ~$20.00 and the bid alone
+            # flipped it 19.74<->20.34 every couple of minutes. LA was genuinely oversold at
+            # $375-445 against a $500 target for 3+ hours and could never escalate, because the
+            # clock never survived long enough to reach the threshold — activate -> suspend ->
+            # lift -> activate, indefinitely. Tuning the threshold cannot fix this; it only
+            # changes which assets flap.
+            #
+            # The guardrail now always sees the truth. Transfer exemption, where genuinely
+            # needed, belongs with the asset manager: it holds authoritative in-transfer state
+            # and can drive the EXISTING `control disable_hold` / `enable_hold` commands — no
+            # transfer-guessing in the trading runtime.
 
             # ── Hysteresis: update correction flag ───────────────────────────────
             # Only meaningful when guardrail is enabled and cache is warm.
@@ -1326,36 +1318,52 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_upper = self._hold_target_usd + self._hold_band_usd
 
                 if not self._hold_correction_active:
-                    # Require two consecutive 60s-cycle readings outside the band before activating.
-                    # This prevents a false trigger when one arb leg completes (sell side lands,
-                    # buy side still pending) — the imbalance is temporary and self-correcting.
+                    # Require HOLD_BREACH_CONFIRM_CYCLES consecutive 60s readings outside the band
+                    # before activating — a duration filter that rides out withdrawals/in-transfer
+                    # moments without needing to guess at balances. Any reading back inside the
+                    # band resets the counter, as does a flip to the opposite edge (below).
                     # Per-trade refresh never runs this branch (only fires when already active).
                     if total_usd < hold_lower:
+                        # A flip to the other edge restarts the window — otherwise an asset
+                        # oscillating across BOTH edges would accumulate count on mixed readings
+                        # and then activate in whichever direction it happened to land on.
+                        if self._hold_breach_count > 0 and not self._hold_breach_oversold:
+                            self._hold_breach_count = 0
+                        self._hold_breach_oversold = True
                         self._hold_breach_count += 1
-                        if self._hold_breach_count >= 2:
+                        if self._hold_breach_count >= HOLD_BREACH_CONFIRM_CYCLES:
                             self.c_set_hold_correction(True, True)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (oversold) — total ${total_usd:.0f} "
                                 f"below band floor ${hold_lower:.0f} | avail-by-venue: {venue_detail}")
-                        else:
+                        elif self._hold_breach_count == 1:
+                            # First cycle of the window only — at HOLD_BREACH_CONFIRM_CYCLES this
+                            # would otherwise log every minute, forever, for anything hovering
+                            # near a band edge that never confirms.
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: breach pending confirmation (oversold) — "
                                 f"total ${total_usd:.0f} below floor ${hold_lower:.0f} "
-                                f"({self._hold_breach_count}/2) | avail-by-venue: {venue_detail}")
+                                f"({self._hold_breach_count}/{HOLD_BREACH_CONFIRM_CYCLES}) | avail-by-venue: {venue_detail}")
                     elif total_usd > hold_upper:
+                        if self._hold_breach_count > 0 and self._hold_breach_oversold:
+                            self._hold_breach_count = 0
+                        self._hold_breach_oversold = False
                         self._hold_breach_count += 1
-                        if self._hold_breach_count >= 2:
+                        if self._hold_breach_count >= HOLD_BREACH_CONFIRM_CYCLES:
                             self.c_set_hold_correction(True, False)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (overbought) — total ${total_usd:.0f} "
                                 f"above band ceiling ${hold_upper:.0f} | avail-by-venue: {venue_detail}")
-                        else:
+                        elif self._hold_breach_count == 1:
+                            # First cycle of the window only — at HOLD_BREACH_CONFIRM_CYCLES this
+                            # would otherwise log every minute, forever, for anything hovering
+                            # near a band edge that never confirms.
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: breach pending confirmation (overbought) — "
                                 f"total ${total_usd:.0f} above ceiling ${hold_upper:.0f} "
-                                f"({self._hold_breach_count}/2) | avail-by-venue: {venue_detail}")
+                                f"({self._hold_breach_count}/{HOLD_BREACH_CONFIRM_CYCLES}) | avail-by-venue: {venue_detail}")
                     else:
                         # Back inside band — reset counter so a brief spike doesn't accumulate.
                         self._hold_breach_count = 0
@@ -1397,7 +1405,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         The SINGLE owner of correction-episode state: the flag, its start timestamp, and the
         one-shot escalation latch. Every transition of _hold_correction_active/_oversold goes
         through here so the three can never desync — there are several such sites (two
-        activations, the deactivation, the low-balance suspend, and both direction flips), and
+        activations, the deactivation, and both direction flips), and
         maintaining a timestamp by hand at each is exactly how this rots.
 
         A "new episode" is either a fresh activation OR a direction flip: both re-stamp the
