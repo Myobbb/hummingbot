@@ -63,7 +63,15 @@ cdef:
     # set to the current time, not incremented. Caveat: the counter advances per EXECUTED
     # refresh, so a paused strategy or a connector outage freezes the window mid-count rather
     # than ageing it — deliberate, a breach should not confirm on readings from before an outage.
-    int HOLD_BREACH_CONFIRM_CYCLES = 15
+    # ASYMMETRIC BY DESIGN. Funds in transit make the aggregate look LOW, never high — a
+    # withdrawal or a slow deposit can fake an OVERSOLD reading, but nothing fakes overbought.
+    # So only the oversold direction needs the long duration filter; making overbought wait the
+    # same 15 min would just let the arb keep over-accumulating for 13 extra minutes.
+    # Overbought keeps the original 2-cycle debounce, which exists for a different and much
+    # shorter transient: one arb leg completing before the other (buy lands, sell still pending).
+    # That self-corrects in seconds and applies to both directions.
+    int HOLD_BREACH_CYCLES_OVERSOLD = 15
+    int HOLD_BREACH_CYCLES_OVERBOUGHT = 2
     double DEFAULT_ORDER_TIMEOUT = 600.0  # 10 minutes timeout for unfilled orders
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
@@ -1318,7 +1326,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_upper = self._hold_target_usd + self._hold_band_usd
 
                 if not self._hold_correction_active:
-                    # Require HOLD_BREACH_CONFIRM_CYCLES consecutive 60s readings outside the band
+                    # Require the direction's confirm-cycle count of consecutive 60s readings outside the band
                     # before activating — a duration filter that rides out withdrawals/in-transfer
                     # moments without needing to guess at balances. Any reading back inside the
                     # band resets the counter, as does a flip to the opposite edge (below).
@@ -1331,39 +1339,39 @@ cdef class ArbitrageLStrategy(StrategyBase):
                             self._hold_breach_count = 0
                         self._hold_breach_oversold = True
                         self._hold_breach_count += 1
-                        if self._hold_breach_count >= HOLD_BREACH_CONFIRM_CYCLES:
+                        if self._hold_breach_count >= HOLD_BREACH_CYCLES_OVERSOLD:
                             self.c_set_hold_correction(True, True)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (oversold) — total ${total_usd:.0f} "
                                 f"below band floor ${hold_lower:.0f} | avail-by-venue: {venue_detail}")
                         elif self._hold_breach_count == 1:
-                            # First cycle of the window only — at HOLD_BREACH_CONFIRM_CYCLES this
-                            # would otherwise log every minute, forever, for anything hovering
-                            # near a band edge that never confirms.
+                            # First cycle of the window only — over a 15-cycle window this would
+                            # otherwise log every minute, forever, for anything hovering near the
+                            # floor that never confirms. A repeated (1/15) for one asset therefore
+                            # means it is dipping in and out of the band and resetting.
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: breach pending confirmation (oversold) — "
                                 f"total ${total_usd:.0f} below floor ${hold_lower:.0f} "
-                                f"({self._hold_breach_count}/{HOLD_BREACH_CONFIRM_CYCLES}) | avail-by-venue: {venue_detail}")
+                                f"({self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERSOLD}) | avail-by-venue: {venue_detail}")
                     elif total_usd > hold_upper:
                         if self._hold_breach_count > 0 and self._hold_breach_oversold:
                             self._hold_breach_count = 0
                         self._hold_breach_oversold = False
                         self._hold_breach_count += 1
-                        if self._hold_breach_count >= HOLD_BREACH_CONFIRM_CYCLES:
+                        if self._hold_breach_count >= HOLD_BREACH_CYCLES_OVERBOUGHT:
                             self.c_set_hold_correction(True, False)
                             self._hold_breach_count = 0
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: correction activated (overbought) — total ${total_usd:.0f} "
                                 f"above band ceiling ${hold_upper:.0f} | avail-by-venue: {venue_detail}")
                         elif self._hold_breach_count == 1:
-                            # First cycle of the window only — at HOLD_BREACH_CONFIRM_CYCLES this
-                            # would otherwise log every minute, forever, for anything hovering
-                            # near a band edge that never confirms.
+                            # First cycle only, mirroring the oversold branch. With a 2-cycle
+                            # window this is at most one line before activation anyway.
                             self.logger().info(
                                 f"Hold-band [{base_asset}]: breach pending confirmation (overbought) — "
                                 f"total ${total_usd:.0f} above ceiling ${hold_upper:.0f} "
-                                f"({self._hold_breach_count}/{HOLD_BREACH_CONFIRM_CYCLES}) | avail-by-venue: {venue_detail}")
+                                f"({self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERBOUGHT}) | avail-by-venue: {venue_detail}")
                     else:
                         # Back inside band — reset counter so a brief spike doesn't accumulate.
                         self._hold_breach_count = 0
