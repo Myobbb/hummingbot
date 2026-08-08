@@ -1376,19 +1376,50 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         # Back inside band — reset counter so a brief spike doesn't accumulate.
                         self._hold_breach_count = 0
                 else:
-                    # Direction flip: if target changed and total is now outside the band on the
-                    # opposite side (e.g. was overbought at $1321 with target=1100, target raised
-                    # to 2100 making $1321 < floor $1950 → now oversold), switch direction so the
-                    # guardrail corrects correctly instead of staying stuck.
+                    # Direction flip. This branch was written for a CONFIG change: `set_hold_target`
+                    # moves the band, so an active correction can legitimately land on the opposite
+                    # side at once (was overbought at $1321 with target=1100; target raised to 2100
+                    # makes $1321 < floor $1950 → now oversold). No confirmation is needed there —
+                    # the balance is not in doubt, only the target moved.
+                    #
+                    # But the condition cannot tell a moved BAND from a moved VALUE, and it used to
+                    # call c_set_hold_correction directly for both. That skipped
+                    # HOLD_BREACH_CYCLES_OVERSOLD entirely — the counter lives only in the
+                    # `not _hold_correction_active` branch above — so an already-correcting asset
+                    # flipped to oversold on ONE 60s reading.
+                    #
+                    # Witnessed on BTW 2026-08-07: tokens shuttling htx<->bitget swung the visible
+                    # total $27 <-> $570. It flipped to oversold at 22:08, 23:15 and 23:56 in one
+                    # cycle each (`direction switched`), while a genuine oversold on the same asset
+                    # took the full 14 min (`breach pending (1/15)` 03:19 -> activated 03:33). Each
+                    # flip restamped the clock, so an unconfirmed $27 reading escalated a BUY-IN at
+                    # 00:56 while BTW genuinely held ~$500. The asset manager could not help: its
+                    # floor is ~9 min against a 60s flip.
+                    #
+                    # FIX: an OVERSOLD flip must earn the same confirmation as a fresh oversold
+                    # activation. Until it does we HOLD the existing overbought correction — if we
+                    # were overbought and now see less, the shortfall may be in flight, so the true
+                    # total may still be over. An OVERBOUGHT flip stays immediate: in-flight funds
+                    # are invisible, so visible <= true, and `visible > ceiling` is always genuine.
                     if total_usd < hold_lower and not self._hold_correction_oversold:
-                        # Flip = new episode (clock + latch reset) — the new direction gets its
-                        # own full escalation window instead of inheriting the old one.
-                        self.c_set_hold_correction(True, True)
-                        self.logger().info(
-                            f"Hold-band [{base_asset}]: direction switched to oversold — total ${total_usd:.0f} "
-                            f"below new band floor ${hold_lower:.0f}")
+                        self._hold_breach_oversold = True
+                        self._hold_breach_count += 1
+                        if self._hold_breach_count >= HOLD_BREACH_CYCLES_OVERSOLD:
+                            # Confirmed: new episode (clock + latch reset) in the new direction.
+                            self.c_set_hold_correction(True, True)
+                            self._hold_breach_count = 0
+                            self.logger().info(
+                                f"Hold-band [{base_asset}]: direction switched to oversold — total ${total_usd:.0f} "
+                                f"below new band floor ${hold_lower:.0f}")
+                        elif self._hold_breach_count == 1:
+                            self.logger().info(
+                                f"Hold-band [{base_asset}]: oversold flip pending confirmation — "
+                                f"total ${total_usd:.0f} below floor ${hold_lower:.0f} "
+                                f"({self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERSOLD}), "
+                                f"holding overbought correction | avail-by-venue: {venue_detail}")
                     elif total_usd > hold_upper and self._hold_correction_oversold:
-                        # Flip = new episode (see above).
+                        # Immediate — see above. New episode (clock + latch reset).
+                        self._hold_breach_count = 0
                         self.c_set_hold_correction(True, False)
                         self.logger().info(
                             f"Hold-band [{base_asset}]: direction switched to overbought — total ${total_usd:.0f} "
@@ -1404,6 +1435,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self.logger().info(
                             f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
                             f"reached target ${self._hold_target_usd:.0f} | avail-by-venue: {venue_detail}")
+                    else:
+                        # Still correcting, not below the floor, not deactivating. Any pending
+                        # OVERSOLD-flip window is stale — the reading that started it did not
+                        # persist — so reset it. Without this the count would survive a trip back
+                        # inside the band and a later dip could confirm on a mixed window.
+                        self._hold_breach_count = 0
 
         except Exception as e:
             self.logger().warning(f"Hold-band cache refresh error: {e}", exc_info=True)
