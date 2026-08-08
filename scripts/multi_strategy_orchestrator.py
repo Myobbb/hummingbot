@@ -2583,6 +2583,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy._hold_target_usd = target
             strategy_instance.config['hold_target_usd'] = target
             self._persist_hold_config(strategy_name, {'hold_target_usd': target, 'hold_target_enabled': True})
+            # Sanity check on re-enable: end any episode latched from BEFORE the disable, so the
+            # refresh below re-evaluates from live balances rather than resuming a stale one.
+            # The AM disables the band for an in-transfer asset and re-enables it once the deposit
+            # lands — which normally puts the asset back INSIDE its band. Without this the
+            # already-active branch of c_refresh_hold_cache would keep correcting (it only exits
+            # on crossing the target CENTRE), on a clock that predates the transfer.
+            if hasattr(strategy, 'clear_hold_correction'):
+                strategy.clear_hold_correction()
             # Immediately refresh the cache so _hold_correction_active is set without
             # waiting up to 60 s for the next c_cleanup_old_orders cycle.
             if hasattr(strategy, 'refresh_hold_cache'):

@@ -5,7 +5,7 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 from prompt_toolkit.application import Application
-from prompt_toolkit.clipboard.pyperclip import PyperclipClipboard
+from prompt_toolkit.clipboard import InMemoryClipboard
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
@@ -113,7 +113,14 @@ class HummingbotCLI(PubSub):
             key_bindings=self.bindings,
             style=load_style(self.client_config_map),
             mouse_support=True,
-            clipboard=PyperclipClipboard(),
+            # InMemoryClipboard, not PyperclipClipboard: on a headless server pyperclip has no
+            # backend (no xclip/xsel/wl-clipboard) and RAISES on any kill-line binding — C-u
+            # (unix_line_discard) and C-k (kill_line) both copy the killed text to the clipboard.
+            # The asset manager sends "C-u C-k" before each `control set hold_target` to clear
+            # the input line, so every graded command produced an unhandled prompt_toolkit
+            # traceback (`Pyperclip could not find a copy/paste mechanism`). Manual Ctrl+U in the
+            # console did the same. Nothing is lost: a system clipboard was never reachable here.
+            clipboard=InMemoryClipboard(),
         )
         await self.app.run_async(pre_run=self.did_start_ui)
         self._stdout_redirect_context.close()

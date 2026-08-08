@@ -1457,7 +1457,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         clock and clear the latch, so the new direction gets its own full escalation window
         rather than inheriting a stale one. Ending an episode zeroes both.
 
-        Off the hot path entirely — only ever called from c_refresh_hold_cache transitions.
+        Off the hot path entirely. Two call sites: c_refresh_hold_cache transitions, and
+        clear_hold_correction (the `control enable_hold` re-check) — which is why the rule is
+        "route through this", not "poke the fields". Poking is how the bug it fixes got in:
+        disable_hold guarded its own writes with hasattr() on _hold_correction_active, which is
+        a non-public cdef attribute, so the guard was always False and the writes never ran.
         """
         if active:
             if (not self._hold_correction_active) or (self._hold_correction_oversold != oversold):
@@ -1491,6 +1495,26 @@ cdef class ArbitrageLStrategy(StrategyBase):
     def refresh_hold_cache(self):
         """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
         self.c_refresh_hold_cache()
+
+    def clear_hold_correction(self):
+        """End the current correction episode. Called by orchestrator before enable_hold's refresh.
+
+        The episode fields are non-public cdef, so callers outside this class cannot set them
+        directly — this routes through c_set_hold_correction so the flag, the clock and the
+        escalation latch stay in sync.
+
+        WHY enable_hold needs it: the guardrail is re-enabled while a stale episode is still
+        latched — the asset manager disables the band for an in-transfer asset, then restores it
+        once the deposit lands. Resuming that episode is wrong, because the deposit usually
+        brings the asset back INSIDE its band, and c_refresh_hold_cache's already-active branch
+        only deactivates on crossing the target CENTRE, not on being in band. So the asset stays
+        "correcting" indefinitely on a pre-transfer clock and escalates a buy-in it no longer
+        needs. Ending the episode here makes the refresh that follows take the ACTIVATION branch
+        instead — a fresh out-of-bounds check against live balances: in band, nothing happens;
+        out of band, it re-confirms normally (2 cycles overbought / 15 oversold) on a new clock.
+        """
+        self.c_set_hold_correction(False, self._hold_correction_oversold)
+        self._hold_breach_count = 0
 
     cdef void c_log_conversion_rates(self):
         """Log conversion rates if they differ from 1:1"""
