@@ -869,6 +869,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._last_hold_escalation_check: float = 0.0
         # strategy_name -> last time we logged why a ripe correction was NOT escalated.
         self._hold_escalation_skip_logged: Dict[str, float] = {}
+        # strategy_name -> timestamp of the last PB side we armed for it. This is the escalation
+        # RATE LIMIT (one arm per HOLD_ESCALATION_AFTER); see _check_hold_escalations.
+        self._hold_last_escalation: Dict[str, float] = {}
 
         # Initialize all configured strategies (but don't start them yet - no clock available)
         self._initialize_arbitrage_m_strategies()
@@ -1429,6 +1432,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         orders. Both systems then target the same number and finish together: the PB marks its
         side complete and self-disables, and the guardrail logs "correction complete".
 
+        A RATE, not a one-shot: at most one arm per HOLD_ESCALATION_AFTER per strategy, and only
+        while neither PB side is enabled. So a correction whose PB stopped WITHOUT ending the
+        episode is picked up again on the next window instead of being stranded — see the
+        ripeness guard for the failure this replaced.
+
         Cost: one property read per strategy, once a minute. Every value comes from the cache
         c_refresh_hold_cache already maintains on its own 60 s cycle — no balance reads, no
         order-book reads, no I/O — so this cannot delay a tick or stale the local books.
@@ -1441,10 +1449,35 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 active, oversold, since, target_usd, total_usd, escalated = strategy.hold_correction_state
             except AttributeError:
                 continue  # not an arb_l strategy — no hold-band guardrail
-            # Not correcting / already escalated this episode / clock not yet armed.
-            if not active or escalated or since <= 0.0:
+            # Not correcting / clock not yet armed.
+            if not active or since <= 0.0:
                 continue
-            if current_timestamp - since < HOLD_ESCALATION_AFTER:
+
+            # RIPENESS = time since the LATER of (episode start, our last arm for this strategy).
+            # That single expression is the whole rate limit: at most one arm per
+            # HOLD_ESCALATION_AFTER, per strategy.
+            #
+            # It replaced `escalated` (the one-shot `_hold_escalated` latch) as the gate on
+            # 2026-08-09. The latch assumed the PB always finishes what it starts, so one arm per
+            # episode was enough. It does not: the PB also stops when it completes against a
+            # transiently bad balance read, or when the venue it chose runs dry. And because the
+            # latch is cleared ONLY by c_set_hold_correction (episode end / direction flip) while
+            # a genuinely out-of-band asset's episode CANNOT end, those assets were stranded for
+            # good — still correcting, no PB, and skipped here SILENTLY, since this guard sits
+            # above the logged skip_reason block. Measured: AIC/UAI/CAMP/EPT stuck 7-8 h each
+            # (~$1,612 of inventory out of band) with 0 SKIPPED lines in 8h39m, because the sweep
+            # never reached that block.
+            #
+            # Why rate-limited rather than simply un-latched: the PB can self-complete seconds
+            # after arming (AIC 2026-08-09 — armed 09:49:49, disabled 09:49:56), so an ungated
+            # retry would re-arm every sweep. Reusing HOLD_ESCALATION_AFTER bounds it to one arm
+            # per window; a no-op re-arm costs three log lines and no orders, and stays VISIBLE —
+            # which is the point, because the failure it replaces was invisible.
+            #
+            # Fresh episodes keep their full window for free: a new episode stamps `since` to
+            # now, which is always later than any earlier arm, so max() picks it.
+            last_arm = self._hold_last_escalation.get(instance.name, 0.0)
+            if current_timestamp - max(since, last_arm) < HOLD_ESCALATION_AFTER:
                 continue
             if target_usd <= 0.0:
                 continue  # guardrail disabled underneath us — nothing meaningful to target
@@ -1460,9 +1493,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 base_asset = instance.name
             label = instance.name if base_asset == instance.name else f"{instance.name} [{base_asset}]"
 
-            # Past this point the correction is RIPE (active, unescalated, older than the
-            # threshold). Anything that stops us now is worth one throttled line — silence here
-            # is what makes "why did nothing happen after 4h?" undiagnosable.
+            # Past this point the correction is RIPE (active, older than the threshold, and not
+            # rate-limited). Anything that stops us now is worth one throttled line — silence
+            # here is what makes "why did nothing happen after 4h?" undiagnosable.
             position_balancer = getattr(strategy, '_position_balancer', None)
             skip_reason = None
             if position_balancer is None:
@@ -1499,8 +1532,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     position_balancer.set_sell_target(target_usd)
                     position_balancer.enable_sell_off()
                     action = "sell-off"
-                # Latch AFTER success; it is cleared by c_set_hold_correction when the episode
-                # ends, so the next episode gets a fresh escalation.
+                # Stamp AFTER success, so a throwing arm retries on the next sweep rather than
+                # burning its window (unchanged from when `_hold_escalated` was the gate).
+                # `escalated` was read before we armed, so it still reflects the PREVIOUS state:
+                # True here means the PB side we armed earlier in this same episode went idle
+                # without ending it — i.e. this is a re-arm, which is worth calling out.
+                rearm_of = self._hold_last_escalation.get(instance.name, 0.0) if escalated else 0.0
+                self._hold_last_escalation[instance.name] = current_timestamp
+                # Kept accurate for `control list` and hold_correction_state; no longer the gate.
                 strategy._hold_escalated = True
                 self._hold_escalation_skip_logged.pop(instance.name, None)
                 self.logger().info(
@@ -1510,6 +1549,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     f"{action} at the hold target ${target_usd:.0f} (current ${total_usd:.0f}). "
                     f"PB {'buy-in' if oversold else 'sell-off'} target is now ${target_usd:.0f} "
                     f"and stays there after the episode ends."
+                    + (f" [RE-ARM — the side armed {(current_timestamp - rearm_of) / 60.0:.0f} min "
+                       f"ago went idle without ending the episode]" if rearm_of > 0.0 else "")
                 )
             except Exception as e:
                 self.logger().error(
@@ -3004,6 +3045,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.strategies = [s for s in self.strategies if s.name != strategy_name]
         self._strategy_by_name.pop(strategy_name, None)  # Remove from index
         self._hold_escalation_skip_logged.pop(strategy_name, None)  # Drop escalation log throttle
+        self._hold_last_escalation.pop(strategy_name, None)         # Drop escalation rate limit
         self.logger().info(f"Strategy '{strategy_name}' removed from memory")
 
         # Step 4: Update the config file
