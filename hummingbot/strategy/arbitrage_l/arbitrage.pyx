@@ -644,7 +644,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 try:
                     hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
                     hold_live_bid = self.c_get_reference_bid_for_asset(hold_base_asset)
-                    # Live balance read for display — avoids stale cache (e.g. mid-transfer)
+                    # Live balance read for display — avoids stale cache (e.g. mid-transfer).
+                    # TOTAL held, matching c_get_aggregated_base_balance, so the panel does not
+                    # under-report the position whenever the PB has an order resting.
                     if self._position_balancer is not None:
                         hold_live_base = self._position_balancer.c_get_aggregated_base_balance(hold_base_asset)
                     else:
@@ -656,7 +658,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                     _key = ((<object>_mt).market, (<object>_mt).base_asset)
                                     if _key not in hold_checked:
                                         hold_checked.add(_key)
-                                        hold_live_base += float((<object>_mt).market.get_available_balance(hold_base_asset))
+                                        hold_live_base += float((<object>_mt).market.get_balance(hold_base_asset))
                 except Exception:
                     hold_live_bid = 0.0
                     hold_live_base = self._cached_total_base_qty
@@ -1235,14 +1237,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         Hysteresis logic:
           - Flag set True  when total_usd crosses outside the outer band (target ± band).
-          - Flag cleared   when total_usd crosses back through target center from the
-            correcting direction (oversold: at total >= target; overbought: at total <= target).
+          - Flag cleared   when total_usd comes back within hold_release_tol of the target
+            center from the correcting direction (oversold: at total >= target - tol;
+            overbought: at total <= target + tol). See the deactivation branch for why the
+            tolerance exists and why it is the position balancer's own min notional.
         """
         cdef:
             double total = 0.0
             double bid = 0.0
             double total_usd = 0.0
             double venue_bal = 0.0
+            double hold_release_tol = 0.0   # how close to target counts as "converged"
             object mp, mt, key
             str base_asset
             set checked
@@ -1257,11 +1262,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # ── Per-venue balance scan ────────────────────────────────────────────
             # Always do the direct scan (O(market_pairs), typically 2–4 items).
-            # Two purposes:
-            #   1. Aggregate total when no position balancer is present.
-            #   2. The `avail-by-venue` breakdown on the hysteresis log lines.
-            # When position balancer is present, it also aggregates (handles aliases); the
-            # per-venue pass still feeds the `avail-by-venue` diagnostic on the hysteresis logs.
+            # Two purposes, and they read DIFFERENT balances on purpose:
+            #   1. Aggregate total when no position balancer is present — get_balance (TOTAL),
+            #      matching c_get_aggregated_base_balance so the guardrail's notion of "how much
+            #      do I hold" does not depend on whether a PB happens to exist.
+            #   2. The `avail-by-venue` breakdown — get_available_balance (FREE), because the
+            #      whole value of that diagnostic is showing what is NOT free.
+            # So `total` deliberately does NOT equal the sum of the split: the gap is base locked
+            # in resting orders. That gap is the signal — it is what identified the position
+            # balancer completing against its own order (2026-08-09, AIC/CAMP htx legs).
             checked = set()
             venue_split = []
             for mp in self._market_pairs:
@@ -1270,8 +1279,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         key = ((<object>mt).market, (<object>mt).base_asset)
                         if key not in checked:
                             checked.add(key)
+                            total += float((<object>mt).market.get_balance(base_asset))
                             venue_bal = float((<object>mt).market.get_available_balance(base_asset))
-                            total += venue_bal
                             venue_split.append(((<object>mt).market.name, venue_bal))
 
             if self._position_balancer is not None:
@@ -1290,6 +1299,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Per-venue diagnostic breakdown. These are AVAILABLE balances, so base locked in
             # a resting order is excluded — the split is what makes a "total looks too low"
             # reading explainable (locked vs genuinely absent vs not yet credited).
+            # `total` above is the TOTAL held, so split-vs-total is read as: they agree => nothing
+            # locked; split far below total => that venue has our base tied up in resting orders.
             venue_detail = " ".join([f"{n}={q:.6g}" for n, q in venue_split])
             if self._hold_target_usd > 0.0:
                 self.logger().debug(
@@ -1322,6 +1333,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Only meaningful when guardrail is enabled and cache is warm.
             if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
                 total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+                # Release tolerance = the position balancer's own completion tolerance, so the two
+                # systems agree on "converged" by construction (see the deactivation branch).
+                # Capped at half the band so a small band can never make release meet activation,
+                # which would erase the hysteresis and chatter. With the live ±$50 bands and a $15
+                # min notional the cap does not bind.
+                # Written as a C conditional rather than min(): this function also runs per-fill
+                # (c_handle_order_completion) while a correction is active, and the builtin would
+                # box both doubles into Python objects on that path.
+                hold_release_tol = self._hold_band_usd * 0.5
+                if self._min_order_usd < hold_release_tol:
+                    hold_release_tol = self._min_order_usd
                 hold_lower = self._hold_target_usd - self._hold_band_usd
                 hold_upper = self._hold_target_usd + self._hold_band_usd
 
@@ -1424,17 +1446,33 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         self.logger().info(
                             f"Hold-band [{base_asset}]: direction switched to overbought — total ${total_usd:.0f} "
                             f"above new band ceiling ${hold_upper:.0f}")
-                    # Deactivate once inside band AND crossed back through target center.
-                    # Oversold correction: total must reach [target, upper] — i.e. $1100–$1250.
-                    # Overbought correction: total must reach [lower, target] — i.e. $950–$1100.
+                    # Deactivate once inside band AND back within hold_release_tol of the centre.
+                    # Oversold correction: total must reach [target - tol, upper].
+                    # Overbought correction: total must reach [lower, target + tol].
                     # The inside-band check prevents false-positive on price spikes past the far band.
+                    #
+                    # The tolerance is NOT slack — without it this branch is unsatisfiable for any
+                    # asset the position balancer converged. The PB stops up to _min_order_usd short
+                    # of the centre and marks itself complete (`shortfall/excess < min notional`),
+                    # because it physically cannot place a smaller order. Requiring a strict centre
+                    # crossing therefore left a deterministic _min_order_usd-wide dead zone
+                    # straddling the target where the PB said "done", the guardrail said "not done",
+                    # and nothing could cross it — the correction ran on with the arb leg capped and
+                    # the one-shot escalation latch set, so it could never re-arm either.
+                    # Live on 2026-08-09: UNION completed its buy-in `shortfall 0.906430` and MOVE
+                    # its sell-off `excess 0.000005`, both still "correcting" hours later (17 such
+                    # dust completions in that run; UNION/LA/FLOW/MOVE all stuck on it).
+                    # Using the PB's own min notional makes the two agree by construction.
                     elif (hold_lower <= total_usd <= hold_upper and
-                            ((self._hold_correction_oversold and total_usd >= self._hold_target_usd) or
-                             (not self._hold_correction_oversold and total_usd <= self._hold_target_usd))):
+                            ((self._hold_correction_oversold and
+                              total_usd >= self._hold_target_usd - hold_release_tol) or
+                             (not self._hold_correction_oversold and
+                              total_usd <= self._hold_target_usd + hold_release_tol))):
                         self.c_set_hold_correction(False, self._hold_correction_oversold)
                         self.logger().info(
                             f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
-                            f"reached target ${self._hold_target_usd:.0f} | avail-by-venue: {venue_detail}")
+                            f"reached target ${self._hold_target_usd:.0f} (±${hold_release_tol:.0f}) "
+                            f"| avail-by-venue: {venue_detail}")
                     else:
                         # Still correcting, not below the floor, not deactivating. Any pending
                         # OVERSOLD-flip window is stale — the reading that started it did not

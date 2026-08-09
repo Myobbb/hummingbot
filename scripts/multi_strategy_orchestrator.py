@@ -182,9 +182,9 @@ logger = None
 # appears. An asset can therefore sit outside its band indefinitely. After HOLD_ESCALATION_AFTER
 # seconds of CONTINUOUS correction we hand the job to the position balancer, which places its own
 # orders, targeting the hold target itself so both systems converge on the same number.
-HOLD_ESCALATION_AFTER = 1 * 60 * 60.0        # 1 h of continuous correction before escalating (was 4 h until 2026-08-06)
+HOLD_ESCALATION_AFTER = 15 * 60.0            # 15 min of continuous correction (4 h -> 1 h 2026-08-06 -> 15 min 2026-08-09)
 HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_hold_cache's own 60 s
-HOLD_ESCALATION_SKIP_LOG_INTERVAL = 3600.0   # re-state a "ripe but skipped" reason at most hourly
+HOLD_ESCALATION_SKIP_LOG_INTERVAL = 900.0    # re-state a "ripe but skipped" reason at most once per window
 
 # Export convenience functions for easy import
 __all__ = [
@@ -1481,7 +1481,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     self.logger().info(
                         f"Hold-band escalation SKIPPED for '{label}': {skip_reason} — "
                         f"correcting ({'oversold' if oversold else 'overbought'}) for "
-                        f"{(current_timestamp - since) / 3600.0:.1f}h, target ${target_usd:.0f}, "
+                        f"{(current_timestamp - since) / 60.0:.0f} min, target ${target_usd:.0f}, "
                         f"current ${total_usd:.0f}"
                     )
                 continue
@@ -1506,7 +1506,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().info(
                     f"Hold-band escalation: '{label}' has been correcting "
                     f"({'oversold' if oversold else 'overbought'}) for "
-                    f"{(current_timestamp - since) / 3600.0:.1f}h — enabling position balancer "
+                    f"{(current_timestamp - since) / 60.0:.0f} min — enabling position balancer "
                     f"{action} at the hold target ${target_usd:.0f} (current ${total_usd:.0f}). "
                     f"PB {'buy-in' if oversold else 'sell-off'} target is now ${target_usd:.0f} "
                     f"and stays there after the episode ends."
@@ -2582,21 +2582,59 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 return False
             strategy._hold_target_usd = target
             strategy_instance.config['hold_target_usd'] = target
+            band = float(strategy._hold_band_usd)
             self._persist_hold_config(strategy_name, {'hold_target_usd': target, 'hold_target_enabled': True})
+
+            # Snapshot the episode flag BEFORE clearing it — whether this enable ended a stale
+            # correction is not recoverable afterwards, and it is the outcome worth logging.
+            # hold_correction_state = (active, oversold, since, target_usd, total_usd, escalated)
+            was_correcting = False
+            try:
+                was_correcting = bool(strategy.hold_correction_state[0])
+            except Exception:
+                pass
+
             # Sanity check on re-enable: end any episode latched from BEFORE the disable, so the
             # refresh below re-evaluates from live balances rather than resuming a stale one.
             # The AM disables the band for an in-transfer asset and re-enables it once the deposit
             # lands — which normally puts the asset back INSIDE its band. Without this the
             # already-active branch of c_refresh_hold_cache would keep correcting (it only exits
             # on crossing the target CENTRE), on a clock that predates the transfer.
+            # `cleared_stale` tracks whether the clear actually ran: on a strategy compiled before
+            # clear_hold_correction existed the hasattr guard skips it, and reporting "CLEARED"
+            # then would be a lie — the episode would still be latched.
+            cleared_stale = False
             if hasattr(strategy, 'clear_hold_correction'):
                 strategy.clear_hold_correction()
+                cleared_stale = was_correcting
             # Immediately refresh the cache so _hold_correction_active is set without
             # waiting up to 60 s for the next c_cleanup_old_orders cycle.
             if hasattr(strategy, 'refresh_hold_cache'):
                 strategy.refresh_hold_cache()
+
+            # Report the re-check verdict. c_refresh_hold_cache logs `breach pending confirmation`
+            # when it re-confirms, but stays SILENT on the in-band case — which is exactly the
+            # outcome worth confirming after a transfer — so spell it out here.
+            recheck = ""
+            try:
+                total_usd = float(strategy.hold_correction_state[4])
+                floor, ceiling = target - band, target + band
+                if total_usd <= 0.0:
+                    # Ambiguous by construction: the cached total is base_qty * bid, so $0 means
+                    # a cold order book OR a genuinely empty position. Don't guess which — the
+                    # refresh above skips its hysteresis entirely when the price cache is cold.
+                    recheck = " — re-check inconclusive: cached total is $0 (cold book or no balance)"
+                elif total_usd > ceiling:
+                    recheck = f" — re-check: total ${total_usd:.0f} above ceiling ${ceiling:.0f}, re-confirming"
+                elif total_usd < floor:
+                    recheck = f" — re-check: total ${total_usd:.0f} below floor ${floor:.0f}, re-confirming"
+                else:
+                    recheck = (f" — re-check: total ${total_usd:.0f} in band [${floor:.0f}, ${ceiling:.0f}], "
+                               f"{'stale correction CLEARED' if cleared_stale else 'no correction'}")
+            except Exception:
+                pass
             self.logger().info(f"Hold-band enabled for '{strategy_name}': target={target:.0f} USD "
-                               f"band=±{strategy._hold_band_usd:.0f}")
+                               f"band=±{band:.0f}{recheck}")
             return True
         except Exception as e:
             self.logger().error(f"Error enabling hold for '{strategy_name}': {e}")

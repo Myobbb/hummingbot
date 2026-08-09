@@ -581,6 +581,9 @@ cdef class PositionBalancerHandler:
         Aggregate base balance using the same source as status (balance_map).
         For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
         OPTIMIZED: Fetches directly from markets to avoid DataFrame overhead.
+
+        POSITION MEASUREMENT ("how much of this asset do I hold"), never order capacity
+        ("how much can I sell right now") — see the get_balance note in the loop.
         """
         cdef:
             double total = 0.0
@@ -589,7 +592,7 @@ cdef class PositionBalancerHandler:
             object mp
             object market_tuple
             tuple key
-            
+
         try:
             aliases = self._get_all_asset_aliases(asset)
             for mp in self.strategy._market_pairs:
@@ -599,17 +602,37 @@ cdef class PositionBalancerHandler:
                         key = (market_tuple.market, market_tuple.base_asset)
                         if key not in checked_keys:
                             checked_keys.add(key)
-                            # Use get_available_balance to match original behavior (only free funds)
-                            total += float(market_tuple.market.get_available_balance(market_tuple.base_asset))
+                            # TOTAL wallet balance, not available. A resting sell order has sold
+                            # NOTHING — those tokens are still held — but get_available_balance
+                            # excludes them, so the position balancer's own order removed the very
+                            # balance it was measuring. It then read its position as near-zero and
+                            # marked the sell-off complete against `value <= target`.
+                            #
+                            # Witnessed 2026-08-09 on the two gate<->htx pairs: the htx leg's
+                            # available fell 95% while the other venue was unchanged TO THE TOKEN
+                            # (CAMP htx 3004320 -> 145166, gate 70206.2 both times; AIC htx
+                            # 43468.1 -> 2131.6, gate 3442.61 both times). Both sell-offs armed at
+                            # 00:16:00 and self-disabled within 21 s, each in the SAME SECOND as an
+                            # undercut-chase cancel — the order was already untracked
+                            # (pending_sell == 0, so the completion guard passed) while the venue
+                            # had not yet released the locked base. Both then sat latched for 8.6 h:
+                            # PB complete, guardrail still correcting, escalation latch set.
+                            #
+                            # Order capacity is unaffected: placement still caps on the per-venue
+                            # get_available_balance in c_find_best_sell_market and
+                            # c_execute_sell_limit, so this cannot oversize an order.
+                            total += float(market_tuple.market.get_balance(market_tuple.base_asset))
         except Exception:
             return 0.0
         return total
 
     cdef double c_get_actual_base_balance(self, str asset):
         """
-        Get ACTUAL base balance without including pending unfilled orders.
-        This is used for target completion checking.
-        Only counts what's actually in the wallet, not what's in open orders.
+        Get the ACTUAL held base balance — used for target completion checking.
+
+        Counts everything in the wallet INCLUDING base locked in our own resting orders,
+        because an unfilled order has not changed the position. (This previously excluded
+        it, which is what let a sell-off complete against its own resting order.)
         """
         return self.c_get_aggregated_base_balance(asset)
 
@@ -625,7 +648,9 @@ cdef class PositionBalancerHandler:
         cdef double agg = self.c_get_aggregated_base_balance(asset)
         cdef double pending_buy = self.c_get_pending_buy_base(asset)
         cdef double pending_sell = self.c_get_pending_sell_base(asset)
-        # Net balance = actual + pending buys - pending sells
+        # Net balance = held + pending buys - pending sells. Correct now that `agg` is the TOTAL
+        # balance: the base behind a resting sell is counted once by agg and removed once here.
+        # While agg was `available` this double-subtracted that base and understated the net.
         return agg + pending_buy - pending_sell
 
     cdef bint c_try_mark_buy_complete(self,
