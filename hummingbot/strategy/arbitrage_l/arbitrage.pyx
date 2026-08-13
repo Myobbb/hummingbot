@@ -151,6 +151,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Trade counter (strategy-specific, not affected by shared connectors)
         self._total_trades = 0
         # Hold-band guardrail (disabled by default)
+        self._hold_enabled = False
         self._hold_target_usd = 0.0
         self._hold_band_usd = 100.0
         self._cached_total_base_qty = 0.0
@@ -298,6 +299,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         # Hold-band guardrail
         self._hold_target_usd = hold_target_usd
+        # Orchestrator collapses hold_target_enabled into the target (0 when disabled),
+        # so a positive target here means enabled. clean() arms 0 explicitly at runtime.
+        self._hold_enabled = hold_target_usd > 0.0
         self._hold_band_usd = hold_band_usd
         self._cached_total_base_qty = 0.0
         self._cached_mid_price_usd = 0.0
@@ -638,7 +642,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 lines.extend(self._position_balancer.get_status_lines(unique_tuples, balance_map))
 
             # Hold-band guardrail status (only shown when actively correcting)
-            if self._hold_target_usd > 0.0 and self._hold_correction_active:
+            if self._hold_enabled and self._hold_correction_active:
                 hold_floor   = self._hold_target_usd - self._hold_band_usd
                 hold_ceiling = self._hold_target_usd + self._hold_band_usd
                 try:
@@ -1302,7 +1306,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # `total` above is the TOTAL held, so split-vs-total is read as: they agree => nothing
             # locked; split far below total => that venue has our base tied up in resting orders.
             venue_detail = " ".join([f"{n}={q:.6g}" for n, q in venue_split])
-            if self._hold_target_usd > 0.0:
+            if self._hold_enabled:
                 self.logger().debug(
                     f"Hold-band [{base_asset}]: total={self._cached_total_base_qty:.6g} "
                     f"bid=${self._cached_mid_price_usd:.8g} "
@@ -1331,7 +1335,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # ── Hysteresis: update correction flag ───────────────────────────────
             # Only meaningful when guardrail is enabled and cache is warm.
-            if self._hold_target_usd > 0.0 and self._cached_mid_price_usd > 0.0:
+            if self._hold_enabled and self._cached_mid_price_usd > 0.0:
                 total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
                 # Release tolerance = the position balancer's own completion tolerance, so the two
                 # systems agree on "converged" by construction (see the deactivation branch).

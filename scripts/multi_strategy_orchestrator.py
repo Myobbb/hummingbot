@@ -2502,8 +2502,23 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         position_balancer.set_sell_target(0.0)
         position_balancer.enable_sell_off()
         self._pending_auto_remove.add(strategy_name)
-        # Disable hold-band so it doesn't interfere with the sell-off
-        self.disable_hold(strategy_name)
+        # ARM the hold-band at zero rather than disabling it. Disabling leaves arb_l's
+        # normal arb legs uncapped, so a routine arb can BUY the asset back while the
+        # sell-off is trying to liquidate it. Held at target 0 the position is always
+        # above the ceiling, so the guardrail suppresses buy legs and lets sells run —
+        # it reinforces the clean instead of standing aside. Enabled even if the
+        # guardrail was previously off for this strategy.
+        strategy_obj = getattr(self._get_strategy_instance(strategy_name), 'strategy', None)
+        if strategy_obj is not None and hasattr(strategy_obj, '_hold_target_usd'):
+            strategy_obj._hold_target_usd = 0.0
+            if hasattr(strategy_obj, '_hold_enabled'):
+                strategy_obj._hold_enabled = True
+            if hasattr(strategy_obj, '_hold_correction_active'):
+                strategy_obj._hold_correction_active = False
+            if hasattr(strategy_obj, '_hold_breach_count'):
+                strategy_obj._hold_breach_count = 0
+        self._persist_hold_config(strategy_name,
+                                  {'hold_target_usd': 0.0, 'hold_target_enabled': True})
         self.logger().info(f"Strategy '{strategy_name}' scheduled for auto-removal after sell-off completes")
         return True
 
@@ -2696,6 +2711,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if not hasattr(strategy, '_hold_target_usd'):
                 return False
             strategy._hold_target_usd = 0.0
+            if hasattr(strategy, '_hold_enabled'):
+                strategy._hold_enabled = False
             if hasattr(strategy, '_hold_correction_active'):
                 strategy._hold_correction_active = False
             if hasattr(strategy, '_hold_breach_count'):
@@ -2722,6 +2739,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if not hasattr(strategy, '_hold_target_usd'):
                 return False
             strategy._hold_target_usd = target_usd
+            if hasattr(strategy, '_hold_enabled'):
+                strategy._hold_enabled = target_usd > 0.0
             # Mirror into instance config so enable_hold can restore it later
             strategy_instance.config['hold_target_usd'] = target_usd
             persist = {'hold_target_usd': target_usd}
