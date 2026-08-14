@@ -1903,6 +1903,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # _hold_correction_active is set/cleared exclusively in c_refresh_hold_cache (60s cycle +
         # per-trade when already active). It is True only when guardrail is enabled, price cache
         # is warm, and total is confirmed outside the band. Single bint read — zero overhead.
+        # Read once here rather than at the base-cap below: the trim needs it too, so this is
+        # the same single call moved earlier, not an added one.
+        sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         _hold_buy_amount  = amount
         _hold_sell_amount = amount
         if self._hold_correction_active:
@@ -1918,6 +1921,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
                 _hold_sell_amount = max(0.0, amount - _delta_base)
                 # _hold_buy_amount stays at `amount`
+                # Zero base on the sell venue: there is no sell leg to place, so this is a
+                # SUPPRESSION, not a proportional trim. The subtraction above cannot express
+                # that — `amount` is sized from the buy ask while `_delta_base` uses the cached
+                # bid, and in any real arb sell_bid > buy_ask, so `amount > _delta_base` and the
+                # max(0.0, ...) clamp never engages. The residue scales WITH the spread
+                # (~5.7% of amount at a 6% edge), so the best opportunities fail hardest:
+                # the base cap below fires on the leftover, then propagates to the buy leg and
+                # zeroes it, killing the very trade the correction wants. Setting it flat here
+                # keeps the existing `_hold_sell_amount == 0` fast path (base cap skipped, leg
+                # dropped at quantization) as the single place zero-sell is handled.
+                if sell_available_now <= EPSILON:
+                    _hold_sell_amount = 0.0
 
             # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
             # sizes (or a lone sell) with nothing saying why. Only reads values already
@@ -1968,7 +1983,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Safety cap — sell venue base balance.
         # Only the sell leg consumes base; when sell is fully suppressed (_hold_sell_amount==0)
         # skip entirely so a zero base balance cannot shrink the buy cap.
-        sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if _hold_sell_amount > 0.0 and sell_available_now + 1e-15 < _hold_sell_amount:
             sell_cap_dec = Decimal.from_float(max(0.0, sell_available_now - QUANTIZATION_EPSILON))
             quantized_sell_cap = self.c_safe_quantize_order_amount(sell_market, sell_market_tuple.trading_pair, sell_cap_dec, sell_price_decimal)
