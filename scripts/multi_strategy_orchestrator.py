@@ -2499,6 +2499,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if not position_balancer:
             return False
 
+        # Disable buy-in FIRST — it cancels any resting buys and clears the flag. `clean`
+        # enables sell-off directly, bypassing the escalation guard that normally refuses to
+        # arm a second side, so without this an asset that was mid buy-in (exactly what an
+        # oversold asset gets escalated into) would have BOTH sides live: buy-in chasing its
+        # old target while sell-off drives to 0. Arming the hold-band at 0 only suppresses
+        # the ARB legs — the position balancer places its own orders and is not governed by
+        # it, so a resting PB buy would otherwise survive the clean.
+        position_balancer.disable_buy_in()
         position_balancer.set_sell_target(0.0)
         position_balancer.enable_sell_off()
         self._pending_auto_remove.add(strategy_name)

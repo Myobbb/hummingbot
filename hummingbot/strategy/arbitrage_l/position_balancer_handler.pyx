@@ -2861,12 +2861,23 @@ cdef class PositionBalancerHandler:
                                         # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
                                         market_base_bal = float(selected_sell_market.market.get_available_balance(
                                             selected_sell_market.base_asset))
-                                        # Subtract any inflight sell orders from the cached balance.
-                                        # Exchange balance caches can lag by several seconds after order placement,
-                                        # so an order placed moments ago may not yet appear as "frozen".
-                                        # _pending_sell_by_asset tracks what we've already committed this session.
+                                        # NO pending-sell deduction here. get_available_balance is
+                                        # already net of base locked in our own resting order, so
+                                        # subtracting _pending_sell_by_asset on top counted the SAME
+                                        # order twice and refused placement while a live sell sat on
+                                        # the book ("insufficient balance (0.04 SMART = $0.00)" —
+                                        # 168 such refusals on FLOW alone, each costing a 60s cooldown).
+                                        #
+                                        # It was also wrong across venues: _pending_sell_by_asset is
+                                        # keyed per ASSET, so a sell resting on one venue was deducted
+                                        # from every other venue's capacity too.
+                                        #
+                                        # The cache-lag race it guarded against cannot happen: the PB
+                                        # keeps at most ONE resting sell per asset (_active_sell_orders,
+                                        # asset -> order_id) and checks it before placing, and that map
+                                        # updates synchronously at placement unlike the balance cache.
                                         pending_sell_base = self.c_get_pending_sell_base(asset_key)
-                                        effective_base_bal = max(0.0, market_base_bal - pending_sell_base)
+                                        effective_base_bal = market_base_bal
                                         if effective_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
                                             # Best sell market has insufficient base balance — record timestamp so we
                                             # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
@@ -3562,6 +3573,12 @@ cdef class PositionBalancerHandler:
         self.strategy.log_with_clock(
             logging.INFO,
             f"Buy-in target updated: {old_target:.2f} -> {target_usd:.2f} USD")
+        # A resting order was sized for the OLD target and is no longer the right size.
+        # Cancel it so the next tick re-places against the new one — otherwise it stays
+        # live and can fill toward a target that no longer exists. asset_manager is the
+        # authority on the target; the book must follow it immediately, not eventually.
+        if target_usd != old_target:
+            self.c_cancel_all_buy_orders()
         # Reset completion flag to allow re-evaluation
         if self._buy_enabled:
             self._buy_completed = False
@@ -3579,6 +3596,11 @@ cdef class PositionBalancerHandler:
         self.strategy.log_with_clock(
             logging.INFO,
             f"Sell-off target updated: {old_target:.2f} -> {target_usd:.2f} USD")
+        # See set_buy_target: a resting sell sized for the old target must go, so the next
+        # tick re-places against the new one. Also frees the base it had locked, which is
+        # what lets the re-placement size itself correctly.
+        if target_usd != old_target:
+            self.c_cancel_all_sell_orders()
         # Reset completion flag to allow re-evaluation
         if self._sell_enabled:
             self._sell_completed = False
