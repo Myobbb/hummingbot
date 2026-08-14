@@ -1561,9 +1561,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return False
         if self._cached_mid_price_usd <= 0.0:
             return False
+        # NOTE: no `total <= 0` bail-out. A $0 total with a WARM price cache is not
+        # ambiguous — it is an empty position, i.e. maximally oversold, which is exactly the
+        # case worth arming. The only genuinely ambiguous $0 is a cold book, and that is
+        # already excluded by the _cached_mid_price_usd check above.
         total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
-        if total_usd <= 0.0:
-            return False
         lower = self._hold_target_usd - self._hold_band_usd
         upper = self._hold_target_usd + self._hold_band_usd
         if total_usd < lower:

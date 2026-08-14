@@ -94,7 +94,8 @@ def load_parser(hummingbot: "HummingbotApplication", command_tabs) -> ThrowingAr
                                      "enable_hold, disable_hold, set, add_market, remove_market, create, clean")
     control_parser.add_argument("identifier", nargs="?", default=None,
                                 help="Strategy name/token (pause/resume/remove/enable/disable), config file (add), "
-                                     "or parameter name (set: buyin, selloff, buy_spread, sell_spread, order_size, refresh_interval, min_profitability)")
+                                     "or parameter name (set: buyin, selloff, buy_spread, sell_spread, order_size, "
+                                     "refresh_interval, min_profitability, hold_target, hold_band, hold_escalation)")
     control_parser.add_argument("value", nargs="*", default=None,
                                 help="For 'set' action: '<strategy_id> <value>'")
     control_parser.set_defaults(func=hummingbot.control)

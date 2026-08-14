@@ -2695,7 +2695,19 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             try:
                 total_usd = float(strategy.hold_correction_state[4])
                 floor, ceiling = target - band, target + band
-                if total_usd <= 0.0:
+                armed_zero = False
+                if total_usd <= 0.0 and hasattr(strategy, 'arm_hold_correction'):
+                    # A $0 total may still be a real, empty position — let arm_hold_correction
+                    # decide: it arms only when the price cache is warm, so a cold book still
+                    # falls through to the inconclusive message below.
+                    try:
+                        armed_zero = bool(strategy.arm_hold_correction())
+                    except Exception:
+                        armed_zero = False
+                if total_usd <= 0.0 and armed_zero:
+                    recheck = (" — re-check: total $0 (empty position, price warm), "
+                               "correction ARMED NOW (skipped confirmation)")
+                elif total_usd <= 0.0:
                     # Ambiguous by construction: the cached total is base_qty * bid, so $0 means
                     # a cold order book OR a genuinely empty position. Don't guess which — the
                     # refresh above skips its hysteresis entirely when the price cache is cold.
