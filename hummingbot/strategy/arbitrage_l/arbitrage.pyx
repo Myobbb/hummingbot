@@ -962,7 +962,20 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # free and prevents a failed order. (Not a hot-path cost — one float subtract.)
         buy_quote_balance = float(buy_market.c_get_available_balance(buy_market_tuple.quote_asset)) - 25.0
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
-        if buy_quote_balance <= EPSILON or sell_base_balance <= EPSILON:
+        if buy_quote_balance <= EPSILON:
+            return (0.0, 0.0, 0.0, 0.0)
+        # Zero sell-side base normally means there is no arb to do. The ONE exception is an
+        # active OVERSOLD correction: the guardrail already trims the sell leg to zero in that
+        # state (mirror of the `buy 0.000000 sell N` lines an overbought correction produces),
+        # so the trade it wants is buy-only and sell-side inventory is not a precondition.
+        # Without this, a strategy at zero on every venue can never bootstrap — the scan bails
+        # here, so profitability is never computed and c_execute_arbitrage (where the trim
+        # lives) is never reached. Sizing then comes from the hold shortfall, not from base;
+        # see _calculate_capacity_limit.
+        # HOT PATH: `and` short-circuits — when base is present the first term is False and
+        # neither bint is read, so the normal path costs one extra double compare.
+        if sell_base_balance <= EPSILON and not (
+                self._hold_correction_active and self._hold_correction_oversold):
             return (0.0, 0.0, 0.0, 0.0)
 
         # Calculate capacity limits once
@@ -1066,6 +1079,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double capacity = sell_base_balance
             object quantized
             double approx_ask
+            double _shortfall_usd
         
         # Get approximate buy price for affordability check via C-level top-of-book
         cdef ExchangeBase _buy_ex = buy_market_tuple.market
@@ -1079,6 +1093,20 @@ cdef class ArbitrageLStrategy(StrategyBase):
         
         # Apply quote balance constraint
         if approx_ask > 0:
+            # Bootstrap case (see the gate in c_calculate_arbitrage_top_order_profitability):
+            # oversold with no sell-side base. `capacity` was seeded from sell_base_balance,
+            # which is ~0 here, so every min() below would floor to zero and nothing could
+            # fire. Re-seed from the USD the correction is actually trying to close, so size
+            # is owned by the same number the guardrail corrects toward. The min() caps that
+            # follow still apply, so quote balance and _max_order_usd remain binding.
+            if (sell_base_balance <= EPSILON and
+                    self._hold_correction_active and self._hold_correction_oversold):
+                _shortfall_usd = self._hold_target_usd - (
+                    self._cached_total_base_qty * self._cached_mid_price_usd)
+                # Stale/cold cache (mid price 0) makes the shortfall meaningless -> no trade.
+                if _shortfall_usd <= 0.0 or self._cached_mid_price_usd <= 0.0:
+                    return 0.0
+                capacity = _shortfall_usd / approx_ask
             if buy_quote_balance > 0:
                 capacity = min(capacity, buy_quote_balance / approx_ask)
             
@@ -1498,11 +1526,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         # persist — so reset it. Without this the count would survive a trip back
                         # inside the band and a later dip could confirm on a mixed window.
                         if self._hold_breach_count > 1:
+                            # NOT "back inside band" — this branch is only reached while a
+                            # correction is STILL active on the opposite side, so the total is
+                            # typically still outside the band, just no longer past the floor.
+                            # ZKL 2026-08-14 12:37 reset at 3/15 on total $632 against a
+                            # [$450, $550] band: correct to discard the stale oversold window,
+                            # but it was never "inside" anything.
                             self.logger().info(
-                                f"Hold-band [{base_asset}]: flip window reset at "
+                                f"Hold-band [{base_asset}]: oversold flip window reset at "
                                 f"{self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERSOLD} — "
-                                f"total ${total_usd:.0f} back inside band "
-                                f"[${hold_lower:.0f}, ${hold_upper:.0f}]")
+                                f"total ${total_usd:.0f} no longer below floor ${hold_lower:.0f} "
+                                f"(still correcting "
+                                f"{'oversold' if self._hold_correction_oversold else 'overbought'})")
                         self._hold_breach_count = 0
 
         except Exception as e:
