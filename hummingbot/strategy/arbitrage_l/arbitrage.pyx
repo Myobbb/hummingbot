@@ -1400,6 +1400,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                 f"({self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERBOUGHT}) | avail-by-venue: {venue_detail}")
                     else:
                         # Back inside band — reset counter so a brief spike doesn't accumulate.
+                        # LOG IT: counts 2..N-1 are silent and so was this reset, so an asset
+                        # oscillating across its band edge produced a stream of identical
+                        # `(1/15)` lines and looked indistinguishable from one stuck mid-window.
+                        # MOVE 2026-08-14 logged (1/15) at 07:03, 07:05 and 07:15 with a frozen
+                        # balance — three separate windows killed by unlogged in-band readings,
+                        # which took three passes to identify. Only fires when progress is
+                        # actually lost (count > 1), so a quiet asset stays quiet.
+                        if self._hold_breach_count > 1:
+                            self.logger().info(
+                                f"Hold-band [{base_asset}]: confirmation window reset at "
+                                f"{self._hold_breach_count}/"
+                                f"{HOLD_BREACH_CYCLES_OVERSOLD if self._hold_breach_oversold else HOLD_BREACH_CYCLES_OVERBOUGHT} "
+                                f"({'oversold' if self._hold_breach_oversold else 'overbought'}) — "
+                                f"total ${total_usd:.0f} back inside band "
+                                f"[${hold_lower:.0f}, ${hold_upper:.0f}]")
                         self._hold_breach_count = 0
                 else:
                     # Direction flip. This branch was written for a CONFIG change: `set_hold_target`
@@ -1482,6 +1497,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         # OVERSOLD-flip window is stale — the reading that started it did not
                         # persist — so reset it. Without this the count would survive a trip back
                         # inside the band and a later dip could confirm on a mixed window.
+                        if self._hold_breach_count > 1:
+                            self.logger().info(
+                                f"Hold-band [{base_asset}]: flip window reset at "
+                                f"{self._hold_breach_count}/{HOLD_BREACH_CYCLES_OVERSOLD} — "
+                                f"total ${total_usd:.0f} back inside band "
+                                f"[${hold_lower:.0f}, ${hold_upper:.0f}]")
                         self._hold_breach_count = 0
 
         except Exception as e:

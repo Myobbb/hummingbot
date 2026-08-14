@@ -2657,6 +2657,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                       f"'control set hold_target {strategy_name} <usd>'")
                 return False
             strategy._hold_target_usd = target
+            # MUST be set here, and BEFORE the re-check below. `_hold_enabled` became a real
+            # flag on 2026-08-14 (0 is now a legitimate target, used by `clean`), so restoring
+            # `_hold_target_usd` alone no longer re-enables the guardrail the way it did when
+            # the gate was `_hold_target_usd > 0.0`. disable_hold sets it False; nothing else
+            # in this path set it back, so every AM transfer-suppression cycle
+            # (disable_hold -> enable_hold) left the guardrail permanently OFF and
+            # arm_hold_correction() bailing on its first guard — the observable symptom being
+            # `re-confirming` in the log below and then no Hold-band lines for that asset at all.
+            # Witnessed on BTW 2026-08-14: disabled 09:57, "re-enabled" 10:00, silent thereafter.
+            strategy._hold_enabled = True
             strategy_instance.config['hold_target_usd'] = target
             band = float(strategy._hold_band_usd)
             self._persist_hold_config(strategy_name, {'hold_target_usd': target, 'hold_target_enabled': True})

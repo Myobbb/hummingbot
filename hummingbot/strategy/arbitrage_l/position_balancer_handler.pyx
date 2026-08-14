@@ -3394,6 +3394,29 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass
 
+        # Exchange min_order_size floor — a BASE-QUANTITY rule, distinct from the notional
+        # check below. Quantization only rounds to the step increment, so an amount can clear
+        # it and still be under the exchange's minimum lot: HAEDAL 2026-08-14 sent 0.0128 into
+        # htx's 0.1 minimum ~90 times in 3 min. Every send is rejected, handle_order_failure
+        # clears tracking so the asset is not blocked, and sell-to-zero is exempt from
+        # INSUF_BAL_RETRY_COOLDOWN — so nothing damps the retry. Treated exactly like the
+        # quantized-to-zero case: for target=0 this residue is unsellable through any order,
+        # so declare completion instead of spinning.
+        try:
+            trading_rule = market._trading_rules.get(sell_market_tuple.trading_pair)
+            if trading_rule is not None and trading_rule.min_order_size > Decimal("0"):
+                if quantized_amount < trading_rule.min_order_size:
+                    self.strategy.logger().info(
+                        f"Position balancer: {asset_key} sell residue {quantized_amount} on "
+                        f"{market.name} is below exchange min_order_size "
+                        f"{trading_rule.min_order_size} — unsellable dust")
+                    if self._sell_target_usd == 0.0:
+                        self.c_try_mark_sell_complete(asset_key, current_value_quote, excess)
+                        self.c_maybe_disable_sell()
+                    return False
+        except Exception:
+            pass
+
         # Check minimum notional.
         # Sell-to-zero exception: when target=0 and the full remaining balance is below the software
         # floor, send the order anyway — the exchange min notional (~$5–$10) is well below our $15
