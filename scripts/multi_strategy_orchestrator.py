@@ -690,6 +690,12 @@ class ArbitrageMInstanceConfig(BaseModel):
         default=1100.0,
         description="Centre of the acceptable holding band in USD (e.g. 1100 → aim to hold ~$1100 worth)"
     )
+    hold_escalation_enabled: bool = Field(
+        default=True,
+        description="Allow the hold-band to auto-arm the position balancer after a stuck "
+                    "correction. Set false to keep the guardrail active (arb legs still get "
+                    "trimmed) but never have buy-in/sell-off armed automatically."
+    )
     hold_band_usd: float = Field(
         default=100.0,
         description="Half-width of the band in USD (target ± band = acceptable range, e.g. 100 → [1000, 1200]). "
@@ -1481,6 +1487,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 continue
             if target_usd <= 0.0:
                 continue  # guardrail disabled underneath us — nothing meaningful to target
+            # Opt-out: guardrail stays ACTIVE (arb legs are still trimmed) but the position
+            # balancer is never auto-armed. For pairs that should accumulate only when the
+            # arb spread justifies it, never via standalone PB limit orders. Absent key ==
+            # enabled, so existing strategies and older YAML are unaffected.
+            if instance.config.get('hold_escalation_enabled', True) is False:
+                continue
 
             # Every hold-band line is tagged with the BASE ASSET, while this sweep only knows the
             # STRATEGY NAME — and they differ whenever a strategy is named for its venues
@@ -2688,10 +2700,25 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     # a cold order book OR a genuinely empty position. Don't guess which — the
                     # refresh above skips its hysteresis entirely when the price cache is cold.
                     recheck = " — re-check inconclusive: cached total is $0 (cold book or no balance)"
-                elif total_usd > ceiling:
-                    recheck = f" — re-check: total ${total_usd:.0f} above ceiling ${ceiling:.0f}, re-confirming"
-                elif total_usd < floor:
-                    recheck = f" — re-check: total ${total_usd:.0f} below floor ${floor:.0f}, re-confirming"
+                elif total_usd > ceiling or total_usd < floor:
+                    # Out of band on an explicit enable: arm the correction immediately rather
+                    # than restarting the confirmation window (15 cycles oversold / 2 overbought).
+                    # enable_hold is only reached by deliberate action — an operator command, or
+                    # the AM restoring a strategy whose transfer has cleared — so the "is this a
+                    # transient imbalance?" question the window exists to answer is already
+                    # settled. arm_hold_correction re-validates against live cached values and
+                    # returns False if anything is off, so this can only skip the WAIT, never
+                    # invent a correction.
+                    armed = False
+                    if hasattr(strategy, 'arm_hold_correction'):
+                        try:
+                            armed = bool(strategy.arm_hold_correction())
+                        except Exception:
+                            armed = False
+                    side = "above ceiling" if total_usd > ceiling else "below floor"
+                    edge = ceiling if total_usd > ceiling else floor
+                    recheck = (f" — re-check: total ${total_usd:.0f} {side} ${edge:.0f}, "
+                               f"{'correction ARMED NOW (skipped confirmation)' if armed else 're-confirming'}")
                 else:
                     recheck = (f" — re-check: total ${total_usd:.0f} in band [${floor:.0f}, ${ceiling:.0f}], "
                                f"{'stale correction CLEARED' if cleared_stale else 'no correction'}")
@@ -2777,6 +2804,27 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         """Set hold-band half-width USD for a strategy."""
         strategy_name = self._resolve_identifier_to_name(identifier)
         return self.set_hold_band(strategy_name, band_usd) if strategy_name else False
+
+    def set_hold_escalation_by_identifier(self, identifier: str, enabled: bool) -> bool:
+        """Enable/disable auto-arming of the position balancer for a strategy."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.set_hold_escalation(strategy_name, enabled) if strategy_name else False
+
+    def set_hold_escalation(self, strategy_name: str, enabled: bool) -> bool:
+        """Set hold-band escalation on/off by full name. Guardrail itself is unaffected."""
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy_instance.config['hold_escalation_enabled'] = bool(enabled)
+            self._persist_hold_config(strategy_name, {'hold_escalation_enabled': bool(enabled)})
+            self.logger().info(
+                f"Hold-band escalation {'ENABLED' if enabled else 'DISABLED'} for '{strategy_name}'"
+                f"{'' if enabled else ' — guardrail still active; position balancer will not be auto-armed'}")
+            return True
+        except Exception as e:
+            self.logger().error(f"Failed to set hold escalation for '{strategy_name}': {e}", exc_info=True)
+            return False
 
     def set_hold_band(self, strategy_name: str, band_usd: float) -> bool:
         """Set hold-band half-width USD for a strategy by full name."""

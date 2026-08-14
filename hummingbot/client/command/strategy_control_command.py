@@ -42,6 +42,7 @@ class StrategyControlCommand:
             control disable_hold <id>                   - Disable hold-band guardrail
             control set hold_target <id> <value>        - Set hold target USD (also enables guardrail)
             control set hold_band <id> <value>          - Set hold band half-width USD
+            control set hold_escalation <id> <on|off>    - Auto-arm PB after stuck correction (default on)
             control add_market <id> <exchange:PAIR>     - Add market to strategy (e.g., 'mexc:BSX-USDT')
             control remove_market <id> <exchange:PAIR>  - Remove market from strategy
             control clean <id>                          - Set sell-off target to 0 and enable sell-off (sell entire position)
@@ -745,6 +746,30 @@ class StrategyControlCommand:
                     self.notify("  Guardrail enabled — arb size will be capped to stay near this target")
                 else:
                     self.notify(f"\n✗ Failed to set hold target for: {strategy_id}")
+
+            elif parameter == "hold_escalation":
+                if not hasattr(strategy, 'set_hold_escalation_by_identifier'):
+                    self.notify("The current strategy does not support hold-band controls.")
+                    return
+                v = value_str.strip().lower()
+                if v in ("on", "true", "1", "yes", "enable", "enabled"):
+                    enabled = True
+                elif v in ("off", "false", "0", "no", "disable", "disabled"):
+                    enabled = False
+                else:
+                    self.notify(f"Error: Invalid value '{value_str}'. Use on/off (or true/false, 1/0).")
+                    return
+                success = strategy.set_hold_escalation_by_identifier(strategy_id, enabled)
+                if success:
+                    if enabled:
+                        self.notify(f"\n✓ Hold-band escalation ENABLED for {strategy_id}")
+                        self.notify("  Position balancer may be auto-armed after a stuck correction.")
+                    else:
+                        self.notify(f"\n✓ Hold-band escalation DISABLED for {strategy_id}")
+                        self.notify("  Guardrail stays active (arb legs still trimmed); buy-in/sell-off")
+                        self.notify("  will NOT be auto-armed. Enable manually if you want PB orders.")
+                else:
+                    self.notify(f"\n✗ Failed to set hold escalation for: {strategy_id}")
 
             elif parameter == "hold_band":
                 if not hasattr(strategy, 'set_hold_band_by_identifier'):

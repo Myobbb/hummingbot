@@ -3167,11 +3167,11 @@ cdef class PositionBalancerHandler:
         # venue here the place line couldn't be attributed to a leg from the log alone.
         if self._buy_spread_is_min:
             self.strategy.logger().info(
-                f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"[PB] Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
-                f"Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"[PB] Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
@@ -3480,11 +3480,11 @@ cdef class PositionBalancerHandler:
         # couldn't be attributed to a leg from the log alone.
         if self._sell_spread_is_min:
             self.strategy.logger().info(
-                f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: min tick)")
         else:
             self.strategy.logger().info(
-                f"Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: {self._sell_spread_pct * 100:.2f}%)")
 
         # Check if target reached - use ACTUAL balance (not adjusted)

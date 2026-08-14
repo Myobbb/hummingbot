@@ -1538,6 +1538,50 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
         self.c_refresh_hold_cache()
 
+    def arm_hold_correction(self):
+        """Activate the correction NOW, skipping the confirmation window. Returns True if armed.
+
+        For an OPERATOR-initiated `control enable_hold`: the confirmation window (15 cycles
+        oversold / 2 overbought) exists to decide whether a breach is a transient imbalance
+        worth ignoring. A human issuing the command has already made that judgement, so
+        making them wait another ~15 minutes for an obviously out-of-band asset is pure lag.
+
+        Deliberately conservative — it never FABRICATES a correction, it only skips the wait
+        for one the refresh has already measured:
+          * guardrail must be enabled with a real target
+          * price cache must be warm and the total non-zero (a $0 total is ambiguous: cold
+            book or genuinely empty — the same case enable_hold reports as inconclusive)
+          * the total must actually be outside the band
+        Anything else returns False and the normal confirmation path runs unchanged.
+        """
+        cdef double total_usd
+        cdef double lower
+        cdef double upper
+        if not self._hold_enabled or self._hold_target_usd <= 0.0:
+            return False
+        if self._cached_mid_price_usd <= 0.0:
+            return False
+        total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
+        if total_usd <= 0.0:
+            return False
+        lower = self._hold_target_usd - self._hold_band_usd
+        upper = self._hold_target_usd + self._hold_band_usd
+        if total_usd < lower:
+            self.c_set_hold_correction(True, True)
+            self._hold_breach_count = 0
+            self.logger().info(
+                f"Hold-band: correction ARMED IMMEDIATELY (oversold) on operator enable — "
+                f"total ${total_usd:.0f} below floor ${lower:.0f}, confirmation window skipped")
+            return True
+        if total_usd > upper:
+            self.c_set_hold_correction(True, False)
+            self._hold_breach_count = 0
+            self.logger().info(
+                f"Hold-band: correction ARMED IMMEDIATELY (overbought) on operator enable — "
+                f"total ${total_usd:.0f} above ceiling ${upper:.0f}, confirmation window skipped")
+            return True
+        return False
+
     def clear_hold_correction(self):
         """End the current correction episode. Called by orchestrator before enable_hold's refresh.
 
@@ -1816,6 +1860,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
                 _hold_sell_amount = max(0.0, amount - _delta_base)
                 # _hold_buy_amount stays at `amount`
+
+            # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
+            # sizes (or a lone sell) with nothing saying why. Only reads values already
+            # computed above — no extra work — and only fires while a correction is active,
+            # so the normal hot path is untouched.
+            if _hold_buy_amount != amount or _hold_sell_amount != amount:
+                self.logger().info(
+                    f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
+                    f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
+                    f"buy {_hold_buy_amount:.6f} sell {_hold_sell_amount:.6f} of {amount:.6f} | "
+                    f"total ${_total_usd:.0f} target ${self._hold_target_usd:.0f} | "
+                    f"profit {profitability * 100:.3f}%")
 
         # ─────────────────────────────────────────────────────────────────────────
 
