@@ -182,6 +182,13 @@ cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before w
 # observed failure, and leaves every already-correct park untouched. Raise it to demand a wider moat.
 cdef double REFUGE_MIN_WALL_GAP_TICKS = 2.0
 cdef int REFUGE_WALL_MAX_LEVELS = 20   # safety bound on the book walk (not a tuning knob)
+
+# How often a PARKED refuge order re-checks that it is still sitting exactly 1 tick inside the
+# wall. Refuge used to be frozen between backstops (~166s measured), so when the wall was pulled
+# the order just stranded with an open gap under it. CHECK 4 now owns repositioning at this
+# cadence and the backstop owns only the exit decision — one owner per concern. 60s matches the
+# better-market scan so the two periodic checks run on the same rhythm.
+cdef double REFUGE_REPARK_INTERVAL = 60.0
 # While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
 # ONCE PER ~2-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 120s-age mark
 # — the order is still live there so order_price is known). At that single re-evaluation we count
@@ -342,6 +349,11 @@ cdef class PositionBalancerHandler:
         # should_backstop_refresh reads it to tell "hiding behind a wall" from "sank".
         self._in_refuge_sell = {}
         self._in_refuge_buy = {}
+        # asset (raw) -> (price, timestamp) of the order that just went away. Bridges the
+        # cancel -> replace gap so placement can still recognise our own stale level. See
+        # c_own_recent_price.
+        self._last_gone_buy_price = {}
+        self._last_gone_sell_price = {}
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -869,6 +881,13 @@ cdef class PositionBalancerHandler:
                     # Remove from active tracking
                     if self._active_buy_orders.get(asset_key) == order_id:
                         self._active_buy_orders.pop(asset_key, None)
+                        # Remember where it rested BEFORE forgetting it: the local book can still
+                        # carry the order for a moment, and the next placement needs to recognise
+                        # that level as ours (L2 self-protection + refuge wall search).
+                        _gone_det = self._active_buy_order_details.get(asset_key)
+                        if _gone_det is not None:
+                            self._last_gone_buy_price[asset_key] = (
+                                float(_gone_det[1]), self.strategy._current_timestamp)
                         # Also remove order details
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
@@ -897,6 +916,11 @@ cdef class PositionBalancerHandler:
                     # Remove from active tracking
                     if self._active_sell_orders.get(asset_key) == order_id:
                         self._active_sell_orders.pop(asset_key, None)
+                        # Remember where it rested BEFORE forgetting it — see the buy side.
+                        _gone_det = self._active_sell_order_details.get(asset_key)
+                        if _gone_det is not None:
+                            self._last_gone_sell_price[asset_key] = (
+                                float(_gone_det[1]), self.strategy._current_timestamp)
                         # Also remove order details
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
@@ -1152,8 +1176,14 @@ cdef class PositionBalancerHandler:
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge EXITED for {canonical} (sank below {foreign_below} orders, "
                                 f"parked behind {refuge_depth}) — refuge premise broken, resuming normal best-ask chasing")
-                # count == 1 -> stay in refuge (re-park under wall). Either way, always refresh.
-                return True
+                    return True          # exited -> refresh, re-places on the NORMAL branch
+                # Still correctly parked. Do NOT cancel/re-place: CHECK 4 owns repositioning of a
+                # refuge order now (REFUGE_REPARK_INTERVAL, closes any gap that opens under/over
+                # us), so a backstop re-park here would only surrender FIFO queue position for an
+                # identical price — observed live: AIC re-parked 3x at 0.01066 with the wall and
+                # frontrunner unchanged. Skipping resets the age timer, exactly like the
+                # non-refuge skip-if-still-correctly-placed path below.
+                return False
 
             # No stored details -> unknown price state -> refresh to be safe.
             if is_buy:
@@ -1857,112 +1887,200 @@ cdef class PositionBalancerHandler:
             # ================================================================
             if not should_cancel and is_maker_mode and order_age >= frontrun_delay:
                 if is_buy:
-                    # CHECK 2: Frontrun - someone placed HIGHER bid than our order
-                    if current_bid > order_price:
-                        should_cancel = True
-                        cancel_reason = f"frontrun (top bid {current_bid:.8g} > our {order_price:.8g})"
-                    
-                    # CHECK 3: Large gap detection (min mode only)
-                    if not should_cancel and spread_is_min and min_price_increment > 0:
-                        # Our order should be 1 tick above effective bid
-                        effective_ref_price = self.c_get_effective_reference_price(
-                            order_ob, current_bid, order_price, min_price_increment, True)
-                        expected_price = effective_ref_price + min_price_increment
-                        gap_amount = abs(order_price - expected_price)
-                        if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
+                    in_refuge = self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
+                    # CHECKS 2 and 3 are TOP-OF-BOOK referenced, so both are meaningless for a
+                    # refuge order, which sits away from the top BY DESIGN: CHECK 2 is the very
+                    # thing refuge suppresses, and CHECK 3 would measure our deliberate distance
+                    # from the top as "drift" and fire every tick. Skipping them in refuge also
+                    # stops them SHORT-CIRCUITING CHECK 4 through the `if not should_cancel`
+                    # chain — in refuge the checks must not gate each other, and CHECK 4 is the
+                    # one that keeps us correctly parked.
+                    if not in_refuge:
+                        # CHECK 2: Frontrun - someone placed HIGHER bid than our order
+                        if current_bid > order_price:
                             should_cancel = True
-                            cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
+                            cancel_reason = f"frontrun (top bid {current_bid:.8g} > our {order_price:.8g})"
 
-                    # CHECK 4: Step-down into gap (min mode only) — mirror of the sell step-up.
-                    # We ARE top bid but the next foreign bid is far below; move down to
-                    # (next_bid + 1 tick) and stay best bid, buying cheaper. Only when NOT
-                    # frontrun (we are top): current_bid ~= order_price. Pre-detection throttle
-                    # (STEP_UP_MIN_INTERVAL) is the API-spam guard. Proactive (reason prefixed
-                    # "step-up …" → caller does NOT mark reactive / streak-bump).
-                    # DISABLED while in refuge (see sell CHECK 4): the refuge 10-min sampler owns
-                    # repositioning of a refuge order; step-up must not walk it around every 30s.
-                    if (not should_cancel and spread_is_min and min_price_increment > 0
-                            and not self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
-                            and current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE
-                            and (self.strategy._current_timestamp
-                                 - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
-                                >= STEP_UP_MIN_INTERVAL):
-                        # NOTE: bid_entries() is a GENERATOR (yields OrderBookRow), not a list.
-                        # entry[0] is our own order (top bid); entry[1] is the next foreign level.
-                        next_bid = 0.0
-                        try:
-                            bid_iter = order_ob.bid_entries()
-                            bid_lvl0 = next(bid_iter, None)
-                            bid_lvl1 = next(bid_iter, None)
-                            if bid_lvl1 is not None:
-                                next_bid = float(bid_lvl1.price)
-                        except Exception:
-                            next_bid = 0.0
-                        if next_bid > 0.0 and next_bid < order_price:
-                            headroom_ticks = (order_price - next_bid) / min_price_increment
-                            if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                        # CHECK 3: Large gap detection (min mode only)
+                        if not should_cancel and spread_is_min and min_price_increment > 0:
+                            # Our order should be 1 tick above effective bid
+                            effective_ref_price = self.c_get_effective_reference_price(
+                                order_ob, current_bid, order_price, min_price_increment, True)
+                            expected_price = effective_ref_price + min_price_increment
+                            gap_amount = abs(order_price - expected_price)
+                            if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                                 should_cancel = True
-                                cancel_reason = (f"step-up into gap (next bid {next_bid:.8g} is "
-                                                 f"{headroom_ticks:.1f} ticks below our {order_price:.8g})")
-                                self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
+                                cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
+
+                    # CHECK 4: sit exactly 1 tick inside the first foreign level BEYOND us.
+                    # ONE rule, two postures (c_first_foreign_beyond resolves the level for both):
+                    #   NORMAL — we ARE top bid and the next bid is far below: step DOWN to
+                    #     (next_bid + 1 tick), staying best bid but buying cheaper. Requires we are
+                    #     top (else CHECK 2 chases instead), gap >= STEP_UP_MIN_GAP_TICKS, throttled
+                    #     by STEP_UP_MIN_INTERVAL as the API-spam guard.
+                    #   REFUGE — we are parked 2nd-best and that next bid IS the wall. Correctly
+                    #     parked means exactly 1 tick of headroom, so a gap >= LARGE_GAP_THRESHOLD
+                    #     means the wall was pulled or moved away and we should close it. Cadence is
+                    #     REFUGE_REPARK_INTERVAL. No "must be top" requirement — we are 2nd by design.
+                    # REFUGE STATE SURVIVES: the "step-up" prefix is excluded from reactive tagging
+                    # (no streak bump, STEP_UP_COOLDOWN), does not match the better-market exit, and
+                    # a pure cancel never clears the refuge flag — so the re-place goes straight back
+                    # through the refuge branch and re-parks against the CURRENT wall.
+                    if not should_cancel and spread_is_min and min_price_increment > 0:
+                        canonical_su = self._get_canonical_asset(asset)
+                        if in_refuge:
+                            gap_needed = LARGE_GAP_THRESHOLD
+                            repark_interval = REFUGE_REPARK_INTERVAL
+                            positioned = True
+                        else:
+                            gap_needed = STEP_UP_MIN_GAP_TICKS
+                            repark_interval = STEP_UP_MIN_INTERVAL
+                            positioned = current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE
+                        if (positioned
+                                and (self.strategy._current_timestamp
+                                     - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
+                            next_bid = self.c_first_foreign_beyond(
+                                order_ob, order_price, min_price_increment, True)
+                            if next_bid > 0.0:
+                                headroom_ticks = (order_price - next_bid) / min_price_increment
+                                if headroom_ticks >= gap_needed:
+                                    should_cancel = True
+                                    cancel_reason = (
+                                        f"step-up into gap ({'refuge re-park, wall' if in_refuge else 'next bid'} "
+                                        f"{next_bid:.8g} is {headroom_ticks:.1f} ticks below our {order_price:.8g})")
+                                    self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
                 else:  # SELL
-                    # CHECK 2: Undercut - someone placed LOWER ask than our order
-                    if current_ask < order_price:
-                        should_cancel = True
-                        cancel_reason = f"undercut (top ask {current_ask:.8g} < our {order_price:.8g})"
-                    
-                    # CHECK 3: Large gap detection (min mode only)
-                    if not should_cancel and spread_is_min and min_price_increment > 0:
-                        # Our order should be 1 tick below effective ask
-                        effective_ref_price = self.c_get_effective_reference_price(
-                            order_ob, current_ask, order_price, min_price_increment, False)
-                        expected_price = effective_ref_price - min_price_increment
-                        gap_amount = abs(order_price - expected_price)
-                        if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
+                    in_refuge = self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
+                    # CHECKS 2 and 3 are TOP-OF-BOOK referenced and are skipped in refuge — see
+                    # the buy side for the full rationale (meaningless there, and they would
+                    # short-circuit CHECK 4 through the `if not should_cancel` chain).
+                    if not in_refuge:
+                        # CHECK 2: Undercut - someone placed LOWER ask than our order
+                        if current_ask < order_price:
                             should_cancel = True
-                            cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
+                            cancel_reason = f"undercut (top ask {current_ask:.8g} < our {order_price:.8g})"
 
-                    # CHECK 4: Step-up into gap (min mode only) — we ARE top ask but the next
-                    # foreign ask is far above; move up to (next_ask - 1 tick) and stay best ask.
-                    # Only when NOT undercut (we are top): current_ask ~= order_price.
-                    # Pre-detection throttle (STEP_UP_MIN_INTERVAL) is the API-spam guard.
-                    # Proactive (reason prefixed "step-up …" → caller does NOT mark reactive,
-                    # so it never feeds the undercut streak / bid-war backoff).
-                    # DISABLED while in refuge: a refuge order's "gap above" is expected (we're parked
-                    # deep), and step-up would walk it up the book every 30s, defeating refuge's
-                    # park-and-hold. A refuge order is repositioned only by the 120s arb backstop
-                    # (which re-reads the wall on the next placement while still in refuge).
-                    if (not should_cancel and spread_is_min and min_price_increment > 0
-                            and not self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
-                            and current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE
-                            and (self.strategy._current_timestamp
-                                 - self._last_step_up_time.get(self._get_canonical_asset(asset), 0.0))
-                                >= STEP_UP_MIN_INTERVAL):
-                        # We're at (or above) top — read the next foreign ask level.
-                        # NOTE: ask_entries() is a GENERATOR (yields OrderBookRow), not a list —
-                        # it is NOT subscriptable and has no len(). Pull the first two rows by
-                        # iterating. entry[0] is our own order (top); entry[1] is the next foreign level.
-                        next_ask = 0.0
-                        try:
-                            ask_iter = order_ob.ask_entries()
-                            ask_lvl0 = next(ask_iter, None)
-                            ask_lvl1 = next(ask_iter, None)
-                            if ask_lvl1 is not None:
-                                next_ask = float(ask_lvl1.price)
-                        except Exception:
-                            next_ask = 0.0
-                        if next_ask > order_price:
-                            headroom_ticks = (next_ask - order_price) / min_price_increment
-                            if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                        # CHECK 3: Large gap detection (min mode only)
+                        if not should_cancel and spread_is_min and min_price_increment > 0:
+                            # Our order should be 1 tick below effective ask
+                            effective_ref_price = self.c_get_effective_reference_price(
+                                order_ob, current_ask, order_price, min_price_increment, False)
+                            expected_price = effective_ref_price - min_price_increment
+                            gap_amount = abs(order_price - expected_price)
+                            if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                                 should_cancel = True
-                                cancel_reason = (f"step-up into gap (next ask {next_ask:.8g} is "
-                                                 f"{headroom_ticks:.1f} ticks above our {order_price:.8g})")
-                                self._last_step_up_time[self._get_canonical_asset(asset)] = self.strategy._current_timestamp
+                                cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
+
+                    # CHECK 4 (buy mirror): sit exactly 1 tick inside the first foreign level BEYOND
+                    # us. ONE rule, two postures — see the buy side for the full note.
+                    #   NORMAL — we ARE top ask, next ask far above: step UP to (next_ask - 1 tick).
+                    #   REFUGE — we are parked 2nd-best and that next ask IS the wall; >= 1.9 ticks
+                    #     of headroom means the wall moved away, so close the gap. Refuge survives
+                    #     (proactive "step-up" prefix + pure cancel never clears the flag).
+                    if not should_cancel and spread_is_min and min_price_increment > 0:
+                        canonical_su = self._get_canonical_asset(asset)
+                        if in_refuge:
+                            gap_needed = LARGE_GAP_THRESHOLD
+                            repark_interval = REFUGE_REPARK_INTERVAL
+                            positioned = True
+                        else:
+                            gap_needed = STEP_UP_MIN_GAP_TICKS
+                            repark_interval = STEP_UP_MIN_INTERVAL
+                            positioned = current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE
+                        if (positioned
+                                and (self.strategy._current_timestamp
+                                     - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
+                            next_ask = self.c_first_foreign_beyond(
+                                order_ob, order_price, min_price_increment, False)
+                            if next_ask > 0.0:
+                                headroom_ticks = (next_ask - order_price) / min_price_increment
+                                if headroom_ticks >= gap_needed:
+                                    should_cancel = True
+                                    cancel_reason = (
+                                        f"step-up into gap ({'refuge re-park, wall' if in_refuge else 'next ask'} "
+                                        f"{next_ask:.8g} is {headroom_ticks:.1f} ticks above our {order_price:.8g})")
+                                    self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
 
         except Exception as e:
             self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
 
         return (should_cancel, cancel_reason)
+
+    cdef double c_own_recent_price(self, str asset, bint is_buy):
+        """
+        The price of OUR order that may still be sitting in the local orderbook: the LIVE order's
+        price if we have one, else the price of the order that just went away. 0.0 if neither.
+
+        WHY the second half exists. handle_order_completion pops _active_*_order_details, so by the
+        time the next placement runs BOTH of the guards that exist for this exact race saw nothing:
+          • the L2 self-protection block (don't reference a top-of-book that is our own stale order)
+          • the refuge wall search (skip our own level when locating the wall)
+        Their `_active_*` lookups were dead code at re-place — the one moment they were written for.
+        A cancel is confirmed before we re-place, but the LOCAL book can still carry the order for a
+        few hundred ms, and refuge now re-places more often (CHECK 4 at REFUGE_REPARK_INTERVAL), so
+        the window is hit more. We stash the price as we forget the order and honour it for
+        PENDING_CANCEL_WAIT_SECONDS — the existing bound on "a cancel that may still be settling".
+        Past that window a level at that price is genuinely someone else's, so we stop claiming it.
+        """
+        cdef:
+            tuple det
+            tuple gone
+            double now = self.strategy._current_timestamp
+        try:
+            if is_buy:
+                det = self._active_buy_order_details.get(asset)
+            else:
+                det = self._active_sell_order_details.get(asset)
+            if det is not None:
+                return float(det[1])                      # live order — authoritative
+            if is_buy:
+                gone = self._last_gone_buy_price.get(asset)
+            else:
+                gone = self._last_gone_sell_price.get(asset)
+            if gone is not None and (now - float(gone[1])) <= PENDING_CANCEL_WAIT_SECONDS:
+                return float(gone[0])
+            return 0.0
+        except Exception:
+            return 0.0
+
+    cdef double c_first_foreign_beyond(self, object order_ob, double order_price,
+                                       double min_tick, bint is_buy):
+        """
+        The first FOREIGN level strictly BEYOND our own order — lower for a buy, higher for a
+        sell — skipping our own level exactly once. Returns 0.0 if there is none.
+
+        This is the ONE definition of "the level we are sitting one tick inside of", and it is
+        deliberately state-agnostic so CHECK 4 can use it in both postures without a second walk:
+          • NORMAL order (we are top of book) -> the next level down/up, i.e. the step-up gap.
+          • REFUGE order (we are parked 2nd-best) -> the WALL we parked against. Levels ABOVE us
+            (the frontrunner and any stacked jumpers) are simply passed over by the comparison.
+        Fail-safe: 0.0 on any error, which every caller reads as "no gap information, do nothing".
+        """
+        cdef:
+            bint skipped_own = False
+            double p = 0.0
+        try:
+            if is_buy:
+                it = order_ob.bid_entries()          # highest-first
+            else:
+                it = order_ob.ask_entries()          # lowest-first
+            while True:
+                row = next(it, None)
+                if row is None:
+                    break
+                p = float(row.price)
+                if (not skipped_own) and abs(p - order_price) < min_tick * 0.5:
+                    skipped_own = True
+                    continue                          # our own order's level (once only)
+                if is_buy:
+                    if p < order_price - min_tick * 0.5:
+                        return p                      # first bid strictly below us
+                else:
+                    if p > order_price + min_tick * 0.5:
+                        return p                      # first ask strictly above us
+            return 0.0
+        except Exception:
+            return 0.0
 
     cdef int c_refuge_foreign_below(self, str asset, bint is_buy):
         """
@@ -3003,37 +3121,37 @@ cdef class PositionBalancerHandler:
                     # If we're replacing an existing order, the old order might still be in the orderbook
                     # Use the second bid level to avoid placing above our own stale order
                     reference_bid = top_bid
-                    if asset_key in self._active_buy_orders:
-                        # We have an active order - check if top bid matches it
-                        existing_order_details = self._active_buy_order_details.get(asset_key)
-                        if existing_order_details is not None:
-                            _, existing_price = existing_order_details
-                            # If top bid matches our existing order (within tolerance), use second bid.
-                            # NOTE: bid_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
-                            # and no len(). Previous code used len()/[1] which always threw and silently
-                            # fell back to top_bid (self-competing). Pull the second row via next().
-                            if abs(top_bid - existing_price) < min_price_increment * 0.5:
-                                try:
-                                    _bid_iter = ob.bid_entries()
-                                    _ = next(_bid_iter, None)              # level 0 (our own top)
-                                    _bid_lvl1 = next(_bid_iter, None)      # level 1 (next foreign)
-                                    if _bid_lvl1 is not None:
-                                        reference_bid = float(_bid_lvl1.price)
-                                        self.strategy.logger().debug(
-                                            f"Position balancer: Top bid {top_bid:.8g} matches our existing order, "
-                                            f"using second bid {reference_bid:.8g} for new order price")
-                                except Exception as e:
-                                    self.strategy.logger().debug(f"Could not get second bid level: {e}")
+                    # c_own_recent_price covers BOTH the live order and the one we just cancelled —
+                    # the `asset_key in self._active_buy_orders` test used to be the only gate here,
+                    # but it is False at re-place (handle_order_completion popped it), which is
+                    # exactly when a stale own-order can still be sitting at the top of the book.
+                    existing_price = self.c_own_recent_price(asset_key, True)
+                    # If top bid IS our own order (live or just-cancelled and still in the local
+                    # book), reference the second bid instead of self-competing.
+                    # NOTE: bid_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
+                    # and no len(). Previous code used len()/[1] which always threw and silently
+                    # fell back to top_bid (self-competing). Pull the second row via next().
+                    if existing_price > 0.0 and abs(top_bid - existing_price) < min_price_increment * 0.5:
+                        try:
+                            _bid_iter = ob.bid_entries()
+                            _ = next(_bid_iter, None)              # level 0 (our own top)
+                            _bid_lvl1 = next(_bid_iter, None)      # level 1 (next foreign)
+                            if _bid_lvl1 is not None:
+                                reference_bid = float(_bid_lvl1.price)
+                                self.strategy.logger().debug(
+                                    f"Position balancer: Top bid {top_bid:.8g} matches our existing order, "
+                                    f"using second bid {reference_bid:.8g} for new order price")
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Could not get second bid level: {e}")
 
                     # SECOND-LEVEL REFUGE (buy mirror): rest under the WALL (2nd bid) — below the
                     # frontrunner — instead of re-overbidding up. Cancel has confirmed, so the book
                     # is [frontrunner@L1, wall@L2, …] and the wall is simply the 2nd bid.
                     if self._in_refuge_buy.get(self._get_canonical_asset(asset_key), False):
                         try:
-                            _own = None
-                            _own_det = self._active_buy_order_details.get(asset_key)
-                            if _own_det is not None:
-                                _own = _own_det[1]                # our current order price
+                            # Our own price: the live order's, or the one we just cancelled if the
+                            # book may still be carrying it (c_own_recent_price). 0.0 = neither.
+                            _own = self.c_own_recent_price(asset_key, True)
                             # WALL SEARCH: _foreign[0] = frontrunner (1st foreign bid). The wall is the
                             # first foreign bid at least REFUGE_MIN_WALL_GAP_TICKS BELOW it — levels
                             # stacked right behind the frontrunner are more penny-jumpers, and tucking
@@ -3050,7 +3168,7 @@ cdef class PositionBalancerHandler:
                                 if _row is None:
                                     break
                                 _p = float(_row.price)
-                                if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
+                                if _own > 0.0 and abs(_p - _own) < min_price_increment * 0.5:
                                     continue                      # skip our own order's level
                                 _seen += 1
                                 if not _foreign:
@@ -3323,27 +3441,28 @@ cdef class PositionBalancerHandler:
                     # If we're replacing an existing order, the old order might still be in the orderbook
                     # Use the second ask level to avoid placing below our own stale order
                     reference_ask = top_ask
-                    if asset_key in self._active_sell_orders:
-                        # We have an active order - check if top ask matches it
-                        existing_order_details = self._active_sell_order_details.get(asset_key)
-                        if existing_order_details is not None:
-                            _, existing_price = existing_order_details
-                            # If top ask matches our existing order (within tolerance), use second ask.
-                            # NOTE: ask_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
-                            # and no len(). Previous code used len()/[1] which always threw and silently
-                            # fell back to top_ask (self-competing). Pull the second row via next().
-                            if abs(top_ask - existing_price) < min_price_increment * 0.5:
-                                try:
-                                    _ask_iter = ob.ask_entries()
-                                    _ = next(_ask_iter, None)              # level 0 (our own top)
-                                    _ask_lvl1 = next(_ask_iter, None)      # level 1 (next foreign)
-                                    if _ask_lvl1 is not None:
-                                        reference_ask = float(_ask_lvl1.price)
-                                        self.strategy.logger().debug(
-                                            f"Position balancer: Top ask {top_ask:.8g} matches our existing order, "
-                                            f"using second ask {reference_ask:.8g} for new order price")
-                                except Exception as e:
-                                    self.strategy.logger().debug(f"Could not get second ask level: {e}")
+                    # c_own_recent_price covers BOTH the live order and the one we just cancelled —
+                    # the `asset_key in self._active_sell_orders` test used to be the only gate here,
+                    # but it is False at re-place (handle_order_completion popped it), which is
+                    # exactly when a stale own-order can still be sitting at the top of the book.
+                    existing_price = self.c_own_recent_price(asset_key, False)
+                    # If top ask IS our own order (live or just-cancelled and still in the local
+                    # book), reference the second ask instead of self-competing.
+                    # NOTE: ask_entries() is a GENERATOR (yields OrderBookRow) — NOT subscriptable
+                    # and no len(). Previous code used len()/[1] which always threw and silently
+                    # fell back to top_ask (self-competing). Pull the second row via next().
+                    if existing_price > 0.0 and abs(top_ask - existing_price) < min_price_increment * 0.5:
+                        try:
+                            _ask_iter = ob.ask_entries()
+                            _ = next(_ask_iter, None)              # level 0 (our own top)
+                            _ask_lvl1 = next(_ask_iter, None)      # level 1 (next foreign)
+                            if _ask_lvl1 is not None:
+                                reference_ask = float(_ask_lvl1.price)
+                                self.strategy.logger().debug(
+                                    f"Position balancer: Top ask {top_ask:.8g} matches our existing order, "
+                                    f"using second ask {reference_ask:.8g} for new order price")
+                        except Exception as e:
+                            self.strategy.logger().debug(f"Could not get second ask level: {e}")
 
                     # SECOND-LEVEL REFUGE: if active, rest under the WALL = the 2nd FOREIGN ask
                     # (next order regardless of size). Walk asks skipping our OWN resting order
@@ -3351,10 +3470,9 @@ cdef class PositionBalancerHandler:
                     # jumper's tick in live testing): jumper = 1st foreign ask, wall = 2nd foreign ask.
                     if self._in_refuge_sell.get(self._get_canonical_asset(asset_key), False):
                         try:
-                            _own = None
-                            _own_det = self._active_sell_order_details.get(asset_key)
-                            if _own_det is not None:
-                                _own = _own_det[1]                # our current order price
+                            # Our own price: the live order's, or the one we just cancelled if the
+                            # book may still be carrying it (c_own_recent_price). 0.0 = neither.
+                            _own = self.c_own_recent_price(asset_key, False)
                             # WALL SEARCH (buy mirror): _foreign[0] = jumper (1st foreign ask). The wall
                             # is the first foreign ask at least REFUGE_MIN_WALL_GAP_TICKS ABOVE it —
                             # levels stacked right on the jumper are more penny-jumpers, and tucking
@@ -3371,7 +3489,7 @@ cdef class PositionBalancerHandler:
                                 if _row is None:
                                     break
                                 _p = float(_row.price)
-                                if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
+                                if _own > 0.0 and abs(_p - _own) < min_price_increment * 0.5:
                                     continue                      # skip our own order's level
                                 _seen += 1
                                 if not _foreign:

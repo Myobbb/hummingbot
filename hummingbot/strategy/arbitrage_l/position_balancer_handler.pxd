@@ -56,9 +56,14 @@ cdef class PositionBalancerHandler:
         dict _last_step_up_time           # canonical_asset -> timestamp of last step-up cancel (pre-detection throttle)
         # Log throttle for the per-tick min_tick=0 warning ("exchange:pair" -> last-logged timestamp)
         dict _last_min_tick_warn_time
-        # Second-level refuge state (per canonical asset) — True = resting under the wall (2nd-best), undercut suppressed
+        # Second-level refuge state (per canonical asset) — truthy = resting under the wall (2nd-best),
+        # undercut suppressed; the VALUE is the intended park depth (foreign levels we sat behind)
         dict _in_refuge_sell
         dict _in_refuge_buy
+        # Price of the order that JUST went away (asset -> (price, timestamp)), so the placement
+        # path can still skip our own level while the local book lags the cancel — see c_own_recent_price
+        dict _last_gone_buy_price
+        dict _last_gone_sell_price
         # Asset alias support (for cross-exchange pairs with different token names)
         dict _asset_aliases
         dict _canonical_asset
@@ -98,6 +103,9 @@ cdef class PositionBalancerHandler:
                                          double min_price_increment, bint got_valid_second_level)
     cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
                                             double frontrun_delay=*)
+    cdef double c_own_recent_price(self, str asset, bint is_buy)
+    cdef double c_first_foreign_beyond(self, object order_ob, double order_price,
+                                       double min_tick, bint is_buy)
     cdef int c_refuge_foreign_below(self, str asset, bint is_buy)
     cdef void c_cancel_stale_orders(self, str asset)
     cdef void _cancel_buy_order(self, str asset, str order_id, str reason, bint reactive=*)
