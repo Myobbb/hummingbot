@@ -36,8 +36,6 @@ QUANTIZATION_EPSILON = 1e-9
 
 # --- Order Hanging Intervals (seconds) ---
 # How long orders hang before being refreshed (cancelled and replaced)
-cdef double DEFAULT_LIMIT_REFRESH_INTERVAL = 60.0       # Default refresh for min/set_spread modes
-cdef double DEFAULT_AGGRESSIVE_REFRESH_INTERVAL = 5.0   # Refresh for aggressive (0%) mode with partial fills
 cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
 
 # --- Fill-pressure adaptive post-fill wait ---
@@ -96,7 +94,6 @@ cdef double MIN_MARKET_SWITCH_DELAY  = 60.0   # seconds — better market (diffe
 cdef double POST_CANCEL_COOLDOWN_REACTIVE  = 3.0   # seconds — reactive: undercut/frontrun/large-gap
 cdef double POST_CANCEL_COOLDOWN_PROACTIVE = 10.0  # seconds — proactive: refresh/better-market/divergence
 # Legacy alias — kept for any external references; equals PROACTIVE value
-cdef double POST_CANCEL_COOLDOWN = 10.0
 
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
@@ -114,10 +111,8 @@ cdef double PENDING_CANCEL_WAIT_SECONDS = 10.0  # Wait at least 10s for cancel c
 cdef double MIN_TICK_WARN_INTERVAL = 300.0  # seconds between min_tick=0 warnings per exchange:pair
 
 # --- Price Threshold Constants ---
-cdef double TICK_TOLERANCE = 0.9            # Tolerance for detecting if order matches top of book (90% of tick)
 cdef double HALF_TICK_TOLERANCE = 0.5       # Half-tick tolerance for price matching
 cdef double LARGE_GAP_THRESHOLD = 1.9       # Multi-tick gap threshold for immediate cancellation (2 ticks)
-cdef double AGGRESSIVE_MODE_TOLERANCE = 0.999  # Price tolerance for aggressive mode (0.1%)
 
 # --- Step-up-into-gap (min mode only) ---
 # When our order IS the top of book but the NEXT foreign level is far away (a big gap
@@ -199,7 +194,6 @@ cdef double REFUGE_REPARK_INTERVAL = 60.0
 # Doing this only at the backstop (not per tick) means refuge decisions happen on the deliberate
 # ~5-6 min cadence, never on a stray tick. Refuge also EXITS on a fill, a session re-enable, or a
 # better-market relocation (those ARE per-tick, in c_cancel_stale_orders). See position-balancer.md.
-cdef double PRICE_DIVERGENCE_THRESHOLD_PCT = 0.01  # 1% threshold for percentage mode divergence
 
 # --- Better Market Switch ---
 # Tolerance for triggering immediate market switch (price difference as ratio)
@@ -251,8 +245,7 @@ cdef class PositionBalancerHandler:
                  double sell_target_usd,
                  object sell_spread_pct,  # float or 'min'
                  double limit_refresh_interval,
-                 double order_size_usd=100.0,
-                 double aggressive_refresh_interval=5.0):
+                 double order_size_usd=100.0):
         """
         Initialize position balancer handler.
 
@@ -310,7 +303,6 @@ cdef class PositionBalancerHandler:
 
         # Limit order refresh
         self._limit_refresh_interval = limit_refresh_interval
-        self._aggressive_refresh_interval = aggressive_refresh_interval
         self._last_buy_order_time = {}    # asset -> timestamp
         self._last_sell_order_time = {}   # asset -> timestamp
         self._active_buy_orders = {}      # asset -> order_id
@@ -1007,7 +999,7 @@ cdef class PositionBalancerHandler:
         # (which always reads canonical) never misses the cooldown on aliased assets.
         # The cooldown duration was already stored in _last_buy/sell_cancel_cooldown by
         # _cancel_buy/sell_order. For external cancels (exchange-initiated) we fall back
-        # to POST_CANCEL_COOLDOWN (proactive/conservative default).
+        # to the proactive/conservative cooldown.
         ts = self.strategy._current_timestamp
         if order_id in self._pending_buy_orders:
             asset_key = self._pending_buy_orders[order_id][0]
@@ -1152,30 +1144,43 @@ cdef class PositionBalancerHandler:
                 else:
                     refuge_depth = int(self._in_refuge_sell.get(canonical, 1) or 1)
                 if foreign_below == 0 or foreign_below > refuge_depth:
-                    # EXIT refuge: jumper gone (0) or sank below >1 order (>=2). Clear flag + streak
-                    # so the imminent re-place takes the NORMAL top-of-book branch, not the wall re-park.
+                    # EXIT refuge: frontrunner gone (0), or we sank below more than we parked behind.
+                    # Clear the flag so the imminent re-place takes the NORMAL top-of-book branch.
+                    #
+                    # THE STREAK IS ONLY RESET ON THE *GOOD* EXIT. The cancel streak measures how
+                    # hostile this book is, so it is cleared when something good happened — a fill
+                    # (handle_order_fill), a better-market relocation, or the antagonist leaving
+                    # (count 0). A "sank" exit is the one outcome that means we LOST: more orders
+                    # piled in front than we chose to sit behind, i.e. positive evidence the book is
+                    # MORE hostile. Wiping the counter there handed the chase a fresh budget and cost
+                    # exactly REFUGE_ARM_STREAK cancels to climb back — measured over 124 sank exits:
+                    # a median of 5 chase cancels / 6 placements / 73s per cycle, every cycle, each
+                    # re-place at top±1tick walking the price against us. Keeping the streak means the
+                    # first frontrun after re-placing re-arms refuge instead (1 cancel, not 5).
                     if is_buy:
                         self._in_refuge_buy.pop(canonical, None)
-                        self._buy_cancel_streak.pop(canonical, None)
                         if foreign_below == 0:
+                            self._buy_cancel_streak.pop(canonical, None)
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge EXITED for {canonical} (frontrunner gone) "
                                 f"— no bids over us, resuming normal best-bid chasing")
                         else:
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge EXITED for {canonical} (sank below {foreign_below} orders, "
-                                f"parked behind {refuge_depth}) — refuge premise broken, resuming normal best-bid chasing")
+                                f"parked behind {refuge_depth}) — refuge premise broken; streak RETAINED at "
+                                f"{int(self._buy_cancel_streak.get(canonical, 0))}, re-arms on the next frontrun")
                     else:
                         self._in_refuge_sell.pop(canonical, None)
-                        self._sell_cancel_streak.pop(canonical, None)
                         if foreign_below == 0:
+                            self._sell_cancel_streak.pop(canonical, None)   # see the buy-side note
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge EXITED for {canonical} (jumper gone) "
                                 f"— no asks under us, resuming normal best-ask chasing")
                         else:
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge EXITED for {canonical} (sank below {foreign_below} orders, "
-                                f"parked behind {refuge_depth}) — refuge premise broken, resuming normal best-ask chasing")
+                                f"parked behind {refuge_depth}) — refuge premise broken; streak RETAINED at "
+                                f"{int(self._sell_cancel_streak.get(canonical, 0))}, re-arms on the next undercut")
                     return True          # exited -> refresh, re-places on the NORMAL branch
                 # Still correctly parked. Do NOT cancel/re-place: CHECK 4 owns repositioning of a
                 # refuge order now (REFUGE_REPARK_INTERVAL, closes any gap that opens under/over
@@ -1573,163 +1578,6 @@ cdef class PositionBalancerHandler:
         
         return False
 
-    cdef tuple c_get_orderbook_prices(self, OrderBook ob):
-        """
-        Get bid/ask prices from orderbook with safety checks.
-
-        Returns: (bid, ask) tuple
-        """
-        cdef:
-            double bid = 0.0
-            double ask = 0.0
-        
-        if ob._bid_book.size() > 0:
-            bid = float(deref(ob._bid_book.rbegin()).getPrice())
-
-        if ob._ask_book.size() > 0:
-            ask = float(deref(ob._ask_book.begin()).getPrice())
-
-        return (bid, ask)
-
-    cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price,
-                                                  double min_price_increment, bint is_buy):
-        """
-        Returns top_price unchanged.
-
-        When our order IS the top (top_price ≈ order_price), effective_price == top_price
-        so callers compute got_valid_second_level = False and skip checks that need a real
-        external reference (conditions 2b and 3 in the periodic block).
-
-        When our order is NOT the top (undercut/frontrunned), CHECK 2 in
-        c_check_immediate_conditions fires before this is ever used for gap logic.
-
-        NOTE: do NOT return the second book level here. The large-gap check in
-        c_check_immediate_conditions uses this as reference: if we're at top and the
-        second level is many ticks away (common on thin markets), returning it would
-        compute a spurious gap and cancel every 5s.
-        """
-        return top_price
-
-    cdef tuple c_check_immediate_frontrun(self, double current_top_price, double order_price, bint is_buy):
-        """
-        Check for immediate frontrun/undercut condition.
-        
-        Returns: (should_cancel, reason) tuple
-        """
-        cdef:
-            bint should_cancel = False
-            str cancel_reason = ""
-        
-        if is_buy:
-            # For buy orders: frontrun if someone bid higher
-            if current_top_price > order_price:
-                should_cancel = True
-                cancel_reason = f"frontrun (immediate) - top bid {current_top_price:.8g} > our {order_price:.8g}"
-        else:
-            # For sell orders: undercut if someone asked lower
-            if current_top_price < order_price:
-                should_cancel = True
-                cancel_reason = f"undercut (immediate) - top ask {current_top_price:.8g} < our {order_price:.8g}"
-        
-        return (should_cancel, cancel_reason)
-
-    cdef tuple c_check_large_gap_immediate(self, double order_price, double expected_price, 
-                                            double min_price_increment, bint is_buy):
-        """
-        Check for large price gaps requiring immediate action.
-        
-        Returns: (should_cancel, reason) tuple
-        """
-        cdef:
-            bint should_cancel = False
-            str cancel_reason = ""
-            double price_gap
-        
-        if min_price_increment <= 0:
-            return (False, "")
-        
-        price_gap = abs(order_price - expected_price)
-        
-        # Immediate cancel if gap >= 2 ticks (large gap, don't wait)
-        if price_gap >= min_price_increment * LARGE_GAP_THRESHOLD:
-            if is_buy:
-                if order_price > expected_price:
-                    should_cancel = True
-                    cancel_reason = f"large gap (immediate) - order {order_price:.8g} vs optimal {expected_price:.8g}, gap {price_gap:.8g}"
-                else:
-                    should_cancel = True
-                    cancel_reason = f"large gap down (immediate) - can buy cheaper at {expected_price:.8g} vs {order_price:.8g}"
-            else:
-                if order_price < expected_price:
-                    should_cancel = True
-                    cancel_reason = f"large gap (immediate) - order {order_price:.8g} vs optimal {expected_price:.8g}, gap {price_gap:.8g}"
-                else:
-                    should_cancel = True
-                    cancel_reason = f"large gap up (immediate) - can sell higher at {expected_price:.8g} vs {order_price:.8g}"
-        
-        return (should_cancel, cancel_reason)
-
-    cdef double c_calculate_ideal_order_price(self, double effective_ref_price, double spread_pct, 
-                                               bint spread_is_min, double min_price_increment, bint is_buy):
-        """
-        Calculate ideal order price based on spread mode.
-        
-        Args:
-            effective_ref_price: Reference price (effective bid for buy, effective ask for sell)
-            spread_pct: Spread percentage (ignored if spread_is_min)
-            spread_is_min: Whether using 'min' tick mode
-            min_price_increment: Minimum price increment
-            is_buy: True for buy orders, False for sell orders
-        
-        Returns: Ideal order price
-        """
-        cdef double ideal_price
-        
-        if spread_is_min:
-            # Min tick mode
-            if is_buy:
-                ideal_price = effective_ref_price + min_price_increment
-            else:
-                ideal_price = effective_ref_price - min_price_increment
-        else:
-            # Percentage mode
-            if is_buy:
-                ideal_price = effective_ref_price * (1.0 + spread_pct)
-            else:
-                ideal_price = effective_ref_price * (1.0 - spread_pct)
-        
-        return ideal_price
-
-    cdef tuple c_check_price_divergence(self, double order_price, double ideal_price, bint spread_is_min, 
-                                         double min_price_increment, bint got_valid_second_level):
-        """
-        Check if order price diverged from ideal price.
-        
-        Returns: (should_cancel, reason) tuple
-        """
-        cdef:
-            bint should_cancel = False
-            str cancel_reason = ""
-            double price_diff_abs = abs(ideal_price - order_price)
-            double price_diff_pct = price_diff_abs / order_price if order_price > 0 else 0.0
-            double cancel_threshold_abs
-            double cancel_threshold_pct = 0.01  # 1% threshold for percentage mode
-        
-        if spread_is_min:
-            # Min mode: use tick-based threshold
-            # Only check divergence if we have a valid second level OR top isn't our order
-            cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
-            if got_valid_second_level and price_diff_abs > cancel_threshold_abs:
-                should_cancel = True
-                cancel_reason = f"price diverged {price_diff_abs:.8g} (ideal {ideal_price:.8g} vs order {order_price:.8g})"
-        else:
-            # Percentage mode: use percentage threshold
-            if price_diff_pct > cancel_threshold_pct:
-                should_cancel = True
-                cancel_reason = f"price diverged {price_diff_pct*100:.2f}% (ideal {ideal_price:.8g} vs order {order_price:.8g})"
-        
-        return (should_cancel, cancel_reason)
-
     cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
                                             double frontrun_delay=MIN_FRONTRUN_CHECK_DELAY):
         """
@@ -1901,54 +1749,58 @@ cdef class PositionBalancerHandler:
                             should_cancel = True
                             cancel_reason = f"frontrun (top bid {current_bid:.8g} > our {order_price:.8g})"
 
-                        # CHECK 3: Large gap detection (min mode only)
+                        # CHECK 3: Large gap — we drifted off (top bid + 1 tick).
                         if not should_cancel and spread_is_min and min_price_increment > 0:
-                            # Our order should be 1 tick above effective bid
-                            effective_ref_price = self.c_get_effective_reference_price(
-                                order_ob, current_bid, order_price, min_price_increment, True)
-                            expected_price = effective_ref_price + min_price_increment
+                            expected_price = current_bid + min_price_increment
                             gap_amount = abs(order_price - expected_price)
                             if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                                 should_cancel = True
                                 cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
 
-                    # CHECK 4: sit exactly 1 tick inside the first foreign level BEYOND us.
-                    # ONE rule, two postures (c_first_foreign_beyond resolves the level for both):
-                    #   NORMAL — we ARE top bid and the next bid is far below: step DOWN to
-                    #     (next_bid + 1 tick), staying best bid but buying cheaper. Requires we are
-                    #     top (else CHECK 2 chases instead), gap >= STEP_UP_MIN_GAP_TICKS, throttled
-                    #     by STEP_UP_MIN_INTERVAL as the API-spam guard.
-                    #   REFUGE — we are parked 2nd-best and that next bid IS the wall. Correctly
-                    #     parked means exactly 1 tick of headroom, so a gap >= LARGE_GAP_THRESHOLD
-                    #     means the wall was pulled or moved away and we should close it. Cadence is
-                    #     REFUGE_REPARK_INTERVAL. No "must be top" requirement — we are 2nd by design.
-                    # REFUGE STATE SURVIVES: the "step-up" prefix is excluded from reactive tagging
-                    # (no streak bump, STEP_UP_COOLDOWN), does not match the better-market exit, and
-                    # a pure cancel never clears the refuge flag — so the re-place goes straight back
-                    # through the refuge branch and re-parks against the CURRENT wall.
+                    # CHECK 4 — reprice. Two postures, each anchored on the reference that posture
+                    # actually cares about. Both are proactive: the "step-up" prefix is excluded from
+                    # reactive tagging (no streak bump, STEP_UP_COOLDOWN), does not match the
+                    # better-market exit, and a pure cancel never clears the refuge flag — so a refuge
+                    # re-park goes straight back through the refuge branch.
+                    #   NORMAL — anchored on US. We ARE top bid and the next bid is far below: step
+                    #     DOWN to (next_bid + 1 tick), staying best bid but buying cheaper. Requires
+                    #     we are top (else CHECK 2 chases), gap >= STEP_UP_MIN_GAP_TICKS, 30s throttle.
+                    #   REFUGE — anchored on the FRONTRUNNER, via the same c_refuge_wall the placement
+                    #     path uses, so the check and the placement can never disagree. Re-park when we
+                    #     are more than LARGE_GAP_THRESHOLD ticks off (wall + 1 tick).
+                    #     Anchoring on our own price here was WRONG (fixed 2026-08-16): it could not see
+                    #     the market moving away from us — parked 0.1099 with the frontrunner at 0.1077
+                    #     it reported "correctly parked" because 0.11 sat one tick above — and when the
+                    #     neighbouring level vanished it read the hole as a gap to jump into, flinging
+                    #     the order up to a distant wall. BARD oscillated +/-3-4% every 60s, 33 times.
                     if not should_cancel and spread_is_min and min_price_increment > 0:
                         canonical_su = self._get_canonical_asset(asset)
-                        if in_refuge:
-                            gap_needed = LARGE_GAP_THRESHOLD
-                            repark_interval = REFUGE_REPARK_INTERVAL
-                            positioned = True
-                        else:
-                            gap_needed = STEP_UP_MIN_GAP_TICKS
-                            repark_interval = STEP_UP_MIN_INTERVAL
-                            positioned = current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE
-                        if (positioned
-                                and (self.strategy._current_timestamp
-                                     - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
-                            next_bid = self.c_first_foreign_beyond(
-                                order_ob, order_price, min_price_increment, True)
-                            if next_bid > 0.0:
-                                headroom_ticks = (order_price - next_bid) / min_price_increment
-                                if headroom_ticks >= gap_needed:
-                                    should_cancel = True
-                                    cancel_reason = (
-                                        f"step-up into gap ({'refuge re-park, wall' if in_refuge else 'next bid'} "
-                                        f"{next_bid:.8g} is {headroom_ticks:.1f} ticks below our {order_price:.8g})")
-                                    self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
+                        repark_interval = REFUGE_REPARK_INTERVAL if in_refuge else STEP_UP_MIN_INTERVAL
+                        if ((self.strategy._current_timestamp
+                             - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
+                            if in_refuge:
+                                wall_price, front_price, _ = self.c_refuge_wall(
+                                    order_ob, order_price, min_price_increment, True)
+                                if wall_price > 0.0:
+                                    target_price = wall_price + min_price_increment
+                                    drift_ticks = abs(order_price - target_price) / min_price_increment
+                                    if drift_ticks > LARGE_GAP_THRESHOLD:
+                                        should_cancel = True
+                                        cancel_reason = (
+                                            f"step-up into gap (refuge re-park to {target_price:.8g} under wall "
+                                            f"{wall_price:.8g}, frontrunner {front_price:.8g} — we are "
+                                            f"{drift_ticks:.1f} ticks off at {order_price:.8g})")
+                                        self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
+                            elif current_bid <= order_price + min_price_increment * HALF_TICK_TOLERANCE:
+                                next_bid = self.c_first_foreign_beyond(
+                                    order_ob, order_price, min_price_increment, True)
+                                if next_bid > 0.0:
+                                    headroom_ticks = (order_price - next_bid) / min_price_increment
+                                    if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                                        should_cancel = True
+                                        cancel_reason = (f"step-up into gap (next bid {next_bid:.8g} is "
+                                                         f"{headroom_ticks:.1f} ticks below our {order_price:.8g})")
+                                        self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
                 else:  # SELL
                     in_refuge = self._in_refuge_sell.get(self._get_canonical_asset(asset), False)
                     # CHECKS 2 and 3 are TOP-OF-BOOK referenced and are skipped in refuge — see
@@ -1960,12 +1812,9 @@ cdef class PositionBalancerHandler:
                             should_cancel = True
                             cancel_reason = f"undercut (top ask {current_ask:.8g} < our {order_price:.8g})"
 
-                        # CHECK 3: Large gap detection (min mode only)
+                        # CHECK 3: Large gap — we drifted off (top ask − 1 tick).
                         if not should_cancel and spread_is_min and min_price_increment > 0:
-                            # Our order should be 1 tick below effective ask
-                            effective_ref_price = self.c_get_effective_reference_price(
-                                order_ob, current_ask, order_price, min_price_increment, False)
-                            expected_price = effective_ref_price - min_price_increment
+                            expected_price = current_ask - min_price_increment
                             gap_amount = abs(order_price - expected_price)
                             if gap_amount > min_price_increment * LARGE_GAP_THRESHOLD:
                                 should_cancel = True
@@ -1979,27 +1828,32 @@ cdef class PositionBalancerHandler:
                     #     (proactive "step-up" prefix + pure cancel never clears the flag).
                     if not should_cancel and spread_is_min and min_price_increment > 0:
                         canonical_su = self._get_canonical_asset(asset)
-                        if in_refuge:
-                            gap_needed = LARGE_GAP_THRESHOLD
-                            repark_interval = REFUGE_REPARK_INTERVAL
-                            positioned = True
-                        else:
-                            gap_needed = STEP_UP_MIN_GAP_TICKS
-                            repark_interval = STEP_UP_MIN_INTERVAL
-                            positioned = current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE
-                        if (positioned
-                                and (self.strategy._current_timestamp
-                                     - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
-                            next_ask = self.c_first_foreign_beyond(
-                                order_ob, order_price, min_price_increment, False)
-                            if next_ask > 0.0:
-                                headroom_ticks = (next_ask - order_price) / min_price_increment
-                                if headroom_ticks >= gap_needed:
-                                    should_cancel = True
-                                    cancel_reason = (
-                                        f"step-up into gap ({'refuge re-park, wall' if in_refuge else 'next ask'} "
-                                        f"{next_ask:.8g} is {headroom_ticks:.1f} ticks above our {order_price:.8g})")
-                                    self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
+                        repark_interval = REFUGE_REPARK_INTERVAL if in_refuge else STEP_UP_MIN_INTERVAL
+                        if ((self.strategy._current_timestamp
+                             - self._last_step_up_time.get(canonical_su, 0.0)) >= repark_interval):
+                            if in_refuge:
+                                wall_price, front_price, _ = self.c_refuge_wall(
+                                    order_ob, order_price, min_price_increment, False)
+                                if wall_price > 0.0:
+                                    target_price = wall_price - min_price_increment
+                                    drift_ticks = abs(order_price - target_price) / min_price_increment
+                                    if drift_ticks > LARGE_GAP_THRESHOLD:
+                                        should_cancel = True
+                                        cancel_reason = (
+                                            f"step-up into gap (refuge re-park to {target_price:.8g} under wall "
+                                            f"{wall_price:.8g}, jumper {front_price:.8g} — we are "
+                                            f"{drift_ticks:.1f} ticks off at {order_price:.8g})")
+                                        self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
+                            elif current_ask >= order_price - min_price_increment * HALF_TICK_TOLERANCE:
+                                next_ask = self.c_first_foreign_beyond(
+                                    order_ob, order_price, min_price_increment, False)
+                                if next_ask > 0.0:
+                                    headroom_ticks = (next_ask - order_price) / min_price_increment
+                                    if headroom_ticks >= STEP_UP_MIN_GAP_TICKS:
+                                        should_cancel = True
+                                        cancel_reason = (f"step-up into gap (next ask {next_ask:.8g} is "
+                                                         f"{headroom_ticks:.1f} ticks above our {order_price:.8g})")
+                                        self._last_step_up_time[canonical_su] = self.strategy._current_timestamp
 
         except Exception as e:
             self.strategy.logger().debug(f"Position balancer: Immediate check failed: {e}")
@@ -2042,6 +1896,71 @@ cdef class PositionBalancerHandler:
             return 0.0
         except Exception:
             return 0.0
+
+    cdef tuple c_refuge_wall(self, object ob, double own_price, double min_tick, bint is_buy):
+        """
+        THE single definition of where a refuge order belongs. Returns
+        `(wall, frontrunner, skipped)`, or `(0.0, 0.0, 0)` when the book has no usable second
+        level (caller then falls back to normal top-of-book placement).
+
+        Park price is always `wall ± 1 tick` — used by BOTH the placement path (to pick the
+        price) and CHECK 4 (to decide whether we are still there). Anchoring on the FRONTRUNNER,
+        not on our own order, is the load-bearing part: a check anchored on our own price cannot
+        see the market moving away from us, and reads the hole left by a vanished neighbour as a
+        gap to jump into. That disagreement made a refuge order oscillate ±3-4% every 60s
+        (BARD, 2026-08-16: 33 re-parks, one of them landing at the identical price).
+
+        Walk (highest-first for bids, lowest-first for asks), skipping our own level once:
+          • first foreign level          -> frontrunner
+          • levels within REFUGE_MIN_WALL_GAP_TICKS of it -> more penny-jumpers, skipped
+          • first level clear of it      -> the wall
+        `_near` keeps the deepest skipped level as a fallback (at the default 2-tick gap that is
+        exactly the adjacent level). The result is clamped so `wall ± 1 tick` can never land at
+        or beyond the frontrunner.
+        """
+        cdef:
+            double p = 0.0
+            double near = 0.0
+            double front = 0.0
+            double wall = 0.0
+            int skipped = 0
+            int seen = 0
+        try:
+            it = ob.bid_entries() if is_buy else ob.ask_entries()
+            while seen < REFUGE_WALL_MAX_LEVELS:
+                row = next(it, None)
+                if row is None:
+                    break
+                p = float(row.price)
+                if own_price > 0.0 and abs(p - own_price) < min_tick * 0.5:
+                    continue                                   # our own order's level
+                seen += 1
+                if front <= 0.0:
+                    front = p
+                    continue
+                # HALF_TICK_TOLERANCE: floats make an exactly-N-ticks-away level compute as
+                # 1.9999999e-6 vs 2e-6, which would be rejected.
+                if (front - p if is_buy else p - front) >= min_tick * (
+                        REFUGE_MIN_WALL_GAP_TICKS - HALF_TICK_TOLERANCE):
+                    wall = p
+                    break
+                near = p
+                skipped += 1
+            if wall <= 0.0:
+                wall = near                                    # no moat in range
+            if wall <= 0.0 or front <= 0.0:
+                return (0.0, 0.0, 0)
+            # Never rest at or beyond the frontrunner: on a book with no moat the wall IS its
+            # neighbour, and wall ± 1 tick resolves back to the frontrunner's own price.
+            if is_buy:
+                if wall > front - min_tick * 2.0:
+                    wall = front - min_tick * 2.0
+            else:
+                if wall < front + min_tick * 2.0:
+                    wall = front + min_tick * 2.0
+            return (wall, front, skipped)
+        except Exception:
+            return (0.0, 0.0, 0)
 
     cdef double c_first_foreign_beyond(self, object order_ob, double order_price,
                                        double min_tick, bint is_buy):
@@ -2274,7 +2193,10 @@ cdef class PositionBalancerHandler:
                     # (parked under THIS exchange's wall, hiding from THIS exchange's frontrunner) is
                     # meaningless on the new venue. Clear refuge AND reset the streak so the next
                     # placement uses the NORMAL top-of-book branch on the new market, and refuge can
-                    # only re-arm after 10 fresh frontruns there. (Mirror of the fill-driven exit.)
+                    # only re-arm after REFUGE_ARM_STREAK fresh frontruns there. (Mirror of the
+                    # fill-driven exit. NB: this and "frontrunner gone" are the only refuge exits
+                    # that clear the streak — a "sank" exit deliberately keeps it, see
+                    # should_backstop_refresh.)
                     if (should_cancel and cancel_reason.startswith("better market")
                             and self._in_refuge_buy.pop(self._get_canonical_asset(asset), None)):
                         self._buy_cancel_streak.pop(self._get_canonical_asset(asset), None)
@@ -2293,118 +2215,30 @@ cdef class PositionBalancerHandler:
                             and not cancel_reason.startswith("refuge")):
                         is_reactive = True
 
-                    # Check if refresh interval passed AND conditions changed
-                    # Determine effective refresh interval (shorter for aggressive partial fills)
                     effective_interval = self._limit_refresh_interval
 
-                    # Aggressive mode (0% spread) and partial fill -> use aggressive interval
-                    if (not self._buy_spread_is_min and self._buy_spread_pct == 0.0):
-                        if order_id in self._pending_buy_orders:
-                            # Unpack correctly: (asset_key, total, filled)
-                            try:
-                                _, _, filled_amt = self._pending_buy_orders[order_id]
-                                if filled_amt > EPSILON:
-                                    effective_interval = self._aggressive_refresh_interval
-                            except Exception:
-                                pass
-
                     if not should_cancel and current_time - last_time > effective_interval:
-                        # Periodic refresh: c_check_immediate_conditions already handles frontrun/gap
-                        # (after 5s) and better-market (after 60s) every tick, so here we only run
-                        # the checks that need a full orderbook snapshot and are not time-gated:
-                        #   2b: 1-tick min-mode frontrun (needs got_valid_second_level)
-                        #   3:  ideal-price gap (market moved down → can buy cheaper)
-                        #   4:  aggressive mode — market moved to our price
-                        #   5:  significant price divergence (c_check_price_divergence)
-                        # Unconditional fallback: always refresh after effective_interval regardless
-                        # of OB conditions (handles exchanges with sparse/stale books where no
-                        # condition ever fires, leaving orders stranded until force-cleanup at 2×timeout).
+                        # SAFETY NET ONLY. Every real repricing decision is made per tick by
+                        # c_check_immediate_conditions (better-market / frontrun / large-gap /
+                        # step-up). This exists solely so an order cannot be stranded when the
+                        # orderbook read fails or our tracking is missing — both are unconditional
+                        # refreshes, no price logic. (The old CONDITIONS 2b/3/4/5 that lived here
+                        # were unreachable: every one was gated on `got_valid_second_level`, which
+                        # was computed from a reference-price helper that always returned
+                        # top-of-book, so it was permanently False.)
                         order_details = self._active_buy_order_details.get(asset)
-                        if order_details is not None:
-                            order_market_tuple, order_price = order_details
-                            try:
-                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
-
-                                if current_ob._bid_book.size() > 0:
-                                    current_bid = float(deref(current_ob._bid_book.rbegin()).getPrice())
-                                else:
-                                    current_bid = 0.0
-
-                                # This market's min_price_increment (per-market, fresh).
-                                trading_pair = order_market_tuple.trading_pair
-                                min_price_increment = self.c_get_min_tick(order_market_tuple)
-
-                                # Calculate effective_bid (second level if top is OUR order)
-                                effective_bid = self.c_get_effective_reference_price(
-                                    current_ob, current_bid, order_price, min_price_increment, True)
-
-                                # Track if we got a valid second level (not our own order)
-                                got_valid_second_level = (effective_bid != current_bid)
-
-                                # Calculate ideal order price
-                                ideal_order_price = self.c_calculate_ideal_order_price(
-                                    effective_bid, self._buy_spread_pct, self._buy_spread_is_min,
-                                    min_price_increment, True)
-
-                                # CONDITION 2b: 1-tick min-mode frontrun/gap (needs got_valid_second_level)
-                                # Complements CHECK 2 in c_check_immediate_conditions which only checks
-                                # current_bid > order_price; this catches the subtler 1-tick misalignment.
-                                if not should_cancel and self._buy_spread_is_min and min_price_increment > 0:
-                                    if got_valid_second_level:
-                                        expected_price = effective_bid + min_price_increment
-                                        price_misalignment = order_price - expected_price
-                                        if abs(price_misalignment) >= min_price_increment * 0.95:
-                                            should_cancel = True
-                                            if price_misalignment > 0:
-                                                cancel_reason = f"1-tick frontrun detected (effective bid {effective_bid:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
-                                            else:
-                                                cancel_reason = f"1-tick gap detected (effective bid {effective_bid:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
-
-                                # CONDITION 3: Market moved DOWN — can buy cheaper
-                                # Skip in aggressive mode (0%): ideal_order_price = effective_bid,
-                                # but the order is placed at top_ask — the spread gap between bid
-                                # and ask is not a "can buy cheaper" signal. Condition 4 handles
-                                # aggressive-mode repricing correctly.
-                                if not should_cancel and not (self._buy_spread_pct == 0.0 and not self._buy_spread_is_min) and ideal_order_price < order_price:
-                                    gap_down = order_price - ideal_order_price
-                                    if self._buy_spread_is_min:
-                                        cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
-                                        if got_valid_second_level and gap_down > cancel_threshold_abs:
-                                            should_cancel = True
-                                            cancel_reason = f"gap down {gap_down:.8g} > threshold {cancel_threshold_abs:.8g} (can buy cheaper)"
-                                    else:
-                                        cancel_threshold_pct = max(0.001, self._buy_spread_pct * 0.5)
-                                        gap_pct = gap_down / order_price if order_price > 0 else 0.0
-                                        if gap_pct > cancel_threshold_pct:
-                                            should_cancel = True
-                                            cancel_reason = f"gap down {gap_pct*100:.2f}% (can buy cheaper at {ideal_order_price:.8g} vs {order_price:.8g})"
-
-                                # CONDITION 4: Aggressive mode — market moved to our price
-                                if not should_cancel and self._buy_spread_pct == 0.0:
-                                    if current_bid >= order_price * AGGRESSIVE_MODE_TOLERANCE:
-                                        should_cancel = True
-                                        cancel_reason = "market moved to our price (aggressive mode)"
-
-                                # CONDITION 5: Significant price divergence
-                                # Skip in aggressive mode (0%): ideal_order_price is based on
-                                # effective_bid but order is at top_ask; the spread gap is not
-                                # divergence. Condition 4 handles aggressive-mode repricing.
-                                if not should_cancel and not (self._buy_spread_pct == 0.0 and not self._buy_spread_is_min):
-                                    should_cancel, cancel_reason = self.c_check_price_divergence(
-                                        order_price, ideal_order_price, self._buy_spread_is_min,
-                                        min_price_increment, got_valid_second_level)
-
-                            except Exception as e:
-                                self.strategy.logger().warning(f"Position balancer: Error checking buy order conditions: {e}")
-                                # On OB error, fall back to unconditional refresh so orders don't get stranded.
-                                if not should_cancel:
-                                    should_cancel = True
-                                    cancel_reason = "periodic refresh (OB error)"
-
-                        else:
-                            # No order details — unknown state, refresh unconditionally.
+                        if order_details is None:
                             should_cancel = True
                             cancel_reason = "periodic refresh (no order details)"
+                        else:
+                            try:
+                                (<ExchangeBase>order_details[0].market).c_get_order_book(
+                                    order_details[0].trading_pair)
+                            except Exception as e:
+                                self.strategy.logger().warning(
+                                    f"Position balancer: Error reading buy orderbook: {e}")
+                                should_cancel = True
+                                cancel_reason = "periodic refresh (OB error)"
 
                     if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
@@ -2496,7 +2330,10 @@ cdef class PositionBalancerHandler:
                     # (parked under THIS exchange's wall, hiding from THIS exchange's jumper) is
                     # meaningless on the new venue. Clear refuge AND reset the streak so the next
                     # placement uses the NORMAL top-of-book branch on the new market, and refuge can
-                    # only re-arm after 10 fresh undercuts there. (Mirror of the fill-driven exit.)
+                    # only re-arm after REFUGE_ARM_STREAK fresh undercuts there. (Mirror of the
+                    # fill-driven exit. NB: this and "jumper gone" are the only refuge exits that
+                    # clear the streak — a "sank" exit deliberately keeps it, see
+                    # should_backstop_refresh.)
                     if (should_cancel and cancel_reason.startswith("better market")
                             and self._in_refuge_sell.pop(self._get_canonical_asset(asset), None)):
                         self._sell_cancel_streak.pop(self._get_canonical_asset(asset), None)
@@ -2515,117 +2352,31 @@ cdef class PositionBalancerHandler:
                             and not cancel_reason.startswith("refuge")):
                         is_reactive = True
 
-                    # Check if refresh interval passed AND conditions changed
-                    # Determine effective refresh interval (shorter for aggressive partial fills)
                     effective_interval = self._limit_refresh_interval
 
-                    # Aggressive mode (0% spread) and partial fill -> use aggressive interval
-                    if (not self._sell_spread_is_min and self._sell_spread_pct == 0.0):
-                        if order_id in self._pending_sell_orders:
-                            # Unpack correctly: (asset_key, total, filled)
-                            try:
-                                _, _, filled_amt = self._pending_sell_orders[order_id]
-                                if filled_amt > EPSILON:
-                                    effective_interval = self._aggressive_refresh_interval
-                            except Exception:
-                                pass
-
                     if not should_cancel and current_time - last_time > effective_interval:
-                        # Periodic refresh: c_check_immediate_conditions already handles undercut/gap
-                        # (after 5s) and better-market (after 60s) every tick, so here we only run
-                        # the checks that need a full orderbook snapshot and are not time-gated:
-                        #   2b: 1-tick min-mode undercut (needs got_valid_second_level)
-                        #   3:  ideal-price gap (market moved up → can sell higher)
-                        #   4:  aggressive mode — market moved to our price
-                        #   5:  significant price divergence (c_check_price_divergence)
-                        # Unconditional fallback: always refresh after effective_interval regardless
-                        # of OB conditions (handles exchanges with sparse/stale books where no
-                        # condition ever fires, leaving orders stranded until force-cleanup at 2×timeout).
+                        # SAFETY NET ONLY. Every real repricing decision is made per tick by
+                        # c_check_immediate_conditions (better-market / frontrun / large-gap /
+                        # step-up). This exists solely so an order cannot be stranded when the
+                        # orderbook read fails or our tracking is missing — both are unconditional
+                        # refreshes, no price logic. (The old CONDITIONS 2b/3/4/5 that lived here
+                        # were unreachable: every one was gated on `got_valid_second_level`, which
+                        # was computed from a reference-price helper that always returned
+                        # top-of-book, so it was permanently False.)
                         order_details = self._active_sell_order_details.get(asset)
-                        if order_details is not None:
-                            order_market_tuple, order_price = order_details
-                            try:
-                                current_ob = (<ExchangeBase>order_market_tuple.market).c_get_order_book(order_market_tuple.trading_pair)
-
-                                current_bid, current_ask = self.c_get_orderbook_prices(current_ob)
-
-                                # This market's min_price_increment (per-market, fresh).
-                                trading_pair = order_market_tuple.trading_pair
-                                min_price_increment = self.c_get_min_tick(order_market_tuple)
-
-                                # Calculate effective_ask (second level if top is OUR order)
-                                effective_ask = self.c_get_effective_reference_price(
-                                    current_ob, current_ask, order_price, min_price_increment, False)
-
-                                # Track if we got a valid second level (not our own order)
-                                got_valid_second_level = (effective_ask != current_ask)
-
-                                # Calculate ideal order price
-                                ideal_order_price = self.c_calculate_ideal_order_price(
-                                    effective_ask, self._sell_spread_pct, self._sell_spread_is_min,
-                                    min_price_increment, False)
-
-                                # CONDITION 2b: 1-tick min-mode undercut/gap (needs got_valid_second_level)
-                                # Complements CHECK 2 in c_check_immediate_conditions which only checks
-                                # current_ask < order_price; this catches the subtler 1-tick misalignment.
-                                if not should_cancel and self._sell_spread_is_min and min_price_increment > 0:
-                                    if got_valid_second_level:
-                                        expected_price = effective_ask - min_price_increment
-                                        price_misalignment = expected_price - order_price
-                                        if abs(price_misalignment) >= min_price_increment * 0.95:
-                                            should_cancel = True
-                                            if price_misalignment > 0:
-                                                cancel_reason = f"1-tick undercut detected (effective ask {effective_ask:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
-                                            else:
-                                                cancel_reason = f"1-tick gap detected (effective ask {effective_ask:.8g}, expected {expected_price:.8g}, actual {order_price:.8g})"
-
-                                # CONDITION 3: Market moved UP — can sell higher
-                                # Skip in aggressive mode (0%): ideal_order_price = effective_ask,
-                                # but the order is placed at top_bid — the spread gap between ask
-                                # and bid is not a "can sell higher" signal. Condition 4 handles
-                                # aggressive-mode repricing correctly.
-                                if not should_cancel and not (self._sell_spread_pct == 0.0 and not self._sell_spread_is_min) and ideal_order_price > order_price:
-                                    gap_up = ideal_order_price - order_price
-                                    if self._sell_spread_is_min:
-                                        cancel_threshold_abs = min_price_increment * TICK_TOLERANCE
-                                        if got_valid_second_level and gap_up > cancel_threshold_abs:
-                                            should_cancel = True
-                                            cancel_reason = f"gap up {gap_up:.8g} > threshold {cancel_threshold_abs:.8g} (can sell higher)"
-                                    else:
-                                        cancel_threshold_pct = max(0.001, self._sell_spread_pct * 0.5)
-                                        gap_pct = gap_up / order_price if order_price > 0 else 0.0
-                                        if gap_pct > cancel_threshold_pct:
-                                            should_cancel = True
-                                            cancel_reason = f"gap up {gap_pct*100:.2f}% (can sell higher at {ideal_order_price:.8g} vs {order_price:.8g})"
-
-                                # CONDITION 4: Aggressive mode — market moved to our price
-                                if not should_cancel and self._sell_spread_pct == 0.0:
-                                    if current_ask <= order_price * (2.0 - AGGRESSIVE_MODE_TOLERANCE):
-                                        should_cancel = True
-                                        cancel_reason = "market moved to our price (aggressive mode)"
-
-                                # CONDITION 5: Significant price divergence
-                                # Skip in aggressive mode (0%): ideal_order_price is based on
-                                # effective_ask but order is at top_bid; the spread gap is not
-                                # divergence. Condition 4 handles aggressive-mode repricing.
-                                if not should_cancel and not (self._sell_spread_pct == 0.0 and not self._sell_spread_is_min):
-                                    should_cancel, cancel_reason = self.c_check_price_divergence(
-                                        order_price, ideal_order_price, self._sell_spread_is_min,
-                                        min_price_increment, got_valid_second_level)
-
-                            except Exception as e:
-                                self.strategy.logger().warning(f"Position balancer: Error checking sell order conditions: {e}")
-                                # On OB error, fall back to unconditional refresh so orders don't get stranded.
-                                if not should_cancel:
-                                    should_cancel = True
-                                    cancel_reason = "periodic refresh (OB error)"
-
-                        else:
-                            # No order details — unknown state, refresh unconditionally.
+                        if order_details is None:
                             should_cancel = True
                             cancel_reason = "periodic refresh (no order details)"
+                        else:
+                            try:
+                                (<ExchangeBase>order_details[0].market).c_get_order_book(
+                                    order_details[0].trading_pair)
+                            except Exception as e:
+                                self.strategy.logger().warning(
+                                    f"Position balancer: Error reading sell orderbook: {e}")
+                                should_cancel = True
+                                cancel_reason = "periodic refresh (OB error)"
 
-                    if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
                         self._cancel_sell_order(asset, order_id, cancel_reason, reactive=is_reactive)
 
@@ -3144,66 +2895,25 @@ cdef class PositionBalancerHandler:
                         except Exception as e:
                             self.strategy.logger().debug(f"Could not get second bid level: {e}")
 
-                    # SECOND-LEVEL REFUGE (buy mirror): rest under the WALL (2nd bid) — below the
-                    # frontrunner — instead of re-overbidding up. Cancel has confirmed, so the book
-                    # is [frontrunner@L1, wall@L2, …] and the wall is simply the 2nd bid.
+                    # SECOND-LEVEL REFUGE (buy): rest one tick above the WALL — below the
+                    # frontrunner — instead of re-overbidding up. c_refuge_wall is the single
+                    # definition of that spot, shared with CHECK 4's re-park test.
                     if self._in_refuge_buy.get(self._get_canonical_asset(asset_key), False):
-                        try:
-                            # Our own price: the live order's, or the one we just cancelled if the
-                            # book may still be carrying it (c_own_recent_price). 0.0 = neither.
-                            _own = self.c_own_recent_price(asset_key, True)
-                            # WALL SEARCH: _foreign[0] = frontrunner (1st foreign bid). The wall is the
-                            # first foreign bid at least REFUGE_MIN_WALL_GAP_TICKS BELOW it — levels
-                            # stacked right behind the frontrunner are more penny-jumpers, and tucking
-                            # under one of those resolves to the frontrunner's own price (see the
-                            # constant's note). _near keeps the deepest too-close level as a fallback,
-                            # which at the default gap of 2 ticks is exactly the old `_foreign[1]`.
-                            _foreign = []
-                            _near = None
-                            _skipped = 0
-                            _seen = 0
-                            _it = ob.bid_entries()
-                            while _seen < REFUGE_WALL_MAX_LEVELS:
-                                _row = next(_it, None)
-                                if _row is None:
-                                    break
-                                _p = float(_row.price)
-                                if _own > 0.0 and abs(_p - _own) < min_price_increment * 0.5:
-                                    continue                      # skip our own order's level
-                                _seen += 1
-                                if not _foreign:
-                                    _foreign.append(_p)           # frontrunner
-                                    continue
-                                # HALF_TICK_TOLERANCE: prices are floats, so an exactly-N-ticks-away
-                                # level computes as 1.9999999e-6 vs 2e-6 and would be rejected.
-                                if (_foreign[0] - _p) >= min_price_increment * (
-                                        REFUGE_MIN_WALL_GAP_TICKS - HALF_TICK_TOLERANCE):
-                                    _foreign.append(_p)           # a real wall, clear of the frontrunner
-                                    break
-                                _near = _p                        # another jumper stacked on the front
-                                _skipped += 1
-                            if len(_foreign) < 2 and _near is not None:
-                                _foreign.append(_near)            # no moat in range — see the clamp below
-                            if len(_foreign) >= 2:                 # _foreign[0]=frontrunner, _foreign[1]=wall
-                                reference_bid = _foreign[1]
-                                # HARD INVARIANT: never rest at or above the frontrunner. On a book with
-                                # no moat at all (every level stacked 1 tick apart) the wall IS the
-                                # frontrunner's neighbour, and wall+1tick resolves back to the
-                                # frontrunner's own price — precisely the bug this search exists to kill.
-                                # Clamp so we always sit at least one tick behind it, cheaper than the front.
-                                if reference_bid > _foreign[0] - min_price_increment * 2.0:
-                                    reference_bid = _foreign[0] - min_price_increment * 2.0
-                                # Record how many foreign levels we deliberately sat behind
-                                # (frontrunner + each skipped jumper). The refuge flag carries it —
-                                # should_backstop_refresh compares the live count against this, so
-                                # hiding behind a real wall is not mistaken for having "sank".
-                                self._in_refuge_buy[self._get_canonical_asset(asset_key)] = _skipped + 1
-                                self.strategy.logger().info(
-                                    f"Position balancer: BUY refuge placement for {asset_key} — "
-                                    f"resting above wall {reference_bid:.8g} (frontrunner {_foreign[0]:.8g})"
-                                    f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
-                        except Exception as e:
-                            self.strategy.logger().debug(f"Refuge wall read failed (buy): {e}")
+                        # Own price: the live order's, or the one just cancelled if the book may
+                        # still be carrying it, so the walk skips our own level. 0.0 = neither.
+                        _wall, _front, _skipped = self.c_refuge_wall(
+                            ob, self.c_own_recent_price(asset_key, True), min_price_increment, True)
+                        if _wall > 0.0:
+                            reference_bid = _wall
+                            # Record how many foreign levels we deliberately sat behind (frontrunner
+                            # + each skipped jumper). The refuge flag carries it — should_backstop_refresh
+                            # compares the live count against this, so hiding behind a real wall is not
+                            # mistaken for having "sank".
+                            self._in_refuge_buy[self._get_canonical_asset(asset_key)] = _skipped + 1
+                            self.strategy.logger().info(
+                                f"Position balancer: BUY refuge placement for {asset_key} — "
+                                f"resting above wall {reference_bid:.8g} (frontrunner {_front:.8g})"
+                                f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
 
                     buy_price = reference_bid + min_price_increment
                     # Check if maker price would cross the spread (become taker)
@@ -3464,67 +3174,25 @@ cdef class PositionBalancerHandler:
                         except Exception as e:
                             self.strategy.logger().debug(f"Could not get second ask level: {e}")
 
-                    # SECOND-LEVEL REFUGE: if active, rest under the WALL = the 2nd FOREIGN ask
-                    # (next order regardless of size). Walk asks skipping our OWN resting order
-                    # (its cancel may not be reflected yet — that exact race put us back at the
-                    # jumper's tick in live testing): jumper = 1st foreign ask, wall = 2nd foreign ask.
+                    # SECOND-LEVEL REFUGE (sell): rest one tick under the WALL — above the
+                    # jumper — instead of re-undercutting down. c_refuge_wall is the single
+                    # definition of that spot, shared with CHECK 4's re-park test.
                     if self._in_refuge_sell.get(self._get_canonical_asset(asset_key), False):
-                        try:
-                            # Our own price: the live order's, or the one we just cancelled if the
-                            # book may still be carrying it (c_own_recent_price). 0.0 = neither.
-                            _own = self.c_own_recent_price(asset_key, False)
-                            # WALL SEARCH (buy mirror): _foreign[0] = jumper (1st foreign ask). The wall
-                            # is the first foreign ask at least REFUGE_MIN_WALL_GAP_TICKS ABOVE it —
-                            # levels stacked right on the jumper are more penny-jumpers, and tucking
-                            # under one of those resolves to the jumper's own price (see the constant's
-                            # note). _near keeps the deepest too-close level as a fallback, which at the
-                            # default gap of 2 ticks is exactly the old `_foreign[1]`.
-                            _foreign = []
-                            _near = None
-                            _skipped = 0
-                            _seen = 0
-                            _it = ob.ask_entries()
-                            while _seen < REFUGE_WALL_MAX_LEVELS:
-                                _row = next(_it, None)
-                                if _row is None:
-                                    break
-                                _p = float(_row.price)
-                                if _own > 0.0 and abs(_p - _own) < min_price_increment * 0.5:
-                                    continue                      # skip our own order's level
-                                _seen += 1
-                                if not _foreign:
-                                    _foreign.append(_p)           # jumper
-                                    continue
-                                # HALF_TICK_TOLERANCE: prices are floats, so an exactly-N-ticks-away
-                                # level computes as 1.9999999e-6 vs 2e-6 and would be rejected.
-                                if (_p - _foreign[0]) >= min_price_increment * (
-                                        REFUGE_MIN_WALL_GAP_TICKS - HALF_TICK_TOLERANCE):
-                                    _foreign.append(_p)           # a real wall, clear of the jumper
-                                    break
-                                _near = _p                        # another jumper stacked on the front
-                                _skipped += 1
-                            if len(_foreign) < 2 and _near is not None:
-                                _foreign.append(_near)            # no moat in range — see the clamp below
-                            if len(_foreign) >= 2:                 # _foreign[0]=jumper, _foreign[1]=wall
-                                reference_ask = _foreign[1]
-                                # HARD INVARIANT: never rest at or below the jumper. On a book with no
-                                # moat at all (every level stacked 1 tick apart) the wall IS the jumper's
-                                # neighbour, and wall-1tick resolves back to the jumper's own price —
-                                # precisely the bug this search exists to kill. Clamp so we always sit at
-                                # least one tick behind it, dearer than the front.
-                                if reference_ask < _foreign[0] + min_price_increment * 2.0:
-                                    reference_ask = _foreign[0] + min_price_increment * 2.0
-                                # Record how many foreign levels we deliberately sat behind
-                                # (jumper + each skipped jumper). The refuge flag carries it —
-                                # should_backstop_refresh compares the live count against this, so
-                                # hiding behind a real wall is not mistaken for having "sank".
-                                self._in_refuge_sell[self._get_canonical_asset(asset_key)] = _skipped + 1
-                                self.strategy.logger().info(
-                                    f"Position balancer: SELL refuge placement for {asset_key} — "
-                                    f"resting under wall {reference_ask:.8g} (jumper {_foreign[0]:.8g})"
-                                    f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
-                        except Exception as e:
-                            self.strategy.logger().debug(f"Refuge wall read failed (sell): {e}")
+                        # Own price: the live order's, or the one just cancelled if the book may
+                        # still be carrying it, so the walk skips our own level. 0.0 = neither.
+                        _wall, _front, _skipped = self.c_refuge_wall(
+                            ob, self.c_own_recent_price(asset_key, False), min_price_increment, False)
+                        if _wall > 0.0:
+                            reference_ask = _wall
+                            # Record how many foreign levels we deliberately sat behind (jumper +
+                            # each skipped jumper). The refuge flag carries it — should_backstop_refresh
+                            # compares the live count against this, so hiding behind a real wall is not
+                            # mistaken for having "sank".
+                            self._in_refuge_sell[self._get_canonical_asset(asset_key)] = _skipped + 1
+                            self.strategy.logger().info(
+                                f"Position balancer: SELL refuge placement for {asset_key} — "
+                                f"resting under wall {reference_ask:.8g} (jumper {_front:.8g})"
+                                f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
 
                     sell_price = reference_ask - min_price_increment
                     # Check if maker price would cross the spread (become taker)
@@ -3916,15 +3584,3 @@ cdef class PositionBalancerHandler:
             logging.INFO,
             f"Limit order refresh interval updated: {old_interval:.0f} -> {refresh_interval:.0f} seconds")
 
-    def set_aggressive_refresh_interval(self, double refresh_interval):
-        """
-        Set the aggressive refresh interval in seconds.
-
-        Args:
-            refresh_interval: Refresh interval for aggressive partial fills (seconds)
-        """
-        old_interval = self._aggressive_refresh_interval
-        self._aggressive_refresh_interval = refresh_interval
-        self.strategy.log_with_clock(
-            logging.INFO,
-            f"Aggressive refresh interval updated: {old_interval:.0f} -> {refresh_interval:.0f} seconds")

@@ -1,6 +1,5 @@
 # distutils: language=c++
 from libcpp.pair cimport pair
-from hummingbot.core.data_type.order_book cimport OrderBook
 from hummingbot.strategy.arbitrage_l.arbitrage cimport ArbitrageLStrategy
 cdef class PositionBalancerHandler:
     """
@@ -31,7 +30,6 @@ cdef class PositionBalancerHandler:
         dict _pending_sell_orders
         # Limit order refresh
         double _limit_refresh_interval
-        double _aggressive_refresh_interval
         dict _last_buy_order_time
         dict _last_sell_order_time
         dict _active_buy_orders
@@ -91,19 +89,10 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_sell_market(self, str asset, bint prefer_fuller_venue=*)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)
-    cdef tuple c_get_orderbook_prices(self, OrderBook ob)
-    cdef double c_get_effective_reference_price(self, OrderBook ob, double top_price, double order_price, 
-                                                  double min_price_increment, bint is_buy)
-    cdef tuple c_check_immediate_frontrun(self, double current_top_price, double order_price, bint is_buy)
-    cdef tuple c_check_large_gap_immediate(self, double order_price, double expected_price, 
-                                            double min_price_increment, bint is_buy)
-    cdef double c_calculate_ideal_order_price(self, double effective_ref_price, double spread_pct, 
-                                               bint spread_is_min, double min_price_increment, bint is_buy)
-    cdef tuple c_check_price_divergence(self, double order_price, double ideal_price, bint spread_is_min, 
-                                         double min_price_increment, bint got_valid_second_level)
     cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
                                             double frontrun_delay=*)
     cdef double c_own_recent_price(self, str asset, bint is_buy)
+    cdef tuple c_refuge_wall(self, object ob, double own_price, double min_tick, bint is_buy)
     cdef double c_first_foreign_beyond(self, object order_ob, double order_price,
                                        double min_tick, bint is_buy)
     cdef int c_refuge_foreign_below(self, str asset, bint is_buy)
