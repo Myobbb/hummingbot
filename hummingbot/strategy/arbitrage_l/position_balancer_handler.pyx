@@ -155,9 +155,9 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # While in REFUGE we SUPPRESS the undercut trigger (we intend to sit 2nd-best) and place at
 # wall ∓ 1 tick instead of top ∓ 1 tick. Exiting only on a fill is safe: if the jumper simply
 # leaves, we are already at wall-1tick == correct top placement, so NORMAL resumes seamlessly.
-# (Future refinement: a "wall must be >= N ticks above the jumper" entry gate so we only take
-# refuge when there's a distinct level to hide under — see position-balancer.md. For now we
-# enter on streak alone; placement reads the 2nd level and falls back to top if there's no wall.)
+# Entry is on streak alone; the WALL SEARCH (not an entry gate) is what guarantees we hide under
+# a distinct level — see REFUGE_MIN_WALL_GAP_TICKS below. Placement falls back to top if the book
+# has no second level at all.
 cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before we stop chasing and take refuge.
                                        # Lowered 10->5 (2026-06-01): the OB-grounded audit showed contested legs
                                        # holding L1 only ~20-34% of the time, burning the streak-5..10 chase
@@ -168,6 +168,20 @@ cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before w
                                        # FUTURE: make this PER-PAIR (aggressive legs chase longer, hopeless legs
                                        # retreat early) + add a price-floor/taker terminal for the `sank below N`
                                        # exits the audit sees routinely — see position-balancer-notes.md.
+
+# Minimum distance (in ticks) a level must sit from the frontrunner/jumper to count as the WALL.
+# WHY (ZIG-USDT/htx, 2026-08-16): the wall used to be taken as literally the 2nd book level, with no
+# gap test. When a second penny-jumper sits 1 tick behind the first, `wall ± 1 tick` resolves to the
+# FRONTRUNNER'S OWN PRICE — so "taking refuge" placed us at the exact price we had just been frontrun
+# at, tied with the frontrunner but behind it in queue, with chasing now suppressed. Measured on a
+# 50-min ZIG buy-in: 5 of 14 refuge parks landed on the frontrunner's price, and every one of those 5
+# had a 1-tick wall gap (the other 9 parks, gap 15-139 ticks, were all fine). Live book at the time:
+# 0.036166 / 0.036165 (1 tick — a jumper pair) / 0.036144 (21 ticks down, 7x the size — the real wall).
+# So: walk PAST levels that are stacked on the frontrunner and take the first one far enough below.
+# 2.0 is the minimal separating value — it skips only STRICTLY ADJACENT levels, which is exactly the
+# observed failure, and leaves every already-correct park untouched. Raise it to demand a wider moat.
+cdef double REFUGE_MIN_WALL_GAP_TICKS = 2.0
+cdef int REFUGE_WALL_MAX_LEVELS = 20   # safety bound on the book walk (not a tuning knob)
 # While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
 # ONCE PER ~2-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 120s-age mark
 # — the order is still live there so order_price is known). At that single re-evaluation we count
@@ -322,8 +336,12 @@ cdef class PositionBalancerHandler:
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
         # the wall instead of top-of-book.
-        self._in_refuge_sell = {}             # canonical_asset -> bint (in sell-side refuge)
-        self._in_refuge_buy = {}              # canonical_asset -> bint (in buy-side refuge)
+        # canonical_asset -> in-refuge marker. Truthy means "in refuge" everywhere; the VALUE is the
+        # intended park depth (how many foreign levels we deliberately sat behind). The arm writes
+        # True (== 1) before the book is read; refuge placement overwrites it with `skipped + 1`.
+        # should_backstop_refresh reads it to tell "hiding behind a wall" from "sank".
+        self._in_refuge_sell = {}
+        self._in_refuge_buy = {}
 
         # Asset alias support (for cross-exchange pairs with different token names)
         # Dictionary mapping asset name to list of aliases (including itself)
@@ -1075,6 +1093,7 @@ cdef class PositionBalancerHandler:
             str canonical
             tuple order_details
             int foreign_below
+            int refuge_depth = 1
         try:
             # Reverse-map order_id -> (asset, side). PB tracks asset -> order_id.
             for a, oid in self._active_sell_orders.items():
@@ -1098,7 +1117,17 @@ cdef class PositionBalancerHandler:
             if (is_buy and self._in_refuge_buy.get(canonical, False)) or \
                ((not is_buy) and self._in_refuge_sell.get(canonical, False)):
                 foreign_below = self.c_refuge_foreign_below(asset, is_buy)
-                if foreign_below == 0 or foreign_below >= 2:
+                # INTENDED DEPTH: how many foreign levels we DELIBERATELY parked behind. The wall
+                # search skips levels stacked on the frontrunner, so a correct park sits behind
+                # (frontrunner + skipped jumpers), not always behind exactly one order. The refuge
+                # flag doubles as that counter (placement stores `skipped + 1`); a plain True from
+                # the arm — or any older state — reads as 1, i.e. the historical `>= 2` behaviour.
+                # Without this, hiding behind a real wall would self-report as "sank" immediately.
+                if is_buy:
+                    refuge_depth = int(self._in_refuge_buy.get(canonical, 1) or 1)
+                else:
+                    refuge_depth = int(self._in_refuge_sell.get(canonical, 1) or 1)
+                if foreign_below == 0 or foreign_below > refuge_depth:
                     # EXIT refuge: jumper gone (0) or sank below >1 order (>=2). Clear flag + streak
                     # so the imminent re-place takes the NORMAL top-of-book branch, not the wall re-park.
                     if is_buy:
@@ -1110,8 +1139,8 @@ cdef class PositionBalancerHandler:
                                 f"— no bids over us, resuming normal best-bid chasing")
                         else:
                             self.strategy.logger().info(
-                                f"Position balancer: BUY refuge EXITED for {canonical} (sank below {foreign_below} orders) "
-                                f"— refuge premise broken, resuming normal best-bid chasing")
+                                f"Position balancer: BUY refuge EXITED for {canonical} (sank below {foreign_below} orders, "
+                                f"parked behind {refuge_depth}) — refuge premise broken, resuming normal best-bid chasing")
                     else:
                         self._in_refuge_sell.pop(canonical, None)
                         self._sell_cancel_streak.pop(canonical, None)
@@ -1121,8 +1150,8 @@ cdef class PositionBalancerHandler:
                                 f"— no asks under us, resuming normal best-ask chasing")
                         else:
                             self.strategy.logger().info(
-                                f"Position balancer: SELL refuge EXITED for {canonical} (sank below {foreign_below} orders) "
-                                f"— refuge premise broken, resuming normal best-ask chasing")
+                                f"Position balancer: SELL refuge EXITED for {canonical} (sank below {foreign_below} orders, "
+                                f"parked behind {refuge_depth}) — refuge premise broken, resuming normal best-ask chasing")
                 # count == 1 -> stay in refuge (re-park under wall). Either way, always refresh.
                 return True
 
@@ -2099,9 +2128,11 @@ cdef class PositionBalancerHandler:
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
-                    # hold our wall order; (b) streak >= ARM and a valid wall (2nd foreign bid >= 2 ticks
-                    # BELOW the frontrunner) exists -> enter refuge, allow this cancel to move us DOWN
-                    # under the wall, retag "refuge". Cleared on any fill.
+                    # hold our wall order; (b) streak >= ARM -> enter refuge, allow this cancel to move
+                    # us DOWN under the wall, retag "refuge". Cleared on any fill.
+                    # NOTE: entry is STREAK-ONLY — there is no wall-distance entry gate here (an older
+                    # comment claimed one). The wall property is enforced at PLACEMENT instead, by the
+                    # wall search (REFUGE_MIN_WALL_GAP_TICKS), which is why arming without a wall is safe.
                     if (should_cancel and self._buy_spread_is_min
                             and cancel_reason.startswith("frontrun")):
                         refuge_canonical = self._get_canonical_asset(asset)
@@ -3003,21 +3034,56 @@ cdef class PositionBalancerHandler:
                             _own_det = self._active_buy_order_details.get(asset_key)
                             if _own_det is not None:
                                 _own = _own_det[1]                # our current order price
+                            # WALL SEARCH: _foreign[0] = frontrunner (1st foreign bid). The wall is the
+                            # first foreign bid at least REFUGE_MIN_WALL_GAP_TICKS BELOW it — levels
+                            # stacked right behind the frontrunner are more penny-jumpers, and tucking
+                            # under one of those resolves to the frontrunner's own price (see the
+                            # constant's note). _near keeps the deepest too-close level as a fallback,
+                            # which at the default gap of 2 ticks is exactly the old `_foreign[1]`.
                             _foreign = []
+                            _near = None
+                            _skipped = 0
+                            _seen = 0
                             _it = ob.bid_entries()
-                            while len(_foreign) < 2:
+                            while _seen < REFUGE_WALL_MAX_LEVELS:
                                 _row = next(_it, None)
                                 if _row is None:
                                     break
                                 _p = float(_row.price)
                                 if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
                                     continue                      # skip our own order's level
-                                _foreign.append(_p)
+                                _seen += 1
+                                if not _foreign:
+                                    _foreign.append(_p)           # frontrunner
+                                    continue
+                                # HALF_TICK_TOLERANCE: prices are floats, so an exactly-N-ticks-away
+                                # level computes as 1.9999999e-6 vs 2e-6 and would be rejected.
+                                if (_foreign[0] - _p) >= min_price_increment * (
+                                        REFUGE_MIN_WALL_GAP_TICKS - HALF_TICK_TOLERANCE):
+                                    _foreign.append(_p)           # a real wall, clear of the frontrunner
+                                    break
+                                _near = _p                        # another jumper stacked on the front
+                                _skipped += 1
+                            if len(_foreign) < 2 and _near is not None:
+                                _foreign.append(_near)            # no moat in range — see the clamp below
                             if len(_foreign) >= 2:                 # _foreign[0]=frontrunner, _foreign[1]=wall
                                 reference_bid = _foreign[1]
+                                # HARD INVARIANT: never rest at or above the frontrunner. On a book with
+                                # no moat at all (every level stacked 1 tick apart) the wall IS the
+                                # frontrunner's neighbour, and wall+1tick resolves back to the
+                                # frontrunner's own price — precisely the bug this search exists to kill.
+                                # Clamp so we always sit at least one tick behind it, cheaper than the front.
+                                if reference_bid > _foreign[0] - min_price_increment * 2.0:
+                                    reference_bid = _foreign[0] - min_price_increment * 2.0
+                                # Record how many foreign levels we deliberately sat behind
+                                # (frontrunner + each skipped jumper). The refuge flag carries it —
+                                # should_backstop_refresh compares the live count against this, so
+                                # hiding behind a real wall is not mistaken for having "sank".
+                                self._in_refuge_buy[self._get_canonical_asset(asset_key)] = _skipped + 1
                                 self.strategy.logger().info(
                                     f"Position balancer: BUY refuge placement for {asset_key} — "
-                                    f"resting above wall {reference_bid:.8g} (frontrunner {_foreign[0]:.8g})")
+                                    f"resting above wall {reference_bid:.8g} (frontrunner {_foreign[0]:.8g})"
+                                    f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (buy): {e}")
 
@@ -3289,21 +3355,56 @@ cdef class PositionBalancerHandler:
                             _own_det = self._active_sell_order_details.get(asset_key)
                             if _own_det is not None:
                                 _own = _own_det[1]                # our current order price
+                            # WALL SEARCH (buy mirror): _foreign[0] = jumper (1st foreign ask). The wall
+                            # is the first foreign ask at least REFUGE_MIN_WALL_GAP_TICKS ABOVE it —
+                            # levels stacked right on the jumper are more penny-jumpers, and tucking
+                            # under one of those resolves to the jumper's own price (see the constant's
+                            # note). _near keeps the deepest too-close level as a fallback, which at the
+                            # default gap of 2 ticks is exactly the old `_foreign[1]`.
                             _foreign = []
+                            _near = None
+                            _skipped = 0
+                            _seen = 0
                             _it = ob.ask_entries()
-                            while len(_foreign) < 2:
+                            while _seen < REFUGE_WALL_MAX_LEVELS:
                                 _row = next(_it, None)
                                 if _row is None:
                                     break
                                 _p = float(_row.price)
                                 if _own is not None and abs(_p - _own) < min_price_increment * 0.5:
                                     continue                      # skip our own order's level
-                                _foreign.append(_p)
+                                _seen += 1
+                                if not _foreign:
+                                    _foreign.append(_p)           # jumper
+                                    continue
+                                # HALF_TICK_TOLERANCE: prices are floats, so an exactly-N-ticks-away
+                                # level computes as 1.9999999e-6 vs 2e-6 and would be rejected.
+                                if (_p - _foreign[0]) >= min_price_increment * (
+                                        REFUGE_MIN_WALL_GAP_TICKS - HALF_TICK_TOLERANCE):
+                                    _foreign.append(_p)           # a real wall, clear of the jumper
+                                    break
+                                _near = _p                        # another jumper stacked on the front
+                                _skipped += 1
+                            if len(_foreign) < 2 and _near is not None:
+                                _foreign.append(_near)            # no moat in range — see the clamp below
                             if len(_foreign) >= 2:                 # _foreign[0]=jumper, _foreign[1]=wall
                                 reference_ask = _foreign[1]
+                                # HARD INVARIANT: never rest at or below the jumper. On a book with no
+                                # moat at all (every level stacked 1 tick apart) the wall IS the jumper's
+                                # neighbour, and wall-1tick resolves back to the jumper's own price —
+                                # precisely the bug this search exists to kill. Clamp so we always sit at
+                                # least one tick behind it, dearer than the front.
+                                if reference_ask < _foreign[0] + min_price_increment * 2.0:
+                                    reference_ask = _foreign[0] + min_price_increment * 2.0
+                                # Record how many foreign levels we deliberately sat behind
+                                # (jumper + each skipped jumper). The refuge flag carries it —
+                                # should_backstop_refresh compares the live count against this, so
+                                # hiding behind a real wall is not mistaken for having "sank".
+                                self._in_refuge_sell[self._get_canonical_asset(asset_key)] = _skipped + 1
                                 self.strategy.logger().info(
                                     f"Position balancer: SELL refuge placement for {asset_key} — "
-                                    f"resting under wall {reference_ask:.8g} (jumper {_foreign[0]:.8g})")
+                                    f"resting under wall {reference_ask:.8g} (jumper {_foreign[0]:.8g})"
+                                    f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
                         except Exception as e:
                             self.strategy.logger().debug(f"Refuge wall read failed (sell): {e}")
 
