@@ -1934,17 +1934,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 if sell_available_now <= EPSILON:
                     _hold_sell_amount = 0.0
 
-            # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
-            # sizes (or a lone sell) with nothing saying why. Only reads values already
-            # computed above — no extra work — and only fires while a correction is active,
-            # so the normal hot path is untouched.
-            if _hold_buy_amount != amount or _hold_sell_amount != amount:
-                self.logger().info(
-                    f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
-                    f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
-                    f"buy {_hold_buy_amount:.6f} sell {_hold_sell_amount:.6f} of {amount:.6f} | "
-                    f"total ${_total_usd:.0f} target ${self._hold_target_usd:.0f} | "
-                    f"profit {profitability * 100:.3f}%")
 
         # ─────────────────────────────────────────────────────────────────────────
 
@@ -2131,6 +2120,27 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self._current_timestamp, dummy_order_id, sell_order_type, f"Sync error: {str(e)}"
                 ))
                 return
+
+            # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
+            # sizes (or a lone sell) with nothing saying why.
+            #
+            # MUST stay here, AFTER placement. It first lived in the trim block ~150 lines up,
+            # which is reached on every EVALUATION — and the arb path is evaluated at tick rate
+            # (0.01s) while execution is gated by _last_global_trade_timestamp. A correction
+            # that runs for hours therefore re-logged the same byte-identical line ~15x/sec
+            # (PIVX 2026-08-16: 2,279 lines, values frozen because the hold cache only moves
+            # every 60s). Both bail-outs above it — "legs suppressed" and the min-notional
+            # check — also emitted it for arbs that never happened.
+            #
+            # Logs the FINAL quantities, not the pre-quantization trim: the notional check can
+            # drop a leg the trim sized, so the old line could claim a sell that never went out.
+            if self._hold_correction_active and _final_buy_qty != _final_sell_qty:
+                self.logger().info(
+                    f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
+                    f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
+                    f"buy {float(_final_buy_qty):.6f} sell {float(_final_sell_qty):.6f} "
+                    f"of {amount:.6f} | total ${_total_usd:.0f} "
+                    f"target ${self._hold_target_usd:.0f} | profit {profitability * 100:.3f}%")
 
             # Track orders — only for legs that were actually placed
             if _final_buy_qty > DECIMAL_ZERO and buy_order_id:

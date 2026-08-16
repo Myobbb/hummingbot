@@ -200,14 +200,25 @@ class StrategyControlCommand:
                 return
             primary_spec = value[0]
             secondary_spec = value[1]
+            # Optional trailing flags, order-independent and stripped before numeric parsing:
+            #   noesc  -> guardrail-only accumulation (buy-in off, escalation off, resumed,
+            #             hold enabled). Without it nothing changes: defaults are untouched.
+            # Parsed by exact match so it can never be confused with a min_profitability value.
+            extras = [str(v).strip() for v in value[2:]]
+            no_escalation = any(e.lower() == "noesc" for e in extras)
             # Parse optional min_profitability if provided (e.g., "2.0" as third arg)
             min_profitability = 2.1
-            if len(value) > 2:
+            for e in extras:
+                if e.lower() == "noesc":
+                    continue
                 try:
-                    min_profitability = float(value[2])
+                    min_profitability = float(e)
+                    break
                 except ValueError:
                     pass  # Keep default
-            safe_ensure_future(self._control_create(identifier, primary_spec, secondary_spec, min_profitability), loop=self.ev_loop)
+            safe_ensure_future(self._control_create(identifier, primary_spec, secondary_spec,
+                                                    min_profitability, no_escalation),
+                               loop=self.ev_loop)
         elif action == "clean":
             if identifier is None:
                 self.notify("Error: Please specify a strategy name or token symbol.")
@@ -880,7 +891,8 @@ class StrategyControlCommand:
                               name: str,
                               primary_spec: str,
                               secondary_spec: str,
-                              min_profitability: float = 2.1):
+                              min_profitability: float = 2.1,
+                              no_escalation: bool = False):
         """Create a new arbitrage strategy at runtime (always starts PAUSED)."""
         try:
             strategy = self.trading_core.strategy
@@ -888,11 +900,15 @@ class StrategyControlCommand:
             self.notify(f"Creating strategy '{name}'...")
             self.notify("  This includes dynamic websocket subscriptions for order book data")
 
+            if no_escalation:
+                self.notify("  noesc: buy-in disabled, escalation off, hold enabled "
+                            "(PB will never arm — entry only on arb spread)")
             success = await strategy.create_strategy(
                 name=name,
                 primary_spec=primary_spec,
                 secondary_spec=secondary_spec,
                 min_profitability=min_profitability,
+                no_escalation=no_escalation,
             )
 
             if success:

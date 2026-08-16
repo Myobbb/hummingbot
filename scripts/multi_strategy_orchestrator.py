@@ -493,7 +493,8 @@ def remove_market(identifier: str, market_spec: str) -> bool:
 
 def create(name: str, primary_spec: str, secondary_spec: str,
            min_profitability: float = 2.1,
-           additional_markets: str = None) -> bool:
+           additional_markets: str = None,
+           no_escalation: bool = False) -> bool:
     """
     Create a new arbitrage strategy at runtime (always starts PAUSED).
 
@@ -513,6 +514,12 @@ def create(name: str, primary_spec: str, secondary_spec: str,
         >>> create("arb_bsx_new", "gate:BSX-USDT", "kucoin:BSX-USDT")
         >>> create("arb_bsx_new", "gate:BSX-USDT", "kucoin:BSX-USDT", min_profitability=2.0)
         >>> create("arb_bsx_3way", "gate:BSX-USDT", "kucoin:BSX-USDT", additional_markets="mexc:BSX-USDT")
+        >>> create("arb_cap", "bybit:CAP-USDT", "kucoin:CAP-USDT", no_escalation=True)
+
+    no_escalation (console: the trailing `noesc` tag) configures the strategy for
+    guardrail-only accumulation — buy-in disabled, escalation off, resumed, hold enabled —
+    so the position balancer never arms and the asset is entered only when the arb spread
+    pays. Composed from the existing verbs; see _apply_no_escalation_preset.
     """
     import asyncio
     orchestrator = _get_orchestrator()
@@ -524,7 +531,8 @@ def create(name: str, primary_spec: str, secondary_spec: str,
             primary_spec=primary_spec,
             secondary_spec=secondary_spec,
             min_profitability=min_profitability,
-            additional_markets=additional_markets
+            additional_markets=additional_markets,
+            no_escalation=no_escalation
         ))
         def _log_result(future):
             try:
@@ -3814,9 +3822,54 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # RUNTIME STRATEGY CREATION
     # ====================================================================================
 
+    def _apply_no_escalation_preset(self, name: str) -> None:
+        """Configure a freshly-created strategy for guardrail-only accumulation (`noesc`).
+
+        Deliberately a COMPOSITION of the four existing verbs rather than new logic — each
+        already validates, persists its own YAML key and logs, so this cannot drift from what
+        the same commands do when typed by hand:
+
+            control disable_buyin <name>
+            control set hold_escalation <name> off
+            control resume <name>
+            control enable_hold <name>
+
+        Order is load-bearing. `enable_hold` runs LAST, after `resume`, because it calls
+        arm_hold_correction() which needs a warm price cache — a strategy that has never
+        ticked has a cold book, so arming there would no-op and the guardrail would sit
+        inactive until the next 60s refresh anyway. Running it after resume also means the
+        `_hold_enabled` flag is set on a strategy that is actually running.
+
+        Net effect: the guardrail is on and will cap/trim arb legs, but the position balancer
+        is never armed — so the asset is entered ONLY when the spread pays, via the
+        zero-balance bootstrap path in arbitrage.pyx. See the guardrail wiki page.
+
+        Failures are logged, not raised: the strategy already exists and is valid at this
+        point, so a half-applied preset must not read as a failed create. Each verb reports
+        its own outcome, so a partial apply is visible and fixable by hand.
+        """
+        for label, fn in (
+            ("disable_buyin", lambda: self.disable_buyin(name)),
+            ("set_hold_escalation off", lambda: self.set_hold_escalation(name, False)),
+            ("resume", lambda: self.resume_strategy(name)),
+            ("enable_hold", lambda: self.enable_hold(name)),
+        ):
+            try:
+                if not fn():
+                    self.logger().warning(
+                        f"[noesc] '{label}' returned False for '{name}' — preset partially "
+                        f"applied; check `status` and finish by hand")
+            except Exception as e:
+                self.logger().error(f"[noesc] '{label}' failed for '{name}': {e}")
+        self.logger().info(
+            f"[noesc] '{name}' created for guardrail-only accumulation: buy-in disabled, "
+            f"escalation off, resumed, hold enabled — PB will never arm; entry happens only "
+            f"when the arb spread clears min_profitability")
+
     async def create_strategy(self, name: str, primary_spec: str, secondary_spec: str,
                               min_profitability: float = 2.1,
-                              additional_markets: str = None) -> bool:
+                              additional_markets: str = None,
+                              no_escalation: bool = False) -> bool:
         """
         Create a new arbitrage strategy at runtime (always starts PAUSED).
 
@@ -3953,6 +4006,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     self.logger().error(f"Failed to update config file: {e}", exc_info=True)
                     self.logger().warning("Strategy created but NOT persisted to config file")
 
+            if no_escalation:
+                self._apply_no_escalation_preset(name)
             return True
 
         except Exception as e:
