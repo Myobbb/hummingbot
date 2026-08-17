@@ -85,6 +85,7 @@ cdef class PositionBalancerHandler:
     cdef bint c_try_mark_buy_complete(self, str pair, double current_value_quote, double shortfall)
     cdef bint c_try_mark_sell_complete(self, str pair, double current_value_quote, double excess)
     cdef void c_scan_and_mark_completion(self)
+    cdef bint c_market_in_failure_cooldown(self, object market_tuple)
     cdef object c_find_best_buy_market(self, str asset)
     cdef object c_find_best_sell_market(self, str asset, bint prefer_fuller_venue=*)
     # Helper methods for cancellation logic

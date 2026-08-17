@@ -1270,6 +1270,33 @@ cdef class PositionBalancerHandler:
 
         return lines
 
+    cdef bint c_market_in_failure_cooldown(self, object market_tuple):
+        """
+        Is this venue inside the strategy's post-failure cooldown?
+
+        `strategy._last_failure_timestamps` maps market_tuple -> cooldown END timestamp and is
+        owned by the arb layer (`c_did_fail_order`), which escalates a repeat failure inside
+        ESCALATION_WINDOW to ESCALATED_COOLDOWN (60 min). This mirrors the arb layer's own read
+        so there is ONE definition of "this venue is refusing us"; we only read, never expire —
+        the arb layer prunes.
+
+        WHY (2026-08-17): the PB never consulted this, so when htx started rejecting EPT sells
+        with `order-limitorder-price-min-error` ("Sell price cannot be lower than 0.000342") —
+        the market had fallen through htx's minimum limit price — the PB re-submitted to the
+        same venue every ~6s for 24 minutes: 239 rejections, 53% of EPT's sell placements.
+        The arb layer had already set a 3600s ESCALATED cooldown; nothing was reading it.
+        Skipping a cooling-down venue here means we fall back to another market gracefully,
+        and place nothing only when every venue is cooling down.
+        """
+        cdef double cooldown_end = 0.0
+        try:
+            if market_tuple in self.strategy._last_failure_timestamps:
+                cooldown_end = float(self.strategy._last_failure_timestamps[market_tuple])
+                return self.strategy._current_timestamp < cooldown_end
+            return False
+        except Exception:
+            return False
+
     cdef object c_find_best_buy_market(self, str asset):
         """
         Find the best market to place a buy order for the given asset.
@@ -1309,6 +1336,10 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset in asset_aliases:
                         try:
+                            # Venue is refusing our orders — fall back to another market
+                            if self.c_market_in_failure_cooldown(market_tuple):
+                                continue
+
                             # Skip markets without enough quote to place even a minimum order
                             market_quote_bal = float(market_tuple.market.get_available_balance(
                                 market_tuple.quote_asset))
@@ -1413,6 +1444,10 @@ cdef class PositionBalancerHandler:
                 for market_tuple in [mp.first, mp.second]:
                     if market_tuple.base_asset in asset_aliases:
                         try:
+                            # Venue is refusing our orders — fall back to another market
+                            if self.c_market_in_failure_cooldown(market_tuple):
+                                continue
+
                             # Use C-level get_order_book for compatibility with all exchanges
                             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 
@@ -1784,7 +1819,14 @@ cdef class PositionBalancerHandler:
                                 if wall_price > 0.0:
                                     target_price = wall_price + min_price_increment
                                     drift_ticks = abs(order_price - target_price) / min_price_increment
-                                    if drift_ticks > LARGE_GAP_THRESHOLD:
+                                    # Same bar as the normal step-up: is this price improvement worth a
+                                    # cancel + cooldown + losing FIFO position? LARGE_GAP_THRESHOLD (1.9)
+                                    # was the wrong constant here — it answers "are we mispriced", and a
+                                    # 2-tick book jitter cleared it by 0.1. Measured over 12h: 32% of all
+                                    # re-parks fired at exactly 2.0 ticks (EPT 51% of 133), and 34% landed
+                                    # on the same wall as the previous park. HALF_TICK_TOLERANCE keeps the
+                                    # float division honest.
+                                    if drift_ticks >= STEP_UP_MIN_GAP_TICKS - HALF_TICK_TOLERANCE:
                                         should_cancel = True
                                         cancel_reason = (
                                             f"step-up into gap (refuge re-park to {target_price:.8g} under wall "
@@ -1837,7 +1879,8 @@ cdef class PositionBalancerHandler:
                                 if wall_price > 0.0:
                                     target_price = wall_price - min_price_increment
                                     drift_ticks = abs(order_price - target_price) / min_price_increment
-                                    if drift_ticks > LARGE_GAP_THRESHOLD:
+                                    # Same bar as the normal step-up — see the buy side for the data.
+                                    if drift_ticks >= STEP_UP_MIN_GAP_TICKS - HALF_TICK_TOLERANCE:
                                         should_cancel = True
                                         cancel_reason = (
                                             f"step-up into gap (refuge re-park to {target_price:.8g} under wall "
@@ -2377,6 +2420,7 @@ cdef class PositionBalancerHandler:
                                 should_cancel = True
                                 cancel_reason = "periodic refresh (OB error)"
 
+                    if should_cancel:
                         # is_reactive is True only for immediate-check (market-event) cancels
                         self._cancel_sell_order(asset, order_id, cancel_reason, reactive=is_reactive)
 
@@ -3013,7 +3057,11 @@ cdef class PositionBalancerHandler:
                 order_type=order_type,
                 price=Decimal(str(buy_price)))
         except Exception as e:
-            self.strategy._last_failure_timestamps[buy_market_tuple] = self.strategy._current_timestamp
+            # The dict holds a cooldown END time, not the failure time. Writing bare `now` here
+            # marked the cooldown already-expired and WIPED any active (possibly ESCALATED)
+            # cooldown the arb layer had set on this venue — fixed 2026-08-17.
+            self.strategy._last_failure_timestamps[buy_market_tuple] = (
+                self.strategy._current_timestamp + self.strategy._order_timeout)
             self.strategy.logger().warning(f"Error submitting buy limit order to {market.name}: {e}")
             return False
 
@@ -3342,7 +3390,11 @@ cdef class PositionBalancerHandler:
                 order_type=order_type,
                 price=Decimal(str(sell_price)))
         except Exception as e:
-            self.strategy._last_failure_timestamps[sell_market_tuple] = self.strategy._current_timestamp
+            # The dict holds a cooldown END time, not the failure time. Writing bare `now` here
+            # marked the cooldown already-expired and WIPED any active (possibly ESCALATED)
+            # cooldown the arb layer had set on this venue — fixed 2026-08-17.
+            self.strategy._last_failure_timestamps[sell_market_tuple] = (
+                self.strategy._current_timestamp + self.strategy._order_timeout)
             self.strategy.logger().warning(f"Error submitting sell limit order to {market.name}: {e}")
             return False
 
