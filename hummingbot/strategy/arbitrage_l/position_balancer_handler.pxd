@@ -54,6 +54,8 @@ cdef class PositionBalancerHandler:
         dict _last_step_up_time           # canonical_asset -> timestamp of last step-up cancel (pre-detection throttle)
         # Log throttle for the per-tick min_tick=0 warning ("exchange:pair" -> last-logged timestamp)
         dict _last_min_tick_warn_time
+        # canonical_asset -> timestamp of the last better-market scan (CHECK 1 cadence)
+        dict _last_market_scan_time
         # Second-level refuge state (per canonical asset) — truthy = resting under the wall (2nd-best),
         # undercut suppressed; the VALUE is the intended park depth (foreign levels we sat behind)
         dict _in_refuge_sell

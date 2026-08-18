@@ -340,6 +340,8 @@ cdef class PositionBalancerHandler:
         # with broken trading_rules emits it at tick rate — PIVX/bitmart logged 1,200,308 lines in
         # ~3h on 2026-07-29. Keyed "exchange:pair" -> last-logged timestamp.
         self._last_min_tick_warn_time = {}
+        # canonical_asset -> timestamp of the last better-market scan (CHECK 1 cadence)
+        self._last_market_scan_time = {}
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
@@ -1709,15 +1711,23 @@ cdef class PositionBalancerHandler:
             min_price_increment = self.c_get_min_tick(order_market_tuple)
 
             # ================================================================
-            # CHECK 1: Better market available (ALL MODES)
-            # Gated by MIN_MARKET_SWITCH_DELAY — cross-exchange price differences
-            # are noisy; switching too quickly causes flip-flopping.
-            # The market scan (c_find_best_*_market) is intentionally deferred to
-            # inside this gate: it's the most expensive call (iterates all pairs,
-            # reads orderbooks) and is pointless before the 60s threshold.
+            # CHECK 1: Better market available
+            # TWO gates, and both matter:
+            #   • order_age >= MIN_MARKET_SWITCH_DELAY — never relocate a fresh order; cross-exchange
+            #     price differences are noisy and switching too quickly causes flip-flopping.
+            #   • a MIN_MARKET_SWITCH_DELAY CADENCE — rescan at most once per interval per asset.
+            # The age gate alone was a minimum, not a rhythm: past 60s the scan ran on EVERY tick
+            # (100 Hz), iterating every market pair and reading every orderbook. Once the sell-off
+            # fuller-venue tie-break moved inside the selector (so the scan and placement agree) that
+            # per-tick path also began emitting its divert line — 24,015 log lines in 6 minutes, 97%
+            # of the whole log, ~57/s for one asset. The scan is a periodic check; make it periodic.
             # ================================================================
-            if order_age >= MIN_MARKET_SWITCH_DELAY:
-                # Only now do we pay the cost of scanning all markets
+            scan_canonical = self._get_canonical_asset(asset)
+            if (order_age >= MIN_MARKET_SWITCH_DELAY
+                    and (self.strategy._current_timestamp
+                         - self._last_market_scan_time.get(scan_canonical, 0.0)) >= MIN_MARKET_SWITCH_DELAY):
+                # Stamp on every scan we actually run, so the cadence is real regardless of outcome.
+                self._last_market_scan_time[scan_canonical] = self.strategy._current_timestamp
                 if is_buy:
                     current_best_market = self.c_find_best_buy_market(asset)
                 else:
