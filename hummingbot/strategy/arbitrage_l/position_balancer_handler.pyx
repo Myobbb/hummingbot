@@ -198,26 +198,35 @@ cdef double REFUGE_REPARK_INTERVAL = 60.0
 # --- Better Market Switch ---
 # Tolerance for triggering immediate market switch (price difference as ratio)
 # e.g., 0.0001 = 0.01% = switch if other market is 0.01% better
-cdef double BETTER_MARKET_SWITCH_TOLERANCE = 0.0001  # 0.01% - switch immediately if another market is better
 
 # Min mode hysteresis: only switch if new market is at least 0.1% better
 # This prevents flip-flopping between markets with nearly identical effective prices
 cdef double MIN_MODE_SWITCH_HYSTERESIS = 0.001  # 0.1% - require meaningful improvement before switching
 
+# --- SELL-OFF venue switching (its own gate, wider than the buy side) ---
+# A sell-off drains a finite base balance, so relocating it is more expensive than relocating a
+# buy-in: emptying whichever venue is momentarily best makes the asset manager shuttle inventory
+# back (withdrawal fee + transit each way, plus an in-transit aggregate dip the hold-band
+# guardrail can misread as oversold). So the sell side demands a BIGGER price improvement before
+# it will move at all. Buy-in keeps MIN_MODE_SWITCH_HYSTERESIS — it spends replenishable quote
+# and has no draining problem, so it should still chase a small edge.
+# Measured over 16.7h / 68 relocations: median improvement was 0.20%, so a 0.3% gate suppresses
+# roughly two thirds of sell-side switches (sells were 51 of the 67 with a following placement).
+cdef double SELL_MODE_SWITCH_HYSTERESIS = 0.003  # 0.3% - sell-off must clear this to relocate
+
 # --- Sell-off venue balance preference ---
 # When SELLING OFF and several venues hold the asset, prefer the venue holding the MOST base
-# among those priced within this fraction of the best. Without it every sell-off goes to
-# whichever venue is momentarily best, draining one venue to zero while another stays full —
-# which makes the asset manager shuttle inventory back and forth (withdraw fee + transfer time
-# each way, and an in-transit aggregate dip the hold-band guardrail can misread as oversold).
+# among those priced within this fraction of the best. Applied ALWAYS (scan and placement alike)
+# so the two never judge differently. Additive: stage 1 picks the best price, stage 2 may divert
+# within this band toward more base; ties keep the best price.
 #
-# ⚠️ MUST NOT EXCEED MIN_MODE_SWITCH_HYSTERESIS. CHECK 1 relocates a resting order as soon as
-# another venue is better by more than that hysteresis; a wider preference here would pick the
-# fuller venue at placement and then CHECK 1 would cancel and move it straight back to the
-# best-price venue, undoing the preference and paying a cancel/replace cycle for nothing.
-# Equal values make the two agree: a venue good enough to be preferred is, by construction,
-# never enough better to trigger a relocation.
-cdef double SELL_BALANCE_PREFERENCE_PCT = MIN_MODE_SWITCH_HYSTERESIS  # 0.1%
+# ⚠️ MUST NOT EXCEED THE SELL SWITCH GATE, and is aliased to it for exactly that reason. CHECK 1
+# relocates a resting sell as soon as another venue is better by more than SELL_MODE_SWITCH_
+# HYSTERESIS; a preference band WIDER than that gate would divert to the fuller venue at
+# placement and CHECK 1 would immediately move it back — a cancel/replace cycle every 60s,
+# forever. Equal values make that impossible: a venue good enough to be preferred is, by
+# construction, never enough better to trigger a relocation.
+cdef double SELL_BALANCE_PREFERENCE_PCT = SELL_MODE_SWITCH_HYSTERESIS  # 0.3%
 
 # --- Insufficient balance retry cooldown ---
 # When the best sell market has insufficient base balance to meet min_order_usd,
@@ -879,7 +888,8 @@ cdef class PositionBalancerHandler:
                         _gone_det = self._active_buy_order_details.get(asset_key)
                         if _gone_det is not None:
                             self._last_gone_buy_price[asset_key] = (
-                                float(_gone_det[1]), self.strategy._current_timestamp)
+                                float(_gone_det[1]), self.strategy._current_timestamp,
+                                _gone_det[0].market.name)
                         # Also remove order details
                         self._active_buy_order_details.pop(asset_key, None)
                         # Clean up cancel request time
@@ -912,7 +922,8 @@ cdef class PositionBalancerHandler:
                         _gone_det = self._active_sell_order_details.get(asset_key)
                         if _gone_det is not None:
                             self._last_gone_sell_price[asset_key] = (
-                                float(_gone_det[1]), self.strategy._current_timestamp)
+                                float(_gone_det[1]), self.strategy._current_timestamp,
+                                _gone_det[0].market.name)
                         # Also remove order details
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
@@ -1299,6 +1310,13 @@ cdef class PositionBalancerHandler:
 
     cdef object c_find_best_buy_market(self, str asset):
         """
+        NO balance-preference tie-break here, and that is DELIBERATE (confirmed 2026-08-18).
+        The sell-off side has one (SELL_BALANCE_PREFERENCE_PCT) because a sell-off drains a finite
+        base balance: left alone it empties whichever venue is momentarily best and the asset
+        manager has to shuttle inventory back, paying a withdrawal fee and transit each way.
+        A buy-in has no such floor — it spends quote, which is replenishable — so the same guard
+        is not wanted here. Do not "restore symmetry" by adding one.
+
         Find the best market to place a buy order for the given asset.
         For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
         and selects the best one regardless of name.
@@ -1397,7 +1415,7 @@ cdef class PositionBalancerHandler:
 
         return best_market
 
-    cdef object c_find_best_sell_market(self, str asset, bint prefer_fuller_venue=False):
+    cdef object c_find_best_sell_market(self, str asset):
         """
         Find the best market to place a sell order for the given asset.
         For assets with aliases (e.g., NODE/NODEOPS), considers ALL alias markets
@@ -1408,11 +1426,17 @@ cdef class PositionBalancerHandler:
         - 'min' mode: Select market with HIGHEST EFFECTIVE SELL PRICE (ask - min_tick)
           This accounts for different min_price_increment across markets.
 
-        `prefer_fuller_venue` (sell-off only, PLACEMENT only): among venues priced within
+        Sell-off venue rule (ALWAYS applied, so the CHECK 1 scan and placement agree): among venues priced within
         SELL_BALANCE_PREFERENCE_PCT of the best, pick the one holding the MOST base. Stops the
         sell-off draining whichever venue is momentarily best down to zero and making the asset
-        manager shuttle inventory back and forth. Off by default so the per-tick better-market
-        scan (CHECK 1) stays a pure price comparison and pays no balance reads.
+        manager shuttle inventory back and forth.
+
+        ALWAYS applied — it used to be placement-only, which made the CHECK 1 scan and the
+        placement judge differently: the scan would flag "better market - X" on pure price, then
+        placement would apply this preference and come straight back to the same venue. 21 of 67
+        relocations over 16.7h were no-ops for exactly that reason. Balance reads here are
+        connector-cache dict lookups, and c_find_best_buy_market already does one per venue on the
+        same per-tick path, so there is no cost argument for keeping the two paths asymmetric.
         """
         cdef:
             object best_market = None
@@ -1428,7 +1452,7 @@ cdef class PositionBalancerHandler:
             bint use_bid_price = (not self._sell_spread_is_min and self._sell_spread_pct == 0.0)
             bint use_effective_price = self._sell_spread_is_min  # 'min' mode needs effective price
             object trading_rule
-            list candidates = []      # [(market_tuple, price)] — only used when prefer_fuller_venue
+            list candidates = []      # [(market_tuple, price)] for the fuller-venue tie-break
             double price_floor
             double cand_bal
             double best_bal
@@ -1501,8 +1525,7 @@ cdef class PositionBalancerHandler:
                                 else:
                                     continue
 
-                            if prefer_fuller_venue:
-                                candidates.append((market_tuple, current_price))
+                            candidates.append((market_tuple, current_price))
 
                             if current_price > best_price:
                                 # DEBUG: Log when a new best is found
@@ -1523,7 +1546,7 @@ cdef class PositionBalancerHandler:
             # SELL_BALANCE_PREFERENCE_PCT of that price AND holds strictly more base. Starting
             # from the best price means ties keep the best price, and a single-venue asset is
             # untouched. Balance reads happen here and nowhere else in this function.
-            if prefer_fuller_venue and best_market is not None and len(candidates) > 1 and best_price > 0.0:
+            if best_market is not None and len(candidates) > 1 and best_price > 0.0:
                 price_floor = best_price * (1.0 - SELL_BALANCE_PREFERENCE_PCT)
                 chosen = best_market
                 orig_bal = float(best_market.market.get_available_balance(best_market.base_asset))
@@ -1725,42 +1748,9 @@ cdef class PositionBalancerHandler:
                             current_effective = order_price  # Our current order price IS our effective price
                             # For SELL: higher effective price is better
                             improvement = (best_effective - current_effective) / current_effective if current_effective > 0 else 0
-                            if improvement > MIN_MODE_SWITCH_HYSTERESIS:
+                            if improvement > SELL_MODE_SWITCH_HYSTERESIS:
                                 should_cancel = True
                                 cancel_reason = f"better market - {current_best_market.market.name} effective={best_effective:.8g} vs current={current_effective:.8g} ({improvement*100:.2f}% better)"
-                else:
-                    best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
-                    
-                    if is_buy:
-                        if not is_maker_mode:
-                            # Aggressive mode: compare asks (taker)
-                            if best_ob._ask_book.size() > 0 and current_ask > 0:
-                                best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
-                                if best_market_price < current_ask * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
-                                    should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8g} < {order_market_tuple.market.name} ask {current_ask:.8g}"
-                        else:
-                            # Percentage maker mode: compare bids (we place above)
-                            if best_ob._bid_book.size() > 0 and current_bid > 0:
-                                best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
-                                if best_market_price < current_bid * (1.0 - BETTER_MARKET_SWITCH_TOLERANCE):
-                                    should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8g} < {order_market_tuple.market.name} bid {current_bid:.8g}"
-                    else:  # SELL
-                        if not is_maker_mode:
-                            # Aggressive mode: compare bids (taker)
-                            if best_ob._bid_book.size() > 0 and current_bid > 0:
-                                best_market_price = float(deref(best_ob._bid_book.rbegin()).getPrice())
-                                if best_market_price > current_bid * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
-                                    should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} bid {best_market_price:.8g} > {order_market_tuple.market.name} bid {current_bid:.8g}"
-                        else:
-                            # Percentage maker mode: compare asks (we place below)
-                            if best_ob._ask_book.size() > 0 and current_ask > 0:
-                                best_market_price = float(deref(best_ob._ask_book.begin()).getPrice())
-                                if best_market_price > current_ask * (1.0 + BETTER_MARKET_SWITCH_TOLERANCE):
-                                    should_cancel = True
-                                    cancel_reason = f"better market - {current_best_market.market.name} ask {best_market_price:.8g} > {order_market_tuple.market.name} ask {current_ask:.8g}"
             
             # ================================================================
             # CHECK 2 & 3: Frontrun + Large Gap (MAKER MODES ONLY)
@@ -2128,17 +2118,16 @@ cdef class PositionBalancerHandler:
 
         REAL-WORLD GOAL: Maintain competitive position in order book while getting best price.
 
-        Every tick — via c_check_immediate_conditions (time-gated):
-          - Frontrun/undercut: someone placed more aggressive order (fires after MIN_FRONTRUN_CHECK_DELAY=5s)
-          - Large gap: order is > ~2 ticks away from top of book (fires after 5s)
-          - Better market: different exchange became significantly better (fires after MIN_MARKET_SWITCH_DELAY=60s)
+        Every tick — via c_check_immediate_conditions (each with its own age gate):
+          CHECK 1  better market   — another venue beats us by > MIN_MODE_SWITCH_HYSTERESIS (age >= 60s)
+          CHECK 2  frontrun/undercut — someone got inside us (age >= 5s, 20s at streak >= 5)
+          CHECK 3  large gap       — we drifted > LARGE_GAP_THRESHOLD ticks off top +/- 1 tick
+          CHECK 4  step-up / refuge re-park — reprice by >= STEP_UP_MIN_GAP_TICKS
+        In REFUGE, CHECKS 2 and 3 are skipped (both are top-of-book referenced) so they cannot
+        gate CHECK 4; see the module header.
 
-        Periodic — after effective_interval (default 60s), same orderbook snapshot:
-          1. Mode disabled → orphaned order cleanup
-          2b. 1-tick min-mode misalignment (needs got_valid_second_level)
-          3.  Market moved in our favor → can get better price
-          4.  Aggressive mode: market moved to our price
-          5.  Significant price divergence (c_check_price_divergence)
+        Periodic — after _limit_refresh_interval: SAFETY NET ONLY (orderbook read failure or
+        missing order details). All repricing decisions are made per tick above.
 
         Stuck cancel detection runs unconditionally when order is in timeout_cancelled_orders.
         """
@@ -2230,22 +2219,6 @@ cdef class PositionBalancerHandler:
                             self.strategy.logger().info(
                                 f"Position balancer: BUY refuge ARMED for {refuge_canonical} "
                                 f"(streak={cancel_streak}) — retreating under the wall, frontrun now suppressed")
-
-                    # ---- BETTER-MARKET exits refuge (buy) ----
-                    # A "better market" cancel relocates us to a DIFFERENT exchange. The refuge posture
-                    # (parked under THIS exchange's wall, hiding from THIS exchange's frontrunner) is
-                    # meaningless on the new venue. Clear refuge AND reset the streak so the next
-                    # placement uses the NORMAL top-of-book branch on the new market, and refuge can
-                    # only re-arm after REFUGE_ARM_STREAK fresh frontruns there. (Mirror of the
-                    # fill-driven exit. NB: this and "frontrunner gone" are the only refuge exits
-                    # that clear the streak — a "sank" exit deliberately keeps it, see
-                    # should_backstop_refresh.)
-                    if (should_cancel and cancel_reason.startswith("better market")
-                            and self._in_refuge_buy.pop(self._get_canonical_asset(asset), None)):
-                        self._buy_cancel_streak.pop(self._get_canonical_asset(asset), None)
-                        self.strategy.logger().info(
-                            f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset)} "
-                            f"(better market) — relocating to a better venue, resuming normal best-bid chasing")
 
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
@@ -2367,22 +2340,6 @@ cdef class PositionBalancerHandler:
                             self.strategy.logger().info(
                                 f"Position balancer: SELL refuge ARMED for {refuge_canonical} "
                                 f"(streak={cancel_streak}) — retreating under the wall, undercut now suppressed")
-
-                    # ---- BETTER-MARKET exits refuge (sell) ----
-                    # A "better market" cancel relocates us to a DIFFERENT exchange. The refuge posture
-                    # (parked under THIS exchange's wall, hiding from THIS exchange's jumper) is
-                    # meaningless on the new venue. Clear refuge AND reset the streak so the next
-                    # placement uses the NORMAL top-of-book branch on the new market, and refuge can
-                    # only re-arm after REFUGE_ARM_STREAK fresh undercuts there. (Mirror of the
-                    # fill-driven exit. NB: this and "jumper gone" are the only refuge exits that
-                    # clear the streak — a "sank" exit deliberately keeps it, see
-                    # should_backstop_refresh.)
-                    if (should_cancel and cancel_reason.startswith("better market")
-                            and self._in_refuge_sell.pop(self._get_canonical_asset(asset), None)):
-                        self._sell_cancel_streak.pop(self._get_canonical_asset(asset), None)
-                        self.strategy.logger().info(
-                            f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset)} "
-                            f"(better market) — relocating to a better venue, resuming normal best-ask chasing")
 
                     # Immediate-check cancels are reactive (market event) EXCEPT:
                     #   - "mode disabled": housekeeping
@@ -2795,11 +2752,11 @@ cdef class PositionBalancerHandler:
                                 base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                                 val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
                                 if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
-                                    # Find the best market to sell on (highest bid). prefer_fuller_venue
-                                    # is set ONLY here: at placement we choose where the inventory
-                                    # leaves from, so spreading the drain across venues matters. The
-                                    # per-tick CHECK 1 scan keeps the plain price comparison.
-                                    selected_sell_market = self.c_find_best_sell_market(asset_key, True)
+                                    # Best market to sell on. The fuller-venue tie-break lives INSIDE
+                                    # the selector and is always applied, so this and the CHECK 1 scan
+                                    # ask the identical question — a "better market" signal can no
+                                    # longer name a venue that placement then declines to use.
+                                    selected_sell_market = self.c_find_best_sell_market(asset_key)
                                     if selected_sell_market is not None:
                                         # Pre-check: ensure selected market has enough base balance for min notional.
                                         # Bypass for sell-to-zero: the full balance IS the order — let c_execute_sell_limit handle it.
@@ -2901,6 +2858,27 @@ cdef class PositionBalancerHandler:
 
         if top_ask <= 0:
             return False
+
+        # VENUE CHANGE — the one and only place a relocation resets our contention state.
+        # The frontrun streak and the refuge posture both describe ONE order book: the bot that
+        # keeps stepping inside us lives on a specific exchange, so carrying either onto a
+        # different book is meaningless. Landing on a new venue wipes both at the root.
+        # Keyed on where the order ACTUALLY lands, NOT on the "better market" cancel reason — that
+        # reason only names the venue the scan liked at that instant, and 31 pct of the time
+        # placement re-selects and comes straight back to the same book (the sell-off fuller-venue
+        # preference is applied at placement but not in the scan). Resetting on the cancel would
+        # wipe a live, legitimate bid war a third of the time; resetting on the landing cannot.
+        _prev_gone = self._last_gone_buy_price.get(asset_key)
+        if _prev_gone is not None and len(_prev_gone) > 2 and _prev_gone[2] != buy_market_tuple.market.name:
+            _canon_venue = self._get_canonical_asset(asset_key)
+            # pop BOTH unconditionally — `a.pop() or b.pop()` would short-circuit and
+            # leave the streak alive whenever we happened to be in refuge.
+            _had_refuge = self._in_refuge_buy.pop(_canon_venue, None)
+            _had_streak = self._buy_cancel_streak.pop(_canon_venue, None)
+            if _had_refuge or _had_streak:
+                self.strategy.logger().info(
+                    f"Position balancer: BUY venue changed for {_canon_venue} "
+                    f"{_prev_gone[2]} -> {buy_market_tuple.market.name} — streak and refuge reset (new book)")
 
         # Calculate limit price based on spread mode
         if self._buy_spread_is_min:
@@ -3039,6 +3017,21 @@ cdef class PositionBalancerHandler:
             if self.c_try_mark_buy_complete(asset_key, current_value_quote, shortfall):
                 return False
             return False
+
+        # SNAP TO THE TICK GRID before quantizing. `wall ± 1 tick` is computed in float, so it can
+        # land a hair off the grid point — 0.000269 - 1e-6 == 0.00026799999999999995 — and
+        # quantize_order_price TRUNCATES, turning that into 0.000267: a full tick lost, in the
+        # aggressive direction. Measured over 16.7h: 106 of 2093 refuge parks landed a tick off,
+        # 51 of them exactly ON the jumper's price. That defeats the never-rest-at-the-frontrunner
+        # clamp, which runs on the pre-quantization float and is correct at that point.
+        # The grid multiple MUST be built in Decimal: a float round-trip (round(px/tick)*tick)
+        # re-introduces the error on the multiply and still loses a tick on ~30% of real prices.
+        try:
+            if min_price_increment is not None and float(min_price_increment) > 0.0:
+                _tick_dec = Decimal(str(min_price_increment))
+                buy_price = float(Decimal(int(Decimal(str(buy_price)) / _tick_dec + Decimal("0.5"))) * _tick_dec)
+        except Exception:
+            pass  # leave the raw price if the grid snap fails
 
         # Quantize price to match exchange precision (prevents log/actual price mismatch)
         try:
@@ -3184,6 +3177,27 @@ cdef class PositionBalancerHandler:
 
         if top_bid <= 0:
             return False
+
+        # VENUE CHANGE — the one and only place a relocation resets our contention state.
+        # The frontrun streak and the refuge posture both describe ONE order book: the bot that
+        # keeps stepping inside us lives on a specific exchange, so carrying either onto a
+        # different book is meaningless. Landing on a new venue wipes both at the root.
+        # Keyed on where the order ACTUALLY lands, NOT on the "better market" cancel reason — that
+        # reason only names the venue the scan liked at that instant, and 31 pct of the time
+        # placement re-selects and comes straight back to the same book (the sell-off fuller-venue
+        # preference is applied at placement but not in the scan). Resetting on the cancel would
+        # wipe a live, legitimate bid war a third of the time; resetting on the landing cannot.
+        _prev_gone = self._last_gone_sell_price.get(asset_key)
+        if _prev_gone is not None and len(_prev_gone) > 2 and _prev_gone[2] != sell_market_tuple.market.name:
+            _canon_venue = self._get_canonical_asset(asset_key)
+            # pop BOTH unconditionally — `a.pop() or b.pop()` would short-circuit and
+            # leave the streak alive whenever we happened to be in refuge.
+            _had_refuge = self._in_refuge_sell.pop(_canon_venue, None)
+            _had_streak = self._sell_cancel_streak.pop(_canon_venue, None)
+            if _had_refuge or _had_streak:
+                self.strategy.logger().info(
+                    f"Position balancer: SELL venue changed for {_canon_venue} "
+                    f"{_prev_gone[2]} -> {sell_market_tuple.market.name} — streak and refuge reset (new book)")
 
         # Calculate limit price based on spread mode
         if self._sell_spread_is_min:
@@ -3374,6 +3388,21 @@ cdef class PositionBalancerHandler:
                 if self.c_try_mark_sell_complete(asset_key, current_value_quote, excess):
                     return False
                 return False
+
+        # SNAP TO THE TICK GRID before quantizing. `wall ± 1 tick` is computed in float, so it can
+        # land a hair off the grid point — 0.000269 - 1e-6 == 0.00026799999999999995 — and
+        # quantize_order_price TRUNCATES, turning that into 0.000267: a full tick lost, in the
+        # aggressive direction. Measured over 16.7h: 106 of 2093 refuge parks landed a tick off,
+        # 51 of them exactly ON the jumper's price. That defeats the never-rest-at-the-frontrunner
+        # clamp, which runs on the pre-quantization float and is correct at that point.
+        # The grid multiple MUST be built in Decimal: a float round-trip (round(px/tick)*tick)
+        # re-introduces the error on the multiply and still loses a tick on ~30% of real prices.
+        try:
+            if min_price_increment is not None and float(min_price_increment) > 0.0:
+                _tick_dec = Decimal(str(min_price_increment))
+                sell_price = float(Decimal(int(Decimal(str(sell_price)) / _tick_dec + Decimal("0.5"))) * _tick_dec)
+        except Exception:
+            pass  # leave the raw price if the grid snap fails
 
         # Quantize price to match exchange precision (prevents log/actual price mismatch)
         try:

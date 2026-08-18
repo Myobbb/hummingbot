@@ -87,7 +87,7 @@ cdef class PositionBalancerHandler:
     cdef void c_scan_and_mark_completion(self)
     cdef bint c_market_in_failure_cooldown(self, object market_tuple)
     cdef object c_find_best_buy_market(self, str asset)
-    cdef object c_find_best_sell_market(self, str asset, bint prefer_fuller_venue=*)
+    cdef object c_find_best_sell_market(self, str asset)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)
     cdef tuple c_check_immediate_conditions(self, str asset, bint is_buy, double order_age,
