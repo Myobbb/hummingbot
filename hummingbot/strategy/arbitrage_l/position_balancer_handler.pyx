@@ -103,6 +103,14 @@ cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detecti
 # This prevents orphaned orders on exchanges with slow cancel confirmations (e.g., BitMart)
 cdef double PENDING_CANCEL_WAIT_SECONDS = 10.0  # Wait at least 10s for cancel confirmation
 
+# --- Post-cancel balance settle ---
+# Some venues keep base counted as locked in `get_available_balance` for seconds to MINUTES after
+# they have themselves confirmed our cancel. PB re-places ~2.9s later, sizes against that stale
+# reading and ships a sub-minimum order the exchange then rejects. Hard cap on how long we are
+# willing to wait for the released base to appear before giving up and placing anyway (fail-open).
+# 300s covers the worst observed recovery (~182s, BLUAI/mexc 2026-08-18) with margin.
+cdef double POST_CANCEL_BALANCE_SETTLE_MAX = 300.0
+
 # --- Log throttle ---
 # The min_tick=0 warning lives inside the per-tick market scan, so a pair whose trading_rules
 # are missing/zero emits it at TICK RATE (100 Hz). PIVX:bitmart produced 1,200,308 lines in ~3h
@@ -342,6 +350,11 @@ cdef class PositionBalancerHandler:
         self._last_min_tick_warn_time = {}
         # canonical_asset -> timestamp of the last better-market scan (CHECK 1 cadence)
         self._last_market_scan_time = {}
+        # per-tick memo for c_arb_pending_base: (base_asset, is_buy) -> remaining base
+        self._arb_pending_cache = {}
+        self._arb_pending_ts = -1.0
+        # asset -> cancel timestamp we already logged a settle-gate wait for (one line per episode)
+        self._settle_gate_logged = {}
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
@@ -669,6 +682,73 @@ cdef class PositionBalancerHandler:
         """
         return self.c_get_aggregated_base_balance(asset)
 
+    cdef double c_arb_pending_base(self, str asset, bint is_buy):
+        """
+        Base amount of `asset` still committed to resting orders the ARB LAYER placed — i.e. every
+        strategy order on this asset that is not one of ours.
+
+        WHY PB must see these. `c_get_aggregated_base_balance` reads TOTAL, which counts base locked
+        in an arb leg as if it were free inventory. PB then sizes against it, and if the arb leg and
+        PB's own order both reduce the position we overshoot the target. Observed on GALA: $193.66 of
+        resting sells against a $104.38 excess, projecting to $410.72 on a $500 target.
+
+        Handles both shapes naturally because the caller applies it symmetrically:
+          • a ROUND-TRIP arb (buy on A + sell on B, same size) nets to zero — PB is unaffected;
+          • a ONE-SIDED / legged arb leaves a single side pending — PB defers by exactly that amount
+            and waits for it to settle.
+
+        Uses the framework's own bookkeeping, so there is nothing new to keep in sync:
+          • `_sb_order_tracker.tracked_limit_orders_map` — the raw dict. NOT the `tracked_limit_orders`
+            property, which rebuilds a list on every access.
+          • `strategy._position_balancer_orders` — the set PB already populates at placement, used
+            here to exclude our own orders (they are counted by _pending_*_by_asset already; counting
+            them twice would make PB under-order).
+
+        SIZE = full `quantity`, deliberately. `OrderTracker` builds its `LimitOrder` without a
+        `filled_quantity` (it defaults to `Decimal("NaN")`) and never updates it afterwards —
+        there is no setter — so partial-fill data simply is not available on this object. Naively
+        computing `quantity - filled_quantity` yields NaN, and since `NaN <= 0` is False the NaN
+        would flow straight into `c_get_adjusted_base_balance` and silently poison every
+        excess/shortfall comparison. We therefore count the full quantity and guard with
+        `.is_nan()` the way `cross_exchange_market_making` does. Over-counting a partially filled
+        leg is the safe direction here: PB defers slightly more than strictly necessary, which
+        errs away from overshooting the target.
+
+        Cached for the current tick — one scan per tick no matter how many assets ask, so the cost is
+        O(open orders) per tick rather than O(assets x open orders).
+        """
+        cdef:
+            double now = self.strategy._current_timestamp
+            double total = 0.0
+            double remaining
+            list aliases
+            str alias
+        try:
+            if now != self._arb_pending_ts:
+                self._arb_pending_ts = now
+                self._arb_pending_cache = {}
+                pb_orders = self.strategy._position_balancer_orders
+                for _mp, order_map in self.strategy._sb_order_tracker.tracked_limit_orders_map.items():
+                    for oid, lo in order_map.items():
+                        if oid in pb_orders:
+                            continue                       # our own — already in _pending_*_by_asset
+                        _filled = lo.filled_quantity
+                        remaining = float(lo.quantity)
+                        if not _filled.is_nan():
+                            remaining -= float(_filled)
+                        if not (remaining > 0.0):        # also drops any NaN that slips through
+                            continue
+                        key = (lo.base_currency, bool(lo.is_buy))
+                        self._arb_pending_cache[key] = self._arb_pending_cache.get(key, 0.0) + remaining
+            if not self._arb_pending_cache:
+                return 0.0
+            aliases = self._get_all_asset_aliases(asset)
+            for alias in aliases:
+                total += <double> self._arb_pending_cache.get((alias, bool(is_buy)), 0.0)
+            return total
+        except Exception:
+            return 0.0                                     # fail-open: behave as before
+
     cdef double c_get_adjusted_base_balance(self, str asset):
         """
         Get adjusted base balance accounting for pending orders.
@@ -681,10 +761,81 @@ cdef class PositionBalancerHandler:
         cdef double agg = self.c_get_aggregated_base_balance(asset)
         cdef double pending_buy = self.c_get_pending_buy_base(asset)
         cdef double pending_sell = self.c_get_pending_sell_base(asset)
+        # ARB-layer legs count too: `agg` is TOTAL, so base locked in an arb sell looks free, and
+        # sizing against it oversells the target once both that leg and our own order fill. Applied
+        # symmetrically, so a round-trip arb (buy+sell, same size) nets to zero and only a one-sided
+        # leg moves the number — PB then defers by exactly that amount until it settles.
+        cdef double arb_buy = self.c_arb_pending_base(asset, True)
+        cdef double arb_sell = self.c_arb_pending_base(asset, False)
         # Net balance = held + pending buys - pending sells. Correct now that `agg` is the TOTAL
         # balance: the base behind a resting sell is counted once by agg and removed once here.
         # While agg was `available` this double-subtracted that base and understated the net.
-        return agg + pending_buy - pending_sell
+        return agg + pending_buy + arb_buy - pending_sell - arb_sell
+
+    cdef bint c_post_cancel_balance_stale(self, object sell_market_tuple, str asset_key):
+        """
+        True while the venue has NOT yet handed back the base released by our own last cancel.
+
+        THE PROBLEM. `get_available_balance` is the capacity reading, and several venues keep our
+        cancelled order's base counted as locked long after the exchange itself confirmed the
+        cancel. Worked example, BLUAI/mexc 2026-08-18 (whole position ~$100):
+
+            08:18:49.281  OrderCancelled — mexc confirms; our own bookkeeping clears correctly
+            08:18:52.210  available still reads 25.19  ( = 7,754.34 total - 7,729.16 cancelled )
+            08:18:52.211  sized + placed 25.18 ($0.33) as a sell-to-zero "dust sweep"
+            08:18:52.213  mexc rejects: notional 0.326 < minimum 1
+            08:21:53      available back to 7,754.35 — normal 7,725.58 order resumes
+
+        5 such orders in 11.7h, every one rejected by the exchange. Nothing was lost — the
+        TOTAL-based completion check correctly refused to mark the sell-off done — but PB spent
+        ~3 minutes trading against a balance it could have known was wrong, and flipped to a venue
+        holding no inventory on the way.
+
+        THE TEST fires only on the PROVEN-stale signature: available is BELOW the amount we know is
+        owed back to us. That is not a heuristic — a cancel moves no base, so a shortfall against
+        the unfilled remainder means the release has not landed. It also cannot introduce a new
+        stall: once the release lands, available = residue + expected >= expected and the gate
+        opens by itself, with no timer to tune. If we already hold more free base than the
+        cancelled order, the gate never engages — and sizing was never going to produce dust.
+
+        Bounded by POST_CANCEL_BALANCE_SETTLE_MAX so a base that genuinely left the venue (a late
+        fill, an asset-manager transfer) cannot park the sell-off forever: past the cap we fail
+        open and place exactly as before.
+
+        Deliberately NOT symmetric with the buy side: zero buy-side blocks and all 5 sub-minimum
+        rejections were sells over the same runtime. A sell-off drains a finite base balance; a
+        buy-in spends replenishable quote. Same asymmetry as the sell-specific venue-switch gate.
+        """
+        cdef:
+            ExchangeBase mkt = sell_market_tuple.market
+            double now = self.strategy._current_timestamp
+            double expected
+            double avail
+        try:
+            rec = self._last_gone_sell_price.get(asset_key)
+            if rec is None or len(rec) < 4:
+                return False
+            expected = float(rec[3])
+            if expected <= EPSILON:
+                return False                        # fully filled — nothing is owed back
+            if rec[2] != mkt.name:
+                return False                        # different venue — not our released base
+            if (now - float(rec[1])) > POST_CANCEL_BALANCE_SETTLE_MAX:
+                return False                        # fail-open: stop waiting, place as before
+            avail = float(mkt.c_get_available_balance(sell_market_tuple.base_asset))
+            if avail >= expected:
+                return False                        # release landed — gate opens
+            # One line per stale episode, not per tick: keyed on the cancel's timestamp.
+            if self._settle_gate_logged.get(asset_key) != rec[1]:
+                self._settle_gate_logged[asset_key] = rec[1]
+                self.strategy.logger().info(
+                    f"Position balancer: waiting for {mkt.name} to release {expected:.8g} "
+                    f"{sell_market_tuple.base_asset} from our cancelled sell "
+                    f"(available {avail:.8g} < {expected:.8g}) — not sizing against a stale "
+                    f"balance; gives up after {POST_CANCEL_BALANCE_SETTLE_MAX:.0f}s")
+            return True
+        except Exception:
+            return False                            # fail-open: behave as before
 
     cdef bint c_try_mark_buy_complete(self,
                                       str pair,
@@ -923,9 +1074,13 @@ cdef class PositionBalancerHandler:
                         # Remember where it rested BEFORE forgetting it — see the buy side.
                         _gone_det = self._active_sell_order_details.get(asset_key)
                         if _gone_det is not None:
+                            # 4th element = base we expect the venue to hand back. A cancel
+                            # releases only the UNFILLED remainder; a fully filled order releases
+                            # nothing and must never arm the settle gate. See
+                            # c_post_cancel_balance_stale.
                             self._last_gone_sell_price[asset_key] = (
                                 float(_gone_det[1]), self.strategy._current_timestamp,
-                                _gone_det[0].market.name)
+                                _gone_det[0].market.name, float(unfilled_amt))
                         # Also remove order details
                         self._active_sell_order_details.pop(asset_key, None)
                         # Clean up cancel request time
@@ -3158,6 +3313,12 @@ cdef class PositionBalancerHandler:
             return False
 
         if base_bal_raw <= 0:
+            return False
+
+        # Post-cancel settle gate — the last thing between us and sizing. Refuse to size against a
+        # balance the venue has not finished releasing after OUR OWN cancel. See
+        # c_post_cancel_balance_stale for the evidence and why the test cannot stall us.
+        if self.c_post_cancel_balance_stale(sell_market_tuple, asset_key):
             return False
 
         # Get order book prices from market (we selected market with highest bid)

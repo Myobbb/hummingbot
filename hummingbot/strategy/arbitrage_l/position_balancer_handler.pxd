@@ -56,6 +56,11 @@ cdef class PositionBalancerHandler:
         dict _last_min_tick_warn_time
         # canonical_asset -> timestamp of the last better-market scan (CHECK 1 cadence)
         dict _last_market_scan_time
+        # per-tick memo for c_arb_pending_base: (base_asset, is_buy) -> remaining base
+        dict _arb_pending_cache
+        double _arb_pending_ts
+        # asset -> cancel timestamp already logged by the post-cancel settle gate
+        dict _settle_gate_logged
         # Second-level refuge state (per canonical asset) — truthy = resting under the wall (2nd-best),
         # undercut suppressed; the VALUE is the intended park depth (foreign levels we sat behind)
         dict _in_refuge_sell
@@ -83,7 +88,9 @@ cdef class PositionBalancerHandler:
     cdef pair[double, double] c_compute_value_and_sell_excess(self, double base_balance, double last_bid)
     cdef double c_get_aggregated_base_balance(self, str asset)
     cdef double c_get_actual_base_balance(self, str asset)
+    cdef double c_arb_pending_base(self, str asset, bint is_buy)
     cdef double c_get_adjusted_base_balance(self, str asset)
+    cdef bint c_post_cancel_balance_stale(self, object sell_market_tuple, str asset_key)
     cdef bint c_try_mark_buy_complete(self, str pair, double current_value_quote, double shortfall)
     cdef bint c_try_mark_sell_complete(self, str pair, double current_value_quote, double excess)
     cdef void c_scan_and_mark_completion(self)
