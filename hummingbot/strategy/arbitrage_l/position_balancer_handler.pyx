@@ -1090,6 +1090,35 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(f"Position balancer: Failed to handle completion for {order_id}: {e}")
 
+    cdef double c_active_fill_pressure_wait(self, str canonical_asset):
+        """
+        The fill-pressure spacing that is STILL IN FORCE — the ONE place either side may read it.
+
+        `_post_fill_extra_wait` is armed by c_record_fill_pressure, which runs from a single site
+        (`arbitrage.pyx` order-completed handler) and returns early for any order that is not PB's.
+        PB orders are overwhelmingly CANCELLED rather than filled to completion, so that recorder may
+        not run again for hours — while the clock the wait is compared against
+        (`_last_buy/_last_sell_completion_time`) is re-stamped on EVERY cancel. The stored wait
+        therefore outlived its trigger and kept spacing placements long after the fill flurry ended:
+        measured over 2d19h, waits stayed in force p50 57 min, p90 19.5h, max 50.6h (UNION 44.3h),
+        costing ~20% of book presence on the affected asset (2026-08-22 audit, notes item 15).
+
+        The recorder already defines when pressure is over — `inter_fill >= FILL_PRESSURE_WINDOW`.
+        This applies that SAME test against NOW instead of against the next completion that may never
+        arrive, so the wait expires on its own. No new knob: the window is the existing one, and an
+        expired entry is dropped so the stored state stops asserting a wait that is no longer real.
+        """
+        cdef:
+            double extra = float(self._post_fill_extra_wait.get(canonical_asset, 0.0))
+            double prior
+        if extra <= 0.0:
+            return 0.0
+        prior = float(self._last_fill_completion_time.get(canonical_asset, 0.0))
+        if prior <= 0.0 or (self.strategy._current_timestamp - prior) >= FILL_PRESSURE_WINDOW:
+            self._post_fill_extra_wait.pop(canonical_asset, None)
+            return 0.0
+        return extra
+
     def c_record_fill_pressure(self, str order_id, bint is_buy):
         """
         Trailing-stop-like adaptive post-fill wait.
@@ -2792,9 +2821,11 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
-                    # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
+                    # spacing); it's 0 after a single fill, and c_active_fill_pressure_wait expires it
+                    # once FILL_PRESSURE_WINDOW has passed with no further PB completion — the recorder
+                    # alone cannot, because it only runs when a PB order fills to completion.
                     time_since_completion = self.strategy._current_timestamp - self._last_buy_completion_time.get(canonical_asset, 0.0)
-                    buy_extra_wait = self._post_fill_extra_wait.get(canonical_asset, 0.0)
+                    buy_extra_wait = self.c_active_fill_pressure_wait(canonical_asset)
                     if time_since_completion < DEFAULT_COMPLETION_COOLDOWN + buy_extra_wait:
                         # Log only when the adaptive extra is the binding constraint (base floor
                         # already cleared) — confirms the armed wait is actively spacing placement.
@@ -2887,9 +2918,11 @@ cdef class PositionBalancerHandler:
                 if not has_active_order:
                     # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
-                    # spacing); it's 0 after a single fill or once pressure cools. See c_record_fill_pressure.
+                    # spacing); it's 0 after a single fill, and c_active_fill_pressure_wait expires it
+                    # once FILL_PRESSURE_WINDOW has passed with no further PB completion — the recorder
+                    # alone cannot, because it only runs when a PB order fills to completion.
                     time_since_completion = self.strategy._current_timestamp - self._last_sell_completion_time.get(canonical_asset, 0.0)
-                    sell_extra_wait = self._post_fill_extra_wait.get(canonical_asset, 0.0)
+                    sell_extra_wait = self.c_active_fill_pressure_wait(canonical_asset)
                     if time_since_completion < DEFAULT_COMPLETION_COOLDOWN + sell_extra_wait:
                         # Log only when the adaptive extra is the binding constraint (base floor
                         # already cleared) — confirms the armed wait is actively spacing placement.

@@ -90,6 +90,7 @@ cdef class PositionBalancerHandler:
     cdef double c_get_actual_base_balance(self, str asset)
     cdef double c_arb_pending_base(self, str asset, bint is_buy)
     cdef double c_get_adjusted_base_balance(self, str asset)
+    cdef double c_active_fill_pressure_wait(self, str canonical_asset)
     cdef bint c_post_cancel_balance_stale(self, object sell_market_tuple, str asset_key)
     cdef bint c_try_mark_buy_complete(self, str pair, double current_value_quote, double shortfall)
     cdef bint c_try_mark_sell_complete(self, str pair, double current_value_quote, double excess)

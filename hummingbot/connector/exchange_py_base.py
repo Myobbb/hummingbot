@@ -1168,11 +1168,13 @@ class ExchangePyBase(ExchangeBase, ABC):
         
         This method:
         1. Validates the trading pair format
-        2. Adds the pair to the symbol map (for exchange symbol lookups)
-        3. Adds the pair to the internal trading pairs list
-        4. Initializes the order book for the pair
-        5. Subscribes to websocket updates for the pair
-        6. Fetches trading rules for the pair (if needed)
+        2. Adds the pair to the internal trading pairs list
+        3. Adds the pair to the symbol map (for exchange symbol lookups) -- must happen before
+           the subscription, because `_subscribe_channels` resolves the exchange symbol from it
+        4. Subscribes to websocket updates for the pair, THEN initializes its order book from a
+           REST snapshot and replays the diffs buffered underneath it
+           (see `OrderBookTracker.add_trading_pair` for why that order matters)
+        5. Fetches trading rules for the pair (if needed)
         
         :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
         :return: True if successfully added, False otherwise

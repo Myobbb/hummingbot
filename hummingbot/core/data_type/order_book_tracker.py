@@ -475,17 +475,65 @@ class OrderBookTracker:
 
     # === Dynamic Trading Pair Management ===
 
+    @staticmethod
+    def _diffs_not_in_snapshot(parked: List[OrderBookMessage],
+                               snapshot_msg: OrderBookMessage) -> List[OrderBookMessage]:
+        """
+        Of the diffs buffered while a snapshot was in flight, keep the ones the snapshot does
+        not already contain.
+
+        On the connectors this matters most for, the diff and snapshot update_ids come from the
+        same exchange sequence (Binance `lastUpdateId`/`u`, KuCoin `sequence`/`sequenceEnd`,
+        MEXC `lastUpdateId`/`r`), so the comparison is exact. Where a connector numbers the two
+        differently the result degrades safely in *both* directions: every diff looks newer and
+        they are all replayed (which is what `_init_order_books` and the hourly
+        `FULL_ORDER_BOOK_RESET_DELTA_SECONDS` refresh already do), or none does and the book is
+        the fresh snapshot alone — at most one REST round-trip stale, and corrected by the next
+        live diff. A diff whose update_id is missing/non-numeric is always replayed.
+
+        This filtering deliberately is *not* delegated to
+        `OrderBook.restore_from_snapshot_and_diffs`: its `bisect_right` relies on
+        `OrderBookMessage.__lt__`, whose final clause is `or self.has_update_id`, so
+        `snapshot < diff` evaluates True for every diff and the replay position is always 0.
+        Pre-filtering here is correct whether or not that comparison is ever changed.
+        """
+        snapshot_uid = snapshot_msg.update_id
+        if not isinstance(snapshot_uid, int) or snapshot_uid <= 0:
+            return list(parked)
+        newer: List[OrderBookMessage] = []
+        for message in parked:
+            update_id = message.update_id
+            if not isinstance(update_id, int) or update_id > snapshot_uid:
+                newer.append(message)
+        return newer
+
     async def add_trading_pair(self, trading_pair: str) -> bool:
         """
         Dynamically add a new trading pair to the order book tracker.
-        
-        This method:
-        1. Adds the pair to the data source's trading pairs list
-        2. Creates an order book for the pair
-        3. Sets up tracking message queue and task
-        4. Subscribes to the websocket for the pair
-        
-        :param trading_pair: The trading pair to add (e.g., "BTC-USDT")
+
+        Order of operations — **subscribe first, snapshot second**:
+
+        1. register the pair with the data source
+        2. subscribe to the websocket
+        3. fetch the REST snapshot
+        4. build the book from the snapshot, replaying the diffs that arrived under it
+
+        Steps 2 and 3 used to run the other way round, which left the pair unsubscribed while
+        its snapshot was in flight. Every update inside that window was lost outright, and on a
+        connector whose feed is purely incremental and which never routes a WS snapshot
+        (Binance and KuCoin — the others either subscribe incrementally or push snapshots) a
+        level deleted in the window survives in the local book until the hourly
+        `FULL_ORDER_BOOK_RESET_DELTA_SECONDS` REST refresh. Measured window on live Binance
+        runtime adds: 88-402 ms.
+
+        Subscribing first closes it: the pair has no entry in `_tracking_message_queues` yet, so
+        `_order_book_diff_router` parks its diffs in `_saved_message_queues` (a bounded deque)
+        instead of dropping them, and step 4 replays the ones the snapshot does not already
+        cover. This is the same protection the startup path gets for free, because
+        `listen_for_subscriptions()` is already running when `_init_order_books()` fetches its
+        snapshots.
+
+        :param trading_pair: The trading pair to add (e.g. "BTC-USDT")
         :return: True if successfully added, False otherwise
         """
         if trading_pair in self._order_books:
@@ -504,33 +552,7 @@ class OrderBookTracker:
             # Add to data source's trading pairs
             self._data_source.add_trading_pair(trading_pair)
 
-            # Initialize order book (with timeout to avoid hanging)
-            try:
-                self._order_books[trading_pair] = await asyncio.wait_for(
-                    self._initial_order_book_for_trading_pair(trading_pair),
-                    timeout=30.0
-                )
-                self.logger().info(f"Initialized order book for {trading_pair}")
-            except asyncio.TimeoutError:
-                self.logger().warning(
-                    f"Timeout initializing order book for {trading_pair}. "
-                    f"Creating empty orderbook, will be populated by WebSocket."
-                )
-                self._order_books[trading_pair] = self.order_book_create_function()
-            except Exception as e:
-                self.logger().warning(
-                    f"Error initializing order book for {trading_pair}: {e}. "
-                    f"Creating empty orderbook, will be populated by WebSocket."
-                )
-                self._order_books[trading_pair] = self.order_book_create_function()
-
-            # Set up tracking queue and task
-            self._tracking_message_queues[trading_pair] = asyncio.Queue()
-            self._tracking_tasks[trading_pair] = safe_ensure_future(
-                self._track_single_book(trading_pair)
-            )
-
-            # Subscribe to websocket for this pair
+            # --- 1. Subscribe FIRST, so the snapshot window is buffered, not lost -----------
             subscribed = await self._data_source.subscribe_to_trading_pair(trading_pair)
             if subscribed:
                 self.logger().info(
@@ -541,6 +563,54 @@ class OrderBookTracker:
                     f"Added trading pair {trading_pair}. "
                     f"Will subscribe on next websocket reconnection."
                 )
+
+            # --- 2. Then the snapshot (diffs are accumulating in _saved_message_queues) -----
+            snapshot_msg: Optional[OrderBookMessage] = None
+            try:
+                snapshot_msg = await asyncio.wait_for(
+                    self._data_source.get_order_book_snapshot_message(trading_pair),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                self.logger().warning(
+                    f"Timeout fetching order book snapshot for {trading_pair}. "
+                    f"Starting from the buffered websocket diffs instead."
+                )
+            except Exception as e:
+                self.logger().warning(
+                    f"Error fetching order book snapshot for {trading_pair}: {e}. "
+                    f"Starting from the buffered websocket diffs instead."
+                )
+
+            # --- 3. Build the book and hand it to the tracking task ------------------------
+            # No `await` from here to the end of the block: the diff router runs as a separate
+            # task and without an await point it cannot append to the deque while it is being
+            # drained, so nothing can slip between the drain and _track_single_book taking over.
+            order_book: OrderBook = self.order_book_create_function()
+            if snapshot_msg is not None:
+                parked: List[OrderBookMessage] = list(self._saved_message_queues[trading_pair])
+                self._saved_message_queues[trading_pair].clear()
+                replay = self._diffs_not_in_snapshot(parked, snapshot_msg)
+                order_book.restore_from_snapshot_and_diffs(snapshot_msg, replay)
+                self.logger().info(
+                    f"Initialized order book for {trading_pair} "
+                    f"(snapshot uid {snapshot_msg.update_id}, replayed {len(replay)} of "
+                    f"{len(parked)} buffered diff(s))"
+                )
+            else:
+                # No snapshot: leave the buffered diffs where they are — _track_single_book
+                # drains _saved_message_queues before its own queue, so the book is populated
+                # from the websocket exactly as it was before this change.
+                self.logger().warning(
+                    f"Created empty order book for {trading_pair}; it will be populated by "
+                    f"the websocket stream."
+                )
+
+            self._order_books[trading_pair] = order_book
+            self._tracking_message_queues[trading_pair] = asyncio.Queue()
+            self._tracking_tasks[trading_pair] = safe_ensure_future(
+                self._track_single_book(trading_pair)
+            )
 
             return True
 

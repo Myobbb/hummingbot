@@ -102,10 +102,27 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
 
         :return: a local copy of the current order book in the exchange
         """
-        snapshot_msg: OrderBookMessage = await self._order_book_snapshot(trading_pair=trading_pair)
+        snapshot_msg: OrderBookMessage = await self.get_order_book_snapshot_message(trading_pair=trading_pair)
         order_book: OrderBook = self.order_book_create_function()
         order_book.apply_snapshot(snapshot_msg.bids, snapshot_msg.asks, snapshot_msg.update_id)
         return order_book
+
+    async def get_order_book_snapshot_message(self, trading_pair: str) -> OrderBookMessage:
+        """
+        Fetches a full order book snapshot as an OrderBookMessage.
+
+        This is the message form of :meth:`get_new_order_book` (which returns an already-built
+        OrderBook). A caller that has to reconcile the snapshot against diffs it buffered while
+        the snapshot was in flight needs the message, because only the message carries the
+        `update_id` those diffs have to be compared against.
+
+        Every connector implements `_order_book_snapshot` and none override `get_new_order_book`,
+        so this wrapper works for all of them without a per-connector change.
+
+        :param trading_pair: the trading pair for which the snapshot has to be retrieved
+        :return: the snapshot as an OrderBookMessage
+        """
+        return await self._order_book_snapshot(trading_pair=trading_pair)
 
     async def listen_for_subscriptions(self):
         """
