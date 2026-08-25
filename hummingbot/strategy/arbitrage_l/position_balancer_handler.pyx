@@ -1644,6 +1644,9 @@ cdef class PositionBalancerHandler:
             double best_bal
             double orig_bal
             object chosen
+            double ref_bid
+            double fund_bal
+            list funded = []          # candidates that can actually fund a minimum order
 
         # Get all aliases for this asset (includes asset itself)
         asset_aliases = self._get_all_asset_aliases(asset)
@@ -1727,11 +1730,55 @@ cdef class PositionBalancerHandler:
                         except Exception:
                             continue
 
+            # ── Funding filter: a venue that cannot fund a minimum order is not a candidate ──
+            # Mirrors c_find_best_buy_market, which already skips venues whose QUOTE balance is below
+            # _min_order_usd. Without the symmetric test the sell selector ranks on price alone, so a
+            # venue that is best-priced but holds ~no base wins outright — and the placement gate then
+            # refuses it and backs off for INSUF_BAL_RETRY_COOLDOWN (60s) instead of simply using a
+            # venue that HAS inventory. Every one of the 82 insufficient-balance skips in the 24.8h
+            # audit was exactly this (CUDIS/bybit 61x while bybit held $0.00; ANIME/bitget 15x).
+            #
+            # Runs BEFORE the balance preference below, so the tie-break can only ever choose among
+            # venues that can actually trade.
+            #
+            # Two deliberate exemptions:
+            #   • sell-to-zero (`_sell_target_usd == 0`) — there the whole point is to sweep dust
+            #     BELOW the floor, so a funding bar would strand it forever. Same condition the
+            #     placement gate uses.
+            #   • no venue clears the bar — keep the unfiltered choice so the placement gate still
+            #     logs and applies its 60s cooldown exactly as before. Filtering to nothing would
+            #     return None, which the caller treats as a silent no-op every tick — worse than today.
+            if (self._sell_target_usd > 0.0 and best_market is not None
+                    and len(candidates) > 1 and self.strategy._min_order_usd > 0.0):
+                ref_bid = float(self.strategy.c_get_reference_bid_for_asset(asset))
+                if ref_bid > 0.0:
+                    funded = []
+                    for market_tuple, current_price in candidates:
+                        fund_bal = float(market_tuple.market.get_available_balance(market_tuple.base_asset))
+                        if fund_bal * ref_bid >= self.strategy._min_order_usd:
+                            funded.append((market_tuple, current_price))
+                    if funded and len(funded) < len(candidates):
+                        chosen = None
+                        best_price = 0.0
+                        for market_tuple, current_price in funded:
+                            if current_price > best_price:
+                                best_price = current_price
+                                chosen = market_tuple
+                        if chosen is not None and chosen is not best_market:
+                            self.strategy.logger().info(
+                                f"Position balancer: sell venue {best_market.market.name} -> {chosen.market.name} "
+                                f"for {asset} — {best_market.market.name} cannot fund a "
+                                f"${self.strategy._min_order_usd:.2f} order; skipping it on funding")
+                        if chosen is not None:
+                            best_market = chosen
+                        candidates = funded
+
             # ── Sell-off venue balance preference (placement only) ────────────────────────
             # Start from the best-priced venue and move only if another venue is BOTH within
             # SELL_BALANCE_PREFERENCE_PCT of that price AND holds strictly more base. Starting
             # from the best price means ties keep the best price, and a single-venue asset is
-            # untouched. Balance reads happen here and nowhere else in this function.
+            # untouched. Operates on the funding-filtered candidate list above, so it can only ever
+            # choose a venue that can actually place.
             if best_market is not None and len(candidates) > 1 and best_price > 0.0:
                 price_floor = best_price * (1.0 - SELL_BALANCE_PREFERENCE_PCT)
                 chosen = best_market
