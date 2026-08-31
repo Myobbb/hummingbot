@@ -158,6 +158,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_check_all_order_timeouts(self)
     cdef void c_check_filled_order_timeouts(self)
     cdef void c_cleanup_old_orders(self)
+    cdef double c_hold_inflight_base(self)
     cdef void c_refresh_hold_cache(self)
     cdef void c_set_hold_correction(self, bint active, bint oversold)
 

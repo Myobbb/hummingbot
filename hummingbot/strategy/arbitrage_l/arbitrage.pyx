@@ -1255,6 +1255,83 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # when there are no orders and no tombstones to clean, which silently starved the
         # guardrail on any idle strategy. Do not re-add it here.
 
+    cdef double c_hold_inflight_base(self):
+        """
+        Net base this strategy has committed to orders that the settled balance cannot see yet,
+        clamped at >= 0. Off the hot path entirely -- one call site, c_refresh_hold_cache.
+
+        WHY. `total` in the caller is a sum of settled wallet balances. An order is invisible to
+        it from the moment it is placed until the venue credits the fill, and that window is not
+        small: on WARD (2026-08-31) bitget filled in 30ms and sent OrderCompleted 11.3s later.
+        `_sb_order_tracker` already spans exactly that window -- an order enters at placement and
+        leaves on completion / cancel / failure -- so the missing base is already tracked, for
+        free, by the framework. Nothing new to keep in sync. Without this, the 60s refresh would
+        wipe the dispatch-time credit whenever it landed while an order was still in flight.
+
+        NO ASSET FILTER, deliberately. This tracker holds only THIS strategy's orders and an
+        arb_l strategy is single-asset (the whole hold-band already reads
+        `_market_pairs[0].first.base_asset` as THE asset). Filtering on `base_currency` would
+        therefore add nothing and would silently drop the second half of an alias pair
+        (NODE/NODEOPS), which the aggregate on the other side of the sum does count.
+
+        SIZE = full `quantity`, same as PositionBalancerHandler.c_arb_pending_base and for the
+        same reason: OrderTracker builds its LimitOrder without a `filled_quantity` (defaults to
+        Decimal("NaN") and is never updated -- there is no setter), so partial-fill data is not
+        available on this object. `.is_nan()` guards it; a NaN would otherwise flow into
+        _cached_total_base_qty and silently poison every band comparison downstream.
+        The cost is a bounded, transient over-count: a fill the venue HAS already credited is
+        counted twice until its completion event arrives (seconds), and every completion
+        refreshes this cache while a correction is active. Over-counting reads the position
+        HIGHER, i.e. buy less / sell more -- convergent toward target, and the same trade-off
+        c_arb_pending_base already makes.
+
+        CLAMPED AT >= 0, deliberately asymmetric. Buys and sells are counted symmetrically first,
+        so a round-trip arb nets to zero and this returns 0 -- the guardrail sees exactly what it
+        saw before. What survives the clamp is a net in-flight ACQUISITION, which can only make
+        the position read higher. A net in-flight DISPOSAL is dropped: letting it read lower could
+        talk the guardrail into buying MORE (the divergent direction, which is this whole bug),
+        and would let a resting sell trip the deactivation hysteresis before the sell actually
+        happened -- re-arming then costs HOLD_BREACH_CYCLES_OVERBOUGHT cycles of unguarded
+        full-size arb, which is the DEXE 2026-07-26 failure. Only the convergent direction is
+        applied.
+
+        COMPLETED ORDERS ARE SKIPPED. BuyOrderCompletedListener calls c_did_complete_buy_order
+        (-> c_handle_order_completion -> this refresh) BEFORE c_did_complete_buy_order_tracker
+        (-> c_stop_tracking_limit_order), so on that one call the order sits in the settled
+        balance AND still in the tracker. The `_completed_orders` tombstone is written at the top
+        of c_handle_order_completion, before the refresh, so it is already set when we get here.
+        """
+        cdef:
+            double inflight_buy = 0.0
+            double inflight_sell = 0.0
+            double qty
+            object order_map
+            object lo
+            object filled
+            str oid
+            string oid_str
+        try:
+            for order_map in self._sb_order_tracker.tracked_limit_orders_map.values():
+                for oid, lo in order_map.items():
+                    oid_str = self._to_cpp_str(oid)
+                    if self._completed_orders.find(oid_str) != self._completed_orders.end():
+                        continue                      # already settled -- counting it double-counts
+                    qty = float(lo.quantity)
+                    filled = lo.filled_quantity
+                    if not filled.is_nan():
+                        qty -= float(filled)
+                    if not (qty > 0.0):               # also drops any NaN that slips through
+                        continue
+                    if lo.is_buy:
+                        inflight_buy += qty
+                    else:
+                        inflight_sell += qty
+        except Exception:
+            return 0.0                                # fail-open: behave exactly as before
+        if inflight_buy > inflight_sell:
+            return inflight_buy - inflight_sell
+        return 0.0
+
     cdef void c_refresh_hold_cache(self):
         """
         Refresh cached total base quantity and mid-price used by the hold-band guardrail.
@@ -1318,6 +1395,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if self._position_balancer is not None:
                 # Delegate aggregate to position balancer (alias-aware, de-duped).
                 total = self._position_balancer.c_get_aggregated_base_balance(base_asset)
+            # Base committed to orders the wallet has not caught up with yet. Gated on
+            # _hold_enabled because every reader of _cached_total_base_qty is hold-band code.
+            if self._hold_enabled:
+                total += self.c_hold_inflight_base()
             self._cached_total_base_qty = total
 
             # Price: same source as PositionBalancerHandler — top-of-book bid via C++ order book
@@ -1897,8 +1978,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # When inactive: both legs run at full `amount`. No other checks needed here.
         # When active (total confirmed outside band, all venues > $20):
         #   Overbought → reduce buy leg by (total - target) / bid; sell runs full.
-        #   Oversold   → reduce sell leg by (target - total) / bid; buy runs full.
+        #   Oversold   → reduce sell leg by (target - total) / bid; buy runs full — EXCEPT when
+        #               the sell venue holds no base, where the sell leg cannot exist at all and
+        #               the buy is capped at the deficit instead (see that branch).
         #   If delta ≥ amount, the reduced leg is fully suppressed (set to 0).
+        # Either way the invariant is the same: net base moved per trade == _delta_base.
         #
         # _hold_correction_active is set/cleared exclusively in c_refresh_hold_cache (60s cycle +
         # per-trade when already active). It is True only when guardrail is enabled, price cache
@@ -1933,6 +2017,19 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # dropped at quantization) as the single place zero-sell is handled.
                 if sell_available_now <= EPSILON:
                     _hold_sell_amount = 0.0
+                    # Zeroing the sell leg also breaks the invariant the trim depends on. With a
+                    # residue sell leg the position moves by exactly _delta_base per trade
+                    # (buy - sell == amount - (amount - _delta_base)); with no sell leg it moves by
+                    # the WHOLE buy leg, and the deficit stops bounding anything. Cap the buy at
+                    # the deficit so net acquisition is the same either way.
+                    #
+                    # Only ever REDUCES, and only inside the branch where the sell venue holds no
+                    # base at all — so a normal two-legged arb never reaches it. In [noesc]
+                    # guardrail-only accumulation the sell venue is empty by definition, which is
+                    # why every fire there was a naked full-size buy (WARD 2026-08-31: three fires
+                    # in 66s, $1450 against a $500 target).
+                    if _hold_buy_amount > _delta_base:
+                        _hold_buy_amount = _delta_base
 
 
         # ─────────────────────────────────────────────────────────────────────────
@@ -2135,6 +2232,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Logs the FINAL quantities, not the pre-quantization trim: the notional check can
             # drop a leg the trim sized, so the old line could claim a sell that never went out.
             if self._hold_correction_active and _final_buy_qty != _final_sell_qty:
+                # Credit the cache with the net base we just committed, BEFORE the venue can
+                # confirm any of it. _cached_total_base_qty is rebuilt only on the 60s cycle and
+                # on OrderCompleted -- a FILL does not touch it. Bitget filled in 30ms and sent
+                # OrderCompleted 11.3s later, so the trim re-fired twice against a $0 reading
+                # (WARD 2026-08-31). The net base just sent is information we already hold: no
+                # balance read, no venue round-trip, one double-add on a path that runs at most
+                # once per tick and only while a correction is active. The guard is the log
+                # line's own -- buy != sell is exactly "net position change is non-zero".
+                #
+                # An async placement failure (MarketOrderFailureEvent) leaves this over-credited
+                # until the next refresh, which errs toward buying LESS -- the safe direction.
+                self._cached_total_base_qty += float(_final_buy_qty) - float(_final_sell_qty)
                 self.logger().info(
                     f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
                     f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
