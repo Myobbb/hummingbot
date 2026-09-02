@@ -76,6 +76,27 @@ cdef:
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
     double ESCALATED_COOLDOWN = 3600.0  # 60 min extended timeout for repeat failures
+    # A timeout-cancel is FIRE-AND-FORGET: c_cancel_order does not raise when the venue
+    # rejects the cancel asynchronously, and the connector emits NO event on that path
+    # (exchange_py_base: logs "Failed to cancel order", returns None). We therefore retry
+    # rather than assume success. Retries are naturally paced by the order tracker's
+    # CANCEL_EXPIRY_DURATION (60s), so this cap is ~5 minutes of trying.
+    int MAX_CANCEL_ATTEMPTS = 5
+    # Orphan reconcile: an order the CONNECTOR still holds but the strategy no longer tracks.
+    # c_stop_tracking_limit_order is strategy-side only — the connector keeps the order and keeps
+    # polling it (exchange_py_base:1066), so a lost order is always recoverable from the connector's
+    # own tracker without any REST call. Only orders older than the min age are considered, so a
+    # freshly placed order that has not yet landed in _sb_order_tracker is never touched.
+    double ORPHAN_SCAN_INTERVAL = 60.0
+    double ORPHAN_MIN_AGE = 300.0
+    # Ceiling on how long the PB may keep vetoing the 120s backstop for one order.
+    # should_backstop_refresh() may return False indefinitely, and each veto RESETS
+    # _order_timestamps — so the order's age is erased and nothing ever cancels it: P2 skips PB
+    # orders outright, and the orphan reconcile only fires on orders the strategy has LOST, not on
+    # ones it still tracks. bing_x/RVV sat 3.4h this way with no cancel ever attempted.
+    # Measured healthy PB order lifetime is p50 57s / p90 94s / max 174s (24.8h audit), so an order
+    # still resting after 30 min is unambiguously stuck and worth one lost queue position.
+    double PB_BACKSTOP_VETO_MAX_AGE = 1800.0
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
@@ -135,6 +156,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._pending_sell_orders_by_market = {}  # market_tuple -> set of sell order_ids
         # Track orders cancelled due to timeout (to avoid cooldown on timeout cancellations)
         self._timeout_cancelled_orders = set()
+        # order_id -> how many timeout-cancels we have issued without a confirming event
+        self._cancel_attempts = {}
+        # OWNERSHIP: order_id -> placement timestamp, for every order THIS strategy placed.
+        # 53 strategies share connectors, so a connector's tracker holds other strategies' orders
+        # too; without this set an orphan scan would cancel another strategy's work.
+        self._placed_order_ids = {}
+        self._last_orphan_scan = 0.0
         # Track position balancer orders (to prevent main strategy from canceling them)
         self._position_balancer_orders = set()
         # Timers and caches
@@ -807,6 +835,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Check filled orders for extended timeout
             self.c_check_filled_order_timeouts()
 
+            # Recover orders the connector still holds but we stopped tracking
+            self.c_reconcile_orphan_orders()
+
             # Periodic maintenance
             if timestamp - self._last_cleanup_timestamp > 60.0:
                 self.c_cleanup_old_orders()
@@ -1148,6 +1179,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             list tombstones_to_remove = []
             string order_id_str
             double timestamp
+            double placed_at
+            double veto_age
             
         # Only clean up if we have orders to check
         if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
@@ -1177,52 +1210,102 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # On skip: leave the order/tracker untouched and RESET the timestamp so it
             # re-evaluates at the next ~120s boundary, not every tick.
             oid_pre = order_id_str.decode('utf-8')
+            # A cancel retry already in flight for this order must NOT be skipped on the PB's
+            # opinion: the order is pending cancel, so "still correctly placed" no longer applies.
             if (self._position_balancer is not None
-                    and oid_pre in self._position_balancer_orders):
+                    and oid_pre in self._position_balancer_orders
+                    and oid_pre not in self._cancel_attempts):
                 try:
                     if not self._position_balancer.should_backstop_refresh(oid_pre):
-                        self._order_timestamps[order_id_str] = self._current_timestamp
-                        continue
+                        # Honour the veto only up to an absolute ceiling. _order_timestamps is
+                        # reset on every deferral, so it cannot measure true age — _placed_order_ids
+                        # holds the original placement time and is immune to the reset.
+                        placed_at = float(self._placed_order_ids.get(oid_pre, 0.0))
+                        veto_age = (self._current_timestamp - placed_at) if placed_at > 0.0 else 0.0
+                        if placed_at <= 0.0 or veto_age < PB_BACKSTOP_VETO_MAX_AGE:
+                            self._order_timestamps[order_id_str] = self._current_timestamp
+                            continue
+                        self.logger().error(
+                            f"PB order {oid_pre} has been vetoing the backstop for {veto_age:.0f}s "
+                            f"(> {PB_BACKSTOP_VETO_MAX_AGE:.0f}s) — overriding and refreshing. "
+                            f"Healthy PB orders live <200s; this one was never going to be cancelled "
+                            f"by any path (bing_x/RVV 2026-09-02 sat 3.4h this way).")
+                        # fall through to the normal refresh/cancel below
                 except Exception:
                     # On error, fall through to the normal refresh (preserve old behaviour).
                     pass
 
-            self._order_timestamps.erase(order_id_str)
-
-            # Check for and cleanup stuck orders (still in tracker when they shouldn't be)
+            # NOTE: the timestamp is NOT erased here any more. It is the only thing that brings an
+            # order back into this loop, and erasing it before a FIRE-AND-FORGET cancel meant a
+            # cancel the venue later rejected could never be retried — the order stayed live on the
+            # exchange, referenced by nothing (gate_io/COMMON 2026-09-01, notes item 20/21). It is
+            # erased below only when the order is genuinely gone, or when we give up at the cap.
             try:
                 oid = order_id_str.decode('utf-8')
 
                 # Attempt to find market pair for the order
                 market_pair = self._sb_order_tracker.c_get_market_pair_from_order_id(oid)
-                
-                # Only log warning and cleanup if order was ACTUALLY stuck (still in tracker)
-                if market_pair is not None:
-                    # CRITICAL: Actually CANCEL the order on the exchange first!
-                    # Previously this only stopped tracking locally, leaving orders orphaned on exchanges.
-                    try:
-                        self._timeout_cancelled_orders.add(oid)  # Mark to skip cooldown
-                        self.c_cancel_order(market_pair, oid)
-                        is_pb_order = oid in self._position_balancer_orders
-                        if is_pb_order:
-                            self.logger().info(
-                                f"Position balancer order {oid} on {market_pair[0].name} "
-                                f"refreshed by backstop (2 min) - CANCEL SENT to exchange")
-                        else:
-                            self.logger().warning(
-                                f"Force cleaned up stuck order {oid} on {market_pair[0].name} "
-                                f"(older than {self._order_timeout * 2}s) - CANCEL SENT to exchange")
-                    except Exception as cancel_error:
+
+                if market_pair is None:
+                    # Not in the tracker any more — nothing to cancel. Drop the timestamp and the
+                    # auxiliary state, exactly as before.
+                    self._order_timestamps.erase(order_id_str)
+                    self._recent_order_market_pair.pop(oid, None)
+                    self._timeout_cancelled_orders.discard(oid)
+                    self._order_fill_timestamps.pop(oid, None)
+                    self._cancel_attempts.pop(oid, None)
+                    continue
+
+                # c_cancel_order is a SILENT no-op while a cancel is already in flight
+                # (strategy_base -> c_check_and_track_cancel, 60s CANCEL_EXPIRY_DURATION, also false
+                # while the created-event is still pending). Counting an attempt or logging
+                # "CANCEL SENT" in that window would be a lie; defer to the next boundary instead.
+                if self._sb_order_tracker.c_has_in_flight_cancel(oid):
+                    self._order_timestamps[order_id_str] = self._current_timestamp
+                    continue
+
+                # CRITICAL: Actually CANCEL the limit order on the exchange first!
+                # Previously this only stopped tracking locally, leaving orders orphaned on exchanges.
+                try:
+                    self._timeout_cancelled_orders.add(oid)  # Mark to skip cooldown
+                    self.c_cancel_order(market_pair, oid)
+                    is_pb_order = oid in self._position_balancer_orders
+                    if is_pb_order:
+                        self.logger().info(
+                            f"Position balancer order {oid} on {market_pair[0].name} "
+                            f"refreshed by backstop (2 min) - CANCEL SENT to exchange")
+                    else:
                         self.logger().warning(
-                            f"Failed to cancel stuck order {oid} on exchange: {cancel_error} - "
-                            f"stopping local tracking anyway")
-                        self._timeout_cancelled_orders.discard(oid)
-                    
-                    self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, oid)
-                    self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
-                    if self._position_balancer is not None:
-                        self._position_balancer.handle_old_order_cleanup(oid)
-                
+                            f"Force cleaned up stuck order {oid} on {market_pair[0].name} "
+                            f"(older than {self._order_timeout * 2}s) - CANCEL SENT to exchange")
+                except Exception as cancel_error:
+                    self.logger().warning(
+                        f"Failed to cancel stuck order {oid} on exchange: {cancel_error}")
+                    self._timeout_cancelled_orders.discard(oid)
+
+                # Retry accounting — see item 20. The cancel above is only REQUESTED; an async
+                # rejection arrives later and raises nothing here, so keep the order tracked and
+                # come back for it at the next cutoff boundary instead of assuming success.
+                attempts = self._cancel_attempts.get(oid, 0) + 1
+                self._cancel_attempts[oid] = attempts
+                if attempts < MAX_CANCEL_ATTEMPTS:
+                    self._order_timestamps[order_id_str] = self._current_timestamp
+                    continue
+
+                # Cap reached: give up exactly as the old code did, but say so LOUDLY — the order
+                # is probably still open on the exchange and only a human can clear it.
+                self.logger().error(
+                    f"Order {oid} on {market_pair[0].name} still tracked after {attempts} cancel "
+                    f"attempts — abandoning it. IT MAY STILL BE OPEN ON THE EXCHANGE and lock "
+                    f"balance; check and cancel it manually.")
+                self._cancel_attempts.pop(oid, None)
+                self._order_timestamps.erase(order_id_str)
+
+                self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, oid)
+                self.c_remove_pending_order(market_pair, oid, "forced_cleanup")
+                if self._position_balancer is not None:
+                    self._position_balancer.handle_old_order_cleanup(oid)
+
                 # Clean up auxiliary tracking
                 self._recent_order_market_pair.pop(oid, None)
                 self._timeout_cancelled_orders.discard(oid)
@@ -1233,6 +1316,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Phase 4: Clean up expired tombstones (independent of order timestamps)
         for order_id_str in tombstones_to_remove:
             self._completed_orders.erase(order_id_str)
+
+        # Prune ownership entries for orders long gone (same cutoff as the tombstones), so
+        # _placed_order_ids cannot grow without bound.
+        try:
+            stale_owned = [k for k, v in self._placed_order_ids.items() if v < cutoff]
+            for k in stale_owned:
+                self._placed_order_ids.pop(k, None)
+        except Exception:
+            pass
         
         # Warn if too many tracked orders
         if self._order_timestamps.size() > self._max_tracked_orders:
@@ -2259,6 +2351,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if buy_market_tuple not in self._pending_buy_orders_by_market:
                         self._pending_buy_orders_by_market[buy_market_tuple] = set()
                     self._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
+                    self._placed_order_ids[buy_order_id] = self._current_timestamp
                 except Exception as e:
                     self.logger().warning(f"Failed to track pending buy order: {e}")
 
@@ -2269,6 +2362,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if sell_market_tuple not in self._pending_sell_orders_by_market:
                         self._pending_sell_orders_by_market[sell_market_tuple] = set()
                     self._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
+                    self._placed_order_ids[sell_order_id] = self._current_timestamp
                 except Exception as e:
                     self.logger().warning(f"Failed to track pending sell order: {e}")
 
@@ -2339,6 +2433,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Cleanup position balancer tracking (delegated to handler).
             # Record fill-pressure FIRST — handle_order_completion pops the pending order,
             # and the recorder needs it present to resolve the canonical asset.
+            # An order that filled after we had issued a timeout-cancel leaves a stale retry
+            # counter behind; clear it so _cancel_attempts only ever holds live retries.
+            self._cancel_attempts.pop(order_id, None)
+            self._placed_order_ids.pop(order_id, None)
+
             if self._position_balancer is not None:
                 self._position_balancer.c_record_fill_pressure(order_id, is_buy)
                 self._position_balancer.handle_order_completion(order_id, is_buy)
@@ -2430,6 +2529,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             pass
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair, order_id)
 
+        # The cancel landed — retries are done.
+        self._cancel_attempts.pop(order_id, None)
+        self._placed_order_ids.pop(order_id, None)
+
         # Cleanup position balancer tracking (delegated to handler)
         if self._position_balancer is not None:
             self._position_balancer.handle_order_cancellation(order_id)
@@ -2515,6 +2618,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # 2026-07-29 — see PositionBalancerHandler.handle_order_failure.)
         if self._position_balancer is not None:
             self._position_balancer.handle_order_failure(order_id)
+        # A rejected placement never rested on the venue — drop ownership.
+        self._placed_order_ids.pop(order_id, None)
 
         if market_pair_tuple is None:
             return
@@ -2547,6 +2652,85 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self.logger().warning(
                 f"Order placement failed on {market_pair_tuple[0].name} for {market_pair_tuple.trading_pair}; "
                 f"cooling down for {cooldown_duration:.0f}s{escalation_note}")
+
+    cdef void c_reconcile_orphan_orders(self):
+        """
+        Recover orders the CONNECTOR still holds but the strategy has stopped tracking.
+
+        WHY THIS EXISTS. All three cancel paths call `c_stop_tracking_limit_order`, which clears
+        only `_sb_order_tracker` — the STRATEGY's view. The connector's own tracker
+        (`ClientOrderTracker`) is untouched and keeps the order until a terminal update arrives,
+        and `_update_orders()` keeps polling it. So when a cancel is rejected (or never issued at
+        all) the order stays live on the venue, locking balance, referenced by nothing on our side:
+        gate_io/COMMON sat for days, bing_x/RVV for hours with no cancel ever attempted. The order
+        is always still there in the connector's tracker — no REST call is needed to find it.
+
+        SAFETY. The process runs ~53 strategies over shared connectors, so a connector's tracker
+        holds every strategy's orders. `_placed_order_ids` is the ownership key: only orders THIS
+        strategy placed are ever considered. Additionally an order must be older than
+        ORPHAN_MIN_AGE (so a placement that has not yet reached `_sb_order_tracker` is never
+        touched), must belong to the market tuple being examined, and must not already have a
+        cancel in flight.
+        """
+        cdef:
+            double now = self._current_timestamp
+            double placed_at
+            object market_pair, mt, market, order
+            str oid
+            list found = []
+        if now - self._last_orphan_scan < ORPHAN_SCAN_INTERVAL:
+            return
+        self._last_orphan_scan = now
+        if not self._placed_order_ids:
+            return
+        try:
+            for market_pair in self._market_pairs:
+                for mt in (market_pair.first, market_pair.second):
+                    market = mt.market
+                    try:
+                        # all_fillable_orders = active + cached + lost, so an order that slipped
+                        # into the cached/lost buckets is still recovered.
+                        tracked = market._order_tracker.all_fillable_orders
+                    except Exception:
+                        try:
+                            tracked = market.in_flight_orders
+                        except Exception:
+                            continue
+                    for oid, order in dict(tracked).items():
+                        placed_at = float(self._placed_order_ids.get(oid, 0.0))
+                        if placed_at <= 0.0:
+                            continue                                  # not ours
+                        if now - placed_at < ORPHAN_MIN_AGE:
+                            continue                                  # too fresh to judge
+                        try:
+                            if order.trading_pair != mt.trading_pair:
+                                continue                              # wrong pair for this tuple
+                            if order.is_done:
+                                continue                              # terminal already
+                        except Exception:
+                            pass
+                        if self._sb_order_tracker.c_get_market_pair_from_order_id(oid) is not None:
+                            continue                                  # strategy still tracks it
+                        if self._sb_order_tracker.c_has_in_flight_cancel(oid):
+                            continue                                  # cancel already going out
+                        found.append((mt, oid, now - placed_at))
+            for mt, oid, age in found:
+                self.logger().error(
+                    f"ORPHAN RECOVERED: order {oid} on {mt.market.name} ({mt.trading_pair}) is still "
+                    f"live in the connector after {age:.0f}s but the strategy stopped tracking it — "
+                    f"cancelling. It was locking balance and no cancel path could see it.")
+                try:
+                    self._recent_order_market_pair[oid] = mt
+                except Exception:
+                    pass
+                self._timeout_cancelled_orders.add(oid)
+                try:
+                    self.c_cancel_order(mt, oid)
+                except Exception as e:
+                    self.logger().error(f"ORPHAN cancel failed for {oid}: {e}")
+                    self._timeout_cancelled_orders.discard(oid)
+        except Exception as e:
+            self.logger().warning(f"Orphan reconcile error: {e}")
 
     cdef void c_check_all_order_timeouts(self):
         """
@@ -2625,15 +2809,34 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._timeout_cancelled_orders.discard(order_id)
                 continue
 
-            # Mark as tombstone with timestamp (prevents resurrection, enables expiry)
-            self._completed_orders[order_id_str] = self._current_timestamp
-
-            # CRITICAL: Stop tracking the order immediately to prevent re-processing
-            # before the cancel event arrives (prevents repeated cancel attempts)
             try:
                 self._recent_order_market_pair[order_id] = market_tuple
             except Exception:
                 pass
+
+            # DO NOT tombstone/untrack yet — the cancel is only REQUESTED. c_cancel_order is
+            # fire-and-forget and the venue may still reject it (gate_io/COMMON 2026-09-01: the
+            # rejection landed 76ms after this line). Untracking here made that order invisible to
+            # every later sweep and it sat live for days, locking the base and deadlocking the
+            # sell-off. Re-processing is already prevented WITHOUT untracking: Phase 1 skips any
+            # order with c_has_in_flight_cancel, armed by strategy_base on every c_cancel_order and
+            # self-expiring after CANCEL_EXPIRY_DURATION (60s) — so a rejected cancel simply retries.
+            # The confirming OrderCancelled event does the real cleanup in c_did_cancel_order_tracker.
+            attempts = self._cancel_attempts.get(order_id, 0) + 1
+            self._cancel_attempts[order_id] = attempts
+            if attempts < MAX_CANCEL_ATTEMPTS:
+                continue
+
+            # Cap reached: stop retrying, but say so LOUDLY — the order is probably still open on
+            # the exchange and only a human can clear it. Silence here is what hid the orphans.
+            self.logger().error(
+                f"Order {order_id} on {market_tuple[0].name} still tracked after {attempts} cancel "
+                f"attempts (~{attempts * 60}s) — abandoning it. IT MAY STILL BE OPEN ON THE EXCHANGE "
+                f"and lock balance; check and cancel it manually.")
+            self._cancel_attempts.pop(order_id, None)
+
+            # Mark as tombstone with timestamp (prevents resurrection, enables expiry)
+            self._completed_orders[order_id_str] = self._current_timestamp
             self._sb_order_tracker.c_stop_tracking_limit_order(market_tuple, order_id)
 
             # Cleanup position balancer tracking (delegated to handler)
@@ -2717,11 +2920,28 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self._timeout_cancelled_orders.discard(order_id)
                 continue
 
+            try:
+                self._recent_order_market_pair[order_id] = market_tuple
+            except Exception:
+                pass
+
+            # Same fire-and-forget hazard as c_cleanup_old_orders — see the note there. Retry
+            # instead of assuming the cancel took; the confirming event does the real cleanup.
+            attempts = self._cancel_attempts.get(order_id, 0) + 1
+            self._cancel_attempts[order_id] = attempts
+            if attempts < MAX_CANCEL_ATTEMPTS:
+                continue
+
+            self.logger().error(
+                f"Filled order {order_id} on {market_tuple[0].name} still tracked after {attempts} "
+                f"cancel attempts (~{attempts * 60}s) — abandoning it. IT MAY STILL BE OPEN ON THE "
+                f"EXCHANGE and lock balance; check and cancel it manually.")
+            self._cancel_attempts.pop(order_id, None)
+
             # Mark as tombstone with timestamp (prevents resurrection, enables expiry)
             try:
                 order_id_str = self._to_cpp_str(order_id)
                 self._completed_orders[order_id_str] = self._current_timestamp
-                self._recent_order_market_pair[order_id] = market_tuple
             except Exception:
                 pass
 

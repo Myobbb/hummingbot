@@ -82,6 +82,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         dict _pending_sell_orders_by_market  # market_tuple -> set of sell order_ids
         # Track orders cancelled due to timeout (to avoid cooldown on timeout cancellations)
         set _timeout_cancelled_orders
+        dict _cancel_attempts
+        dict _placed_order_ids
+        double _last_orphan_scan
         # Track position balancer orders (to prevent main strategy from canceling them)
         set _position_balancer_orders
 

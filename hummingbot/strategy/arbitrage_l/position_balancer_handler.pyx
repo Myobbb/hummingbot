@@ -3318,6 +3318,10 @@ cdef class PositionBalancerHandler:
         # Mark as position balancer order to prevent main strategy timeout cancellation
         try:
             self.strategy._position_balancer_orders.add(buy_order_id)
+            # Ownership for the orphan reconcile (arbitrage.pyx c_reconcile_orphan_orders):
+            # PB places its own orders, so without this they would never be recoverable —
+            # and every orphan found so far (COMMON/gate_io, RVV/bing_x) was a PB order.
+            self.strategy._placed_order_ids[buy_order_id] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
@@ -3693,6 +3697,10 @@ cdef class PositionBalancerHandler:
         # Mark as position balancer order to prevent main strategy timeout cancellation
         try:
             self.strategy._position_balancer_orders.add(sell_order_id)
+            # Ownership for the orphan reconcile (arbitrage.pyx c_reconcile_orphan_orders):
+            # PB places its own orders, so without this they would never be recoverable —
+            # and every orphan found so far (COMMON/gate_io, RVV/bing_x) was a PB order.
+            self.strategy._placed_order_ids[sell_order_id] = self.strategy._current_timestamp
         except Exception as e:
             self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
 
