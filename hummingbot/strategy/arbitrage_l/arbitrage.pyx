@@ -89,14 +89,6 @@ cdef:
     # freshly placed order that has not yet landed in _sb_order_tracker is never touched.
     double ORPHAN_SCAN_INTERVAL = 60.0
     double ORPHAN_MIN_AGE = 300.0
-    # Ceiling on how long the PB may keep vetoing the 120s backstop for one order.
-    # should_backstop_refresh() may return False indefinitely, and each veto RESETS
-    # _order_timestamps — so the order's age is erased and nothing ever cancels it: P2 skips PB
-    # orders outright, and the orphan reconcile only fires on orders the strategy has LOST, not on
-    # ones it still tracks. bing_x/RVV sat 3.4h this way with no cancel ever attempted.
-    # Measured healthy PB order lifetime is p50 57s / p90 94s / max 174s (24.8h audit), so an order
-    # still resting after 30 min is unambiguously stuck and worth one lost queue position.
-    double PB_BACKSTOP_VETO_MAX_AGE = 1800.0
     double EPSILON = 1e-10
     double QUANTIZATION_EPSILON = 1e-12
     double RATE_LOG_INTERVAL = 300.0
@@ -1179,8 +1171,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
             list tombstones_to_remove = []
             string order_id_str
             double timestamp
-            double placed_at
-            double veto_age
             
         # Only clean up if we have orders to check
         if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
@@ -1217,20 +1207,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     and oid_pre not in self._cancel_attempts):
                 try:
                     if not self._position_balancer.should_backstop_refresh(oid_pre):
-                        # Honour the veto only up to an absolute ceiling. _order_timestamps is
-                        # reset on every deferral, so it cannot measure true age — _placed_order_ids
-                        # holds the original placement time and is immune to the reset.
-                        placed_at = float(self._placed_order_ids.get(oid_pre, 0.0))
-                        veto_age = (self._current_timestamp - placed_at) if placed_at > 0.0 else 0.0
-                        if placed_at <= 0.0 or veto_age < PB_BACKSTOP_VETO_MAX_AGE:
-                            self._order_timestamps[order_id_str] = self._current_timestamp
-                            continue
-                        self.logger().error(
-                            f"PB order {oid_pre} has been vetoing the backstop for {veto_age:.0f}s "
-                            f"(> {PB_BACKSTOP_VETO_MAX_AGE:.0f}s) — overriding and refreshing. "
-                            f"Healthy PB orders live <200s; this one was never going to be cancelled "
-                            f"by any path (bing_x/RVV 2026-09-02 sat 3.4h this way).")
-                        # fall through to the normal refresh/cancel below
+                        # The PB's veto is ABSOLUTE — deliberately. An age-based override was tried
+                        # 2026-09-02 and reverted the same day: a correctly-placed order on a quiet
+                        # book legitimately rests for hours, and cancelling it re-places at the
+                        # identical price, surrendering FIFO queue position for nothing — exactly the
+                        # churn this veto exists to prevent. bing_x/RVV was mistaken for an orphan on
+                        # age alone; the book showed it sitting AT the best ask the whole time.
+                        # Age does not indicate an orphan. Use c_reconcile_orphan_orders instead: it
+                        # fires only when the strategy has genuinely LOST the order.
+                        self._order_timestamps[order_id_str] = self._current_timestamp
+                        continue
                 except Exception:
                     # On error, fall through to the normal refresh (preserve old behaviour).
                     pass
