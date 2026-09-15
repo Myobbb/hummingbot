@@ -19,6 +19,7 @@ startup, and its `except Exception` does NOT catch SystemExit (a BaseException) 
 `sys.exit()` out here killed HB on launch instead of starting it. Import must be a no-op.
 """
 import sys
+from decimal import Decimal
 
 
 def main() -> int:
@@ -44,6 +45,28 @@ def main() -> int:
     chk("coinex registered", "coinex" in s)
     chk("live venues intact", all(x in s for x in
         ["binance", "bybit", "kucoin", "gate_io", "mexc", "htx", "bing_x", "okx", "bitget", "bitmart"]))
+    # The check that was missing: HB does NOT construct a connector the way a test script does.
+    # UserBalances.connect_market (user/user_balances.py:37) builds kwargs via
+    # ConnectorSetting.conn_init_parameters -- which ALWAYS injects `balance_asset_limit` -- and
+    # calls connector_class(**params). A connector whose __init__ omits that argument imports and
+    # registers perfectly, then dies with TypeError the first time `balance` touches it.
+    # Exercise the real construction path, not a hand-written kwargs list.
+    from hummingbot.client.config.config_helpers import get_connector_class
+    for name in ("coinex", "gate_io", "bybit"):
+        setting = s[name]
+        keys = {k: "x" for k in (setting.config_keys.__class__.model_fields if setting.config_keys else {})
+                if k != "connector"}
+        params = setting.conn_init_parameters(
+            trading_pairs=["BTC-USDT"], trading_required=False, api_keys=keys,
+            balance_asset_limit={}, rate_limits_share_pct=Decimal("100"),
+        )
+        try:
+            get_connector_class(name)(**params)
+            chk(f"{name}: constructs through the real conn_init_parameters path", True)
+        except Exception as exception:
+            chk(f"{name}: constructs through the real conn_init_parameters path", False,
+                f"-> {type(exception).__name__}: {exception}")
+
     print("\nPREFLIGHT OK" if ok else "\nPREFLIGHT FAILED — do not restart")
     return 0 if ok else 1
 

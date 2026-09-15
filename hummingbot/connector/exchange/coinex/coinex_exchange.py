@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -28,9 +28,6 @@ from hummingbot.core.data_type.trade_fee import (
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class CoinexExchange(ExchangePyBase):
     """
@@ -45,20 +42,27 @@ class CoinexExchange(ExchangePyBase):
 
     def __init__(
         self,
-        client_config_map: "ClientConfigAdapter",
         coinex_api_key: str,
         coinex_secret_key: str,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ) -> None:
+        """
+        Signature must match what ConnectorSetting.conn_init_parameters builds
+        (client/settings.py), which ALWAYS passes `balance_asset_limit` and — for sub-domains —
+        `rate_limits_share_pct`. This fork's ExchangePyBase takes exactly those two and no
+        config-map argument; every other connector here follows the same shape.
+        """
         self._api_key = coinex_api_key
         self._secret_key = coinex_secret_key
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._audit_seen: set = set()   # one-shot audit tags; see _audit_once
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ------------------------------------------------------------------ identity / config
 

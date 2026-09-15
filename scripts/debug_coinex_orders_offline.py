@@ -26,7 +26,6 @@ from typing import Any, Dict, List
 
 from bidict import bidict
 
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.coinex import coinex_constants as CONSTANTS
 from hummingbot.connector.exchange.coinex.coinex_exchange import CoinexExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -46,13 +45,7 @@ def check(label: str, got: Any, want: Any) -> None:
 
 
 def build_connector() -> CoinexExchange:
-    # Imported INSIDE the function on purpose: HB's autocomplete builder
-    # (client/ui/completer.py get_strategies_v2_with_config) imports every scripts/*.py at
-    # launch and treats any module-level BaseClientModel subclass as a strategy config, which
-    # would list this debug script under `start --script`. Keeping it local stays out of that.
-    from hummingbot.client.config.client_config_map import ClientConfigMap
     ex = CoinexExchange(
-        client_config_map=ClientConfigAdapter(ClientConfigMap()),
         coinex_api_key="k", coinex_secret_key="s",
         trading_pairs=[TRADING_PAIR], trading_required=False,
     )

@@ -27,7 +27,6 @@ import time
 from decimal import Decimal
 from typing import List
 
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.coinex.coinex_exchange import CoinexExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
 
@@ -36,17 +35,11 @@ RUNTIME_ADD_PAIR = "CARDS-USDT"
 
 
 async def main() -> int:
-    # Imported INSIDE the function on purpose: HB's autocomplete builder
-    # (client/ui/completer.py get_strategies_v2_with_config) imports every scripts/*.py at
-    # launch and treats any module-level BaseClientModel subclass as a strategy config, which
-    # would list this debug script under `start --script`. Keeping it local stays out of that.
-    from hummingbot.client.config.client_config_map import ClientConfigMap
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 25
     pairs = sys.argv[2:] or DEFAULT_PAIRS
     failures: List[str] = []
 
     connector = CoinexExchange(
-        client_config_map=ClientConfigAdapter(ClientConfigMap()),
         coinex_api_key="", coinex_secret_key="",
         trading_pairs=list(pairs),
         trading_required=False,
