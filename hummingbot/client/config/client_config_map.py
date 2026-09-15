@@ -464,11 +464,6 @@ class ExchangeRateSourceModeBase(RateSourceModeBase):
         return RATE_ORACLE_SOURCES[self.model_config["title"]]()
 
 
-class AscendExRateSourceMode(ExchangeRateSourceModeBase):
-    name: str = Field(default="ascend_ex")
-    model_config = ConfigDict(title="ascend_ex")
-
-
 class BinanceRateSourceMode(ExchangeRateSourceModeBase):
     name: str = Field(default="binance")
     model_config = ConfigDict(title="binance")
@@ -669,7 +664,6 @@ class DeriveRateSourceMode(ExchangeRateSourceModeBase):
 
 
 RATE_SOURCE_MODES = {
-    AscendExRateSourceMode.model_config["title"]: AscendExRateSourceMode,
     BinanceRateSourceMode.model_config["title"]: BinanceRateSourceMode,
     BinanceUSRateSourceMode.model_config["title"]: BinanceUSRateSourceMode,
     CoinGeckoRateSourceMode.model_config["title"]: CoinGeckoRateSourceMode,

@@ -1,6 +1,5 @@
 from typing import Dict, Type
 
-from hummingbot.data_feed.candles_feed.ascend_ex_spot_candles.ascend_ex_spot_candles import AscendExSpotCandles
 from hummingbot.data_feed.candles_feed.binance_perpetual_candles import BinancePerpetualCandles
 from hummingbot.data_feed.candles_feed.binance_spot_candles import BinanceSpotCandles
 from hummingbot.data_feed.candles_feed.bitmart_perpetual_candles.bitmart_perpetual_candles import (
@@ -50,7 +49,6 @@ class CandlesFactory:
         "gate_io_perpetual": GateioPerpetualCandles,
         "kucoin": KucoinSpotCandles,
         "kucoin_perpetual": KucoinPerpetualCandles,
-        "ascend_ex": AscendExSpotCandles,
         "okx_perpetual": OKXPerpetualCandles,
         "okx": OKXSpotCandles,
         "kraken": KrakenSpotCandles,

@@ -7,7 +7,6 @@ import hummingbot.client.settings  # noqa
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.rate_oracle.sources.ascend_ex_rate_source import AscendExRateSource
 from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
 from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUSRateSource
 from hummingbot.core.rate_oracle.sources.coin_cap_rate_source import CoinCapRateSource
@@ -31,7 +30,6 @@ RATE_ORACLE_SOURCES = {
     "coin_gecko": CoinGeckoRateSource,
     "coin_cap": CoinCapRateSource,
     "kucoin": KucoinRateSource,
-    "ascend_ex": AscendExRateSource,
     "gate_io": GateIoRateSource,
     "coinbase_advanced_trade": CoinbaseAdvancedTradeRateSource,
     "cube": CubeRateSource,
