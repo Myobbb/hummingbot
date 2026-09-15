@@ -27,7 +27,6 @@ import sys
 from decimal import Decimal
 from typing import List
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.coinex.coinex_exchange import CoinexExchange
 from hummingbot.core.clock import Clock
@@ -39,6 +38,11 @@ TRADING_PAIR = "BTC-USDT"
 
 
 async def main() -> int:
+    # Imported INSIDE the function on purpose: HB's autocomplete builder
+    # (client/ui/completer.py get_strategies_v2_with_config) imports every scripts/*.py at
+    # launch and treats any module-level BaseClientModel subclass as a strategy config, which
+    # would list this debug script under `start --script`. Keeping it local stays out of that.
+    from hummingbot.client.config.client_config_map import ClientConfigMap
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 40
     failures: List[str] = []
 
