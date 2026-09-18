@@ -61,6 +61,10 @@ cdef class PositionBalancerHandler:
         double _arb_pending_ts
         # asset -> cancel timestamp already logged by the post-cancel settle gate
         dict _settle_gate_logged
+        # asset -> last time we warned that a computed position came out NEGATIVE (impossible state)
+        dict _neg_position_warn_time
+        # our own orders untracked by a stuck-cancel cleanup while still live on the venue
+        set _disowned_live_orders
         # Second-level refuge state (per canonical asset) — truthy = resting under the wall (2nd-best),
         # undercut suppressed; the VALUE is the intended park depth (foreign levels we sat behind)
         dict _in_refuge_sell
@@ -89,6 +93,7 @@ cdef class PositionBalancerHandler:
     cdef double c_get_aggregated_base_balance(self, str asset)
     cdef double c_get_actual_base_balance(self, str asset)
     cdef double c_arb_pending_base(self, str asset, bint is_buy)
+    cdef bint c_order_still_tracked(self, str order_id)
     cdef double c_get_adjusted_base_balance(self, str asset)
     cdef double c_active_fill_pressure_wait(self, str canonical_asset)
     cdef bint c_post_cancel_balance_stale(self, object sell_market_tuple, str asset_key)

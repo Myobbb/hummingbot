@@ -355,6 +355,11 @@ cdef class PositionBalancerHandler:
         self._arb_pending_ts = -1.0
         # asset -> cancel timestamp we already logged a settle-gate wait for (one line per episode)
         self._settle_gate_logged = {}
+        # asset -> last NEGATIVE-position warning (throttled; see c_try_mark_sell_complete)
+        self._neg_position_warn_time = {}
+        # Our own orders that a stuck-cancel cleanup untracked while they were still live on
+        # the venue — excluded from c_arb_pending_base so they are never mistaken for arb legs.
+        self._disowned_live_orders = set()
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
@@ -431,6 +436,68 @@ cdef class PositionBalancerHandler:
     def is_sell_completed(self):
         """Returns True if sell-off target has been reached."""
         return self._sell_completed
+
+    def position_drained(self):
+        """
+        (drained, detail) — "is there anything left worth selling?", answered fresh.
+
+        Python-visible on purpose: the orchestrator's `clean` auto-remove path is `.py` and cannot
+        reach a cdef method, and `_min_order_usd` is not a public cdef attr, so the bar has to be
+        applied here where the numbers live. Reads the TOTAL balance and a live reference bid —
+        never a cache: a stale position is what this gate exists to catch.
+
+        `drained` is True only when the asset is genuinely gone or down to untradeable dust. The
+        bar is the PB's own `_min_order_usd` — the same threshold c_try_mark_sell_complete uses to
+        call a residual too small to trade — so there is no new knob and no second definition of
+        "dust" to keep in sync.
+
+        An unpriceable holding returns NOT drained. A bid of 0 means the book is empty or not warm,
+        not that the tokens are worthless, and value = base * 0 = 0 would otherwise read as "fully
+        sold" — the same false-zero class of bug as the one this whole change fixes.
+        """
+        cdef:
+            str asset_key
+            str canonical
+            double base = 0.0
+            double bid
+            double value
+            double bar = self.strategy._min_order_usd
+        # Deliberately NOT c_get_aggregated_base_balance, even though this repeats it: that one
+        # ends in `except Exception: return 0.0`, which is the right fail-open for sizing and
+        # exactly wrong here. A swallowed read error would arrive as base == 0 and this gate would
+        # certify a funded strategy as drained — the same false-zero that produced the losses it is
+        # meant to stop. Here the read must either succeed or say so.
+        try:
+            asset_key = self.strategy._market_pairs[0].first.base_asset
+            canonical = self._get_canonical_asset(asset_key)
+            aliases = self._get_all_asset_aliases(canonical)
+            checked = set()
+            for mp in self.strategy._market_pairs:
+                for mt in (mp.first, mp.second):
+                    if mt.base_asset in aliases:
+                        key = (mt.market, mt.base_asset)
+                        if key not in checked:
+                            checked.add(key)
+                            base += float(mt.market.get_balance(mt.base_asset))
+            if not checked:
+                # No venue in this strategy can hold the asset — a zero here is an artefact of the
+                # market set, not a statement about inventory.
+                return False, "no market tuple holds this asset — cannot measure the position"
+            bid = self.strategy.c_get_reference_bid_for_asset(canonical)
+        except Exception as e:
+            # Cannot measure => cannot certify drained. Fail CLOSED: refusing a removal is
+            # recoverable, removing a funded strategy is not.
+            return False, f"position unreadable ({e})"
+        if base <= EPSILON:
+            return True, f"{canonical} balance is zero"
+        if bid <= 0.0:
+            return False, (f"{canonical} still holds {base:.8g} but has no reference bid "
+                           f"(empty/cold book) — cannot price it, so not certifying it as sold")
+        value = base * bid
+        if value < bar:
+            return True, f"{canonical} down to dust: {base:.8g} = ${value:.2f} < ${bar:.2f}"
+        return False, (f"{canonical} still holds {base:.8g} = ${value:.2f} "
+                       f"(bid ${bid:.8g}), above the ${bar:.2f} dust bar")
 
     cdef void _build_asset_aliases(self):
         """
@@ -728,9 +795,18 @@ cdef class PositionBalancerHandler:
                 self._arb_pending_ts = now
                 self._arb_pending_cache = {}
                 pb_orders = self.strategy._position_balancer_orders
+                # ...plus orders a stuck-cancel cleanup untracked locally while they were still
+                # live on the venue. They are ours, not arb legs. Their base is NOT re-added to
+                # _pending_*_by_asset (the cleanup cleared it on the assumption the cancel lands),
+                # so they are simply not counted here — the same treatment any of our own orders
+                # gets once its pending bookkeeping is gone. Sizing cannot overshoot as a result:
+                # placement is still capped by the venue's own get_available_balance, which
+                # excludes the base the live order has locked, and c_post_cancel_balance_stale
+                # defers sizing entirely while the venue has not released it.
+                disowned = self._disowned_live_orders
                 for _mp, order_map in self.strategy._sb_order_tracker.tracked_limit_orders_map.items():
                     for oid, lo in order_map.items():
-                        if oid in pb_orders:
+                        if oid in pb_orders or oid in disowned:
                             continue                       # our own — already in _pending_*_by_asset
                         _filled = lo.filled_quantity
                         remaining = float(lo.quantity)
@@ -748,6 +824,22 @@ cdef class PositionBalancerHandler:
             return total
         except Exception:
             return 0.0                                     # fail-open: behave as before
+
+    cdef bint c_order_still_tracked(self, str order_id):
+        """
+        True while the FRAMEWORK still holds this order — i.e. no terminal event has landed.
+
+        Same source of truth c_arb_pending_base scans, so "is it ours" and "is it still resting"
+        are answered from one place. Used by the stuck-cancel cleanup to decide whether it must
+        keep ownership of the order it is about to untrack locally.
+        """
+        try:
+            for _mp, order_map in self.strategy._sb_order_tracker.tracked_limit_orders_map.items():
+                if order_id in order_map:
+                    return True
+        except Exception:
+            return True          # fail-safe: assume still live, so ownership is KEPT, not dropped
+        return False
 
     cdef double c_get_adjusted_base_balance(self, str asset):
         """
@@ -861,6 +953,36 @@ cdef class PositionBalancerHandler:
                                        double current_value_quote,
                                        double excess):
         """Mark sell-off as completed if at target or remaining < min notional."""
+        # A NEGATIVE position is an accounting artifact, never a holding — and with `control clean`
+        # (target 0) the `value <= target` branch below reads it as FULLY SOLD, disables sell-off,
+        # and the orchestrator auto-removes the strategy with the asset still in the wallet.
+        # That is not hypothetical: 5 strategies were removed holding ~$240 in the 8 days to
+        # 2026-09-18 (PUNDIX 653.16 tokens / $71.9 left on mexc, KAS $86.7, PYR $63.6, SNEK $15.7,
+        # M87 $2.3). Route: a stuck cancel -> c_check_stuck_cancel force-cleanup ->
+        # handle_order_completion discards the order from strategy._position_balancer_orders while
+        # it is STILL LIVE in _sb_order_tracker (mexc confirmed PUNDIX's cancel 24 s AFTER the
+        # removal) -> c_arb_pending_base, which excludes by exactly that set, counts our own order
+        # as a foreign arb leg at its FULL quantity -> c_get_adjusted_base_balance goes negative
+        # (PUNDIX: 653.16 held - 907.60 order = -254.44 -> -$28.03).
+        #
+        # Refusing here is the correct answer in every direction: the caller treats False as "not
+        # done" and keeps selling, which is what a real remaining position requires. Fixing the
+        # caller (below, and at CHECK-1) to read the ACTUAL balance removes the only known source
+        # of a negative value, so this guard should log NOTHING — it is the invariant, not the fix.
+        # Throttled per asset anyway (MIN_TICK_WARN_INTERVAL): at tick_size 0.01 an unthrottled
+        # line here would be ~100/s, the same flood that min_tick=0 produced (1.2M lines).
+        if current_value_quote < 0.0:
+            if (self.strategy._current_timestamp
+                    - <double> self._neg_position_warn_time.get(pair, 0.0)) >= MIN_TICK_WARN_INTERVAL:
+                self._neg_position_warn_time[pair] = self.strategy._current_timestamp
+                self.strategy.logger().warning(
+                    f"Position balancer: NEGATIVE computed position for {pair} "
+                    f"(${current_value_quote:.2f}) — refusing to mark the sell-off complete. "
+                    f"A held position cannot be negative, so this is an accounting artifact "
+                    f"(most likely one of our own live orders counted as a foreign arb leg after a "
+                    f"stuck-cancel cleanup). Sell-off stays armed; further warnings for this asset "
+                    f"suppressed for {MIN_TICK_WARN_INTERVAL:.0f}s.")
+            return False
         if current_value_quote <= self._sell_target_usd:
             self._sell_completed = True
             self.c_maybe_disable_sell()
@@ -1010,6 +1132,10 @@ cdef class PositionBalancerHandler:
         try:
             # Remove from position balancer tracking set
             self.strategy._position_balancer_orders.discard(order_id)
+            # ...and from the disowned-but-live set, if a stuck cancel had put it there. This runs
+            # for every terminal event (venue cancel, fill, old-order sweep) and before the
+            # is_buy branch, so the set cannot outlive the order it describes.
+            self._disowned_live_orders.discard(order_id)
 
             if is_buy:
                 pend = self._pending_buy_orders.pop(order_id, None)
@@ -1855,6 +1981,38 @@ cdef class PositionBalancerHandler:
             
             # Force cleanup by calling handle_order_cancellation
             self.handle_order_cancellation(order_id)
+
+            # OWNERSHIP MUST SURVIVE THE CLEANUP.
+            # handle_order_cancellation -> handle_order_completion discards the id from
+            # strategy._position_balancer_orders, and that set is the ONLY thing telling
+            # c_arb_pending_base "this order is ours, it is already in _pending_*_by_asset".
+            # But the order is by definition STILL LIVE here — that is what "stuck" means — so
+            # dropping ownership re-labels our own resting order as a FOREIGN ARB LEG, counted at
+            # its full quantity. The local tracking above must go (it is what blocks placement);
+            # the attribution must not. Dropping both is what produced the 2026-09-18 losses:
+            # sell side -> adjusted position went negative and `value <= target 0` read as fully
+            # sold (5 strategies auto-removed holding ~$240); buy side -> adjusted was inflated by
+            # exactly the shortfall the order was sized to close, so the buy-in read as complete
+            # (19 of 34 killed, 12 of them oversold).
+            #
+            # Recorded in a DEDICATED set, not by re-adding to strategy._position_balancer_orders.
+            # That set answers five different questions in arbitrage.pyx, and only one of them is
+            # attribution: it also grants the 2-min backstop cutoff instead of the arb one
+            # (c_cleanup_old_orders), gives the PB a veto on the backstop refresh, and makes
+            # c_check_all_order_timeouts SKIP the order entirely. Putting a disowned order back
+            # there would fix the accounting and simultaneously stop anything from chasing it —
+            # the PB has just forgotten it, so the arb timeout path is the only chaser left. That
+            # is how the PIVX deadlock was built. This set is read by c_arb_pending_base and
+            # nothing else, so every lifecycle behaviour stays exactly as it is today.
+            #
+            # Bounded, not a leak: handle_order_completion discards from it unconditionally, and
+            # the framework always gets there — via handle_order_cancellation on the venue's own
+            # cancel event, or handle_old_order_cleanup on the 60 s sweep. All 72 stuck-cancel
+            # events in the 8 days to 2026-09-18 resolved: median 22.1 s, p90 43.3 s, max 49.8 s,
+            # none past 60 s. The liveness test keeps it honest — an order that is ALREADY gone has
+            # had its terminal event, so adding it now would orphan the id forever.
+            if self.c_order_still_tracked(order_id):
+                self._disowned_live_orders.add(order_id)
             
             # Clean up from timeout set
             self.strategy._timeout_cancelled_orders.discard(order_id)
@@ -2827,11 +2985,37 @@ cdef class PositionBalancerHandler:
             #
             # Guarded on nothing being in flight: `base_bal` is the ADJUSTED balance, so while a
             # buy order rests it already counts toward the target and `actual` legitimately lags.
-            # With zero pending, adjusted == actual, so this completes on the values already
-            # computed — no extra balance reads, and once _buy_completed is set the enclosing
-            # `not self._buy_completed` stops it re-running.
+            #
+            # The guard used to be the WHOLE story, on the premise "with zero pending,
+            # adjusted == actual, so this completes on the values already computed — no extra
+            # balance reads". That is true of _pending_buy_by_asset, which the guard reads, and
+            # FALSE of c_arb_pending_base, which it does not: after a stuck-cancel cleanup
+            # (handle_order_completion discards the order from strategy._position_balancer_orders
+            # while it is still LIVE in _sb_order_tracker) our own buy becomes a foreign arb leg,
+            # counted at its FULL quantity, so `adjusted` is INFLATED by up to a whole order.
+            #
+            # That is deterministic on the LAST order of any buy-in, not a coincidence of sizes:
+            # the PB sizes a buy at min(order_size_usd, shortfall), so once the gap fits in one
+            # order, qty * bid == shortfall exactly and adjusted == actual + shortfall == target.
+            # The gap looks closed because the order that was going to close it got counted as
+            # inventory. **19 of 34 stuck buy-cancels in the 8 days to 2026-09-18 terminated the
+            # buy-in this way** (all mexc; AO 9x, FLT 3x, GLQ 2x). GLQ 09-18 09:17:46 cancel ->
+            # 09:17:56 "Buy-in target reached" -> 09:18:14 hold-band reports the position OVERSOLD
+            # at $413 against a $450 floor: the disowned order was 152,632.77 GLQ = $86.7, and
+            # $413 + $86.7 = $499.7 = the $500 target, to the dollar. Buy-in was switched off and
+            # every buy order cancelled $87 short, leaving the arb under-inventoried until the AM
+            # re-armed it.
+            #
+            # So completion reads the ACTUAL position, exactly as the sell gate below and the
+            # CHECK-2 site further down already do. No negative-value guard is needed on this side
+            # (unlike the sell gate): the arb terms inflate, and an inflated-away value only makes
+            # `shortfall` larger, i.e. keeps buying. Costs one balance read on the tick the side
+            # closes out — `shortfall_or_excess <= 0` is false on every working tick.
+            # Detail: [[trading/hummingbot/P2 Hummingbot Open Items#clean-disowned-order-false-complete]]
             if shortfall_or_excess <= 0.0 and self.c_get_pending_buy_base(canonical_asset) <= 0.0:
-                self.c_try_mark_buy_complete(canonical_asset, current_value, shortfall_or_excess)
+                base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
+                val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
+                self.c_try_mark_buy_complete(canonical_asset, val_result_actual.first, val_result_actual.second)
 
             if shortfall_or_excess > 0:
                 # Check if already have pending buy order for ANY alias
@@ -2925,10 +3109,34 @@ cdef class PositionBalancerHandler:
             # c_try_mark_sell_complete's `value <= target` branch was unreachable from the tick
             # loop. This is what left a sell-off armed BELOW its target indefinitely — the stale
             # `_sell_enabled` flag that blocked EDGE's oversold escalation on 2026-07-30.
-            # Sell-to-zero (`control clean`, target 0) is unaffected: excess stays > 0 until the
-            # balance is actually gone, so this branch does not fire early.
+            # The original note here claimed sell-to-zero (`control clean`, target 0) was
+            # unaffected because "excess stays > 0 until the balance is actually gone". That was
+            # WRONG, and it is what the 2026-09-18 audit found: excess is computed from the
+            # ADJUSTED balance, which a disowned live order drives to <= 0 with the balance fully
+            # intact. The read below is now the ACTUAL position, which is what makes that claim
+            # true rather than assumed.
             if shortfall_or_excess <= 0.0 and self.c_get_pending_sell_base(canonical_asset) <= 0.0:
-                self.c_try_mark_sell_complete(canonical_asset, current_value, shortfall_or_excess)
+                # Completion is a POSITION question, so it reads the ACTUAL (TOTAL) balance — the
+                # same rule c_get_actual_base_balance and the CHECK-2 site 60 lines below already
+                # follow, and the same rule the 2026-08-09 `available`-vs-`total` fix established.
+                # It used to complete on `current_value` (the ADJUSTED balance) on the premise that
+                # "with zero pending, adjusted == actual" — true of _pending_sell_by_asset, which
+                # the guard above covers, but NOT of c_arb_pending_base, which the guard does not
+                # cover and which counts a leg at its FULL quantity. A stuck-cancel cleanup hands
+                # our own live order to that term, so adjusted went negative (or, when the order
+                # WAS the whole position, exactly 0.0 — SNEK) and `value <= target 0` read as
+                # "fully sold": 5 strategies auto-removed still holding ~$240 by 2026-09-18.
+                # Detail: [[trading/hummingbot/P2 Hummingbot Open Items#clean-disowned-order-false-complete]]
+                #
+                # Costs one balance read, and only on the tick a side actually closes out
+                # (shortfall_or_excess <= 0 is false on every working tick), so the hot path is
+                # unchanged. Correct in the ordinary case too: with a sell resting, adjusted sat one
+                # order-size BELOW actual, so a graded sell-off closed while still that far above
+                # its target. Real closes are unaffected — actual <= target still fires, and a
+                # genuinely emptied wallet still gives value 0 <= 0.
+                base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
+                val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
+                self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second)
 
             if shortfall_or_excess > 0:
                 # Check if already have pending sell order for ANY alias

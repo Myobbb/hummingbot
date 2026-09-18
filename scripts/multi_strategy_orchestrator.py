@@ -184,6 +184,8 @@ logger = None
 # orders, targeting the hold target itself so both systems converge on the same number.
 HOLD_ESCALATION_AFTER = 15 * 60.0            # 15 min of continuous correction (4 h -> 1 h 2026-08-06 -> 15 min 2026-08-09)
 HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_hold_cache's own 60 s
+# Re-check cadence for an auto-remove held back by a non-drained position (see on_tick).
+AUTO_REMOVE_RECHECK_INTERVAL = 60.0
 HOLD_ESCALATION_SKIP_LOG_INTERVAL = 900.0    # re-state a "ripe but skipped" reason at most once per window
 
 # Export convenience functions for easy import
@@ -496,7 +498,8 @@ def create(name: str, primary_spec: str, secondary_spec: str,
            additional_markets: str = None,
            no_escalation: bool = False) -> bool:
     """
-    Create a new arbitrage strategy at runtime (always starts PAUSED).
+    Create a new arbitrage strategy at runtime (starts PAUSED — except with
+    no_escalation, whose preset ends in `resume` and leaves it running).
 
     Use 'control resume <name>' to start trading after verifying settings.
 
@@ -504,8 +507,11 @@ def create(name: str, primary_spec: str, secondary_spec: str,
         name: Unique name for the strategy (e.g., 'arb_bsx_new')
         primary_spec: Primary market as 'exchange:PAIR' (e.g., 'gate:BSX-USDT')
         secondary_spec: Secondary market as 'exchange:PAIR' (e.g., 'kucoin:BSX-USDT')
-        min_profitability: Minimum profitability percentage (default: 1.5%)
-        additional_markets: Optional comma-separated list of additional markets
+        min_profitability: Minimum profitability percentage (default: 2.1)
+        additional_markets: Optional comma-separated list of additional markets.
+            NOTE: reachable only from this console function — `control create` parses
+            just the two specs, so a 3-way strategy cannot be made from that command.
+        no_escalation: Apply the guardrail-only preset (console tag: `noesc`)
 
     Returns:
         True if the task was scheduled successfully (actual result logs async)
@@ -878,6 +884,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Strategies scheduled for automatic removal once their sell-off completes.
         # Populated by clean(); drained in on_tick() when sell is no longer active.
         self._pending_auto_remove: Set[str] = set()
+        # Strategies whose auto-remove is being held back because the asset is NOT drained —
+        # membership only throttles the warning to one line per strategy (see on_tick).
+        self._auto_remove_blocked: Set[str] = set()
+        self._last_blocked_recheck: float = 0.0
 
         # Throttle clock for the stuck-hold-correction sweep (see _check_hold_escalations).
         self._last_hold_escalation_check: float = 0.0
@@ -1684,11 +1694,61 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             for strategy_name in list(self._pending_auto_remove):
                 instance = self._strategy_by_name.get(strategy_name)
                 if instance is None:
-                    # Already removed by other means — just clean up the set
+                    # Already removed by other means — just clean up the sets
                     self._pending_auto_remove.discard(strategy_name)
+                    self._auto_remove_blocked.discard(strategy_name)
                     continue
                 pb = getattr(instance.strategy, '_position_balancer', None)
                 if pb is None or not pb.is_sell_enabled:
+                    # `is_sell_enabled == False` means the position balancer BELIEVES it is done —
+                    # it is not evidence that the asset was sold, and until 2026-09-18 nothing on
+                    # this path checked. A stuck cancel was enough to make it believe that with the
+                    # whole position still in the wallet: 5 strategies were removed holding ~$240
+                    # (PUNDIX 653.16 tokens / $71.90 left on mexc, KAS $86.73, PYR $63.57,
+                    # SNEK $15.62, M87 $2.31) — and removal is the irreversible half, because it
+                    # rewrites the config, evicts the trading pair and drops the only component
+                    # that was still trying to sell. The asset then only surfaces if the Asset
+                    # Manager's watcher happens to flag it as TRADED-NOWHERE.
+                    #
+                    # So the flag no longer decides alone: ask the balancer what is actually left.
+                    # The bar is its own `_min_order_usd`, the threshold it already uses to call a
+                    # residual too small to trade, so `control clean`'s designed dust tolerance
+                    # still removes normally (M87's $2.31 would; the other four would not).
+                    # Fails CLOSED — an unreadable or unpriceable position is not certified sold.
+                    #
+                    # Refusing keeps the name in _pending_auto_remove, so if the residual later
+                    # drains the removal completes on its own with no operator action. Deliberately
+                    # NOT re-arming the sell-off here: that would risk an arm/complete/arm loop
+                    # against whatever caused the false completion. This is a backstop, not a cure
+                    # — the causes live in the balancer's completion gates.
+                    # Already-blocked strategies stay pending forever by design, so re-checking
+                    # them every tick would run a balance read at tick rate (tick_size 0.01 =
+                    # ~100/s, indefinitely). First look is immediate — the common case is a
+                    # genuinely drained asset that should be removed without delay — and only the
+                    # re-checks are throttled, one float compare when not due.
+                    if strategy_name in self._auto_remove_blocked:
+                        if (current_timestamp - self._last_blocked_recheck
+                                < AUTO_REMOVE_RECHECK_INTERVAL):
+                            continue
+                        self._last_blocked_recheck = current_timestamp
+                    drained, detail = True, ""
+                    try:
+                        drained, detail = pb.position_drained() if pb is not None else (True, "")
+                    except Exception as e:
+                        drained, detail = False, f"residual check failed ({e})"
+                    if not drained:
+                        # Once per strategy: on_tick runs at tick_size 0.01, so an unthrottled line
+                        # here is ~100/s (the min_tick=0 flood, 1.2M lines, already taught that).
+                        if strategy_name not in self._auto_remove_blocked:
+                            self._auto_remove_blocked.add(strategy_name)
+                            self.logger().warning(
+                                f"Auto-remove BLOCKED for '{strategy_name}': sell-off reports "
+                                f"complete but {detail}. Keeping the strategy — it would otherwise "
+                                f"be removed with the asset still held. Sell the residual or "
+                                f"re-arm the sell-off; removal completes by itself once drained."
+                            )
+                        continue
+                    self._auto_remove_blocked.discard(strategy_name)
                     self._pending_auto_remove.discard(strategy_name)
                     to_remove.append(strategy_name)
             for strategy_name in to_remove:
@@ -3880,8 +3940,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             name: Unique name for the strategy
             primary_spec: Primary market as 'exchange:PAIR' (e.g., 'gate:BSX-USDT')
             secondary_spec: Secondary market as 'exchange:PAIR' (e.g., 'kucoin:BSX-USDT')
-            min_profitability: Minimum profitability percentage (default: 1.5)
+            min_profitability: Minimum profitability percentage (default: 2.1)
             additional_markets: Optional comma-separated additional markets
+            no_escalation: Apply the guardrail-only preset (console tag: `noesc`).
+                NOTE: the preset ends with `resume`, so a `noesc` strategy does NOT
+                stay paused — unlike a plain create, it starts running.
 
         Returns:
             True if successful, False otherwise
