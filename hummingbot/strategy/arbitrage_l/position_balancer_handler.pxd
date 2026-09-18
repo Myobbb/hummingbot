@@ -65,6 +65,10 @@ cdef class PositionBalancerHandler:
         dict _neg_position_warn_time
         # our own orders untracked by a stuck-cancel cleanup while still live on the venue
         set _disowned_live_orders
+        # when each side's completion condition first held (0.0 = not holding) — see
+        # COMPLETION_CONFIRM_SECONDS: a single balance sample must not close a side out
+        double _buy_complete_since
+        double _sell_complete_since
         # Second-level refuge state (per canonical asset) — truthy = resting under the wall (2nd-best),
         # undercut suppressed; the VALUE is the intended park depth (foreign levels we sat behind)
         dict _in_refuge_sell

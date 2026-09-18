@@ -241,6 +241,36 @@ cdef double SELL_BALANCE_PREFERENCE_PCT = SELL_MODE_SWITCH_HYSTERESIS  # 0.3%
 # suppress retries for this many seconds to avoid spamming every 2s tick.
 cdef double INSUF_BAL_RETRY_COOLDOWN = 60.0  # 60s between retries on insufficient balance
 
+# How long a completion condition must hold CONTINUOUSLY before either side is marked complete.
+#
+# WHY. Completing a side is a one-way door: it cancels every order on that side, disables it "for
+# this session", and on the `control clean` path hands the strategy to the orchestrator's
+# auto-remove. The gate that opens it was evaluating a SINGLE balance sample — and the connectors
+# flicker. Measured over the 8 days to 2026-09-18: 398 of 5,328 hold-band readings (**7.5%**) are
+# isolated outliers, a value that disagrees with both neighbours while they agree with each other
+# (ARGUS repeatedly reads 559 -> [28] -> 562). Only 14 of the 398 are explained by a venue dropping
+# out of the aggregate, so this is connector _account_balances flicker, the same class as
+# htx-account-balance-collapse, not an alias or market-set artefact.
+#
+# The hold band already survives this: it needs 15 consecutive confirmations before it will flip a
+# correction's direction, which is why it REJECTED the DMC sample on 2026-09-18 21:04 (logged
+# "1/15, holding overbought correction") while the completion gate two seconds earlier ACCEPTED the
+# same bad number, read DMC as $124 against a $500 target, and disabled a sell-off on a position
+# that was really ~$590. This constant gives the completion gate the same kind of tolerance.
+#
+# WHY TIME AND NOT A COUNT. Consecutive evaluations can be 10 ms apart at tick_size 0.01, and these
+# dips live in the connector's balance dict until the next refresh — seconds, not milliseconds — so
+# a "two consecutive ticks" counter would simply sample the same bad value twice. The condition has
+# to hold across wall-clock time.
+#
+# WHY 60 s COSTS NOTHING. While a side is waiting to confirm it is, by definition, at or past its
+# target, so there is nothing for it to place: the position is not traded during the wait, only the
+# flag is deferred. Against a `control clean` that runs for tens of minutes (PUNDIX 2026-09-18:
+# 63 min) this is noise, and 60 s is the interval this file already uses whenever it decides a
+# balance reading is not to be trusted yet (INSUF_BAL_RETRY_COOLDOWN) and the cadence the hold
+# band's own cache refreshes on.
+cdef double COMPLETION_CONFIRM_SECONDS = 60.0
+
 
 cdef class PositionBalancerHandler:
     """
@@ -360,6 +390,10 @@ cdef class PositionBalancerHandler:
         # Our own orders that a stuck-cancel cleanup untracked while they were still live on
         # the venue — excluded from c_arb_pending_base so they are never mistaken for arb legs.
         self._disowned_live_orders = set()
+        # When each side's completion condition first became true (0.0 = not currently true).
+        # Gates c_try_mark_*_complete on COMPLETION_CONFIRM_SECONDS — see that constant.
+        self._buy_complete_since = 0.0
+        self._sell_complete_since = 0.0
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
         # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
         # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
@@ -933,20 +967,31 @@ cdef class PositionBalancerHandler:
                                       str pair,
                                       double current_value_quote,
                                       double shortfall):
-        """Mark buy-in as completed if at target or remaining < min notional."""
-        if current_value_quote >= self._buy_target_usd:
-            self._buy_completed = True
-            self.c_maybe_disable_buy()
-            return True
-        if shortfall > 0 and shortfall < self.strategy._min_order_usd:
-            self._buy_completed = True
+        """
+        Mark buy-in as completed if at target or remaining < min notional — but only once the
+        condition has held for COMPLETION_CONFIRM_SECONDS. See that constant for why a single
+        sample is not enough (7.5% of balance readings are isolated outliers).
+        """
+        cdef bint at_target = current_value_quote >= self._buy_target_usd
+        cdef bint is_dust = (shortfall > 0.0) and (shortfall < self.strategy._min_order_usd)
+        if not (at_target or is_dust):
+            self._buy_complete_since = 0.0          # condition broke — start over
+            return False
+        if self._buy_complete_since <= 0.0:
+            self._buy_complete_since = self.strategy._current_timestamp
+            return False
+        if (self.strategy._current_timestamp - self._buy_complete_since) < COMPLETION_CONFIRM_SECONDS:
+            return False
+        self._buy_completed = True
+        self._buy_complete_since = 0.0
+        if is_dust and not at_target:
             self.strategy.log_with_clock(
                 logging.INFO,
                 f"Buy-in considered complete on {pair}: "
-                f"shortfall {shortfall:.6f} < min notional {self.strategy._min_order_usd:.6f}")
-            self.c_maybe_disable_buy()
-            return True
-        return False
+                f"shortfall {shortfall:.6f} < min notional {self.strategy._min_order_usd:.6f} "
+                f"(held {COMPLETION_CONFIRM_SECONDS:.0f}s)")
+        self.c_maybe_disable_buy()
+        return True
 
     cdef bint c_try_mark_sell_complete(self,
                                        str pair,
@@ -982,20 +1027,33 @@ cdef class PositionBalancerHandler:
                     f"(most likely one of our own live orders counted as a foreign arb leg after a "
                     f"stuck-cancel cleanup). Sell-off stays armed; further warnings for this asset "
                     f"suppressed for {MIN_TICK_WARN_INTERVAL:.0f}s.")
+            self._sell_complete_since = 0.0             # a bad sample is not a confirmation
             return False
-        if current_value_quote <= self._sell_target_usd:
-            self._sell_completed = True
-            self.c_maybe_disable_sell()
-            return True
-        if excess > 0 and excess < self.strategy._min_order_usd:
-            self._sell_completed = True
+        # Same confirmation window as the buy side: the condition must hold for
+        # COMPLETION_CONFIRM_SECONDS before the side is closed out. This is the second, entirely
+        # stuck-cancel-free route into a false completion — with `control clean`'s target of 0 ANY
+        # transient low read satisfies `value <= target` — and it is the one that fired on DMC
+        # 2026-09-18 21:04 while the hold band was rejecting the very same number at 1/15.
+        cdef bint at_target = current_value_quote <= self._sell_target_usd
+        cdef bint is_dust = (excess > 0.0) and (excess < self.strategy._min_order_usd)
+        if not (at_target or is_dust):
+            self._sell_complete_since = 0.0             # condition broke — start over
+            return False
+        if self._sell_complete_since <= 0.0:
+            self._sell_complete_since = self.strategy._current_timestamp
+            return False
+        if (self.strategy._current_timestamp - self._sell_complete_since) < COMPLETION_CONFIRM_SECONDS:
+            return False
+        self._sell_completed = True
+        self._sell_complete_since = 0.0
+        if is_dust and not at_target:
             self.strategy.log_with_clock(
                 logging.INFO,
                 f"Sell-off considered complete on {pair}: "
-                f"excess {excess:.6f} < min notional {self.strategy._min_order_usd:.6f}")
-            self.c_maybe_disable_sell()
-            return True
-        return False
+                f"excess {excess:.6f} < min notional {self.strategy._min_order_usd:.6f} "
+                f"(held {COMPLETION_CONFIRM_SECONDS:.0f}s)")
+        self.c_maybe_disable_sell()
+        return True
 
     cdef void c_scan_and_mark_completion(self):
         """Re-evaluate asset balance and complete buy/sell if targets reached."""
@@ -3967,6 +4025,7 @@ cdef class PositionBalancerHandler:
         if not self._buy_enabled:
             self._buy_enabled = True
             self._buy_completed = False
+            self._buy_complete_since = 0.0   # fresh session -> fresh confirmation window
             # Fresh session must start in NORMAL mode (chase best bid), not stale refuge.
             self._in_refuge_buy.clear()
             self.strategy.log_with_clock(
@@ -3996,6 +4055,7 @@ cdef class PositionBalancerHandler:
         if not self._sell_enabled:
             self._sell_enabled = True
             self._sell_completed = False
+            self._sell_complete_since = 0.0   # fresh session -> fresh confirmation window
             # Fresh session must start in NORMAL mode (chase best ask), not stale refuge.
             # Refuge is only re-armed by a fresh streak of undercuts. (Unlike the streak/
             # completion dicts, a stale refuge flag would change behaviour — it would skip
@@ -4040,6 +4100,10 @@ cdef class PositionBalancerHandler:
         # Reset completion flag to allow re-evaluation
         if self._buy_enabled:
             self._buy_completed = False
+            # Time already accrued toward COMPLETION_CONFIRM_SECONDS was accrued against the OLD
+            # target, so it says nothing about the new one. Restart the confirmation.
+            if target_usd != old_target:
+                self._buy_complete_since = 0.0
             self.c_scan_and_mark_completion()
 
     def set_sell_target(self, double target_usd):
@@ -4062,6 +4126,10 @@ cdef class PositionBalancerHandler:
         # Reset completion flag to allow re-evaluation
         if self._sell_enabled:
             self._sell_completed = False
+            # Time already accrued toward COMPLETION_CONFIRM_SECONDS was accrued against the OLD
+            # target, so it says nothing about the new one. Restart the confirmation.
+            if target_usd != old_target:
+                self._sell_complete_since = 0.0
             self.c_scan_and_mark_completion()
 
     def set_buy_spread(self, object spread_pct):
