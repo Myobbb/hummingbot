@@ -1390,6 +1390,52 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except Exception as e:
                 self.logger().warning(f"Hold-band cache warm-up failed for '{si.name}': {e}")
 
+        # Re-arm any `control clean` that was in flight when the process stopped.
+        #
+        # clean() holds four of its five effects in MEMORY only — sell target 0, sell-off enabled,
+        # the _pending_auto_remove entry, and the guardrail armed AT 0 — and the one thing it does
+        # persist is read back as the opposite of what it meant: it writes
+        # `hold_target_usd: 0.0` + `hold_target_enabled: true`, but the config->strategy hand-off
+        # collapses the pair ("hold_target_usd": config.hold_target_usd if
+        # config.hold_target_enabled else 0.0) and arbitrage.pyx then derives
+        # `_hold_enabled = hold_target_usd > 0.0`, i.e. False. So a restart mid-clean used to leave
+        # the asset with nothing selling it down, nothing scheduled to remove it, and — the part
+        # that can actually cost money — the GUARDRAIL OFF, which is what stops a routine arb from
+        # buying back the position the clean is trying to liquidate. Silently: no line said the
+        # clean had been dropped.
+        #
+        # The fingerprint is `hold_target_enabled: true` AND `hold_target_usd == 0.0`, a pair only
+        # clean() writes — set_hold_target(0) persists hold_target_enabled False explicitly "so
+        # YAML stays consistent on reload", disable_hold persists False, and enable_hold refuses a
+        # target <= 0.0 outright. KEEP IT THAT WAY: any other path that persists that pair will be
+        # re-armed as a clean on the next start.
+        #
+        # Deliberately here and not at config load. clean() -> enable_sell_off() ->
+        # c_scan_and_mark_completion() reads balances and the reference bid immediately, and on a
+        # cold connector a base or bid of 0 satisfies `value <= target 0`; by this point markets are
+        # ready and balances are warm (measured 2026-09-18: first hold-band tick 21 s after start,
+        # and no asset read $0 then non-zero later). Guarded on _pending_auto_remove so that this
+        # firing again on a later reconnection is a no-op rather than restarting the sell-off's
+        # confirmation window via enable_sell_off().
+        for si in self.strategies:
+            try:
+                if si.name in self._pending_auto_remove:
+                    continue                      # already armed in memory — nothing to restore
+                cfg = si.config
+                if not cfg.get('hold_target_enabled', False):
+                    continue
+                if float(cfg.get('hold_target_usd', -1.0)) != 0.0:
+                    continue
+                self.logger().warning(
+                    f"Strategy '{si.name}' was mid-`control clean` when the process stopped "
+                    f"(persisted hold_target_usd=0 with the guardrail enabled) — re-arming it: "
+                    f"sell-off to zero, guardrail armed at zero, auto-remove once drained. "
+                    f"Without this the position would sit unsold with arb buy-backs unblocked."
+                )
+                self.clean(si.name)
+            except Exception as e:
+                self.logger().warning(f"Clean re-arm check failed for '{si.name}': {e}")
+
     def _start_all_strategies_if_needed(self):
         """
         Start all V1 strategies with the clock.
