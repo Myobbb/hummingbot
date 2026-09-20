@@ -1926,21 +1926,55 @@ cdef class PositionBalancerHandler:
             # venues that can actually trade.
             #
             # Two deliberate exemptions:
-            #   • sell-to-zero (`_sell_target_usd == 0`) — there the whole point is to sweep dust
-            #     BELOW the floor, so a funding bar would strand it forever. Same condition the
-            #     placement gate uses.
-            #   • no venue clears the bar — keep the unfiltered choice so the placement gate still
-            #     logs and applies its 60s cooldown exactly as before. Filtering to nothing would
-            #     return None, which the caller treats as a silent no-op every tick — worse than today.
-            if (self._sell_target_usd > 0.0 and best_market is not None
-                    and len(candidates) > 1 and self.strategy._min_order_usd > 0.0):
+            #   • no venue clears the bar — for a GRADED target keep the unfiltered choice so the
+            #     placement gate still logs and applies its 60s cooldown exactly as before.
+            #     Filtering to nothing would return None, which the caller treats as a silent
+            #     no-op every tick — worse than today.
+            #
+            # THE BAR IS THE SMALLEST ORDER THAT VENUE CAN ACTUALLY TAKE, and that differs by target:
+            #   • graded target -> OUR floor, _min_order_usd: we refuse to trade smaller.
+            #   • sell-to-zero  -> the VENUE's floor: there the whole point is to sweep dust below our
+            #     floor, so our floor must not apply — but the venue's still does. This block used to
+            #     be skipped entirely for target 0, which let a venue holding physically unsellable
+            #     residue keep winning selection while another venue held real inventory: SC
+            #     2026-09-19, gate_io 0.6 SC (quantizes to 0) chosen over htx's $314, logging
+            #     `quantized to zero` 1096 times at 2 s intervals. Using the venue's own floor here
+            #     picks htx instead, and the sweep continues where it can actually run.
+            # c_safe_quantize_order_amount is the same call c_execute_sell_limit makes, so "can this
+            # venue take an order" is answered once, with one rule, before we build one.
+            if (best_market is not None
+                    # Candidate count is NOT part of the guard: with one candidate there is
+                    # nothing to switch to, but "that one cannot take an order either" is
+                    # exactly the answer a sell-to-zero needs — SC becomes single-venue on
+                    # htx once gate_io's residue clears, and would spin there on the same
+                    # message. The _min_order_usd > 0 test moves to the graded branch, the
+                    # only place it means anything.
+                    and candidates):
                 ref_bid = float(self.strategy.c_get_reference_bid_for_asset(asset))
                 if ref_bid > 0.0:
                     funded = []
                     for market_tuple, current_price in candidates:
                         fund_bal = float(market_tuple.market.get_available_balance(market_tuple.base_asset))
-                        if fund_bal * ref_bid >= self.strategy._min_order_usd:
-                            funded.append((market_tuple, current_price))
+                        if self._sell_target_usd > 0.0:
+                            if (self.strategy._min_order_usd <= 0.0
+                                    or fund_bal * ref_bid >= self.strategy._min_order_usd):
+                                funded.append((market_tuple, current_price))
+                        else:
+                            try:
+                                if self.strategy.c_safe_quantize_order_amount(
+                                        market_tuple.market, market_tuple.trading_pair,
+                                        Decimal(str(fund_bal)), Decimal(str(current_price))) > Decimal("0"):
+                                    funded.append((market_tuple, current_price))
+                            except Exception:
+                                funded.append((market_tuple, current_price))   # unknown -> keep it
+                    # Sell-to-zero with nothing sellable anywhere IS the terminal state: every venue's
+                    # residue is below that venue's own lot size. Returning None makes the tick a
+                    # no-op instead of building an order the exchange cannot accept — BULLA
+                    # 2026-09-20 logged `quantized to zero` 30 times in 59 s on kucoin=0.1/mexc=0.01
+                    # before completing. The completion check runs before this call, so its
+                    # confirmation window keeps ticking and the clean still finishes on time.
+                    if not funded and self._sell_target_usd == 0.0:
+                        return None
                     if funded and len(funded) < len(candidates):
                         chosen = None
                         best_price = 0.0
@@ -1951,8 +1985,9 @@ cdef class PositionBalancerHandler:
                         if chosen is not None and chosen is not best_market:
                             self.strategy.logger().info(
                                 f"Position balancer: sell venue {best_market.market.name} -> {chosen.market.name} "
-                                f"for {asset} — {best_market.market.name} cannot fund a "
-                                f"${self.strategy._min_order_usd:.2f} order; skipping it on funding")
+                                f"for {asset} — {best_market.market.name} cannot fund "
+                                f"{('a $%.2f order' % self.strategy._min_order_usd) if self._sell_target_usd > 0.0 else 'its own minimum lot'}"
+                                f"; skipping it on funding")
                         if chosen is not None:
                             best_market = chosen
                         candidates = funded
@@ -3263,6 +3298,23 @@ cdef class PositionBalancerHandler:
                                 base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                                 val_result_actual = self.c_compute_value_and_sell_excess(base_bal_actual, last_bid)
                                 if not self.c_try_mark_sell_complete(canonical_asset, val_result_actual.first, val_result_actual.second):
+                                    # Nothing left that we would actually place: for a graded target the
+                                    # smallest order we allow ourselves is _min_order_usd, so once the gap
+                                    # is under it no order can close it. c_execute_sell_limit already
+                                    # refuses such an order — it just did so from deep inside the
+                                    # placement path, at WARNING level, on every tick of the completion
+                                    # confirmation window: DELOREAN 2026-09-19 logged the same
+                                    # `volume_usd=7.534063 < min_order_usd=15` 30 times in 59 s before
+                                    # completing. Deciding it here costs one compare and makes the run
+                                    # silent, with no behaviour change — the same condition is what
+                                    # c_try_mark_sell_complete is confirming.
+                                    #
+                                    # Sell-to-zero is deliberately exempt: there we DO place below our
+                                    # floor (the dust sweep), and the only real floor is the venue's own,
+                                    # which c_find_best_sell_market now applies per candidate.
+                                    if (self._sell_target_usd > 0.0
+                                            and val_result_actual.second < self.strategy._min_order_usd):
+                                        return False
                                     # Best market to sell on. The fuller-venue tie-break lives INSIDE
                                     # the selector and is always applied, so this and the CHECK 1 scan
                                     # ask the identical question — a "better market" signal can no
