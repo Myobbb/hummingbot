@@ -1785,6 +1785,48 @@ cdef class PositionBalancerHandler:
 
         return best_market
 
+    cdef object c_placeable_sell_amount(self, object market_tuple, double amount, double price):
+        """
+        What this venue would actually accept for `amount` of base at `price` — or 0 if nothing.
+
+        THE single answer to "can this venue take a sell order for this?". It exists because the
+        candidate filter in c_find_best_sell_market and the placement in c_execute_sell_limit used
+        to answer it separately, and drifted: placement quantized `amount - QUANTIZATION_EPSILON`
+        while the filter passed the raw balance. Quantization floors to the venue's step, so a
+        balance of EXACTLY one step survives `quantize(step)` and dies on `quantize(step - 1e-9)`.
+        That is the whole bug: the filter kept the venue, placement then refused it, and the pair
+        spun at tick rate — kucoin's LOFI/BULLA step is 0.1 (see the 5154.7 fill precision) and both
+        residues were 0.1. BULLA logged it 30x on 2026-09-20, LOFI 30 more on 09-22 with the filter
+        already live. Two call sites agreeing by convention is what failed; one call cannot.
+
+        Applies both PHYSICAL floors, in the order placement applied them:
+          • the step — c_safe_quantize_order_amount, which already falls back internally;
+          • the exchange's min_order_size, a base-quantity rule the step can clear and still miss —
+            HAEDAL 2026-08-14 sent 0.0128 into htx's 0.1 minimum ~90 times in 3 min, every send
+            rejected, and sell-to-zero is exempt from INSUF_BAL_RETRY_COOLDOWN so nothing damped
+            the retry. That is why the lot rule has to be answered here and not only at placement.
+        The NOTIONAL floor is deliberately NOT here: it is policy, not physics, and differs by
+        target (our _min_order_usd for a graded target, bypassed for a sell-to-zero sweep), so it
+        stays with the caller. max_order_size is a cap rather than a floor and likewise stays.
+
+        Fails OPEN on a missing/unreadable trading rule — returns the quantized amount — so a venue
+        whose rules have not loaded is tried rather than silently written off.
+        """
+        cdef object q = self.strategy.c_safe_quantize_order_amount(
+            market_tuple.market, market_tuple.trading_pair,
+            Decimal(str(max(0.0, amount - QUANTIZATION_EPSILON))),
+            Decimal(str(price)))
+        if q <= Decimal("0"):
+            return Decimal("0")
+        try:
+            trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
+            if (trading_rule is not None and trading_rule.min_order_size > Decimal("0")
+                    and q < trading_rule.min_order_size):
+                return Decimal("0")
+        except Exception:
+            pass
+        return q
+
     cdef object c_find_best_sell_market(self, str asset):
         """
         Find the best market to place a sell order for the given asset.
@@ -1940,8 +1982,10 @@ cdef class PositionBalancerHandler:
             #     2026-09-19, gate_io 0.6 SC (quantizes to 0) chosen over htx's $314, logging
             #     `quantized to zero` 1096 times at 2 s intervals. Using the venue's own floor here
             #     picks htx instead, and the sweep continues where it can actually run.
-            # c_safe_quantize_order_amount is the same call c_execute_sell_limit makes, so "can this
-            # venue take an order" is answered once, with one rule, before we build one.
+            # "Can this venue take an order for what it holds" is c_placeable_sell_amount's job and
+            # nobody else's — placement asks the identical call, so the two cannot drift. They did,
+            # once, by a single QUANTIZATION_EPSILON, and it cost BULLA 30 log lines and LOFI 30
+            # more; see that helper for the post-mortem.
             if (best_market is not None
                     # Candidate count is NOT part of the guard: with one candidate there is
                     # nothing to switch to, but "that one cannot take an order either" is
@@ -1959,14 +2003,9 @@ cdef class PositionBalancerHandler:
                             if (self.strategy._min_order_usd <= 0.0
                                     or fund_bal * ref_bid >= self.strategy._min_order_usd):
                                 funded.append((market_tuple, current_price))
-                        else:
-                            try:
-                                if self.strategy.c_safe_quantize_order_amount(
-                                        market_tuple.market, market_tuple.trading_pair,
-                                        Decimal(str(fund_bal)), Decimal(str(current_price))) > Decimal("0"):
-                                    funded.append((market_tuple, current_price))
-                            except Exception:
-                                funded.append((market_tuple, current_price))   # unknown -> keep it
+                        elif self.c_placeable_sell_amount(
+                                market_tuple, fund_bal, current_price) > Decimal("0"):
+                            funded.append((market_tuple, current_price))
                     # Sell-to-zero with nothing sellable anywhere IS the terminal state: every venue's
                     # residue is below that venue's own lot size. Returning None makes the tick a
                     # no-op instead of building an order the exchange cannot accept — BULLA
@@ -3890,16 +3929,20 @@ cdef class PositionBalancerHandler:
             return False
 
         # Quantize
-        quantized_amount = self.strategy.c_safe_quantize_order_amount(
-            market, sell_market_tuple.trading_pair,
-            Decimal(str(max(0.0, amount_to_sell - QUANTIZATION_EPSILON))),
-            Decimal(str(sell_price)))
+        # The ONE test for "will this venue take it" — the same call c_find_best_sell_market's
+        # candidate filter makes, so the filter can never hand us a venue placement then refuses.
+        # Covers the step AND the exchange's min_order_size; both used to be checked here
+        # separately, the second one below the max_order_size clamp. Folding them in changes no
+        # outcome (the clamp only reduces toward max_order_size, which is >= min_order_size) and
+        # removes the second log site.
+        quantized_amount = self.c_placeable_sell_amount(
+            sell_market_tuple, amount_to_sell, sell_price)
 
         if quantized_amount <= Decimal("0"):
             self.strategy.logger().warning(
-                f"Position balancer: Sell order blocked - quantized to zero. "
-                f"{sell_market_tuple.base_asset} on {market.name} "
-                f"pre_quantize={amount_to_sell:.8g}, quantized={quantized_amount}")
+                f"Position balancer: Sell order blocked - {sell_market_tuple.base_asset} residue "
+                f"is below {market.name}'s own step or minimum lot. "
+                f"pre_quantize={amount_to_sell:.8g}, placeable={quantized_amount}")
             # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
             # Declare completion so the balancer doesn't spin forever on unsellable residue.
             if self._sell_target_usd == 0.0:
@@ -3916,35 +3959,17 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass
 
-        # Exchange min_order_size floor — a BASE-QUANTITY rule, distinct from the notional
-        # check below. Quantization only rounds to the step increment, so an amount can clear
-        # it and still be under the exchange's minimum lot: HAEDAL 2026-08-14 sent 0.0128 into
-        # htx's 0.1 minimum ~90 times in 3 min. Every send is rejected, handle_order_failure
-        # clears tracking so the asset is not blocked, and sell-to-zero is exempt from
-        # INSUF_BAL_RETRY_COOLDOWN — so nothing damps the retry. Treated exactly like the
-        # quantized-to-zero case: for target=0 this residue is unsellable through any order,
-        # so declare completion instead of spinning.
-        try:
-            trading_rule = market._trading_rules.get(sell_market_tuple.trading_pair)
-            if trading_rule is not None and trading_rule.min_order_size > Decimal("0"):
-                if quantized_amount < trading_rule.min_order_size:
-                    self.strategy.logger().info(
-                        f"Position balancer: {asset_key} sell residue {quantized_amount} on "
-                        f"{market.name} is below exchange min_order_size "
-                        f"{trading_rule.min_order_size} — unsellable dust")
-                    if self._sell_target_usd == 0.0:
-                        self.c_try_mark_sell_complete(asset_key, current_value_quote, excess)
-                        self.c_maybe_disable_sell()
-                    return False
-        except Exception:
-            pass
-
         # Check minimum notional.
         # Sell-to-zero exception: when target=0 and the full remaining balance is below the software
         # floor, send the order anyway — the exchange min notional (~$5–$10) is well below our $15
         # floor, so most exchanges will accept it. If an exchange rejects it, the error is caught in
-        # c_sell_with_specific_market and we retry next tick. Completion never triggers for target=0
-        # while balance remains > 0, so infinite retries are not possible after a real fill.
+        # c_sell_with_specific_market and we retry next tick. (An earlier note here claimed
+        # "completion never triggers for target=0 while balance remains > 0" — not true: the dust
+        # branch in c_try_mark_sell_complete is target-agnostic and does complete a sell-to-zero
+        # once the whole remainder is under _min_order_usd. Left as-is deliberately — the sweep
+        # runs during the 60s confirmation window, so a sellable residue keeps selling and the
+        # branch only lands once the residue is physically stuck; PUNDIX $0.0022, ES $0.000107,
+        # BULLA $0.011, LOFI $0.000416.)
         # For any non-zero target, block as usual and mark complete.
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self.strategy._min_order_usd:
