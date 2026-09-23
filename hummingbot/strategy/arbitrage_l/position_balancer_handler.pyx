@@ -365,6 +365,9 @@ cdef class PositionBalancerHandler:
         self._last_sell_cancel_time = {}      # canonical_asset -> timestamp when sell order was cancelled
         self._last_sell_cancel_cooldown = {}  # canonical_asset -> cooldown duration to apply (reactive vs proactive)
         self._last_sell_insuf_bal_time = {}   # asset -> timestamp of last "sell skipped - insufficient balance" (for INSUF_BAL_RETRY_COOLDOWN)
+        # Retry pace after a placement attempt that SENT NOTHING — see c_handle_position_balancing.
+        self._last_buy_noop_time = {}         # canonical_asset -> timestamp
+        self._last_sell_noop_time = {}        # canonical_asset -> timestamp
         # Consecutive-cancel backoff: count cancels without a fill to detect stuck-undercutter loops
         self._buy_cancel_streak = {}          # canonical_asset -> int, resets on fill
         self._sell_cancel_streak = {}         # canonical_asset -> int, resets on fill
@@ -3202,7 +3205,14 @@ cdef class PositionBalancerHandler:
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
                         time_since_cancel = self.strategy._current_timestamp - self._last_buy_cancel_time.get(canonical_asset, 0.0)
                         required_cooldown = self._last_buy_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
-                        if time_since_cancel >= required_cooldown:
+                        # NO-OP RETRY PACE. An attempt that sent nothing (dust gap, below min notional,
+                        # a resting arb leg pre-counted in the adjusted balance ...) is retried after
+                        # next_trade_delay: the same pace the strategy-wide stamp used to impose by
+                        # accident, now held by this side alone so the arb is no longer locked out.
+                        # Sits before the completion check so that check keeps its old 2 s sampling
+                        # while an attempt keeps coming back empty.
+                        time_since_noop = self.strategy._current_timestamp - self._last_buy_noop_time.get(canonical_asset, 0.0)
+                        if time_since_cancel >= required_cooldown and time_since_noop >= self.strategy._next_trade_delay:
                             # For completion check, use ACTUAL balance (not adjusted)
                             base_bal_actual = self.c_get_actual_base_balance(canonical_asset)
                             val_result_actual = self.c_compute_value_and_buy_shortfall(base_bal_actual, last_bid)
@@ -3223,6 +3233,7 @@ cdef class PositionBalancerHandler:
                                         placed = self.c_execute_buy_limit(selected_buy_market, selected_sell_market)
                                         if placed:
                                             return True
+                                        self._last_buy_noop_time[canonical_asset] = self.strategy._current_timestamp
                                     else:
                                         pending_info = f", pending={pending_buy_quote:.2f}" if pending_buy_quote > 0 else ""
                                         self.strategy.logger().warning(
@@ -3323,7 +3334,9 @@ cdef class PositionBalancerHandler:
                         #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
                         time_since_cancel = self.strategy._current_timestamp - self._last_sell_cancel_time.get(canonical_asset, 0.0)
                         required_cooldown = self._last_sell_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
-                        if time_since_cancel >= required_cooldown:
+                        # No-op retry pace — mirror of the buy side above.
+                        time_since_noop = self.strategy._current_timestamp - self._last_sell_noop_time.get(canonical_asset, 0.0)
+                        if time_since_cancel >= required_cooldown and time_since_noop >= self.strategy._next_trade_delay:
                             # Check insufficient-balance cooldown — suppresses retry spam when the best sell
                             # market has insufficient base balance. Only applies for non-zero target; sell-to-zero
                             # always proceeds so c_execute_sell_limit can handle dust specially.
@@ -3399,6 +3412,7 @@ cdef class PositionBalancerHandler:
                                             placed = self.c_execute_sell_limit(selected_buy_market, selected_sell_market)
                                             if placed:
                                                 return True
+                                            self._last_sell_noop_time[canonical_asset] = self.strategy._current_timestamp
 
         return False
 
@@ -3406,10 +3420,10 @@ cdef class PositionBalancerHandler:
         """
         Execute buy using limit order with spread from top bid.
         Pattern: Place limit buy at (top_bid * (1 - spread_pct))
-        """
-        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
-        self.strategy._last_global_trade_timestamp = self.strategy._current_timestamp
 
+        Returns True only if an order was SENT. The strategy's trade-cooldown stamp is written
+        immediately before the send (see there), never on entry: every exit above it sends nothing.
+        """
         cdef:
             str asset_key = buy_market_tuple.base_asset
             ExchangeBase market = buy_market_tuple.market
@@ -3438,6 +3452,7 @@ cdef class PositionBalancerHandler:
             double top_ask
             double top_bid
             double buy_price
+            double taker_from_px = 0.0   # maker price that would have crossed; 0.0 = placed as maker
             double max_affordable_base
             double amount_to_buy
             object quantized_amount
@@ -3540,15 +3555,13 @@ cdef class PositionBalancerHandler:
                                 f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
 
                     buy_price = reference_bid + min_price_increment
-                    # Check if maker price would cross the spread (become taker)
+                    # Maker price would cross the spread -> place at the ask (taker). Informational only:
+                    # remember the maker price and log it AFTER the order is sent (see the send). It used
+                    # to be a WARNING printed here, before sizing, so it also appeared on attempts that then
+                    # sent nothing (815 of 976 lines, 09-13..09-23) and read as the reason nothing was placed.
                     if buy_price >= top_ask:
-                        # IMPORTANT: Spread is too tight for maker order
-                        # Log clear warning so user understands why using taker price
-                        self.strategy.logger().warning(
-                            f"Position balancer: Spread too tight for 'min' tick mode on {buy_market_tuple.trading_pair}. "
-                            f"Calculated maker price {buy_price:.8g} >= ask {top_ask:.8g}. "
-                            f"Using ask price (will pay taker fees instead of maker rebate).")
-                        buy_price = top_ask  # Use taker price with clear warning
+                        taker_from_px = buy_price
+                        buy_price = top_ask
                 else:
                     # No min_price_increment available, fall back to taker
                     self.strategy.logger().warning(
@@ -3567,15 +3580,10 @@ cdef class PositionBalancerHandler:
             if top_bid <= 0:
                 return False
             buy_price = top_bid * (1.0 + self._buy_spread_pct)
-            # Check if maker price would cross the spread (become taker)
+            # Would cross -> taker. Noted here, logged after the send (same as 'min' above).
             if buy_price >= top_ask:
-                # IMPORTANT: Spread is too tight for this percentage
-                # Log clear warning so user understands why using taker price
-                self.strategy.logger().warning(
-                    f"Position balancer: Spread too tight for {self._buy_spread_pct*100:.2f}% spread on {buy_market_tuple.trading_pair}. "
-                    f"Calculated maker price {buy_price:.8g} >= ask {top_ask:.8g}. "
-                    f"Using ask price (will pay taker fees instead of maker rebate).")
-                buy_price = top_ask  # Use taker price with clear warning
+                taker_from_px = buy_price
+                buy_price = top_ask
 
         # Calculate amount based on shortfall, available quote, and order size limit.
         # Use ADJUSTED shortfall to account for pending orders and avoid over-ordering.
@@ -3641,6 +3649,16 @@ cdef class PositionBalancerHandler:
             buy_price = float(quantized_price)
         except Exception:
             pass  # Fall back to original price if quantization fails
+
+        # THE TRADE-COOLDOWN STAMP BELONGS HERE, on the send, never on entry. It used to be the first
+        # line of this function, so every exit above (nothing to size, dust, below min notional) still
+        # locked the WHOLE strategy for next_trade_delay: orchestrated c_tick skips the arb scan while
+        # the stamp is fresh, and in the profitable branch the PB runs first, so the arb then tripped its
+        # own duplicate guard ("Skipping duplicate arbitrage execution"). 183 arb executions dropped
+        # 09-13..09-23 (DELOREAN 107, UNION 39, AIC 23, AO 8). The arb layer already follows this rule:
+        # c_execute_arbitrage resets its stamp when it aborts. Nothing between entry and here can
+        # re-enter c_tick, so the same-tick double-execution guards are unaffected.
+        self.strategy._last_global_trade_timestamp = self.strategy._current_timestamp
 
         # Place limit buy order (no expiration_seconds — limit orders are managed by the
         # balancer's own cancel/replace logic; passing _next_trade_delay here would set a
@@ -3715,6 +3733,17 @@ cdef class PositionBalancerHandler:
                 f"[PB] Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: {self._buy_spread_pct * 100:.2f}%)")
 
+        # Taker note: INFO, written only for an order that actually went out at the ask, after the send
+        # so it costs the send nothing. Text keeps the old shape ("Spread too tight for ... on PAIR ...
+        # >= ask ...") so pb_monitor's taker-fallback counter still parses it, and now counts real
+        # taker placements only.
+        if taker_from_px > 0.0:
+            _mode = "'min' tick mode" if self._buy_spread_is_min else f"{self._buy_spread_pct * 100:.2f}% spread"
+            self.strategy.logger().info(
+                f"Position balancer: Spread too tight for {_mode} on {buy_market_tuple.trading_pair}. "
+                f"Calculated maker price {taker_from_px:.8g} >= ask {top_ask:.8g}. "
+                f"Placed {buy_order_id} at the ask as taker (taker fee instead of maker rebate).")
+
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet
         base_bal_actual = self.c_get_actual_base_balance(asset_key)
@@ -3730,10 +3759,10 @@ cdef class PositionBalancerHandler:
         """
         Execute sell using limit order with spread from top ask.
         Pattern: Place limit sell at (top_ask * (1 + spread_pct))
-        """
-        # CRITICAL: Set timestamp IMMEDIATELY to prevent race condition
-        self.strategy._last_global_trade_timestamp = self.strategy._current_timestamp
 
+        Returns True only if an order was SENT. The trade-cooldown stamp is written immediately
+        before the send, never on entry — same rule and reasons as c_execute_buy_limit.
+        """
         cdef:
             str asset_key = sell_market_tuple.base_asset
             ExchangeBase market = sell_market_tuple.market
@@ -3768,6 +3797,7 @@ cdef class PositionBalancerHandler:
             double top_bid
             double top_ask
             double sell_price
+            double taker_from_px = 0.0   # maker price that would have crossed; 0.0 = placed as maker
             double amount_to_sell
             object quantized_amount
             object order_type = OrderType.LIMIT
@@ -3869,15 +3899,11 @@ cdef class PositionBalancerHandler:
                                 f" — skipped {_skipped} stacked level(s), parking behind {_skipped + 1}")
 
                     sell_price = reference_ask - min_price_increment
-                    # Check if maker price would cross the spread (become taker)
+                    # Would cross -> place at the bid (taker). Noted here, logged after the send — see
+                    # the buy side for why this is no longer a WARNING printed before sizing.
                     if sell_price <= top_bid:
-                        # IMPORTANT: Spread is too tight for maker order
-                        # Log clear warning so user understands why using taker price
-                        self.strategy.logger().warning(
-                            f"Position balancer: Spread too tight for 'min' tick mode on {sell_market_tuple.trading_pair}. "
-                            f"Calculated maker price {sell_price:.8g} <= bid {top_bid:.8g}. "
-                            f"Using bid price (will pay taker fees instead of maker rebate).")
-                        sell_price = top_bid  # Use taker price with clear warning
+                        taker_from_px = sell_price
+                        sell_price = top_bid
                 else:
                     # No min_price_increment available, fall back to taker
                     self.strategy.logger().warning(
@@ -3896,15 +3922,10 @@ cdef class PositionBalancerHandler:
             if top_ask <= 0:
                 return False
             sell_price = top_ask * (1.0 - self._sell_spread_pct)
-            # Check if maker price would cross the spread (become taker)
+            # Would cross -> taker. Noted here, logged after the send (same as 'min' above).
             if sell_price <= top_bid:
-                # IMPORTANT: Spread is too tight for this percentage
-                # Log clear warning so user understands why using taker price
-                self.strategy.logger().warning(
-                    f"Position balancer: Spread too tight for {self._sell_spread_pct*100:.2f}% spread on {sell_market_tuple.trading_pair}. "
-                    f"Calculated maker price {sell_price:.8g} <= bid {top_bid:.8g}. "
-                    f"Using bid price (will pay taker fees instead of maker rebate).")
-                sell_price = top_bid  # Use taker price with clear warning
+                taker_from_px = sell_price
+                sell_price = top_bid
 
         # Calculate amount based on excess, available base, and order size limit.
         # Use ADJUSTED excess to account for pending orders and avoid over-ordering.
@@ -4009,6 +4030,11 @@ cdef class PositionBalancerHandler:
         except Exception:
             pass  # Fall back to original price if quantization fails
 
+        # Trade-cooldown stamp: on the send, never on entry (see c_execute_buy_limit). Every exit above
+        # sends nothing, including the post-cancel settle gate: DELOREAN 09-17 waited out its full 300 s
+        # there with a live, profitable arb blocked on every tick (107 of the 183 dropped).
+        self.strategy._last_global_trade_timestamp = self.strategy._current_timestamp
+
         # Place limit sell order (no expiration_seconds — same reasoning as buy above)
         try:
             sell_order_id = self.strategy.c_sell_with_specific_market(
@@ -4079,6 +4105,15 @@ cdef class PositionBalancerHandler:
             self.strategy.logger().info(
                 f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: {self._sell_spread_pct * 100:.2f}%)")
+
+        # Taker note: INFO, only for an order that actually went out at the bid, after the send (same
+        # text shape as before, so pb_monitor still parses it). See c_execute_buy_limit.
+        if taker_from_px > 0.0:
+            _mode = "'min' tick mode" if self._sell_spread_is_min else f"{self._sell_spread_pct * 100:.2f}% spread"
+            self.strategy.logger().info(
+                f"Position balancer: Spread too tight for {_mode} on {sell_market_tuple.trading_pair}. "
+                f"Calculated maker price {taker_from_px:.8g} <= bid {top_bid:.8g}. "
+                f"Placed {sell_order_id} at the bid as taker (taker fee instead of maker rebate).")
 
         # Check if target reached - use ACTUAL balance (not adjusted)
         # to avoid marking as complete when order hasn't filled yet

@@ -45,6 +45,8 @@ cdef class PositionBalancerHandler:
         dict _last_sell_cancel_time
         dict _last_sell_cancel_cooldown
         dict _last_sell_insuf_bal_time
+        dict _last_buy_noop_time          # canonical_asset -> last buy placement attempt that sent nothing
+        dict _last_sell_noop_time         # canonical_asset -> same, sell side
         dict _buy_cancel_streak
         dict _sell_cancel_streak
         # Fill-pressure adaptive post-fill wait (trailing-stop-like spacing)
