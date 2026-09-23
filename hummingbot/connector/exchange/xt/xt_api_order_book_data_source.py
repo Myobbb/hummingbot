@@ -1,7 +1,7 @@
 import asyncio
-import heapq
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from bisect import bisect_left, insort
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from hummingbot.connector.exchange.xt import xt_constants as CONSTANTS, xt_web_utils as web_utils
 from hummingbot.core.data_type.common import TradeType
@@ -26,14 +26,36 @@ _SNAPSHOT_MAX_ATTEMPTS = 8
 _MAX_LEVELS_PER_SIDE = 2000
 
 
-class _LocalBook:
-    """One market's book as XT's 'Orderbook manage' page defines it: absolute quantity per level."""
+def _update_side(levels: Dict[float, float], prices: List[float], updates: Iterable) -> None:
+    # Absolute quantity per price; 0 deletes the level, and deleting an unknown level is normal.
+    for price, qty in updates:
+        p, q = float(price), float(qty)
+        if q > 0:
+            if p not in levels:
+                insort(prices, p)
+            levels[p] = q
+        elif p in levels:
+            del levels[p]
+            del prices[bisect_left(prices, p)]
 
-    __slots__ = ("bids", "asks", "last_id", "synced", "buffer", "bootstrapping", "attempts")
+
+class _LocalBook:
+    """
+    One market's book as XT's 'Orderbook manage' page defines it: absolute quantity per level.
+
+    Each side keeps a dict (price -> quantity) plus its prices in ascending order, so the top N is
+    a slice. Rebuilding the top 50 from the whole book on every push (heapq over 500-2000 levels)
+    was the largest cost per push (S7, 2026-09-23).
+    """
+
+    __slots__ = ("bids", "asks", "bid_prices", "ask_prices", "last_id", "synced", "buffer", "bootstrapping",
+                 "attempts")
 
     def __init__(self) -> None:
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
+        self.bid_prices: List[float] = []
+        self.ask_prices: List[float] = []
         self.last_id: Optional[int] = None
         self.synced: bool = False
         self.buffer: List[Dict[str, Any]] = []
@@ -43,11 +65,39 @@ class _LocalBook:
     def reset(self) -> None:
         self.bids.clear()
         self.asks.clear()
+        self.bid_prices.clear()
+        self.ask_prices.clear()
         self.last_id = None
         self.synced = False
         self.buffer.clear()
         self.bootstrapping = False
         self.attempts = 0
+
+    def load(self, bids: Iterable, asks: Iterable) -> None:
+        self.bids = {float(p): float(q) for p, q in bids if float(q) > 0}
+        self.asks = {float(p): float(q) for p, q in asks if float(q) > 0}
+        self.bid_prices = sorted(self.bids)
+        self.ask_prices = sorted(self.asks)
+
+    def apply(self, event: Dict[str, Any]) -> None:
+        _update_side(self.bids, self.bid_prices, event.get("b") or ())
+        _update_side(self.asks, self.ask_prices, event.get("a") or ())
+        if len(self.bid_prices) > _MAX_LEVELS_PER_SIDE:
+            cut = len(self.bid_prices) - _MAX_LEVELS_PER_SIDE // 2
+            for p in self.bid_prices[:cut]:
+                del self.bids[p]
+            del self.bid_prices[:cut]
+        if len(self.ask_prices) > _MAX_LEVELS_PER_SIDE:
+            keep = _MAX_LEVELS_PER_SIDE // 2
+            for p in self.ask_prices[keep:]:
+                del self.asks[p]
+            del self.ask_prices[keep:]
+
+    def top(self, depth: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """Best `depth` levels per side, best first."""
+        bids, asks = self.bids, self.asks
+        return ([(p, bids[p]) for p in reversed(self.bid_prices[-depth:])],
+                [(p, asks[p]) for p in self.ask_prices[:depth]])
 
 
 class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
@@ -67,6 +117,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
       - c_apply_snapshot also stamps last_applied_diff, which the orchestrator's stale-book check
         reads, so a snapshot-only feed keeps that check honest;
       - HTX's mbp.refresh.20 already feeds a 100 ms snapshot stream through the same path.
+
+    Speed: a depth push is applied and handed to the tracker inside the WebSocket reader, as soon as
+    it is read. Queueing it for the diff listener task first cost one more event-loop hand-off,
+    which under Hummingbot's 10 ms strategy ticks added up to ~3 ms at p99 (S7). REST snapshots still
+    go through that queue: until one is applied the book only buffers, so arrival order is kept.
 
     A runtime add subscribes the new market on the live socket instead of disconnecting it, and
     `_refresh_snapshot_for_pair` gives the orchestrator a per-market repair that leaves every other
@@ -93,6 +148,9 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ping_task: Optional[asyncio.Task] = None
         self._next_request_id: int = 0
         self._warned: set = set()
+        # The tracker's diff stream, known once listen_for_order_book_diffs runs; depth pushes are
+        # delivered straight into it from the WebSocket reader.
+        self._diff_output: Optional[asyncio.Queue] = None
 
     # ------------------------------------------------------------------ helpers
 
@@ -145,16 +203,19 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return response["result"]
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        """REST snapshot for the tracker's initial book (and its hourly fallback). The same result
-        also seeds this data source's local book when that book is still waiting for one, so the
-        startup does not fetch every market twice."""
+        """Snapshot for the tracker's initial book and its hourly refresh. A live (synced) local book
+        answers it directly: it is newer than any REST answer, and a REST snapshot applied after it
+        would roll the tracker's book back until the next push. Otherwise REST, and the same result
+        seeds the local book, so the startup does not fetch every market twice."""
         try:
             symbol = await self._symbol_for_pair(trading_pair)
         except KeyError:
             raise ValueError(f"XT {trading_pair} has no entry in the connector's symbol map; "
                              f"no depth snapshot was requested") from None
-        result = await self._request_depth(symbol)
         book = self._book(symbol)
+        if book.synced:
+            return self._snapshot_message(trading_pair, book)
+        result = await self._request_depth(symbol)
         if not book.synced:
             self._message_queue[self._diff_messages_queue_key].put_nowait(
                 {"topic": _REST_SNAPSHOT, "s": symbol, "result": result})
@@ -270,13 +331,28 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception as e:
             self.logger().warning(f"XT public WS keepalive stopped: {e}")
 
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        self._diff_output = output
+        await super().listen_for_order_book_diffs(ev_loop, output)
+
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant) -> None:
+        diff_key = self._diff_messages_queue_key
+        diff_queue = self._message_queue[diff_key]
         async for ws_response in websocket_assistant.iter_messages():
             data = ws_response.data
             if not isinstance(data, dict):
                 continue  # the text "pong" reply
             channel = self._channel_originating_message(event_message=data)
-            if channel in self._get_messages_queue_keys():
+            if channel == diff_key:
+                # Applied here, now. The queue is used only while it holds something (a REST snapshot,
+                # or a push that came before the listener started), so the arrival order is kept.
+                output = self._diff_output
+                if (output is not None and diff_queue.empty()
+                        and (data.get("data") or {}).get("s") in self._symbol_to_pair_cache):
+                    self._on_depth_update(data, output)
+                else:
+                    diff_queue.put_nowait(data)
+            elif channel in self._get_messages_queue_keys():
                 self._message_queue[channel].put_nowait(data)
             else:
                 await self._process_message_for_unknown_channel(event_message=data, websocket_assistant=websocket_assistant)
@@ -313,10 +389,23 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # ------------------------------------------------------------------ the local book
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue) -> None:
+        """The queued path (REST snapshots, and pushes that could not be applied on arrival)."""
         if raw_message.get("topic") == _REST_SNAPSHOT:
-            await self._apply_rest_snapshot(raw_message["s"], raw_message["result"], message_queue)
+            symbol = raw_message["s"]
+            if symbol not in self._symbol_to_pair_cache:
+                await self._pair_for_symbol(symbol)
+            self._apply_rest_snapshot(symbol, raw_message["result"], message_queue)
             return
+        symbol = (raw_message.get("data") or {}).get("s")
+        if not symbol:
+            return
+        if symbol not in self._symbol_to_pair_cache:
+            await self._pair_for_symbol(symbol)
+        self._on_depth_update(raw_message, message_queue)
 
+    def _on_depth_update(self, raw_message: Dict[str, Any], output: asyncio.Queue) -> None:
+        """One depth_update push, per the 'Orderbook manage' procedure. Synchronous: it runs inside
+        the WebSocket reader. The symbol is already in _symbol_to_pair_cache."""
         data = raw_message.get("data") or {}
         symbol = data.get("s")
         if not symbol:
@@ -339,11 +428,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             book.buffer.append(data)
             self._ensure_bootstrap(symbol)
             return
-        self._apply_levels(book, data)
+        book.apply(data)
         book.last_id = i
-        await self._emit(symbol, book, message_queue)
+        self._emit(symbol, book, output)
 
-    async def _apply_rest_snapshot(self, symbol: str, result: Dict[str, Any], message_queue: asyncio.Queue) -> None:
+    def _apply_rest_snapshot(self, symbol: str, result: Dict[str, Any], output: asyncio.Queue) -> None:
         book = self._book(symbol)
         if book.synced:
             return  # a late or duplicate snapshot for a book that is already live
@@ -360,8 +449,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._ensure_bootstrap(symbol, delay=_SNAPSHOT_RETRY_DELAY)
             return
 
-        book.bids = {float(p): float(q) for p, q in (result.get("bids") or []) if float(q) > 0}
-        book.asks = {float(p): float(q) for p, q in (result.get("asks") or []) if float(q) > 0}
+        book.load(result.get("bids") or [], result.get("asks") or [])
         book.last_id = last_update_id
         for event in pending:
             fi, i = int(event["fi"]), int(event["i"])
@@ -372,48 +460,34 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 book.reset()
                 self._ensure_bootstrap(symbol)
                 return
-            self._apply_levels(book, event)
+            book.apply(event)
             book.last_id = i
         book.buffer.clear()
         book.synced = True
         book.attempts = 0
-        await self._emit(symbol, book, message_queue)
+        self._emit(symbol, book, output)
 
     @staticmethod
-    def _apply_levels(book: _LocalBook, event: Dict[str, Any]) -> None:
-        # Absolute quantity per price; 0 deletes the level, and deleting an unknown level is normal.
-        for side, levels in ((book.bids, event.get("b") or ()), (book.asks, event.get("a") or ())):
-            for price, qty in levels:
-                p, q = float(price), float(qty)
-                if q > 0:
-                    side[p] = q
-                else:
-                    side.pop(p, None)
-        if len(book.bids) > _MAX_LEVELS_PER_SIDE:
-            book.bids = dict(heapq.nlargest(_MAX_LEVELS_PER_SIDE // 2, book.bids.items()))
-        if len(book.asks) > _MAX_LEVELS_PER_SIDE:
-            book.asks = dict(heapq.nsmallest(_MAX_LEVELS_PER_SIDE // 2, book.asks.items()))
+    def _message(trading_pair: str, update_id: int, bids: list, asks: list) -> OrderBookMessage:
+        return OrderBookMessage(
+            message_type=OrderBookMessageType.SNAPSHOT,
+            content={"trading_pair": trading_pair, "update_id": update_id, "bids": bids, "asks": asks},
+            timestamp=time.time(),
+        )
 
-    async def _emit(self, symbol: str, book: _LocalBook, message_queue: asyncio.Queue) -> None:
-        bids = heapq.nlargest(CONSTANTS.EMIT_DEPTH, book.bids.items())
-        asks = heapq.nsmallest(CONSTANTS.EMIT_DEPTH, book.asks.items())
+    def _snapshot_message(self, trading_pair: str, book: _LocalBook) -> OrderBookMessage:
+        bids, asks = book.top(CONSTANTS.EMIT_DEPTH)
+        return self._message(trading_pair, book.last_id, bids, asks)
+
+    def _emit(self, symbol: str, book: _LocalBook, output: asyncio.Queue) -> None:
+        bids, asks = book.top(CONSTANTS.EMIT_DEPTH)
         if bids and asks and bids[0][0] >= asks[0][0]:
             # Cannot happen with an unbroken sequence; treat it as corruption and start over.
             self.logger().warning(f"XT {symbol}: crossed book (bid {bids[0][0]} >= ask {asks[0][0]}); rebuilding.")
             book.reset()
             self._ensure_bootstrap(symbol)
             return
-        trading_pair = await self._pair_for_symbol(symbol)
-        message_queue.put_nowait(OrderBookMessage(
-            message_type=OrderBookMessageType.SNAPSHOT,
-            content={
-                "trading_pair": trading_pair,
-                "update_id": book.last_id,
-                "bids": bids,
-                "asks": asks,
-            },
-            timestamp=time.time(),
-        ))
+        output.put_nowait(self._message(self._symbol_to_pair_cache[symbol], book.last_id, bids, asks))
 
     # ------------------------------------------------------------------ trades
 
