@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,9 +41,9 @@ class XtExchange(ExchangePyBase):
     trading/exchanges/xt-api) and the pyxt SDK. Every XT-specific choice below cites the doc page, the
     SDK, or a live observation; open questions are audit-logged ([XT-AUDIT]) rather than guessed.
 
-    Scope: LIMIT (GTC) orders only, which is all arb_l and the position balancer send. XT's
-    `timeInForces` on API-tradable markets list GTC/IOC and no GTX (post-only), and MARKET orders
-    have never been exercised here, so neither is offered.
+    Scope: LIMIT (GTC) orders only, which is all arb_l and the position balancer send. Where XT lists
+    `timeInForces` at all (184 of 1185 markets, 2026-09-23) it is GTC/IOC with no GTX (post-only), and
+    MARKET orders have never been exercised here, so neither is offered.
     """
 
     web_utils = web_utils
@@ -203,23 +204,31 @@ class XtExchange(ExchangePyBase):
         return response
 
     @staticmethod
+    def _raw(response: Any) -> str:
+        """XT's response body as JSON, complete, for logs and error messages."""
+        try:
+            return json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return repr(response)
+
+    @staticmethod
     def _raise_on_error(response: Dict[str, Any], context: str) -> Dict[str, Any]:
         if web_utils.is_error_response(response):
             mc = web_utils.error_code(response)
-            raise XtBusinessError(f"{context}: {mc} ({response})", mc)
+            raise XtBusinessError(f"{context}: {mc} | XT response: {XtExchange._raw(response)}", mc)
         return response
 
     def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                           order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
         """
         The base treats only HTTP 4xx as an exchange rejection and logs anything else as a network
-        error with a traceback. XT refuses orders with HTTP 200 + rc=1, so a routine refusal
-        (ORDER_002 insufficient funds, a filter) would look like an outage. It is logged as the
-        rejection it is; transport failures still take the base path.
+        error with a traceback. XT refuses orders with HTTP 200 + rc=1, so a refusal would look like
+        an outage. It is logged as a refusal, with the request and XT's complete response; transport
+        failures still take the base path.
         """
         if isinstance(exception, XtBusinessError):
-            self.logger().warning(f"XT rejected {trade_type.name.lower()} {order_type.name} order for {amount} "
-                                  f"{trading_pair} at {price}: {exception.mc}")
+            self.logger().warning(f"XT rejected {trade_type.name.lower()} {order_type.name} order {order_id} for "
+                                  f"{amount} {trading_pair} at {price}: {exception}")
             self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
             return
         super()._on_order_failure(order_id, trading_pair, amount, trade_type, order_type, price, exception, **kwargs)
@@ -247,6 +256,29 @@ class XtExchange(ExchangePyBase):
             return Decimal(default)
 
     # ------------------------------------------------------------------ orders
+
+    async def _create_order(self, trade_type: TradeType, order_id: str, trading_pair: str, amount: Decimal,
+                            order_type: OrderType, price: Optional[Decimal] = None, **kwargs):
+        """
+        The base reads self._trading_rules[trading_pair] before it tracks the order. With no rule it
+        stops there with a bare KeyError in a background task (B2-USDT, 2026-09-23). Nothing is sent to
+        XT, the order is never tracked, no failure event fires, and the strategy keeps cancelling an
+        order that does not exist. Here the order is tracked and failed the way the base fails its own
+        pre-send checks (min size, min notional), with a message saying it was not sent and why.
+        """
+        if trading_pair not in self._trading_rules:
+            message = (f"{trade_type.name} {order_type.name} order {order_id} for {amount} {trading_pair} at {price} "
+                       f"was NOT sent to XT: the connector has no trading rule for {trading_pair} "
+                       f"({len(self._trading_rules)} rules built from GET {CONSTANTS.SYMBOL_PATH}).")
+            self.logger().error(message)
+            self.start_tracking_order(order_id=order_id, exchange_order_id=None, trading_pair=trading_pair,
+                                      order_type=order_type, trade_type=trade_type, price=price, amount=amount,
+                                      **kwargs)
+            self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair,
+                                             exception=ValueError(message))
+            return
+        await super()._create_order(trade_type=trade_type, order_id=order_id, trading_pair=trading_pair,
+                                    amount=amount, order_type=order_type, price=price, **kwargs)
 
     async def _place_order(
         self,
@@ -281,19 +313,18 @@ class XtExchange(ExchangePyBase):
             # would mark it FAILED and stop tracking it, leaving a live order nobody watches. Ask XT by
             # client id first; only a confirmed absence lets the failure stand.
             exchange_order_id = await self._find_order_by_client_id(order_id)
-            self._audit("place-order-unanswered", client_id=order_id, error=str(transport_error)[:160],
+            self._audit("place-order-unanswered", client_id=order_id, error=repr(transport_error),
                         found_on_exchange=exchange_order_id)
             if exchange_order_id is not None:
                 return exchange_order_id, self.current_timestamp
             raise
-        # AUDIT: whether string price/quantity are accepted, on a market with orderTypes [] as well
-        # as one that lists LIMIT, and what the response echoes.
-        self._audit("place-order", request=data, rc=response.get("rc"), mc=response.get("mc"),
-                    result=response.get("result"))
-        self._raise_on_error(response, f"Error submitting order {order_id}")
+        # AUDIT: every placement with XT's complete answer. What string price/quantity, orderTypes []
+        # or openapiEnabled=false mean for an order is read from these lines, not assumed.
+        self._audit("place-order", request=self._raw(data), response=self._raw(response))
+        self._raise_on_error(response, f"Order {order_id} refused, request {self._raw(data)}")
         result = response.get("result") or {}
         if result.get("orderId") is None:
-            raise IOError(f"Error submitting order {order_id}: XT returned no orderId ({response})")
+            raise IOError(f"Error submitting order {order_id}: XT returned no orderId | XT response: {self._raw(response)}")
         return str(result["orderId"]), self.current_timestamp
 
     async def _find_order_by_client_id(self, client_order_id: str) -> Optional[str]:
@@ -325,7 +356,7 @@ class XtExchange(ExchangePyBase):
             limit_id=CONSTANTS.CANCEL_ORDER_LIMIT_ID,
         )
         self._audit("cancel-order", client_id=order_id, exchange_order_id=exchange_order_id,
-                    rc=response.get("rc"), mc=response.get("mc"), result=response.get("result"))
+                    response=self._raw(response))
         self._raise_on_error(response, f"Error cancelling order {order_id}")
         return True
 
@@ -543,11 +574,11 @@ class XtExchange(ExchangePyBase):
 
     async def _add_trading_pair_to_symbol_map(self, trading_pair: str):
         """
-        Runtime add of a pair missing from the startup map. The base builds `f"{base}{quote}"`
-        ("BTCUSDT"), which XT does not recognise, so the pair would subscribe and trade under a dead
-        symbol with no error (the OKX 'hyphen poison' class). XT's form is lowercase with an
-        underscore. A pair that is missing from the startup map was filtered out there as not
-        API-tradable, so its orders will be refused (SYMBOL_005); that is said loudly.
+        Runtime add of a pair that is not in the startup map, i.e. not among the markets
+        GET /v4/public/symbol listed at startup (every listed market is mapped). The base builds
+        `f"{base}{quote}"` ("BTCUSDT"), which XT does not recognise, so the pair would subscribe and
+        trade under a dead symbol with no error (the OKX 'hyphen poison' class). XT's form is
+        lowercase base_quote (all 1185 listed markets, 2026-09-23).
         """
         symbol_map = await self.trading_pair_symbol_map()
         if trading_pair in symbol_map.inverse:
@@ -556,9 +587,8 @@ class XtExchange(ExchangePyBase):
         exchange_symbol = f"{base.lower()}_{quote.lower()}"
         symbol_map[exchange_symbol] = trading_pair
         self.logger().warning(
-            f"XT {trading_pair} was not in the startup symbol map: it is not API-tradable (offline, trading "
-            f"disabled or openapiEnabled=false). Added as {exchange_symbol} for market data; orders on it will "
-            f"be rejected with {CONSTANTS.MC_SYMBOL_NOT_API_TRADABLE}.")
+            f"XT {trading_pair} was not among the markets GET {CONSTANTS.SYMBOL_PATH} listed at startup; "
+            f"mapped to {exchange_symbol}. XT's answers to its requests will show whether it exists.")
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """

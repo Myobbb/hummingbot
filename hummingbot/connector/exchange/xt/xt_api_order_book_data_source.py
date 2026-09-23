@@ -148,7 +148,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """REST snapshot for the tracker's initial book (and its hourly fallback). The same result
         also seeds this data source's local book when that book is still waiting for one, so the
         startup does not fetch every market twice."""
-        symbol = await self._symbol_for_pair(trading_pair)
+        try:
+            symbol = await self._symbol_for_pair(trading_pair)
+        except KeyError:
+            raise ValueError(f"XT {trading_pair} has no entry in the connector's symbol map; "
+                             f"no depth snapshot was requested") from None
         result = await self._request_depth(symbol)
         book = self._book(symbol)
         if not book.synced:
@@ -200,17 +204,27 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_channels(self, ws: WSAssistant) -> None:
         try:
             topics: List[str] = []
+            subscribed = 0
             for trading_pair in self._trading_pairs:
-                symbol = await self._symbol_for_pair(trading_pair)
+                try:
+                    symbol = await self._symbol_for_pair(trading_pair)
+                except KeyError:
+                    # One unknown pair must not fail the whole subscription: the reconnect loop would
+                    # hit it again every time and leave every XT book empty.
+                    self._warn_once(f"unmapped:{trading_pair}",
+                                    f"XT {trading_pair} has no entry in the connector's symbol map; its market data "
+                                    f"is not subscribed. The other markets are.")
+                    continue
                 self._book(symbol).reset()
                 topics.extend(self._topics(symbol))
+                subscribed += 1
             for i in range(0, len(topics), CONSTANTS.WS_TOPICS_PER_REQUEST):
                 await ws.send(WSJSONRequest(payload={
                     "method": CONSTANTS.WS_METHOD_SUBSCRIBE,
                     "params": topics[i:i + CONSTANTS.WS_TOPICS_PER_REQUEST],
                     "id": self._request_id(),
                 }))
-            self.logger().info(f"Subscribed to XT depth_update and trade channels for {len(self._trading_pairs)} markets.")
+            self.logger().info(f"Subscribed to XT depth_update and trade channels for {subscribed} markets.")
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))

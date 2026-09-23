@@ -66,7 +66,7 @@ MC_OUTDATED_MESSAGE = "AUTH_105"      # clock drift: the only code that means "r
 MC_PERMISSION_DENIED = "AUTH_106"
 MC_ORDER_NOT_FOUND = "ORDER_005"      # verified live for orderId, clientOrderId and the path form
 MC_INSUFFICIENT_FUNDS = "ORDER_002"
-MC_SYMBOL_NOT_API_TRADABLE = "SYMBOL_005"
+MC_SYMBOL_NOT_API_TRADABLE = "SYMBOL_005"  # docs: "The symbol does not support trading via API"
 
 TIME_SYNC_ERROR_CODES = [MC_OUTDATED_MESSAGE]
 

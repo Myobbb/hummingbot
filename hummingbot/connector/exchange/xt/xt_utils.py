@@ -19,27 +19,15 @@ DEFAULT_FEES = TradeFeeSchema(
 
 def is_exchange_information_valid(symbol_info: Dict[str, Any]) -> bool:
     """
-    A market this connector can trade: ONLINE, trading enabled and **API trading enabled**.
+    Structural check only: the entry names a symbol and its two currencies.
 
-    `openapiEnabled` is the gate that matters. Live on 2026-09-23 only 434 of 1096 USDT markets
-    passed all three, and 213 of the 459 XT tickers in the P1 groups were openapiEnabled=false. An
-    order on such a market fails with SYMBOL_005, so it is kept out of the symbol map altogether.
-
-    Open question, recorded rather than guessed: 313 of the 434 list `orderTypes: []` (the rest list
-    LIMIT/MARKET). An empty list is not treated as "no LIMIT", because that would drop most tradable
-    markets (PEPE included) on an undocumented reading. The first live order on such a market settles
-    it; the placement is audit-logged.
+    XT's flags (`state`, `tradingEnabled`, `openapiEnabled`, `orderTypes`) are NOT used to drop
+    markets. The docs do not say what they mean for an API order ("openapiEnabled: is OPENAPI enabled").
+    A filter on them stopped the B2-USDT orders before they were sent (2026-09-23), so XT's answer was
+    never seen. Every listed market gets a symbol and a trading rule, and XT's response to an order
+    is what decides. It is logged in full.
     """
-    if not symbol_info.get("symbol"):
-        return False
-    if symbol_info.get("state") != "ONLINE":
-        return False
-    if symbol_info.get("tradingEnabled") is not True or symbol_info.get("openapiEnabled") is not True:
-        return False
-    order_types = symbol_info.get("orderTypes") or []
-    if order_types and "LIMIT" not in order_types:
-        return False
-    return True
+    return all(symbol_info.get(key) not in (None, "") for key in ("symbol", "baseCurrency", "quoteCurrency"))
 
 
 class XtConfigMap(BaseConnectorConfigMap):
