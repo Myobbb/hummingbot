@@ -3565,11 +3565,11 @@ cdef class PositionBalancerHandler:
                 else:
                     # No min_price_increment available, fall back to taker
                     self.strategy.logger().warning(
-                        f"Position balancer: No min_price_increment for {buy_market_tuple.trading_pair}, using taker price")
+                        f"Position balancer: No min_price_increment for {asset_key} on {market.name}, using taker price")
                     buy_price = top_ask
             except Exception as e:
                 self.strategy.logger().warning(
-                    f"Position balancer: Error calculating 'min' mode price for {buy_market_tuple.trading_pair}: {e}, using taker")
+                    f"Position balancer: Error calculating 'min' mode price for {asset_key} on {market.name}: {e}, using taker")
                 buy_price = top_ask  # Fall back to taker on error
         elif self._buy_spread_pct == 0.0:
             # Aggressive mode (0%): Buy at ask (taker) - this is intentional
@@ -3675,7 +3675,7 @@ cdef class PositionBalancerHandler:
             # cooldown the arb layer had set on this venue — fixed 2026-08-17.
             self.strategy._last_failure_timestamps[buy_market_tuple] = (
                 self.strategy._current_timestamp + self.strategy._order_timeout)
-            self.strategy.logger().warning(f"Error submitting buy limit order to {market.name}: {e}")
+            self.strategy.logger().warning(f"Error submitting buy limit order for {asset_key} to {market.name}: {e}")
             return False
 
         # Track order
@@ -3688,7 +3688,8 @@ cdef class PositionBalancerHandler:
                 self.strategy._pending_buy_orders_by_market[buy_market_tuple] = set()
             self.strategy._pending_buy_orders_by_market[buy_market_tuple].add(buy_order_id)
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to track pending buy order by market: {e}")
+            self.strategy.logger().warning(
+                f"Failed to track pending buy order by market for {asset_key} on {market.name} ({buy_order_id}): {e}")
 
         # Mark as position balancer order to prevent main strategy timeout cancellation
         try:
@@ -3698,7 +3699,8 @@ cdef class PositionBalancerHandler:
             # and every orphan found so far (COMMON/gate_io, RVV/bing_x) was a PB order.
             self.strategy._placed_order_ids[buy_order_id] = self.strategy._current_timestamp
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
+            self.strategy.logger().warning(
+                f"Failed to mark order {buy_order_id} ({asset_key} on {market.name}) as position balancer order: {e}")
 
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:
@@ -3718,7 +3720,7 @@ cdef class PositionBalancerHandler:
             # Store order details for smart cancellation (market_tuple, price)
             self._active_buy_order_details[asset_key] = (buy_market_tuple, buy_price)
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id}: {e}")
+            self.strategy.logger().warning(f"Failed to track buy limit order {buy_order_id} ({asset_key} on {market.name}): {e}")
 
         # Log order placement. Includes `on {venue}` (symmetric with the Cancelled line)
         # so the placed venue is explicit — a multi-venue asset (e.g. PANTHER htx↔mexc)
@@ -3740,7 +3742,7 @@ cdef class PositionBalancerHandler:
         if taker_from_px > 0.0:
             _mode = "'min' tick mode" if self._buy_spread_is_min else f"{self._buy_spread_pct * 100:.2f}% spread"
             self.strategy.logger().info(
-                f"Position balancer: Spread too tight for {_mode} on {buy_market_tuple.trading_pair}. "
+                f"Position balancer: Spread too tight for {_mode} on {buy_market_tuple.trading_pair} ({market.name}). "
                 f"Calculated maker price {taker_from_px:.8g} >= ask {top_ask:.8g}. "
                 f"Placed {buy_order_id} at the ask as taker (taker fee instead of maker rebate).")
 
@@ -3907,11 +3909,11 @@ cdef class PositionBalancerHandler:
                 else:
                     # No min_price_increment available, fall back to taker
                     self.strategy.logger().warning(
-                        f"Position balancer: No min_price_increment for {sell_market_tuple.trading_pair}, using taker price")
+                        f"Position balancer: No min_price_increment for {asset_key} on {market.name}, using taker price")
                     sell_price = top_bid
             except Exception as e:
                 self.strategy.logger().warning(
-                    f"Position balancer: Error calculating 'min' mode price for {sell_market_tuple.trading_pair}: {e}, using taker")
+                    f"Position balancer: Error calculating 'min' mode price for {asset_key} on {market.name}: {e}, using taker")
                 sell_price = top_bid  # Fall back to taker on error
         elif self._sell_spread_pct == 0.0:
             # Aggressive mode (0%): Sell at bid (taker) - this is intentional
@@ -3942,7 +3944,7 @@ cdef class PositionBalancerHandler:
 
         if amount_to_sell <= EPSILON:
             self.strategy.logger().warning(
-                f"Position balancer: Sell order blocked - amount too small. "
+                f"Position balancer: Sell order blocked - {asset_key} on {market.name}: amount too small. "
                 f"amount_to_sell={amount_to_sell:.8g}, excess_adjusted={excess_adjusted:.6f}, "
                 f"last_bid={last_bid:.8g}, base_bal_raw={base_bal_raw:.8g}, "
                 f"pending_sell={pending_sell_base:.8g}, effective_raw={effective_raw:.8g}, "
@@ -3961,8 +3963,8 @@ cdef class PositionBalancerHandler:
 
         if quantized_amount <= Decimal("0"):
             self.strategy.logger().warning(
-                f"Position balancer: Sell order blocked - {sell_market_tuple.base_asset} residue "
-                f"is below {market.name}'s own step or minimum lot. "
+                f"Position balancer: Sell order blocked - {asset_key} on {market.name}: residue "
+                f"is below the venue's own step or minimum lot. "
                 f"pre_quantize={amount_to_sell:.8g}, placeable={quantized_amount}")
             # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
             # Declare completion so the balancer doesn't spin forever on unsellable residue.
@@ -3996,11 +3998,11 @@ cdef class PositionBalancerHandler:
         if volume_usd < self.strategy._min_order_usd:
             if self._sell_target_usd == 0.0:
                 self.strategy.logger().info(
-                    f"Position balancer: Sell-to-zero dust sweep for {asset_key} - "
+                    f"Position balancer: Sell-to-zero dust sweep for {asset_key} on {market.name} - "
                     f"sending {float(quantized_amount):.6f} (${volume_usd:.2f}) below software floor")
             else:
                 self.strategy.logger().warning(
-                    f"Position balancer: Sell order blocked - below min notional. "
+                    f"Position balancer: Sell order blocked - {asset_key} on {market.name}: below min notional. "
                     f"volume_usd={volume_usd:.6f} < min_order_usd={self.strategy._min_order_usd:.6f}, "
                     f"quantized_amount={quantized_amount}, sell_price={sell_price:.8g}")
                 # Too small, mark complete
@@ -4048,7 +4050,7 @@ cdef class PositionBalancerHandler:
             # cooldown the arb layer had set on this venue — fixed 2026-08-17.
             self.strategy._last_failure_timestamps[sell_market_tuple] = (
                 self.strategy._current_timestamp + self.strategy._order_timeout)
-            self.strategy.logger().warning(f"Error submitting sell limit order to {market.name}: {e}")
+            self.strategy.logger().warning(f"Error submitting sell limit order for {asset_key} to {market.name}: {e}")
             return False
 
         # Track order
@@ -4061,7 +4063,8 @@ cdef class PositionBalancerHandler:
                 self.strategy._pending_sell_orders_by_market[sell_market_tuple] = set()
             self.strategy._pending_sell_orders_by_market[sell_market_tuple].add(sell_order_id)
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to track pending sell order by market: {e}")
+            self.strategy.logger().warning(
+                f"Failed to track pending sell order by market for {asset_key} on {market.name} ({sell_order_id}): {e}")
 
         # Mark as position balancer order to prevent main strategy timeout cancellation
         try:
@@ -4071,7 +4074,8 @@ cdef class PositionBalancerHandler:
             # and every orphan found so far (COMMON/gate_io, RVV/bing_x) was a PB order.
             self.strategy._placed_order_ids[sell_order_id] = self.strategy._current_timestamp
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to mark order as position balancer order: {e}")
+            self.strategy.logger().warning(
+                f"Failed to mark order {sell_order_id} ({asset_key} on {market.name}) as position balancer order: {e}")
 
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:
@@ -4091,7 +4095,7 @@ cdef class PositionBalancerHandler:
             # Store order details for smart cancellation (market_tuple, price)
             self._active_sell_order_details[asset_key] = (sell_market_tuple, sell_price)
         except Exception as e:
-            self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id}: {e}")
+            self.strategy.logger().warning(f"Failed to track sell limit order {sell_order_id} ({asset_key} on {market.name}): {e}")
 
         # Log order placement. Includes `on {venue}` (symmetric with the Cancelled line)
         # so the placed venue is explicit — a multi-venue asset picks its best market per
@@ -4111,7 +4115,7 @@ cdef class PositionBalancerHandler:
         if taker_from_px > 0.0:
             _mode = "'min' tick mode" if self._sell_spread_is_min else f"{self._sell_spread_pct * 100:.2f}% spread"
             self.strategy.logger().info(
-                f"Position balancer: Spread too tight for {_mode} on {sell_market_tuple.trading_pair}. "
+                f"Position balancer: Spread too tight for {_mode} on {sell_market_tuple.trading_pair} ({market.name}). "
                 f"Calculated maker price {taker_from_px:.8g} <= bid {top_bid:.8g}. "
                 f"Placed {sell_order_id} at the bid as taker (taker fee instead of maker rebate).")
 
