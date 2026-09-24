@@ -34,8 +34,9 @@ QUANTIZATION_EPSILON = 1e-9
 # All timing and threshold values are consolidated here for easy tweaking
 # =============================================================================
 
-# --- Order Hanging Intervals (seconds) ---
-# How long orders hang before being refreshed (cancelled and replaced)
+# --- Post-completion wait ---
+# Minimum wait after ANY terminal event on a side (fill, cancel, timeout, rejection: each one stamps
+# _last_*_completion_time) before that side places again. Fill pressure can extend it (below).
 cdef double DEFAULT_COMPLETION_COOLDOWN = 2.0            # Cooldown after order completion before placing new order
 
 # --- Fill-pressure adaptive post-fill wait ---
@@ -81,19 +82,19 @@ cdef double MIN_FRONTRUN_CHECK_DELAY = 5.0    # seconds — frontrun/undercut + 
 cdef double MIN_MARKET_SWITCH_DELAY  = 60.0   # seconds — better market (different exchange)
 
 # --- Post-cancel cooldown before placing the next order ---
-# Two tiers based on cancel reason:
+# Chosen by _cancel_buy/sell_order from the cancel reason (classified in c_cancel_stale_orders):
 #
-# POST_CANCEL_COOLDOWN_REACTIVE (3s) — market moved against us (undercut/frontrun/large-gap).
-#   We need to reprice quickly to reclaim top-of-book. 3s is enough to let the exchange
-#   process the cancel and avoid a rapid-fire burst impression.
+# POST_CANCEL_COOLDOWN_REACTIVE (3s) — a market event: frontrun/undercut, large gap, better
+#   market. Also bumps the cancel streak. Reprice quickly to get back on the book.
 #
-# POST_CANCEL_COOLDOWN_PROACTIVE (10s) — we initiated the cancel (periodic refresh,
-#   better market, price divergence). No urgency; the existing order was not beaten.
+# POST_CANCEL_COOLDOWN_PROACTIVE (10s) — housekeeping: mode disabled / target reached, and the
+#   periodic safety-net refresh. Also the fallback when a cancel we did not send arrives before
+#   we ever cancelled this asset ourselves (see handle_order_cancellation).
 #
-# Both are distinct from DEFAULT_COMPLETION_COOLDOWN (2s, used after a fill).
-cdef double POST_CANCEL_COOLDOWN_REACTIVE  = 3.0   # seconds — reactive: undercut/frontrun/large-gap
-cdef double POST_CANCEL_COOLDOWN_PROACTIVE = 10.0  # seconds — proactive: refresh/better-market/divergence
-# Legacy alias — kept for any external references; equals PROACTIVE value
+# Step-up and refuge cancels use STEP_UP_COOLDOWN (3s) and do not bump the streak.
+# All of these are separate from DEFAULT_COMPLETION_COOLDOWN (2s), which follows every completion.
+cdef double POST_CANCEL_COOLDOWN_REACTIVE  = 3.0   # seconds — reactive: frontrun/undercut, large gap, better market
+cdef double POST_CANCEL_COOLDOWN_PROACTIVE = 10.0  # seconds — proactive: mode disabled, periodic refresh
 
 # --- Stuck Cancel Detection ---
 cdef double STUCK_CANCEL_MULTIPLIER = 2.0  # Multiplier for stuck cancel detection (2x refresh interval)
@@ -152,15 +153,15 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 # market order lifts THEM, not us. When they fill/leave we are best-of-book again at a
 # better price.
 #
-# State machine per canonical asset, with hysteresis to avoid flip-flop:
-#   NORMAL --(undercut fires AND streak >= REFUGE_ARM_STREAK)--> REFUGE
-#   REFUGE --(any fill -> streak resets, _in_refuge cleared in handle_order_fill)--> NORMAL
-# While in REFUGE we SUPPRESS the undercut trigger (we intend to sit 2nd-best) and place at
-# wall ∓ 1 tick instead of top ∓ 1 tick. Exiting only on a fill is safe: if the jumper simply
-# leaves, we are already at wall-1tick == correct top placement, so NORMAL resumes seamlessly.
+# State machine per canonical asset:
+#   NORMAL --(frontrun/undercut fires AND streak >= REFUGE_ARM_STREAK)--> REFUGE
+#   REFUGE --(fill | order lands on another venue | backstop: jumper gone or we sank | enable_*)--> NORMAL
+# While in REFUGE we SUPPRESS the frontrun/undercut trigger (we intend to sit 2nd-best) and place
+# at wall ∓ 1 tick (c_refuge_wall) instead of top ∓ 1 tick. CHECK 4 re-parks every
+# REFUGE_REPARK_INTERVAL; the backstop (should_backstop_refresh) decides the exit.
 # Entry is on streak alone; the WALL SEARCH (not an entry gate) is what guarantees we hide under
 # a distinct level — see REFUGE_MIN_WALL_GAP_TICKS below. Placement falls back to top if the book
-# has no second level at all.
+# has no usable second level.
 cdef double REFUGE_ARM_STREAK = 5.0    # consecutive reactive undercuts before we stop chasing and take refuge.
                                        # Lowered 10->5 (2026-06-01): the OB-grounded audit showed contested legs
                                        # holding L1 only ~20-34% of the time, burning the streak-5..10 chase
@@ -192,23 +193,21 @@ cdef int REFUGE_WALL_MAX_LEVELS = 20   # safety bound on the book walk (not a tu
 # cadence and the backstop owns only the exit decision — one owner per concern. 60s matches the
 # better-market scan so the two periodic checks run on the same rhythm.
 cdef double REFUGE_REPARK_INTERVAL = 60.0
-# While in refuge we SUPPRESS undercut and simply HOLD (per tick). Repositioning AND exit are handled
-# ONCE PER ~2-MIN BACKSTOP CYCLE in should_backstop_refresh (c_cleanup_old_orders, at the 120s-age mark
-# — the order is still live there so order_price is known). At that single re-evaluation we count
-# foreign orders beating us (c_refuge_foreign_below):
-#   0  -> jumper gone (alone at top)            -> EXIT refuge, re-place NORMAL
-#   >=2 -> sank below more than one order        -> EXIT refuge (2nd-best premise broken), re-place NORMAL
-#   1  -> normal hold                            -> stay in refuge, re-park under the wall
-# Doing this only at the backstop (not per tick) means refuge decisions happen on the deliberate
-# ~5-6 min cadence, never on a stray tick. Refuge also EXITS on a fill, a session re-enable, or a
-# better-market relocation (those ARE per-tick, in c_cancel_stale_orders). See position-balancer.md.
+# While in refuge the per-tick check SUPPRESSES frontrun/undercut and skips CHECKS 2/3; CHECK 4
+# re-parks (above). The EXIT is decided once per backstop cycle in should_backstop_refresh
+# (c_cleanup_old_orders: a 60s pass over PB orders aged >= 120s — the order is still live there, so
+# its price is known). It counts foreign orders beating us (c_refuge_foreign_below) against the
+# depth we parked behind (the refuge flag's value):
+#   0          -> jumper gone                        -> EXIT refuge (streak reset), refresh
+#   > depth    -> sank below more than we parked behind -> EXIT refuge (streak kept), refresh
+#   otherwise  -> correctly parked                   -> keep the order (CHECK 4 owns repositioning)
+# Refuge also exits on a fill (handle_order_fill), when an order lands on a different venue
+# (c_execute_*), and on enable_* (fresh session). See position-balancer.md, Refuge state machine.
 
-# --- Better Market Switch ---
-# Tolerance for triggering immediate market switch (price difference as ratio)
-# e.g., 0.0001 = 0.01% = switch if other market is 0.01% better
-
-# Min mode hysteresis: only switch if new market is at least 0.1% better
-# This prevents flip-flopping between markets with nearly identical effective prices
+# --- Better market switch (CHECK 1) ---
+# BUY-in relocation gate: another venue's effective price must beat our order price by more than
+# this before we move. Prevents flip-flopping between venues with nearly identical prices.
+# The sell side has its own, wider gate below.
 cdef double MIN_MODE_SWITCH_HYSTERESIS = 0.001  # 0.1% - require meaningful improvement before switching
 
 # --- SELL-OFF venue switching (its own gate, wider than the buy side) ---
@@ -345,8 +344,8 @@ cdef class PositionBalancerHandler:
         # Pending order tracking (separate for buy/sell)
         self._pending_buy_by_asset = {}   # asset -> base amount pending
         self._pending_sell_by_asset = {}  # asset -> base amount pending
-        self._pending_buy_orders = {}     # order_id -> (asset, amount)
-        self._pending_sell_orders = {}    # order_id -> (asset, amount)
+        self._pending_buy_orders = {}     # order_id -> (asset, total_amount, filled_amount)
+        self._pending_sell_orders = {}    # order_id -> (asset, total_amount, filled_amount)
 
         # Limit order refresh
         self._limit_refresh_interval = limit_refresh_interval
@@ -358,8 +357,8 @@ cdef class PositionBalancerHandler:
         self._active_sell_order_details = {}  # asset -> (market_tuple, price)
         self._buy_cancel_request_time = {}    # asset -> timestamp when cancel was requested
         self._sell_cancel_request_time = {}   # asset -> timestamp when cancel was requested
-        self._last_buy_completion_time = {}   # asset -> timestamp when buy order completed
-        self._last_sell_completion_time = {}  # asset -> timestamp when sell order completed
+        self._last_buy_completion_time = {}   # canonical_asset -> last terminal event of a buy order (fill, cancel, timeout, rejection)
+        self._last_sell_completion_time = {}  # canonical_asset -> last terminal event of a sell order
         self._last_buy_cancel_time = {}       # canonical_asset -> timestamp when buy order was cancelled
         self._last_buy_cancel_cooldown = {}   # canonical_asset -> cooldown duration to apply (reactive vs proactive)
         self._last_sell_cancel_time = {}      # canonical_asset -> timestamp when sell order was cancelled
@@ -398,18 +397,19 @@ cdef class PositionBalancerHandler:
         self._buy_complete_since = 0.0
         self._sell_complete_since = 0.0
         # Second-level refuge state (per canonical asset). True = we have stopped chasing the
-        # penny-jumper and are resting under the wall (2nd-best). Set on detection, cleared on
-        # any fill (handle_order_fill). While True, undercut is suppressed and placement targets
-        # the wall instead of top-of-book.
+        # penny-jumper and are resting under the wall (2nd-best). Set when refuge arms; cleared by
+        # a fill, an order landing on a different venue, the backstop exit, or enable_*. While set,
+        # frontrun/undercut is suppressed and placement targets the wall instead of top-of-book.
         # canonical_asset -> in-refuge marker. Truthy means "in refuge" everywhere; the VALUE is the
         # intended park depth (how many foreign levels we deliberately sat behind). The arm writes
         # True (== 1) before the book is read; refuge placement overwrites it with `skipped + 1`.
         # should_backstop_refresh reads it to tell "hiding behind a wall" from "sank".
         self._in_refuge_sell = {}
         self._in_refuge_buy = {}
-        # asset (raw) -> (price, timestamp) of the order that just went away. Bridges the
-        # cancel -> replace gap so placement can still recognise our own stale level. See
-        # c_own_recent_price.
+        # asset (raw) -> (price, timestamp, venue[, unfilled base — sell side only]) of the order
+        # that just went away. Bridges the cancel -> replace gap so placement can still recognise
+        # our own stale level (c_own_recent_price), detects a venue change at the next placement,
+        # and feeds the sell-side settle gate (c_post_cancel_balance_stale).
         self._last_gone_buy_price = {}
         self._last_gone_sell_price = {}
 
@@ -1381,26 +1381,33 @@ cdef class PositionBalancerHandler:
         """Clean up pending order tracking on order cancellation."""
         # Record cancel time under the CANONICAL asset key so the placement gate
         # (which always reads canonical) never misses the cooldown on aliased assets.
-        # The cooldown duration was already stored in _last_buy/sell_cancel_cooldown by
-        # _cancel_buy/sell_order. For external cancels (exchange-initiated) we fall back
-        # to the proactive/conservative cooldown.
+        #
+        # The cooldown DURATION is one value per asset in _last_buy/sell_cancel_cooldown, written by
+        # _cancel_buy/sell_order each time WE cancel, and never cleared. So a cancel we did not send
+        # reuses the value our own last cancel of this asset left, and leaves the streak alone.
+        # In practice that is the arb layer's 2-min backstop refresh (2,640 of them 09-13..09-23,
+        # re-placed after a median 2.9s; genuine venue-side cancels were ~1 in 10 days), and it is
+        # the right behaviour: the backstop only refreshes when should_backstop_refresh says so,
+        # and that function already sets the streak on purpose (reset on "jumper gone", kept on
+        # "sank"). The 10s default + streak +1 below apply only before our first cancel of the
+        # asset in this session.
         ts = self.strategy._current_timestamp
         if order_id in self._pending_buy_orders:
             asset_key = self._pending_buy_orders[order_id][0]
             canonical = self._get_canonical_asset(asset_key)
             # Start cooldown clock NOW (when exchange confirms cancel, not when we sent the request).
             self._last_buy_cancel_time[canonical] = ts
-            # Cooldown duration was already set by _cancel_buy_order for internal cancels.
-            # For external/exchange-initiated cancels (not in dict), use conservative default
-            # and count toward the streak.
+            # Key absent = we have not cancelled this asset yet this session, and this cancel is
+            # not ours: conservative default, counted toward the streak.
             if canonical not in self._last_buy_cancel_cooldown:
                 self._last_buy_cancel_cooldown[canonical] = POST_CANCEL_COOLDOWN_PROACTIVE
                 self._buy_cancel_streak[canonical] = self._buy_cancel_streak.get(canonical, 0) + 1
-            # else: _cancel_buy_order already wrote cooldown and incremented streak; leave both.
+            # else: keep the stored cooldown and streak — ours for our own cancels, inherited otherwise.
         elif order_id in self._pending_sell_orders:
             asset_key = self._pending_sell_orders[order_id][0]
             canonical = self._get_canonical_asset(asset_key)
             self._last_sell_cancel_time[canonical] = ts
+            # Same rule as the buy side above.
             if canonical not in self._last_sell_cancel_cooldown:
                 self._last_sell_cancel_cooldown[canonical] = POST_CANCEL_COOLDOWN_PROACTIVE
                 self._sell_cancel_streak[canonical] = self._sell_cancel_streak.get(canonical, 0) + 1
@@ -1423,8 +1430,9 @@ cdef class PositionBalancerHandler:
         Clean up tracking for an order the exchange REJECTED at placement.
 
         The PB registers its tracking dicts (_active_*_orders, _active_*_order_details,
-        _pending_*_orders, _pending_*_by_asset) BEFORE the order is sent, so a rejected
-        placement leaves a phantom "active order" for that asset. Placement gate step 3
+        _pending_*_orders, _pending_*_by_asset) as soon as the send call returns an order id —
+        before the exchange has accepted the order — so a rejected placement leaves a phantom
+        "active order" for that asset. Placement gate step 3
         ("no active order for any alias") then blocks EVERY future order for that asset,
         permanently: no cancel event will ever arrive to clean it up, and the arb backstop
         cannot reach it either (its handle_old_order_cleanup call is gated on the order still
@@ -1456,26 +1464,22 @@ cdef class PositionBalancerHandler:
 
     def should_backstop_refresh(self, str order_id):
         """
-        Decide whether the arb-layer 120s backstop (c_cleanup_old_orders) should actually
-        cancel/re-place this position-balancer order, or leave it in place.
+        Decide whether the arb-layer backstop (c_cleanup_old_orders: a 60s pass over PB orders aged
+        >= 120s) should actually cancel/re-place this position-balancer order, or leave it in place.
 
-        The backstop is purely age-based: it fires every ~10 min regardless of whether the
-        order still needs repricing. For a healthy top-of-book min order on a stale book
-        (e.g. ARTX on bing_x) this is pure churn — we cancel and re-place at the SAME price,
-        losing FIFO queue position for nothing.
+        The backstop itself is purely age-based. For a healthy top-of-book min order on a stale
+        book (e.g. ARTX on bing_x) a refresh is pure churn — cancel and re-place at the SAME price,
+        losing FIFO queue position for nothing. The caller treats False as an absolute veto.
 
         Returns True  -> let the backstop refresh (cancel + re-place).
         Returns False -> order is still correctly placed; skip the refresh (keep queue position).
 
-        Refuge orders: this is the ONE ~2-min periodic re-evaluation point for them (called by the
-        backstop at the 120s-age mark — NOT per tick). We count foreign orders beating us
-        (c_refuge_foreign_below) and decide:
-          • count == 0 -> jumper gone (alone at top)   -> EXIT refuge, then refresh (re-place NORMAL).
-          • count >= 2 -> sank below >1 order (premise broken) -> EXIT refuge, then refresh (NORMAL).
-          • count == 1 -> normal refuge hold -> stay in refuge, refresh (re-park under the wall).
-        Either way we return True (the backstop always re-places a refuge order); the only question
-        is whether the flag survives into the re-place (count 1 -> refuge re-park; 0/≥2 -> normal).
-        The check lives HERE so it fires exactly once per ~2-min backstop cycle, never on a stray tick.
+        Refuge orders: this is where the refuge EXIT is decided — once per backstop cycle, never
+        per tick. We count foreign orders beating us (c_refuge_foreign_below) against the depth we
+        parked behind (the refuge flag's value, `skipped + 1`; a bare True reads as 1):
+          • count == 0     -> jumper gone        -> EXIT refuge (streak reset), return True.
+          • count > depth  -> we sank below it   -> EXIT refuge (streak KEPT), return True.
+          • otherwise      -> correctly parked   -> return False (CHECK 4 owns repositioning).
 
         Otherwise (non-refuge) we reuse the SAME oracle as the per-tick chase logic
         (c_check_immediate_conditions) with a large order_age so every check is active
@@ -2034,7 +2038,7 @@ cdef class PositionBalancerHandler:
                             best_market = chosen
                         candidates = funded
 
-            # ── Sell-off venue balance preference (placement only) ────────────────────────
+            # ── Sell-off venue balance preference (every call: CHECK 1 scan and placement) ──
             # Start from the best-priced venue and move only if another venue is BOTH within
             # SELL_BALANCE_PREFERENCE_PCT of that price AND holds strictly more base. Starting
             # from the best price means ties keep the best price, and a single-venue asset is
@@ -2148,10 +2152,19 @@ cdef class PositionBalancerHandler:
             # had its terminal event, so adding it now would orphan the id forever.
             if self.c_order_still_tracked(order_id):
                 self._disowned_live_orders.add(order_id)
-            
-            # Clean up from timeout set
-            self.strategy._timeout_cancelled_orders.discard(order_id)
-            
+                # The cancel MARKER must survive too. Our cancel request is still out, and the
+                # venue's answer to it is the late event this cleanup stopped waiting for. With the
+                # marker dropped, c_did_cancel_order_tracker read that answer as an exchange-side
+                # cancel and put the venue in failure cooldown (order_timeout, 60 min on a repeat),
+                # which blocks the arb and PB venue selection there. 120 of 131 stuck cancels
+                # ended that way, 2026-09-13 → 09-24 (117 × 180 s, 3 × 3600 s; 115 on mexc).
+                # Kept, the answer lands as TIMEOUT-CANCELLED like any PB cancel, and that branch
+                # discards it. If a fill ends the order instead, the backstop's untracked branch
+                # clears it.
+            else:
+                # Already terminal: no answer is coming, so nothing would ever consume the marker.
+                self.strategy._timeout_cancelled_orders.discard(order_id)
+
             # Clean up cancel request time
             if is_buy:
                 self._buy_cancel_request_time.pop(asset, None)
@@ -2260,7 +2273,7 @@ cdef class PositionBalancerHandler:
             if current_best_market is not None and current_best_market.market.name != order_market_tuple.market.name:
                 # Different market is now best - compare prices
                 # For 'min' mode: compare effective frontrun prices with hysteresis
-                # Only switch if new market is significantly better (0.1%) to prevent flip-flopping
+                # Only switch if new market is significantly better (0.1% buy / 0.3% sell) to prevent flip-flopping
                 if spread_is_min:
                     # Get effective price of new best market (its OWN per-market tick).
                     best_ob = (<ExchangeBase>current_best_market.market).c_get_order_book(current_best_market.trading_pair)
@@ -2326,7 +2339,8 @@ cdef class PositionBalancerHandler:
                     #     we are top (else CHECK 2 chases), gap >= STEP_UP_MIN_GAP_TICKS, 30s throttle.
                     #   REFUGE — anchored on the FRONTRUNNER, via the same c_refuge_wall the placement
                     #     path uses, so the check and the placement can never disagree. Re-park when we
-                    #     are more than LARGE_GAP_THRESHOLD ticks off (wall + 1 tick).
+                    #     are >= STEP_UP_MIN_GAP_TICKS - HALF_TICK_TOLERANCE (4.5) ticks off (wall + 1
+                    #     tick), at most once per REFUGE_REPARK_INTERVAL.
                     #     Anchoring on our own price here was WRONG (fixed 2026-08-16): it could not see
                     #     the market moving away from us — parked 0.1099 with the frontrunner at 0.1077
                     #     it reported "correctly parked" because 0.11 sat one tick above — and when the
@@ -2386,12 +2400,12 @@ cdef class PositionBalancerHandler:
                                 should_cancel = True
                                 cancel_reason = f"large gap {gap_amount:.8g} > {min_price_increment * LARGE_GAP_THRESHOLD:.8g}"
 
-                    # CHECK 4 (buy mirror): sit exactly 1 tick inside the first foreign level BEYOND
-                    # us. ONE rule, two postures — see the buy side for the full note.
-                    #   NORMAL — we ARE top ask, next ask far above: step UP to (next_ask - 1 tick).
-                    #   REFUGE — we are parked 2nd-best and that next ask IS the wall; >= 1.9 ticks
-                    #     of headroom means the wall moved away, so close the gap. Refuge survives
-                    #     (proactive "step-up" prefix + pure cancel never clears the flag).
+                    # CHECK 4 (buy mirror) — see the buy side for the full note.
+                    #   NORMAL — we ARE top ask, next foreign ask far above: step UP to
+                    #     (next_ask - 1 tick) via c_first_foreign_beyond.
+                    #   REFUGE — re-park to (wall - 1 tick) from c_refuge_wall when >= 4.5 ticks off,
+                    #     at most once per REFUGE_REPARK_INTERVAL. Refuge survives (proactive
+                    #     "step-up" prefix + a pure cancel never clears the flag).
                     if not should_cancel and spread_is_min and min_price_increment > 0:
                         canonical_su = self._get_canonical_asset(asset)
                         repark_interval = REFUGE_REPARK_INTERVAL if in_refuge else STEP_UP_MIN_INTERVAL
@@ -2535,12 +2549,10 @@ cdef class PositionBalancerHandler:
         The first FOREIGN level strictly BEYOND our own order — lower for a buy, higher for a
         sell — skipping our own level exactly once. Returns 0.0 if there is none.
 
-        This is the ONE definition of "the level we are sitting one tick inside of", and it is
-        deliberately state-agnostic so CHECK 4 can use it in both postures without a second walk:
-          • NORMAL order (we are top of book) -> the next level down/up, i.e. the step-up gap.
-          • REFUGE order (we are parked 2nd-best) -> the WALL we parked against. Levels ABOVE us
-            (the frontrunner and any stacked jumpers) are simply passed over by the comparison.
-        Fail-safe: 0.0 on any error, which every caller reads as "no gap information, do nothing".
+        Used by CHECK 4's NORMAL step-up: when we are top of book, this is the next level down/up,
+        i.e. the gap we may step into. (The REFUGE branch of CHECK 4 uses c_refuge_wall instead, the
+        same definition placement uses.)
+        Fail-safe: 0.0 on any error, which the caller reads as "no gap information, do nothing".
         """
         cdef:
             bint skipped_own = False
@@ -2570,26 +2582,17 @@ cdef class PositionBalancerHandler:
 
     cdef int c_refuge_foreign_below(self, str asset, bint is_buy):
         """
-        While in refuge, count FOREIGN orders strictly more aggressive than us (asks at/below our
+        While in refuge, count FOREIGN levels strictly more aggressive than us (asks at/below our
         price for a sell; bids at/above for a buy) — i.e. how many orders are currently beating us.
-        Drives both refuge exit conditions: count 0 = jumper gone (alone at top); count >= 2 = we
-        sank below more than one order (refuge premise broken); count 1 = normal refuge hold.
+        A foreign order sharing our exact tick counts (it beats us in queue / could resume jumping);
+        our OWN order's level is skipped exactly once. The walk stops once it passes our price.
 
-        This is the safe place to inspect refuge position: the order is LIVE in the book, so we know
-        our own price (order_price from details) and can walk the book skipping our own level. (At
-        re-park time we could NOT do this — details are popped, _own is None — which is why the
-        gap-based re-park promote was rejected; see position-balancer.md Weakness #2.)
+        Caller: should_backstop_refresh, which compares the count with the depth we parked behind:
+        0 -> jumper gone (exit), > depth -> we sank (exit), otherwise -> hold. The order is LIVE
+        there, so its price is known — that is why the check lives at the backstop.
 
-        Counts FOREIGN levels strictly MORE AGGRESSIVE than us — i.e. ASKS at/below our price (sell)
-        or BIDS at/above our price (buy). A foreign order sharing our exact tick counts (it's beating
-        us in queue / could resume jumping). Skips our OWN order's level exactly once. Used by the
-        two refuge exit checks in c_cancel_stale_orders:
-          • count == 0  -> "jumper gone" (we're alone at top) -> EXIT refuge, resume chasing.
-          • count >= 2  -> we SANK below MORE THAN ONE order (refuge failed to hold 2nd-best — the
-                           premise "sit one above a single jumper" is broken) -> EXIT refuge.
-          • count == 1  -> normal refuge state (one jumper below us, holding) -> stay.
-        Returns the count. Fail-safe: returns 1 on any error / missing details (the neutral "stay in
-        refuge" value — neither exit condition fires).
+        Returns the count. Fail-safe: returns 1 on any error / missing details — the neutral value
+        (neither exit fires at the default depth of 1).
         """
         cdef:
             tuple order_details
@@ -2653,7 +2656,7 @@ cdef class PositionBalancerHandler:
         REAL-WORLD GOAL: Maintain competitive position in order book while getting best price.
 
         Every tick — via c_check_immediate_conditions (each with its own age gate):
-          CHECK 1  better market   — another venue beats us by > MIN_MODE_SWITCH_HYSTERESIS (age >= 60s)
+          CHECK 1  better market   — another venue beats us by > 0.1% (buy) / 0.3% (sell); age >= 60s, one scan per 60s
           CHECK 2  frontrun/undercut — someone got inside us (age >= 5s, 20s at streak >= 5)
           CHECK 3  large gap       — we drifted > LARGE_GAP_THRESHOLD ticks off top +/- 1 tick
           CHECK 4  step-up / refuge re-park — reprice by >= STEP_UP_MIN_GAP_TICKS
@@ -2725,9 +2728,10 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, True, current_time - last_time, effective_frontrun_delay)
 
-                    # NOTE: refuge re-evaluation (count foreign orders above us → EXIT if 0=frontrunner
-                    # gone or >=2=sank below >1 order) is done once per ~2-min backstop cycle in
-                    # should_backstop_refresh, NOT here per-tick. On tick we only SUPPRESS + HOLD (below).
+                    # NOTE: the refuge EXIT (count foreign orders above us: 0 = frontrunner gone, more
+                    # than the parked depth = sank) is decided once per backstop cycle in
+                    # should_backstop_refresh, NOT here per tick. On tick we only SUPPRESS the frontrun
+                    # (below); CHECK 4 re-parks.
 
                     # ---- SECOND-LEVEL REFUGE (buy): don't chase the penny-jumper (mirror of sell) ----
                     # On "frontrun" (someone bid HIGHER than us): (a) already in refuge -> suppress and
@@ -2740,9 +2744,9 @@ cdef class PositionBalancerHandler:
                             and cancel_reason.startswith("frontrun")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_buy.get(refuge_canonical, False):
-                            # (a) HOLD — suppress the frontrun and sit above the wall. Per-tick does NOT
-                            # reposition/re-evaluate; the 120s backstop (should_backstop_refresh) does the
-                            # ~5-6 min count-based re-eval (re-park under wall / exit on 0 or >=2). Mirror of sell.
+                            # (a) HOLD — suppress the frontrun and sit above the wall. Repositioning is
+                            # CHECK 4 (every REFUGE_REPARK_INTERVAL); the exit is decided by the backstop
+                            # (should_backstop_refresh). Mirror of sell.
                             should_cancel = False
                             cancel_reason = ""
                         elif cancel_streak >= REFUGE_ARM_STREAK:
@@ -2836,39 +2840,36 @@ cdef class PositionBalancerHandler:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
 
-                    # NOTE: the refuge re-evaluation (count foreign orders below us → EXIT refuge if
-                    # 0 = jumper gone, or >=2 = sank below >1 order so the 2nd-best premise is broken)
-                    # is NOT done here per-tick. It runs once per ~2-min backstop cycle in
-                    # should_backstop_refresh (the order is still live there, so order_price is known).
-                    # On tick we only SUPPRESS undercut + HOLD (below); repositioning/exit is the
-                    # backstop's job. See should_backstop_refresh + position-balancer.md Exit conditions.
+                    # NOTE: the refuge EXIT (count foreign orders below us: 0 = jumper gone, more than
+                    # the parked depth = sank) is decided once per backstop cycle in
+                    # should_backstop_refresh (the order is still live there, so its price is known),
+                    # NOT here per tick. On tick we only SUPPRESS the undercut (below); CHECK 4 re-parks.
 
                     # ---- SECOND-LEVEL REFUGE (sell): don't chase the penny-jumper ----
                     # When the immediate check says "undercut", decide between chasing (normal) and
                     # taking refuge under the wall. Two cases:
                     #   (a) ALREADY in refuge -> SUPPRESS the undercut (we intend to sit 2nd-best;
                     #       the jumper is below us by design). Hold our wall order.
-                    #   (b) NOT in refuge yet, but the jumper has undercut us REFUGE_ARM_STREAK times
-                    #       in a row AND a valid wall exists -> ENTER refuge: allow this cancel (so the
-                    #       order can move UP), retag it "refuge" (proactive), and let placement put us
-                    #       at wall-1tick. Subsequent cycles hit case (a).
-                    # Refuge is cleared on any fill (handle_order_fill).
+                    #   (b) NOT in refuge yet, but the streak has reached REFUGE_ARM_STREAK -> ENTER
+                    #       refuge (streak-only: no wall-distance entry gate — the wall search at
+                    #       placement enforces the wall property): allow this cancel (so the order can
+                    #       move UP), retag it "refuge" (proactive), and let placement put us at
+                    #       wall - 1 tick. Subsequent cycles hit case (a).
+                    # Refuge exits on a fill, an order landing on another venue, the backstop exit,
+                    # or enable_sell_off.
                     if (should_cancel and self._sell_spread_is_min
                             and cancel_reason.startswith("undercut")):
                         refuge_canonical = self._get_canonical_asset(asset)
                         if self._in_refuge_sell.get(refuge_canonical, False):
-                            # (a) HOLD — suppress the undercut and sit under the wall. Per-tick does
-                            # NOT reposition or re-evaluate a refuge order; that is the 120s backstop's
-                            # job (should_backstop_refresh): every ~5-6 min it counts orders below us
-                            # and either re-parks under the current wall (1 jumper) or EXITS refuge
-                            # (0 = jumper gone, >=2 = sank below >1 order). On tick we only suppress + hold.
+                            # (a) HOLD — suppress the undercut and sit under the wall. Repositioning is
+                            # CHECK 4 (every REFUGE_REPARK_INTERVAL); the exit is decided by the backstop
+                            # (should_backstop_refresh). Mirror of buy.
                             should_cancel = False
                             cancel_reason = ""
                         elif cancel_streak >= REFUGE_ARM_STREAK:
                             # (b) enter refuge — move up under the wall on this cancel.
-                            # If no real wall exists, placement reads the 2nd ask and falls back to
-                            # normal top-of-book; a "wall must be >= N ticks above jumper" entry gate
-                            # is a future refinement (see position-balancer.md).
+                            # If the book has no usable wall, placement falls back to normal
+                            # top-of-book; a wall-distance entry gate is a possible future refinement.
                             self._in_refuge_sell[refuge_canonical] = True
                             cancel_reason = "refuge (taking 2nd-best under wall — stop chasing penny-jumper)"
                             self.strategy.logger().info(
@@ -2923,8 +2924,9 @@ cdef class PositionBalancerHandler:
         Uses stored market_tuple for robust direct cancellation by order_id.
 
         Args:
-            reactive: True if cancel is driven by a market event (undercut/frontrun/large-gap).
-                      Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of PROACTIVE (10s).
+            reactive: True if cancel is driven by a market event (frontrun/undercut, large gap,
+                      better market). Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of
+                      PROACTIVE (10s) and bumps the streak. Step-up/refuge reasons use STEP_UP_COOLDOWN.
         """
         cdef:
             tuple order_details
@@ -2969,8 +2971,8 @@ cdef class PositionBalancerHandler:
             else:
                 cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_buy_cancel_cooldown[canonical] = cooldown
-            # Only increment streak for reactive (market-event) cancels.
-            # Proactive refreshes (periodic, better-market, divergence, step-up) are scheduled
+            # Only increment streak for reactive cancels (frontrun/undercut, large gap, better
+            # market). Proactive ones (mode disabled, periodic refresh, step-up, refuge) are
             # housekeeping — counting them would back off frontrun detection on thin
             # markets that refresh often but are rarely frontrun.
             if reactive:
@@ -2996,8 +2998,9 @@ cdef class PositionBalancerHandler:
         Uses stored market_tuple for robust direct cancellation by order_id.
 
         Args:
-            reactive: True if cancel is driven by a market event (undercut/frontrun/large-gap).
-                      Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of PROACTIVE (10s).
+            reactive: True if cancel is driven by a market event (frontrun/undercut, large gap,
+                      better market). Uses POST_CANCEL_COOLDOWN_REACTIVE (3s) instead of
+                      PROACTIVE (10s) and bumps the streak. Step-up/refuge reasons use STEP_UP_COOLDOWN.
         """
         cdef:
             tuple order_details
@@ -3042,8 +3045,8 @@ cdef class PositionBalancerHandler:
             else:
                 cooldown = POST_CANCEL_COOLDOWN_REACTIVE if reactive else POST_CANCEL_COOLDOWN_PROACTIVE
             self._last_sell_cancel_cooldown[canonical] = cooldown
-            # Only increment streak for reactive (market-event) cancels.
-            # Proactive refreshes (periodic, better-market, divergence, step-up) are scheduled
+            # Only increment streak for reactive cancels (frontrun/undercut, large gap, better
+            # market). Proactive ones (mode disabled, periodic refresh, step-up, refuge) are
             # housekeeping — counting them would back off undercut detection on thin
             # markets that refresh often but are rarely undercut.
             if reactive:
@@ -3185,7 +3188,8 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
+                    # Post-completion wait: 2s after ANY terminal event on this side (fill or cancel —
+                    # both stamp the completion time) + the adaptive fill-pressure extra (0..25s).
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
                     # spacing); it's 0 after a single fill, and c_active_fill_pressure_wait expires it
                     # once FILL_PRESSURE_WINDOW has passed with no further PB completion — the recorder
@@ -3201,8 +3205,10 @@ cdef class PositionBalancerHandler:
                                 f"({time_since_completion:.1f}s/{DEFAULT_COMPLETION_COOLDOWN + buy_extra_wait:.1f}s)")
                     else:
                         # Check post-cancel cooldown — duration depends on why we cancelled:
-                        #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
-                        #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        #   reactive (frontrun/undercut, large gap, better market): POST_CANCEL_COOLDOWN_REACTIVE (3s)
+                        #   step-up / refuge: STEP_UP_COOLDOWN (3s)
+                        #   proactive (mode disabled, periodic refresh): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        #   not sent by us: see handle_order_cancellation
                         time_since_cancel = self.strategy._current_timestamp - self._last_buy_cancel_time.get(canonical_asset, 0.0)
                         required_cooldown = self._last_buy_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
                         # NO-OP RETRY PACE. An attempt that sent nothing (dust gap, below min notional,
@@ -3314,7 +3320,8 @@ cdef class PositionBalancerHandler:
                             break
 
                 if not has_active_order:
-                    # Post-fill cooldown: 2s base + adaptive fill-pressure extra (0..8s).
+                    # Post-completion wait: 2s after ANY terminal event on this side (fill or cancel —
+                    # both stamp the completion time) + the adaptive fill-pressure extra (0..25s).
                     # The extra grows when consecutive fills arrive quickly (trailing-stop-like
                     # spacing); it's 0 after a single fill, and c_active_fill_pressure_wait expires it
                     # once FILL_PRESSURE_WINDOW has passed with no further PB completion — the recorder
@@ -3330,8 +3337,10 @@ cdef class PositionBalancerHandler:
                                 f"({time_since_completion:.1f}s/{DEFAULT_COMPLETION_COOLDOWN + sell_extra_wait:.1f}s)")
                     else:
                         # Check post-cancel cooldown — duration depends on why we cancelled:
-                        #   reactive (undercut/frontrun/gap): POST_CANCEL_COOLDOWN_REACTIVE (3s)
-                        #   proactive (refresh/better-market): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        #   reactive (frontrun/undercut, large gap, better market): POST_CANCEL_COOLDOWN_REACTIVE (3s)
+                        #   step-up / refuge: STEP_UP_COOLDOWN (3s)
+                        #   proactive (mode disabled, periodic refresh): POST_CANCEL_COOLDOWN_PROACTIVE (10s)
+                        #   not sent by us: see handle_order_cancellation
                         time_since_cancel = self.strategy._current_timestamp - self._last_sell_cancel_time.get(canonical_asset, 0.0)
                         required_cooldown = self._last_sell_cancel_cooldown.get(canonical_asset, POST_CANCEL_COOLDOWN_PROACTIVE)
                         # No-op retry pace — mirror of the buy side above.
@@ -3418,8 +3427,10 @@ cdef class PositionBalancerHandler:
 
     cdef bint c_execute_buy_limit(self, object buy_market_tuple, object sell_market_tuple):
         """
-        Execute buy using limit order with spread from top bid.
-        Pattern: Place limit buy at (top_bid * (1 - spread_pct))
+        Place one PB buy limit order on buy_market_tuple.
+        Price: 'min' = reference bid + 1 tick, where the reference is the top bid, the next level if
+        the top is our own order, or the wall in refuge — at the ask (taker) if that would cross;
+        percentage = top_bid * (1 + pct); 0% = the ask.
 
         Returns True only if an order was SENT. The strategy's trade-cooldown stamp is written
         immediately before the send (see there), never on entry: every exit above it sends nothing.
@@ -3481,10 +3492,10 @@ cdef class PositionBalancerHandler:
         # keeps stepping inside us lives on a specific exchange, so carrying either onto a
         # different book is meaningless. Landing on a new venue wipes both at the root.
         # Keyed on where the order ACTUALLY lands, NOT on the "better market" cancel reason — that
-        # reason only names the venue the scan liked at that instant, and 31 pct of the time
-        # placement re-selects and comes straight back to the same book (the sell-off fuller-venue
-        # preference is applied at placement but not in the scan). Resetting on the cancel would
-        # wipe a live, legitimate bid war a third of the time; resetting on the landing cannot.
+        # reason only names the venue the scan liked at that instant, and placement re-selects
+        # (when this rule was written, 31 pct of relocations came straight back to the same book).
+        # Resetting on the cancel would wipe a live, legitimate bid war; resetting on the landing
+        # cannot.
         _prev_gone = self._last_gone_buy_price.get(asset_key)
         if _prev_gone is not None and len(_prev_gone) > 2 and _prev_gone[2] != buy_market_tuple.market.name:
             _canon_venue = self._get_canonical_asset(asset_key)
@@ -3759,8 +3770,10 @@ cdef class PositionBalancerHandler:
 
     cdef bint c_execute_sell_limit(self, object buy_market_tuple, object sell_market_tuple):
         """
-        Execute sell using limit order with spread from top ask.
-        Pattern: Place limit sell at (top_ask * (1 + spread_pct))
+        Place one PB sell limit order on sell_market_tuple.
+        Price: 'min' = reference ask - 1 tick, where the reference is the top ask, the next level if
+        the top is our own order, or the wall in refuge — at the bid (taker) if that would cross;
+        percentage = top_ask * (1 - pct); 0% = the bid.
 
         Returns True only if an order was SENT. The trade-cooldown stamp is written immediately
         before the send, never on entry — same rule and reasons as c_execute_buy_limit.
@@ -3827,10 +3840,10 @@ cdef class PositionBalancerHandler:
         # keeps stepping inside us lives on a specific exchange, so carrying either onto a
         # different book is meaningless. Landing on a new venue wipes both at the root.
         # Keyed on where the order ACTUALLY lands, NOT on the "better market" cancel reason — that
-        # reason only names the venue the scan liked at that instant, and 31 pct of the time
-        # placement re-selects and comes straight back to the same book (the sell-off fuller-venue
-        # preference is applied at placement but not in the scan). Resetting on the cancel would
-        # wipe a live, legitimate bid war a third of the time; resetting on the landing cannot.
+        # reason only names the venue the scan liked at that instant, and placement re-selects
+        # (when this rule was written, 31 pct of relocations came straight back to the same book).
+        # Resetting on the cancel would wipe a live, legitimate bid war; resetting on the landing
+        # cannot.
         _prev_gone = self._last_gone_sell_price.get(asset_key)
         if _prev_gone is not None and len(_prev_gone) > 2 and _prev_gone[2] != sell_market_tuple.market.name:
             _canon_venue = self._get_canonical_asset(asset_key)

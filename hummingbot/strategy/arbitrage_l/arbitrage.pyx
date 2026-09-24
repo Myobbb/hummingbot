@@ -1166,7 +1166,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """
         cdef:
             double cutoff = self._current_timestamp - (self._order_timeout * 2)
-            double pb_cutoff = self._current_timestamp - 120.0  # 2 min for position balancer orders (refuge re-park / drift backstop); lowered 5min→2min 2026-06-03 (refuge rotted below the wall between the old 5-min checks)
+            double pb_cutoff = self._current_timestamp - 120.0  # 2 min for position balancer orders (refuge exit / drift backstop); lowered 5min→2min 2026-06-03 (refuge rotted below the wall between the old 5-min checks)
             list timestamps_to_remove = []
             list tombstones_to_remove = []
             string order_id_str
@@ -1177,8 +1177,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
             
         # Phase 1: Find old entries in order timestamps (based on creation time).
-        # Position balancer orders use a longer threshold (2 min) — the position balancer
-        # manages its own refresh cycle; this is just a backstop, not an error condition.
+        # Position balancer orders use a shorter threshold (2 min, vs 2 × order_timeout) — the
+        # position balancer manages its own refresh cycle; this is just a backstop, not an error.
         for order_id_str, timestamp in self._order_timestamps:
             oid_str = order_id_str.decode('utf-8')
             effective_cutoff = pb_cutoff if oid_str in self._position_balancer_orders else cutoff
@@ -1196,7 +1196,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # The 120s expiry is purely age-based; for a healthy top-of-book min order on a
             # stale book this would cancel + re-place at the SAME price, losing FIFO queue
             # position for nothing. Ask the PB whether a refresh is actually warranted.
-            # (Refuge orders always return True — the backstop is their only reposition.)
+            # (Refuge orders: the PB decides the refuge EXIT here and keeps a correctly parked order;
+            # repositioning a refuge order is CHECK 4's job, not the backstop's.)
             # On skip: leave the order/tracker untouched and RESET the timestamp so it
             # re-evaluates at the next ~120s boundary, not every tick.
             oid_pre = order_id_str.decode('utf-8')
@@ -2595,8 +2596,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._sb_order_tracker.c_stop_tracking_limit_order(market_pair_tuple, order_id)
         self.c_remove_pending_order(market_pair_tuple, order_id, "failed")
 
-        # The position balancer registers its own tracking dicts BEFORE sending an order, so a
-        # rejected placement leaves a phantom "active order" that blocks placement gate step 3
+        # The position balancer registers its own tracking dicts as soon as the send call returns
+        # (before the venue accepts the order), so a rejected placement leaves a phantom
+        # "active order" that blocks placement gate step 3
         # for that asset FOREVER (no cancel event can arrive; the backstop's PB cleanup is gated
         # on the order still being in _sb_order_tracker, which the line above just cleared).
         # Must run BEFORE the `market_pair_tuple is None` return — a failed order is frequently
