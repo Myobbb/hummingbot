@@ -385,6 +385,9 @@ cdef class PositionBalancerHandler:
         # per-tick memo for c_arb_pending_base: (base_asset, is_buy) -> remaining base
         self._arb_pending_cache = {}
         self._arb_pending_ts = -1.0
+        # per-tick memo for c_tick_position_bid
+        self._tick_position_bid = 0.0
+        self._tick_position_bid_ts = -1.0
         # asset -> cancel timestamp we already logged a settle-gate wait for (one line per episode)
         self._settle_gate_logged = {}
         # asset -> last NEGATIVE-position warning (throttled; see c_try_mark_sell_complete)
@@ -480,8 +483,9 @@ cdef class PositionBalancerHandler:
 
         Python-visible on purpose: the orchestrator's `clean` auto-remove path is `.py` and cannot
         reach a cdef method, and `_min_order_usd` is not a public cdef attr, so the bar has to be
-        applied here where the numbers live. Reads the TOTAL balance and a live reference bid —
-        never a cache: a stale position is what this gate exists to catch.
+        applied here where the numbers live. Reads the TOTAL balance and the live position bid
+        (each venue at its own bid) — never a cache: a stale position is what this gate exists to
+        catch.
 
         `drained` is True only when the asset is genuinely gone or down to untradeable dust. The
         bar is the PB's own `_min_order_usd` — the same threshold c_try_mark_sell_complete uses to
@@ -520,7 +524,7 @@ cdef class PositionBalancerHandler:
                 # No venue in this strategy can hold the asset — a zero here is an artefact of the
                 # market set, not a statement about inventory.
                 return False, "no market tuple holds this asset — cannot measure the position"
-            bid = self.strategy.c_get_reference_bid_for_asset(canonical)
+            bid = self.strategy.c_get_position_bid(canonical)
         except Exception as e:
             # Cannot measure => cannot certify drained. Fail CLOSED: refusing a removal is
             # recoverable, removing a funded strategy is not.
@@ -862,6 +866,29 @@ cdef class PositionBalancerHandler:
         except Exception:
             return 0.0                                     # fail-open: behave as before
 
+    cdef double c_tick_position_bid(self, str asset):
+        """
+        strategy.c_get_position_bid, computed at most ONCE per tick for the PB's in-tick paths:
+        c_handle_position_balancing, c_execute_buy/sell_limit and the c_find_best_sell_market
+        funding guard.
+
+        WHY. c_handle_position_balancing runs in FRONT of c_execute_arbitrage on a profitable tick
+        (arbitrage.pyx c_tick), and on the other ticks c_tick calls it twice (branch B) or once per
+        market pair (branch C, 6 calls on a 3-venue strategy). Reading every venue's balance and
+        book on each of those calls, and again at placement, would repeat identical work inside one
+        synchronous tick. Same per-tick memo as c_arb_pending_base: nothing can move a balance or a
+        book in the middle of a tick.
+
+        One PB manages one asset, and every alias resolves to the same alias set, so the tick alone
+        is the key. Off-tick callers (status, position_drained, c_scan_and_mark_completion) call
+        strategy.c_get_position_bid directly: their reads must be live.
+        """
+        cdef double now = self.strategy._current_timestamp
+        if now != self._tick_position_bid_ts:
+            self._tick_position_bid = self.strategy.c_get_position_bid(asset)
+            self._tick_position_bid_ts = now
+        return self._tick_position_bid
+
     cdef bint c_order_still_tracked(self, str order_id):
         """
         True while the FRAMEWORK still holds this order — i.e. no terminal event has landed.
@@ -1084,8 +1111,8 @@ cdef class PositionBalancerHandler:
         asset_key = self.strategy._market_pairs[0].first.base_asset
         canonical_asset = self._get_canonical_asset(asset_key)
 
-        # Get reference bid using canonical asset
-        last_bid = self.strategy.c_get_reference_bid_for_asset(canonical_asset)
+        # Position bid: each venue's balance valued at that venue's own bid (c_get_position_bid)
+        last_bid = self.strategy.c_get_position_bid(canonical_asset)
 
         # Build balances
         # OPTIMIZATION: c_get_actual_base_balance now fetches directly from connectors
@@ -1620,8 +1647,8 @@ cdef class PositionBalancerHandler:
         agg_lines = []
         any_active = False
         for a in base_assets:
-            # Get reference bid
-            bid = self.strategy.c_get_reference_bid_for_asset(a)
+            # Position bid (each venue at its own bid)
+            bid = self.strategy.c_get_position_bid(a)
             # Aggregate base balance
             total_base = 0.0
             for t in unique_tuples:
@@ -2001,14 +2028,17 @@ cdef class PositionBalancerHandler:
                     # message. The _min_order_usd > 0 test moves to the graded branch, the
                     # only place it means anything.
                     and candidates):
-                ref_bid = float(self.strategy.c_get_reference_bid_for_asset(asset))
+                ref_bid = self.c_tick_position_bid(asset)
                 if ref_bid > 0.0:
                     funded = []
                     for market_tuple, current_price in candidates:
                         fund_bal = float(market_tuple.market.get_available_balance(market_tuple.base_asset))
                         if self._sell_target_usd > 0.0:
+                            # This venue's base is worth what it sells for HERE: its own bid, never
+                            # another venue's (see c_get_position_bid).
                             if (self.strategy._min_order_usd <= 0.0
-                                    or fund_bal * ref_bid >= self.strategy._min_order_usd):
+                                    or fund_bal * self.strategy.c_get_venue_bid(market_tuple)
+                                    >= self.strategy._min_order_usd):
                                 funded.append((market_tuple, current_price))
                         elif self.c_placeable_sell_amount(
                                 market_tuple, fund_bal, current_price) > Decimal("0"):
@@ -3086,7 +3116,7 @@ cdef class PositionBalancerHandler:
             str asset_key = buy_market_tuple.base_asset
             str canonical_asset = self._get_canonical_asset(asset_key)
             list asset_aliases = self._get_all_asset_aliases(asset_key)
-            double last_bid = self.strategy.c_get_reference_bid_for_asset(canonical_asset)
+            double last_bid = self.c_tick_position_bid(canonical_asset)
             double base_bal = self.c_get_adjusted_base_balance(canonical_asset)
             str alias
             double base_bal_actual
@@ -3403,7 +3433,10 @@ cdef class PositionBalancerHandler:
                                         # updates synchronously at placement unlike the balance cache.
                                         pending_sell_base = self.c_get_pending_sell_base(asset_key)
                                         effective_base_bal = market_base_bal
-                                        if effective_base_bal * last_bid < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
+                                        # Priced at the selected venue's OWN bid: it is that venue's
+                                        # base, and it sells there (see c_get_position_bid).
+                                        venue_base_usd = effective_base_bal * self.strategy.c_get_venue_bid(selected_sell_market)
+                                        if venue_base_usd < self.strategy._min_order_usd and self._sell_target_usd > 0.0:
                                             # Best sell market has insufficient base balance — record timestamp so we
                                             # don't retry every 2s tick. Will recheck after INSUF_BAL_RETRY_COOLDOWN.
                                             self._last_sell_insuf_bal_time[canonical_asset] = self.strategy._current_timestamp
@@ -3412,7 +3445,7 @@ cdef class PositionBalancerHandler:
                                                 f"Position balancer: {canonical_asset} sell skipped - "
                                                 f"{selected_sell_market.market.name} insufficient balance "
                                                 f"({effective_base_bal:.4f} {selected_sell_market.base_asset}"
-                                                f"{pending_info} = ${effective_base_bal * last_bid:.2f} < min ${self.strategy._min_order_usd:.2f}), "
+                                                f"{pending_info} = ${venue_base_usd:.2f} < min ${self.strategy._min_order_usd:.2f}), "
                                                 f"retry in {INSUF_BAL_RETRY_COOLDOWN:.0f}s")
                                         else:
                                             # For buy market, just use the other market from the pair
@@ -3441,7 +3474,7 @@ cdef class PositionBalancerHandler:
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
             double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
             double base_bal_actual = self.c_get_actual_base_balance(asset_key)
-            double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
+            double last_bid = self.c_tick_position_bid(asset_key)
             # Use adjusted balance for shortfall calculation (accounts for pending orders)
             pair[double, double] val_short_adjusted = self.c_compute_value_and_buy_shortfall(base_bal_adjusted, last_bid)
             double shortfall_adjusted = val_short_adjusted.second
@@ -3465,6 +3498,7 @@ cdef class PositionBalancerHandler:
             double buy_price
             double taker_from_px = 0.0   # maker price that would have crossed; 0.0 = placed as maker
             double max_affordable_base
+            double size_bid              # this venue's bid: converts the value gap into base
             double amount_to_buy
             object quantized_amount
             object order_type = OrderType.LIMIT
@@ -3604,8 +3638,12 @@ cdef class PositionBalancerHandler:
         effective_quote_bal = max(0.0, quote_bal - pending_buy_quote)
         max_affordable_base = effective_quote_bal / buy_price if buy_price > 0 else 0.0
         max_order_base = self._order_size_usd / buy_price if buy_price > 0 else 0.0
+        # The gap is a VALUE. The base this order adds lands on THIS venue and is valued at its own
+        # bid (c_get_position_bid), so convert at that bid. A venue with no bid is valued at the
+        # position bid, hence the fallback.
+        size_bid = top_bid if top_bid > 0 else last_bid
         amount_to_buy = min(
-            shortfall_adjusted / last_bid if last_bid > 0 else 0.0,
+            shortfall_adjusted / size_bid if size_bid > 0 else 0.0,
             max_affordable_base,
             max_order_base
         )
@@ -3784,7 +3822,7 @@ cdef class PositionBalancerHandler:
             double base_bal_raw = float(market.c_get_available_balance(sell_market_tuple.base_asset))
             double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
             double base_bal_actual = self.c_get_actual_base_balance(asset_key)
-            double last_bid = self.strategy.c_get_reference_bid_for_asset(asset_key)
+            double last_bid = self.c_tick_position_bid(asset_key)
             # Use adjusted balance for excess calculation (accounts for pending orders)
             pair[double, double] val_excess_adjusted = self.c_compute_value_and_sell_excess(base_bal_adjusted, last_bid)
             double excess_adjusted = val_excess_adjusted.second
@@ -3949,8 +3987,10 @@ cdef class PositionBalancerHandler:
         max_order_base = self._order_size_usd / sell_price if sell_price > 0 else 0.0
         pending_sell_base = self.c_get_pending_sell_base(asset_key)
         effective_raw = max(0.0, base_bal_raw - pending_sell_base)
+        # The gap is a VALUE. The base this order removes is valued at THIS venue's own bid
+        # (c_get_position_bid), so convert at that bid (top_bid > 0 is checked above).
         amount_to_sell = min(
-            excess_adjusted / last_bid if last_bid > 0 else 0.0,
+            excess_adjusted / top_bid if top_bid > 0 else 0.0,
             effective_raw,
             max_order_base
         )
@@ -3959,7 +3999,7 @@ cdef class PositionBalancerHandler:
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - {asset_key} on {market.name}: amount too small. "
                 f"amount_to_sell={amount_to_sell:.8g}, excess_adjusted={excess_adjusted:.6f}, "
-                f"last_bid={last_bid:.8g}, base_bal_raw={base_bal_raw:.8g}, "
+                f"position_bid={last_bid:.8g}, venue_bid={top_bid:.8g}, base_bal_raw={base_bal_raw:.8g}, "
                 f"pending_sell={pending_sell_base:.8g}, effective_raw={effective_raw:.8g}, "
                 f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8g}")
             return False

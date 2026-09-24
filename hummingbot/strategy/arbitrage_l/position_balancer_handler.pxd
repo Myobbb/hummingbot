@@ -61,6 +61,9 @@ cdef class PositionBalancerHandler:
         # per-tick memo for c_arb_pending_base: (base_asset, is_buy) -> remaining base
         dict _arb_pending_cache
         double _arb_pending_ts
+        # per-tick memo for c_tick_position_bid: strategy.c_get_position_bid, once per tick
+        double _tick_position_bid
+        double _tick_position_bid_ts
         # asset -> cancel timestamp already logged by the post-cancel settle gate
         dict _settle_gate_logged
         # asset -> last time we warned that a computed position came out NEGATIVE (impossible state)
@@ -99,6 +102,7 @@ cdef class PositionBalancerHandler:
     cdef double c_get_aggregated_base_balance(self, str asset)
     cdef double c_get_actual_base_balance(self, str asset)
     cdef double c_arb_pending_base(self, str asset, bint is_buy)
+    cdef double c_tick_position_bid(self, str asset)
     cdef bint c_order_still_tracked(self, str order_id)
     cdef double c_get_adjusted_base_balance(self, str asset)
     cdef double c_active_fill_pressure_wait(self, str canonical_asset)

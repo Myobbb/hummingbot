@@ -102,7 +102,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         public double _hold_target_usd   # centre of acceptable band, e.g. 1100.0
         public double _hold_band_usd     # half-width, e.g. 100.0 → band is [1000, 1200]
         double _cached_total_base_qty    # sum of base across all venues; refreshed every 60 s
-        double _cached_mid_price_usd     # top-of-book bid (same source as position balancer); refreshed every 60 s
+        double _cached_mid_price_usd     # position bid: each venue at its own top bid (c_get_position_bid, same as position balancer); refreshed every 60 s
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
         int  _hold_breach_count          # consecutive 60s-cycle readings outside band before activation
@@ -136,6 +136,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Trading logic
     cdef double c_get_reference_bid_for_asset(self, str asset_key)
+    cdef double c_get_venue_bid(self, object market_tuple)
+    cdef double c_get_position_bid(self, str asset_key)
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
                                                              object buy_market_tuple,
                                                              object sell_market_tuple,

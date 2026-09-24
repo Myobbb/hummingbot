@@ -667,7 +667,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 hold_ceiling = self._hold_target_usd + self._hold_band_usd
                 try:
                     hold_base_asset = (<object>self._market_pairs[0]).first.base_asset
-                    hold_live_bid = self.c_get_reference_bid_for_asset(hold_base_asset)
+                    hold_live_bid = self.c_get_position_bid(hold_base_asset)
                     # Live balance read for display — avoids stale cache (e.g. mid-transfer).
                     # TOTAL held, matching c_get_aggregated_base_balance, so the panel does not
                     # under-report the position whenever the PB has an order resting.
@@ -895,7 +895,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
         return True
 
     cdef double c_get_reference_bid_for_asset(self, str asset_key):
-        """Return a non-zero bid for the given base asset from any active market tuple, or 0.0 if none."""
+        """
+        Return a non-zero bid for the given base asset from any active market tuple, or 0.0 if none.
+
+        ONE venue's bid: the first market-pair leg holding the asset with a bid, which is the
+        primary (the orchestrator builds pair 0 as primary -> secondary). Never value a holding
+        with it — use c_get_position_bid, which prices each venue at its own bid. It remains as
+        that function's fallback when nothing priceable is held.
+        """
         cdef:
             double last_bid = 0.0
             ExchangeBase _ex
@@ -921,6 +928,82 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     if last_bid > 0.0:
                         break
         return last_bid if last_bid > 0.0 else 0.0
+
+    cdef double c_get_venue_bid(self, object market_tuple):
+        """Top bid on ONE venue's book, or 0.0 if it has none or cannot be read."""
+        cdef:
+            ExchangeBase _ex
+            OrderBook _ob
+            double bid = 0.0
+        try:
+            _ex = market_tuple.market
+            _ob = _ex.c_get_order_book(market_tuple.trading_pair)
+            if _ob._bid_book.size() > 0:
+                bid = deref(_ob._bid_book.rbegin()).getPrice()
+        except Exception:
+            return 0.0
+        return bid if bid > 0.0 else 0.0
+
+    cdef double c_get_position_bid(self, str asset_key):
+        """
+        The price to value this strategy's holding of `asset_key` at: every venue's balance at THAT
+        venue's own top bid, folded into one price,
+            sum(balance_v * bid_v) / sum(balance_v)
+        so TOTAL base * this == the per-venue value, and every `base * bid` reader (hold-band cache,
+        position balancer completion / gap / drained) stays one multiplication.
+
+        WHY. c_get_reference_bid_for_asset is ONE venue's bid (the primary's), and every value used
+        to be the whole cross-venue balance times it, which is wrong whenever the venues' prices
+        diverge. ISLAND 2026-09-24: all 1.1M tokens on gate (bid ~0.0003), primary kucoin (bid
+        0.0007). The guardrail and the PB read $769 OVERBOUGHT on a holding worth ~$330, below the
+        $450 floor, and the escalated sell-off sold 386,929 ISLAND ($117) on gate. Per venue it
+        held $210 against the $511 logged.
+
+        Same venues x aliases and the same TOTAL balance (get_balance) as
+        PositionBalancerHandler.c_get_aggregated_base_balance, so the weights are exactly the
+        balance the callers multiply by. A venue holding base but showing no bid (empty/cold book)
+        is left out of both sums, i.e. its base takes the other venues' price. Nothing priceable
+        held (a zero position, or no book anywhere) -> the reference bid, so a buy-in from zero and
+        a cold start behave exactly as before.
+
+        Off the arb hot path: its readers are the 60 s hold-cache refresh, PB ticks and status.
+        """
+        cdef:
+            double value = 0.0
+            double priced_base = 0.0
+            double bal
+            double bid
+            list aliases
+            set checked = set()
+            object mp
+            object mt
+            tuple key
+        try:
+            if self._position_balancer is not None:
+                aliases = self._position_balancer._get_all_asset_aliases(asset_key)
+            else:
+                aliases = [asset_key]
+            for mp in self._market_pairs:
+                for mt in (mp.first, mp.second):
+                    if mt.base_asset not in aliases:
+                        continue
+                    key = (mt.market, mt.base_asset)
+                    if key in checked:
+                        continue
+                    checked.add(key)
+                    bal = float(mt.market.get_balance(mt.base_asset))
+                    if bal <= 0.0:
+                        continue
+                    bid = self.c_get_venue_bid(mt)
+                    if bid <= 0.0:
+                        continue
+                    value += bal * bid
+                    priced_base += bal
+        except Exception:
+            priced_base = 0.0                     # fail-open: behave exactly as before
+        if priced_base > 0.0:
+            return value / priced_base
+        return self.c_get_reference_bid_for_asset(asset_key)
 
 
     cdef pair[int, double] c_top_of_book_profitable_get_conv(self,
@@ -1480,10 +1563,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 total += self.c_hold_inflight_base()
             self._cached_total_base_qty = total
 
-            # Price: same source as PositionBalancerHandler — top-of-book bid via C++ order book
-            # (c_get_reference_bid_for_asset). Faster than get_mid_price, never returns 0 if
-            # the book has any bids, and consistent with how position value is computed everywhere.
-            bid = self.c_get_reference_bid_for_asset(base_asset)
+            # Price: the position bid, each venue's balance at that venue's own top bid
+            # (c_get_position_bid), the same source as PositionBalancerHandler, so the guardrail
+            # and the PB value the holding identically. It used to be the primary's bid alone,
+            # applied to every venue's balance (ISLAND 2026-09-24, see c_get_position_bid).
+            # Never 0 while any venue has a bid.
+            bid = self.c_get_position_bid(base_asset)
             if bid > 0.0:
                 self._cached_mid_price_usd = bid
             # If bid == 0 (no order book yet) keep previous cached value — do not zero out.
