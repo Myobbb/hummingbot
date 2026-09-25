@@ -99,6 +99,7 @@ cdef class PositionBalancerHandler:
     cdef double c_get_pending_sell_base(self, str asset)
     cdef pair[double, double] c_compute_value_and_buy_shortfall(self, double base_balance, double last_bid)
     cdef pair[double, double] c_compute_value_and_sell_excess(self, double base_balance, double last_bid)
+    cdef list c_asset_venues(self, str asset)
     cdef double c_get_aggregated_base_balance(self, str asset)
     cdef double c_get_actual_base_balance(self, str asset)
     cdef double c_arb_pending_base(self, str asset, bint is_buy)
@@ -113,6 +114,7 @@ cdef class PositionBalancerHandler:
     cdef bint c_market_in_failure_cooldown(self, object market_tuple)
     cdef object c_find_best_buy_market(self, str asset)
     cdef object c_placeable_sell_amount(self, object market_tuple, double amount, double price)
+    cdef bint c_residue_sellable(self, str asset)
     cdef object c_find_best_sell_market(self, str asset)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)

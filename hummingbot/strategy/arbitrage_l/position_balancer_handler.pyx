@@ -488,9 +488,10 @@ cdef class PositionBalancerHandler:
         catch.
 
         `drained` is True only when the asset is genuinely gone or down to untradeable dust. The
-        bar is the PB's own `_min_order_usd` — the same threshold c_try_mark_sell_complete uses to
-        call a residual too small to trade — so there is no new knob and no second definition of
-        "dust" to keep in sync.
+        bar is the PB's own `_min_order_usd`, the dust threshold of c_try_mark_sell_complete, so
+        there is no new knob. For a clean the PB also waits until no venue can take the residue
+        (c_residue_sellable). That only happens below this bar, so the two agree whenever the
+        orchestrator gets here.
 
         An unpriceable holding returns NOT drained. A bid of 0 means the book is empty or not warm,
         not that the tokens are worthless, and value = base * 0 = 0 would otherwise read as "fully
@@ -503,24 +504,19 @@ cdef class PositionBalancerHandler:
             double bid
             double value
             double bar = self.strategy._min_order_usd
-        # Deliberately NOT c_get_aggregated_base_balance, even though this repeats it: that one
-        # ends in `except Exception: return 0.0`, which is the right fail-open for sizing and
-        # exactly wrong here. A swallowed read error would arrive as base == 0 and this gate would
-        # certify a funded strategy as drained — the same false-zero that produced the losses it is
-        # meant to stop. Here the read must either succeed or say so.
+        # Deliberately NOT c_get_aggregated_base_balance: that one ends in `except Exception:
+        # return 0.0`, which is the right fail-open for sizing and exactly wrong here. A swallowed
+        # read error would arrive as base == 0 and this gate would certify a funded strategy as
+        # drained — the same false-zero that produced the losses it is meant to stop. The venue
+        # walk is shared (c_asset_venues); the failure policy is not: here the read must either
+        # succeed or say so.
         try:
             asset_key = self.strategy._market_pairs[0].first.base_asset
             canonical = self._get_canonical_asset(asset_key)
-            aliases = self._get_all_asset_aliases(canonical)
-            checked = set()
-            for mp in self.strategy._market_pairs:
-                for mt in (mp.first, mp.second):
-                    if mt.base_asset in aliases:
-                        key = (mt.market, mt.base_asset)
-                        if key not in checked:
-                            checked.add(key)
-                            base += float(mt.market.get_balance(mt.base_asset))
-            if not checked:
+            venues = self.c_asset_venues(canonical)
+            for mt in venues:
+                base += float(mt.market.get_balance(mt.base_asset))
+            if not venues:
                 # No venue in this strategy can hold the asset — a zero here is an artefact of the
                 # market set, not a statement about inventory.
                 return False, "no market tuple holds this asset — cannot measure the position"
@@ -730,6 +726,33 @@ cdef class PositionBalancerHandler:
             excess = current_value - self._sell_target_usd
         return pair[double, double](current_value, excess)
 
+    cdef list c_asset_venues(self, str asset):
+        """
+        Every venue this strategy holds `asset` on: each market tuple whose base is one of the
+        asset's aliases, once per (market, base), in market-pair order.
+
+        The ONE definition of "where is this asset held", shared by everything that has to agree on
+        it: c_get_aggregated_base_balance (TOTAL), position_drained (the auto-remove gate) and
+        c_residue_sellable (a clean's stopping rule). If they walked different venue sets, a clean
+        could be measured on one set and declared done on another. Raises on a bad read; each
+        caller keeps its own failure policy (TOTAL fails open to 0, the two gates fail closed).
+        """
+        cdef:
+            list aliases = self._get_all_asset_aliases(asset)
+            list venues = []
+            set seen = set()
+            tuple key
+            object mp
+            object market_tuple
+        for mp in self.strategy._market_pairs:
+            for market_tuple in (mp.first, mp.second):
+                if market_tuple.base_asset in aliases:
+                    key = (market_tuple.market, market_tuple.base_asset)
+                    if key not in seen:
+                        seen.add(key)
+                        venues.append(market_tuple)
+        return venues
+
     cdef double c_get_aggregated_base_balance(self, str asset):
         """
         Aggregate base balance using the same source as status (balance_map).
@@ -741,41 +764,30 @@ cdef class PositionBalancerHandler:
         """
         cdef:
             double total = 0.0
-            list aliases
-            set checked_keys = set()
-            object mp
             object market_tuple
-            tuple key
 
         try:
-            aliases = self._get_all_asset_aliases(asset)
-            for mp in self.strategy._market_pairs:
-                for market_tuple in [mp.first, mp.second]:
-                    if market_tuple.base_asset in aliases:
-                        # Ensure we don't double count the same market+asset combo
-                        key = (market_tuple.market, market_tuple.base_asset)
-                        if key not in checked_keys:
-                            checked_keys.add(key)
-                            # TOTAL wallet balance, not available. A resting sell order has sold
-                            # NOTHING — those tokens are still held — but get_available_balance
-                            # excludes them, so the position balancer's own order removed the very
-                            # balance it was measuring. It then read its position as near-zero and
-                            # marked the sell-off complete against `value <= target`.
-                            #
-                            # Witnessed 2026-08-09 on the two gate<->htx pairs: the htx leg's
-                            # available fell 95% while the other venue was unchanged TO THE TOKEN
-                            # (CAMP htx 3004320 -> 145166, gate 70206.2 both times; AIC htx
-                            # 43468.1 -> 2131.6, gate 3442.61 both times). Both sell-offs armed at
-                            # 00:16:00 and self-disabled within 21 s, each in the SAME SECOND as an
-                            # undercut-chase cancel — the order was already untracked
-                            # (pending_sell == 0, so the completion guard passed) while the venue
-                            # had not yet released the locked base. Both then sat latched for 8.6 h:
-                            # PB complete, guardrail still correcting, escalation latch set.
-                            #
-                            # Order capacity is unaffected: placement still caps on the per-venue
-                            # get_available_balance in c_find_best_sell_market and
-                            # c_execute_sell_limit, so this cannot oversize an order.
-                            total += float(market_tuple.market.get_balance(market_tuple.base_asset))
+            for market_tuple in self.c_asset_venues(asset):
+                # TOTAL wallet balance, not available. A resting sell order has sold
+                # NOTHING — those tokens are still held — but get_available_balance
+                # excludes them, so the position balancer's own order removed the very
+                # balance it was measuring. It then read its position as near-zero and
+                # marked the sell-off complete against `value <= target`.
+                #
+                # Witnessed 2026-08-09 on the two gate<->htx pairs: the htx leg's
+                # available fell 95% while the other venue was unchanged TO THE TOKEN
+                # (CAMP htx 3004320 -> 145166, gate 70206.2 both times; AIC htx
+                # 43468.1 -> 2131.6, gate 3442.61 both times). Both sell-offs armed at
+                # 00:16:00 and self-disabled within 21 s, each in the SAME SECOND as an
+                # undercut-chase cancel — the order was already untracked
+                # (pending_sell == 0, so the completion guard passed) while the venue
+                # had not yet released the locked base. Both then sat latched for 8.6 h:
+                # PB complete, guardrail still correcting, escalation latch set.
+                #
+                # Order capacity is unaffected: placement still caps on the per-venue
+                # get_available_balance in c_find_best_sell_market and
+                # c_execute_sell_limit, so this cannot oversize an order.
+                total += float(market_tuple.market.get_balance(market_tuple.base_asset))
         except Exception:
             return 0.0
         return total
@@ -1066,6 +1078,15 @@ cdef class PositionBalancerHandler:
         # 2026-09-18 21:04 while the hold band was rejecting the very same number at 1/15.
         cdef bint at_target = current_value_quote <= self._sell_target_usd
         cdef bint is_dust = (excess > 0.0) and (excess < self.strategy._min_order_usd)
+        # A sell-to-zero is done only when no venue can take what is left (c_residue_sellable).
+        # The sweep sells BELOW _min_order_usd, so that floor is no stopping rule. FLT 2026-09-24:
+        # 2,691 FLT ($14.99 against gate's 1 FLT / $3 minimum) read as dust at the very call that
+        # placed its sweep, and 3 s after a step-up cancel the clean closed with $14.76 unsold. The
+        # at-target branch asks too: value <= 0 while base is still held means a zero bid (cold or
+        # empty book), not a sold position.
+        if (at_target or is_dust) and self._sell_target_usd <= 0.0 and self.c_residue_sellable(pair):
+            at_target = False
+            is_dust = False
         if not (at_target or is_dust):
             self._sell_complete_since = 0.0             # condition broke — start over
             return False
@@ -1833,15 +1854,21 @@ cdef class PositionBalancerHandler:
         residues were 0.1. BULLA logged it 30x on 2026-09-20, LOFI 30 more on 09-22 with the filter
         already live. Two call sites agreeing by convention is what failed; one call cannot.
 
-        Applies both PHYSICAL floors, in the order placement applied them:
+        Applies the venue's three PHYSICAL floors, the same admission test
+        ExchangePyBase._create_order runs before it sends anything:
           • the step — c_safe_quantize_order_amount, which already falls back internally;
           • the exchange's min_order_size, a base-quantity rule the step can clear and still miss —
             HAEDAL 2026-08-14 sent 0.0128 into htx's 0.1 minimum ~90 times in 3 min, every send
             rejected, and sell-to-zero is exempt from INSUF_BAL_RETRY_COOLDOWN so nothing damped
             the retry. That is why the lot rule has to be answered here and not only at placement.
-        The NOTIONAL floor is deliberately NOT here: it is policy, not physics, and differs by
-        target (our _min_order_usd for a graded target, bypassed for a sell-to-zero sweep), so it
-        stays with the caller. max_order_size is a cap rather than a floor and likewise stays.
+          • the exchange's min_notional_size at `price`. The connector refuses below it without
+            sending ("Order notional ... is lower than minimum notional size ..."), and the refusal
+            is a failure event, so c_did_fail_order cools the venue down for the arb as well. PB
+            sells hit it: SUNDOG/bybit 2.22 < 5 (2026-09-22) and CORE/bitget 0.0005 < 1 (09-23).
+            Skipped when `price` <= 0 (unknown); the venue is then judged on step and lot alone.
+        OUR notional floor, _min_order_usd, is policy, not physics, and differs by target (applied
+        to a graded target, bypassed for a sell-to-zero sweep), so it stays with the caller.
+        max_order_size is a cap rather than a floor and likewise stays.
 
         Fails OPEN on a missing/unreadable trading rule — returns the quantized amount — so a venue
         whose rules have not loaded is tried rather than silently written off.
@@ -1854,12 +1881,56 @@ cdef class PositionBalancerHandler:
             return Decimal("0")
         try:
             trading_rule = market_tuple.market._trading_rules.get(market_tuple.trading_pair)
-            if (trading_rule is not None and trading_rule.min_order_size > Decimal("0")
-                    and q < trading_rule.min_order_size):
-                return Decimal("0")
+            if trading_rule is not None:
+                if trading_rule.min_order_size > Decimal("0") and q < trading_rule.min_order_size:
+                    return Decimal("0")
+                if (price > 0.0 and trading_rule.min_notional_size > Decimal("0")
+                        and q * Decimal(str(price)) < trading_rule.min_notional_size):
+                    return Decimal("0")
         except Exception:
             pass
         return q
+
+    cdef bint c_residue_sellable(self, str asset):
+        """
+        Can ANY venue of this strategy take a sell order for what it holds of `asset`?
+
+        The stopping rule of a sell-to-zero. Our _min_order_usd floor is not one: the sweep sells
+        below it on purpose, so "under $15 left" only means the sweep is on its last order. What is
+        left is dust when no venue can take it, the terminal state c_find_best_sell_market already
+        returns None for. Same physics, same call: c_placeable_sell_amount, venue by venue.
+
+        Two inputs differ from the selector's, and both can only make this answer "sellable":
+          • the TOTAL held on each venue (get_balance over c_asset_venues, exactly as TOTAL), not
+            the available balance: base locked in our own resting sweep or in an arb leg is still
+            held, and is for sale again once that order ends;
+          • the venue's best ASK as the price (its bid only when the ask side is empty), the
+            highest price the PB quotes there. The selector prices at or below it, so this never
+            calls a residue unsellable while the selector could still place a sweep for it.
+        With no book at all the price is unknown (0) and only step and lot are judged.
+        Fails SAFE: True (not dust) on any error. An unreadable venue must not close a clean.
+        """
+        cdef:
+            object market_tuple
+            OrderBook ob
+            double held
+            double price
+        try:
+            for market_tuple in self.c_asset_venues(asset):
+                held = float(market_tuple.market.get_balance(market_tuple.base_asset))
+                if held <= 0.0:
+                    continue
+                price = 0.0
+                ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
+                if ob._ask_book.size() > 0:
+                    price = float(deref(ob._ask_book.begin()).getPrice())
+                elif ob._bid_book.size() > 0:
+                    price = float(deref(ob._bid_book.rbegin()).getPrice())
+                if self.c_placeable_sell_amount(market_tuple, held, price) > Decimal("0"):
+                    return True
+        except Exception:
+            return True
+        return False
 
     cdef object c_find_best_sell_market(self, str asset):
         """
@@ -2044,7 +2115,8 @@ cdef class PositionBalancerHandler:
                                 market_tuple, fund_bal, current_price) > Decimal("0"):
                             funded.append((market_tuple, current_price))
                     # Sell-to-zero with nothing sellable anywhere IS the terminal state: every venue's
-                    # residue is below that venue's own lot size. Returning None makes the tick a
+                    # residue is below that venue's own lot or minimum notional (the same verdict
+                    # c_residue_sellable gives the completion check). Returning None makes the tick a
                     # no-op instead of building an order the exchange cannot accept — BULLA
                     # 2026-09-20 logged `quantized to zero` 30 times in 59 s on kucoin=0.1/mexc=0.01
                     # before completing. The completion check runs before this call, so its
@@ -4007,20 +4079,21 @@ cdef class PositionBalancerHandler:
         # Quantize
         # The ONE test for "will this venue take it" — the same call c_find_best_sell_market's
         # candidate filter makes, so the filter can never hand us a venue placement then refuses.
-        # Covers the step AND the exchange's min_order_size; both used to be checked here
-        # separately, the second one below the max_order_size clamp. Folding them in changes no
-        # outcome (the clamp only reduces toward max_order_size, which is >= min_order_size) and
-        # removes the second log site.
+        # Covers the step, the exchange's min_order_size and its min notional at sell_price. The
+        # first two used to be checked here separately, the second below the max_order_size clamp.
+        # Folding them in changes no outcome (the clamp only reduces toward max_order_size, which is
+        # >= min_order_size) and removes the second log site.
         quantized_amount = self.c_placeable_sell_amount(
             sell_market_tuple, amount_to_sell, sell_price)
 
         if quantized_amount <= Decimal("0"):
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - {asset_key} on {market.name}: residue "
-                f"is below the venue's own step or minimum lot. "
+                f"is below the venue's own step, minimum lot or minimum notional. "
                 f"pre_quantize={amount_to_sell:.8g}, placeable={quantized_amount}")
-            # For sell-to-zero: dust below the exchange lot size cannot be sold via any order.
-            # Declare completion so the balancer doesn't spin forever on unsellable residue.
+            # For sell-to-zero: ask for completion. c_try_mark_sell_complete closes the clean only
+            # when no venue can take what is left (c_residue_sellable), so a residue another venue
+            # can still sell keeps the side armed.
             if self._sell_target_usd == 0.0:
                 self.c_try_mark_sell_complete(asset_key, current_value_quote, excess)
                 self.c_maybe_disable_sell()
@@ -4037,15 +4110,12 @@ cdef class PositionBalancerHandler:
 
         # Check minimum notional.
         # Sell-to-zero exception: when target=0 and the full remaining balance is below the software
-        # floor, send the order anyway — the exchange min notional (~$5–$10) is well below our $15
-        # floor, so most exchanges will accept it. If an exchange rejects it, the error is caught in
-        # c_sell_with_specific_market and we retry next tick. (An earlier note here claimed
-        # "completion never triggers for target=0 while balance remains > 0" — not true: the dust
-        # branch in c_try_mark_sell_complete is target-agnostic and does complete a sell-to-zero
-        # once the whole remainder is under _min_order_usd. Left as-is deliberately — the sweep
-        # runs during the 60s confirmation window, so a sellable residue keeps selling and the
-        # branch only lands once the residue is physically stuck; PUNDIX $0.0022, ES $0.000107,
-        # BULLA $0.011, LOFI $0.000416.)
+        # floor, send the order anyway. c_placeable_sell_amount above has already applied the
+        # venue's own floors (step, lot, min notional), so what reaches here is an order the
+        # exchange accepts. The clean itself completes only once no venue can take what is left
+        # (c_try_mark_sell_complete -> c_residue_sellable), so the sweep keeps selling until the
+        # residue is physically stuck. That used to be assumed of the 60 s window, and FLT
+        # 2026-09-24 disproved it: $14.76 sellable, closed as dust.
         # For any non-zero target, block as usual and mark complete.
         volume_usd = float(quantized_amount) * sell_price
         if volume_usd < self.strategy._min_order_usd:
