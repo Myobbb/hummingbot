@@ -66,6 +66,8 @@ cdef class PositionBalancerHandler:
         double _tick_position_bid_ts
         # asset -> cancel timestamp already logged by the post-cancel settle gate
         dict _settle_gate_logged
+        # asset -> id of the live sell we already logged as kept by c_reprice_would_strand
+        dict _kept_sell_logged
         # asset -> last time we warned that a computed position came out NEGATIVE (impossible state)
         dict _neg_position_warn_time
         # our own orders untracked by a stuck-cancel cleanup while still live on the venue
@@ -115,6 +117,7 @@ cdef class PositionBalancerHandler:
     cdef object c_find_best_buy_market(self, str asset)
     cdef object c_placeable_sell_amount(self, object market_tuple, double amount, double price)
     cdef bint c_residue_sellable(self, str asset)
+    cdef bint c_reprice_would_strand(self, str asset, str reason)
     cdef object c_find_best_sell_market(self, str asset)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)

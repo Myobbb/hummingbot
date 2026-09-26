@@ -390,6 +390,8 @@ cdef class PositionBalancerHandler:
         self._tick_position_bid_ts = -1.0
         # asset -> cancel timestamp we already logged a settle-gate wait for (one line per episode)
         self._settle_gate_logged = {}
+        # asset -> id of the live sell already logged as kept (c_reprice_would_strand): one line per order
+        self._kept_sell_logged = {}
         # asset -> last NEGATIVE-position warning (throttled; see c_try_mark_sell_complete)
         self._neg_position_warn_time = {}
         # Our own orders that a stuck-cancel cleanup untracked while they were still live on
@@ -1564,6 +1566,12 @@ cdef class PositionBalancerHandler:
             if asset is None:
                 return True
 
+            # A refresh is cancel + re-place too: veto it for a sell whose remainder (with the
+            # venue's free base) could not be placed again (c_reprice_would_strand); the order
+            # keeps resting and filling.
+            if not is_buy and self.c_reprice_would_strand(asset, "backstop refresh"):
+                return False
+
             # Refuge orders — the ~2-min periodic re-evaluation (count orders below us).
             canonical = self._get_canonical_asset(asset)
             if (is_buy and self._in_refuge_buy.get(canonical, False)) or \
@@ -1931,6 +1939,59 @@ cdef class PositionBalancerHandler:
         except Exception:
             return True
         return False
+
+    cdef bint c_reprice_would_strand(self, str asset, str reason):
+        """
+        Would cancelling our live sell for `asset` to reprice it strand what it could still sell?
+
+        A reprice (chase, re-park, relocation, backstop refresh) is cancel + re-place. The exchange
+        enforces its minimums only when an order is PLACED; a resting order keeps filling whatever
+        is left of it. So when what a re-placement could use right after the cancel (the venue's
+        free base plus this order's unfilled remainder) is below the venue's floor, no re-placement
+        can follow: the cancel only turns inventory in a live order into dust that can never be
+        sold. AO 2026-09-26: a gate sweep of 3.64 AO had filled 3.09 when a 1-tick undercut chase
+        cancelled it; the remaining 0.55 AO ($2.78 against gate's $3 minimum) could not be placed
+        again and the clean closed with it.
+
+        The remainder is ours, updated on every fill event (handle_order_fill), so the measure does
+        not lag a fill the way the venue's TOTAL can: AO's last fill landed 2 s before that cancel.
+        Same physics as everywhere else, c_placeable_sell_amount on that venue, priced at the
+        venue's bid: the lowest price a re-placement could take, so a borderline case keeps the
+        order (a kept order can still fill; a cancelled one cannot be placed again).
+        True = keep the order, logged once per order. Fails OPEN (False): with the order or its
+        details unknown, or anything unreadable, the reprice goes ahead exactly as before.
+        """
+        cdef:
+            str order_id
+            tuple details
+            object pend
+            object market_tuple
+            double remaining
+            double free_after
+        try:
+            order_id = self._active_sell_orders.get(asset)
+            if order_id is None:
+                return False
+            details = self._active_sell_order_details.get(asset)
+            pend = self._pending_sell_orders.get(order_id)
+            if details is None or pend is None:
+                return False
+            market_tuple = details[0]
+            remaining = max(0.0, float(pend[1]) - float(pend[2]))
+            free_after = float(market_tuple.market.get_available_balance(market_tuple.base_asset)) + remaining
+            if self.c_placeable_sell_amount(
+                    market_tuple, free_after, self.strategy.c_get_venue_bid(market_tuple)) > Decimal("0"):
+                return False
+            if self._kept_sell_logged.get(asset) != order_id:
+                self._kept_sell_logged[asset] = order_id
+                self.strategy.logger().info(
+                    f"Position balancer: Keeping sell order {order_id} for {asset} on "
+                    f"{market_tuple.market.name}: {free_after:.8g} {market_tuple.base_asset} "
+                    f"({remaining:.8g} of it left on this order) is below the venue's minimum, so it "
+                    f"could not be placed again. It rests until filled (skipped: {reason}).")
+            return True
+        except Exception:
+            return False
 
     cdef object c_find_best_sell_market(self, str asset):
         """
@@ -2941,6 +3002,12 @@ cdef class PositionBalancerHandler:
                     if not should_cancel:
                         should_cancel, cancel_reason = self.c_check_immediate_conditions(
                             asset, False, current_time - last_time, effective_frontrun_delay)
+                        # A reprice that cannot re-place anything is not a reprice: keep the order,
+                        # it still fills (c_reprice_would_strand). Checked before the refuge logic
+                        # below, so a kept order never arms refuge.
+                        if should_cancel and self.c_reprice_would_strand(asset, cancel_reason):
+                            should_cancel = False
+                            cancel_reason = ""
 
                     # NOTE: the refuge EXIT (count foreign orders below us: 0 = jumper gone, more than
                     # the parked depth = sank) is decided once per backstop cycle in

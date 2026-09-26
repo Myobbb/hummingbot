@@ -102,6 +102,12 @@ EMIT_DEPTH = 50
 # Topics per subscribe request. XT publishes no cap; P1 runs 50 per connection in production.
 WS_TOPICS_PER_REQUEST = 50
 
+# XT's own trading switch per market (GET /v4/public/symbol?symbols=...). XT keeps a switched-off
+# market's book two-sided (FUSD, 2026-09-26: tradingEnabled=false, depth still 15 bids / 41 asks), so
+# the order book data source reads the switch itself and shows such a market's book empty.
+TRADING_SWITCH_INTERVAL = 30   # seconds between reads of the tracked markets
+TRADING_SWITCH_BATCH = 50      # markets per request
+
 # Client sends text "ping", server answers text "pong", and disconnects after 60 s without a ping
 # (Heartbeat). 20 s keeps a wide margin, as the P1 adapter does.
 WS_HEARTBEAT_INTERVAL = 20

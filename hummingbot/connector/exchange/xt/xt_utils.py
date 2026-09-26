@@ -26,6 +26,9 @@ def is_exchange_information_valid(symbol_info: Dict[str, Any]) -> bool:
     A filter on them stopped the B2-USDT orders before they were sent (2026-09-23), so XT's answer was
     never seen. Every listed market gets a symbol and a trading rule, and XT's response to an order
     is what decides. It is logged in full.
+
+    The flags do drive what the tracker SEES: XtAPIOrderBookDataSource shows a market XT has switched
+    off as an empty book (XT keeps it two-sided; FUSD 2026-09-26), the way a halt looks elsewhere.
     """
     return all(symbol_info.get(key) not in (None, "") for key in ("symbol", "baseCurrency", "quoteCurrency"))
 

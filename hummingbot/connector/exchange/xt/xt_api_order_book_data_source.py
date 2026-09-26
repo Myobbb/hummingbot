@@ -126,6 +126,15 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
     A runtime add subscribes the new market on the live socket instead of disconnecting it, and
     `_refresh_snapshot_for_pair` gives the orchestrator a per-market repair that leaves every other
     book alone.
+
+    XT's trading switch: a market XT switches off keeps its book two-sided (FUSD 2026-09-26:
+    tradingEnabled=false, the frozen book still quoting against live venues). Every other venue's halt
+    ends in an empty book or no symbol, which is what `status` ('<venue> empty order book') and arb_l's
+    top-of-book gate react to. So while XT has a tracked market switched off, the tracker gets an EMPTY
+    book for it. The rule is P1's (openapiEnabled + tradingEnabled) plus state ONLINE, read from
+    GET /v4/public/symbol every TRADING_SWITCH_INTERVAL and before a market's first snapshot. The local
+    book is still kept, and the market's symbol and trading rule stay (the B2 KeyError), so switching
+    back on shows the book at once.
     """
 
     def __init__(
@@ -151,6 +160,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # The tracker's diff stream, known once listen_for_order_book_diffs runs; depth pushes are
         # delivered straight into it from the WebSocket reader.
         self._diff_output: Optional[asyncio.Queue] = None
+        # XT's trading switch: symbols XT has switched off (shown empty), and symbols read at least once.
+        self._switched_off: set = set()
+        self._switch_known: set = set()
+        self._switch_lock = asyncio.Lock()
+        self._switch_failing: bool = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -213,20 +227,22 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise ValueError(f"XT {trading_pair} has no entry in the connector's symbol map; "
                              f"no depth snapshot was requested") from None
         book = self._book(symbol)
+        await self._ensure_switch_known(symbol)
         if book.synced:
-            return self._snapshot_message(trading_pair, book)
+            return self._snapshot_message(trading_pair, symbol, book)
         result = await self._request_depth(symbol)
         if not book.synced:
             self._message_queue[self._diff_messages_queue_key].put_nowait(
                 {"topic": _REST_SNAPSHOT, "s": symbol, "result": result})
         update_id = int(result["lastUpdateId"])
+        off = symbol in self._switched_off
         return OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content={
                 "trading_pair": trading_pair,
                 "update_id": update_id,
-                "bids": result.get("bids") or [],
-                "asks": result.get("asks") or [],
+                "bids": [] if off else (result.get("bids") or []),
+                "asks": [] if off else (result.get("asks") or []),
             },
             timestamp=float(result.get("timestamp") or time.time() * 1e3) * 1e-3,
         )
@@ -252,6 +268,110 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             book.bootstrapping = False
             self.logger().warning(f"XT depth snapshot for {symbol} failed ({e}); retrying in 2 s.")
             self._ensure_bootstrap(symbol, delay=2.0)
+
+    # ------------------------------------------------------------------ XT's trading switch
+
+    @staticmethod
+    def _is_tradable(info: Optional[Dict[str, Any]]) -> bool:
+        # P1's rule (groups_updater keeps a market only with openapiEnabled + tradingEnabled) plus state.
+        return (info is not None and info.get("state") == "ONLINE"
+                and info.get("tradingEnabled") is True and info.get("openapiEnabled") is True)
+
+    async def _tracked_symbols(self) -> List[str]:
+        symbols = []
+        for trading_pair in list(self._trading_pairs):
+            try:
+                symbols.append(await self._symbol_for_pair(trading_pair))
+            except KeyError:
+                continue  # unmapped: nothing is subscribed for it either
+        return symbols
+
+    async def _read_switches(self, symbols: List[str]) -> None:
+        """Read XT's switch for these markets and apply it. A market missing from the answer is no longer
+        listed (XT drops a delisted market), so it counts as off.
+
+        Live 2026-09-26: `symbols=` naming only unknown markets returns XT's WHOLE list (~1.2 MB), and
+        `symbol=` answers an unknown market with an empty list. So a lone market is asked with `symbol=`,
+        and a multi-market answer that lists none of them is not trusted (one bad reply must not empty
+        every tracked book)."""
+        rest_assistant = await self._api_factory.get_rest_assistant()
+        for i in range(0, len(symbols), CONSTANTS.TRADING_SWITCH_BATCH):
+            batch = symbols[i:i + CONSTANTS.TRADING_SWITCH_BATCH]
+            response = await rest_assistant.execute_request(
+                url=web_utils.public_rest_url(CONSTANTS.SYMBOL_PATH, domain=self._domain),
+                params={"symbol": batch[0]} if len(batch) == 1 else {"symbols": ",".join(batch)},
+                method=RESTMethod.GET,
+                throttler_limit_id=CONSTANTS.SYMBOL_PATH,
+            )
+            if web_utils.is_error_response(response):
+                raise IOError(f"Error reading XT's trading switch: {response}")
+            listed = {s.get("symbol"): s for s in (response.get("result") or {}).get("symbols") or []
+                      if isinstance(s, dict)}
+            if len(batch) > 1 and not any(symbol in listed for symbol in batch):
+                raise IOError(f"XT's trading switch lists none of {batch[:3]}{'...' if len(batch) > 3 else ''}")
+            for symbol in batch:
+                self._apply_switch(symbol, listed.get(symbol))
+
+    def _apply_switch(self, symbol: str, info: Optional[Dict[str, Any]]) -> None:
+        self._switch_known.add(symbol)
+        off = not self._is_tradable(info)
+        if off == (symbol in self._switched_off):
+            return
+        pair = self._symbol_to_pair_cache.get(symbol, symbol)
+        flags = ("not listed" if info is None else
+                 f"state={info.get('state')} tradingEnabled={info.get('tradingEnabled')} "
+                 f"openapiEnabled={info.get('openapiEnabled')}")
+        book = self._book(symbol)
+        output = self._diff_output
+        if off:
+            self._switched_off.add(symbol)
+            self.logger().warning(f"XT {pair}: trading is switched off by XT ({flags}); its book is shown "
+                                  f"empty until XT switches it back on.")
+            if output is not None and symbol in self._symbol_to_pair_cache:
+                output.put_nowait(self._message(pair, book.last_id or 0, [], []))
+        else:
+            self._switched_off.discard(symbol)
+            self.logger().info(f"XT {pair}: trading is back on ({flags}); its book is shown again.")
+            if book.synced and output is not None and symbol in self._symbol_to_pair_cache:
+                self._emit(symbol, book, output)
+            else:
+                self._ensure_bootstrap(symbol)
+
+    async def _ensure_switch_known(self, symbol: str) -> None:
+        """Before a market's first snapshot reaches the tracker, so a market that is already switched off
+        never shows its frozen book. One request covers every tracked market not read yet."""
+        if symbol in self._switch_known:
+            return
+        async with self._switch_lock:
+            if symbol in self._switch_known:
+                return
+            try:
+                symbols = sorted(({symbol} | set(await self._tracked_symbols())) - self._switch_known)
+                await self._read_switches(symbols)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._warn_once("switch-first-read",
+                                f"XT trading-switch read failed ({e}); markets count as on until the next read "
+                                f"(every {CONSTANTS.TRADING_SWITCH_INTERVAL} s).")
+
+    async def _trading_switch_loop(self) -> None:
+        while True:
+            try:
+                symbols = await self._tracked_symbols()
+                if symbols:
+                    await self._read_switches(symbols)
+                if self._switch_failing:
+                    self._switch_failing = False
+                    self.logger().info("XT trading-switch reads work again.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not self._switch_failing:
+                    self._switch_failing = True
+                    self.logger().warning(f"XT trading-switch read failed ({e}); every market keeps its last "
+                                          f"state. Retrying every {CONSTANTS.TRADING_SWITCH_INTERVAL} s.")
+            await asyncio.sleep(CONSTANTS.TRADING_SWITCH_INTERVAL)
 
     # ------------------------------------------------------------------ WebSocket
 
@@ -333,7 +453,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         self._diff_output = output
-        await super().listen_for_order_book_diffs(ev_loop, output)
+        switch_task = asyncio.ensure_future(self._trading_switch_loop())
+        try:
+            await super().listen_for_order_book_diffs(ev_loop, output)
+        finally:
+            switch_task.cancel()
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant) -> None:
         diff_key = self._diff_messages_queue_key
@@ -475,11 +599,17 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             timestamp=time.time(),
         )
 
-    def _snapshot_message(self, trading_pair: str, book: _LocalBook) -> OrderBookMessage:
+    def _snapshot_message(self, trading_pair: str, symbol: str, book: _LocalBook) -> OrderBookMessage:
+        if symbol in self._switched_off:
+            return self._message(trading_pair, book.last_id, [], [])
         bids, asks = book.top(CONSTANTS.EMIT_DEPTH)
         return self._message(trading_pair, book.last_id, bids, asks)
 
     def _emit(self, symbol: str, book: _LocalBook, output: asyncio.Queue) -> None:
+        if symbol in self._switched_off:
+            # Switched off by XT: the book is kept, the tracker sees it empty, like a halt elsewhere.
+            output.put_nowait(self._message(self._symbol_to_pair_cache[symbol], book.last_id, [], []))
+            return
         bids, asks = book.top(CONSTANTS.EMIT_DEPTH)
         if bids and asks and bids[0][0] >= asks[0][0]:
             # Cannot happen with an unbroken sequence; treat it as corruption and start over.
