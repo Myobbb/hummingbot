@@ -4060,7 +4060,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 buy_in_target_usd=500.0,
                 hold_target_enabled=True,
                 hold_target_usd=500.0,
-                hold_band_usd=100.0,
+                # ±50 = asset_manager's 500-tier band (HOLD_BAND_BY_TIER), so a new strategy
+                # already matches it and the AM sends no `set hold_band`; it raises it to 100
+                # only when the asset grades into a higher tier.
+                hold_band_usd=50.0,
                 additional_markets=additional_list
             )
 
