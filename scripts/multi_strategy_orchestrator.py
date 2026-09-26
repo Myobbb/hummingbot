@@ -523,9 +523,10 @@ def create(name: str, primary_spec: str, secondary_spec: str,
         >>> create("arb_cap", "bybit:CAP-USDT", "kucoin:CAP-USDT", no_escalation=True)
 
     no_escalation (console: the trailing `noesc` tag) configures the strategy for
-    guardrail-only accumulation — buy-in disabled, escalation off, resumed, hold enabled —
-    so the position balancer never arms and the asset is entered only when the arb spread
-    pays. Composed from the existing verbs; see _apply_no_escalation_preset.
+    guardrail-only accumulation — buy-in disabled, buy-in escalation off, resumed, hold
+    enabled — so the position balancer never arms a buy and the asset is entered only when
+    the arb spread pays. An overbought correction still escalates to a sell-off. Composed
+    from the existing verbs; see _apply_no_escalation_preset.
     """
     import asyncio
     orchestrator = _get_orchestrator()
@@ -708,7 +709,8 @@ class ArbitrageMInstanceConfig(BaseModel):
         default=True,
         description="Allow the hold-band to auto-arm the position balancer after a stuck "
                     "correction. Set false to keep the guardrail active (arb legs still get "
-                    "trimmed) but never have buy-in/sell-off armed automatically."
+                    "trimmed) but never have the buy-in armed automatically. An overbought "
+                    "correction still escalates to a sell-off."
     )
     hold_band_usd: float = Field(
         default=100.0,
@@ -1551,11 +1553,14 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 continue
             if target_usd <= 0.0:
                 continue  # guardrail disabled underneath us — nothing meaningful to target
-            # Opt-out: guardrail stays ACTIVE (arb legs are still trimmed) but the position
-            # balancer is never auto-armed. For pairs that should accumulate only when the
-            # arb spread justifies it, never via standalone PB limit orders. Absent key ==
-            # enabled, so existing strategies and older YAML are unaffected.
-            if instance.config.get('hold_escalation_enabled', True) is False:
+            # Opt-out, BUY SIDE ONLY: guardrail stays ACTIVE (arb legs are still trimmed) but an
+            # oversold correction never auto-arms the buy-in. For pairs that should accumulate
+            # only when the arb spread justifies it, never via standalone PB limit orders. An
+            # overbought correction still escalates to a sell-off: until 2026-09-26 the opt-out
+            # covered both sides, and noesc assets sat above their ceiling with nothing selling
+            # the excess (60 overbought episodes past 15 min in 4 days, up to 23 h). Absent key
+            # == enabled, so existing strategies and older YAML are unaffected.
+            if oversold and instance.config.get('hold_escalation_enabled', True) is False:
                 continue
 
             # Every hold-band line is tagged with the BASE ASSET, while this sweep only knows the
@@ -2942,12 +2947,13 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         return self.set_hold_band(strategy_name, band_usd) if strategy_name else False
 
     def set_hold_escalation_by_identifier(self, identifier: str, enabled: bool) -> bool:
-        """Enable/disable auto-arming of the position balancer for a strategy."""
+        """Enable/disable auto-arming of the position balancer's buy-in for a strategy."""
         strategy_name = self._resolve_identifier_to_name(identifier)
         return self.set_hold_escalation(strategy_name, enabled) if strategy_name else False
 
     def set_hold_escalation(self, strategy_name: str, enabled: bool) -> bool:
-        """Set hold-band escalation on/off by full name. Guardrail itself is unaffected."""
+        """Set hold-band buy-in escalation on/off by full name. Guardrail itself is unaffected,
+        and an overbought correction escalates to a sell-off either way."""
         strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
             return False
@@ -2956,7 +2962,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             self._persist_hold_config(strategy_name, {'hold_escalation_enabled': bool(enabled)})
             self.logger().info(
                 f"Hold-band escalation {'ENABLED' if enabled else 'DISABLED'} for '{strategy_name}'"
-                f"{'' if enabled else ' — guardrail still active; position balancer will not be auto-armed'}")
+                f"{'' if enabled else ' — guardrail still active; buy-in will not be auto-armed (sell-off still escalates)'}")
             return True
         except Exception as e:
             self.logger().error(f"Failed to set hold escalation for '{strategy_name}': {e}", exc_info=True)
@@ -3947,8 +3953,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         `_hold_enabled` flag is set on a strategy that is actually running.
 
         Net effect: the guardrail is on and will cap/trim arb legs, but the position balancer
-        is never armed — so the asset is entered ONLY when the spread pays, via the
-        zero-balance bootstrap path in arbitrage.pyx. See the guardrail wiki page.
+        never arms a buy — so the asset is entered ONLY when the spread pays, via the
+        zero-balance bootstrap path in arbitrage.pyx. An overbought correction still
+        escalates to a sell-off (_check_hold_escalations). See the guardrail wiki page.
 
         Failures are logged, not raised: the strategy already exists and is valid at this
         point, so a half-applied preset must not read as a failed create. Each verb reports
@@ -3969,8 +3976,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"[noesc] '{label}' failed for '{name}': {e}")
         self.logger().info(
             f"[noesc] '{name}' created for guardrail-only accumulation: buy-in disabled, "
-            f"escalation off, resumed, hold enabled — PB will never arm; entry happens only "
-            f"when the arb spread clears min_profitability")
+            f"buy-in escalation off, resumed, hold enabled — PB never arms a buy (an overbought "
+            f"correction still escalates to a sell-off); entry happens only when the arb spread "
+            f"clears min_profitability")
 
     async def create_strategy(self, name: str, primary_spec: str, secondary_spec: str,
                               min_profitability: float = 2.1,

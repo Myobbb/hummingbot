@@ -42,7 +42,7 @@ class StrategyControlCommand:
             control disable_hold <id>                   - Disable hold-band guardrail
             control set hold_target <id> <value>        - Set hold target USD (also enables guardrail)
             control set hold_band <id> <value>          - Set hold band half-width USD
-            control set hold_escalation <id> <on|off>    - Auto-arm PB after stuck correction (default on)
+            control set hold_escalation <id> <on|off>    - Auto-arm PB buy-in after stuck correction (default on; sell-off always escalates)
             control add_market <id> <exchange:PAIR>     - Add market to strategy (e.g., 'mexc:BSX-USDT')
             control remove_market <id> <exchange:PAIR>  - Remove market from strategy
             control clean <id>                          - Set sell-off target to 0 and enable sell-off (sell entire position)
@@ -201,8 +201,9 @@ class StrategyControlCommand:
             primary_spec = value[0]
             secondary_spec = value[1]
             # Optional trailing flags, order-independent and stripped before numeric parsing:
-            #   noesc  -> guardrail-only accumulation (buy-in off, escalation off, resumed,
-            #             hold enabled). Without it nothing changes: defaults are untouched.
+            #   noesc  -> guardrail-only accumulation (buy-in off, buy-in escalation off,
+            #             resumed, hold enabled; an overbought correction still escalates to
+            #             a sell-off). Without it nothing changes: defaults are untouched.
             # Parsed by exact match so it can never be confused with a min_profitability value.
             extras = [str(v).strip() for v in value[2:]]
             no_escalation = any(e.lower() == "noesc" for e in extras)
@@ -777,8 +778,8 @@ class StrategyControlCommand:
                         self.notify("  Position balancer may be auto-armed after a stuck correction.")
                     else:
                         self.notify(f"\n✓ Hold-band escalation DISABLED for {strategy_id}")
-                        self.notify("  Guardrail stays active (arb legs still trimmed); buy-in/sell-off")
-                        self.notify("  will NOT be auto-armed. Enable manually if you want PB orders.")
+                        self.notify("  Guardrail stays active (arb legs still trimmed); buy-in will NOT be")
+                        self.notify("  auto-armed. An overbought correction still escalates to a sell-off.")
                 else:
                     self.notify(f"\n✗ Failed to set hold escalation for: {strategy_id}")
 
@@ -901,8 +902,8 @@ class StrategyControlCommand:
             self.notify("  This includes dynamic websocket subscriptions for order book data")
 
             if no_escalation:
-                self.notify("  noesc: buy-in disabled, escalation off, hold enabled "
-                            "(PB will never arm — entry only on arb spread)")
+                self.notify("  noesc: buy-in disabled, buy-in escalation off, hold enabled "
+                            "(PB never arms a buy — entry only on arb spread; sell-off still escalates)")
             success = await strategy.create_strategy(
                 name=name,
                 primary_spec=primary_spec,
