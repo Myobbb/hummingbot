@@ -392,6 +392,8 @@ cdef class PositionBalancerHandler:
         self._settle_gate_logged = {}
         # asset -> id of the live sell already logged as kept (c_reprice_would_strand): one line per order
         self._kept_sell_logged = {}
+        # asset -> resting arb-sell base already logged as a placement wait (sell gap gate): one line per set of legs
+        self._sell_wait_logged = {}
         # asset -> last NEGATIVE-position warning (throttled; see c_try_mark_sell_complete)
         self._neg_position_warn_time = {}
         # Our own orders that a stuck-cancel cleanup untracked while they were still live on
@@ -3545,6 +3547,31 @@ cdef class PositionBalancerHandler:
                                     if (self._sell_target_usd > 0.0
                                             and val_result_actual.second < self.strategy._min_order_usd):
                                         return False
+                                    # The same rule for the gap we can ACT on. `shortfall_or_excess` is the
+                                    # ADJUSTED excess, the one c_execute_sell_limit sizes on: it nets out
+                                    # our own resting orders, every arb-layer sell leg included
+                                    # (c_arb_pending_base), so the PB never oversells behind one. When those
+                                    # legs cover all but less than the floor, no order we allow ourselves
+                                    # exists until they settle, and the sizer used to re-derive that refusal
+                                    # at WARNING every next_trade_delay. PHA 2026-09-27: 233 warnings in 4
+                                    # windows, each exactly one arb sell leg's life on htx (981.85 PHA
+                                    # 04:06:21 -> 04:09:21, cancelled unfilled); 1,091 in 5 days across PHA,
+                                    # DELOREAN, AIC and TT. Wait here instead, one INFO line per set of
+                                    # legs. Completion is unaffected (it reads the actual gap, above), and a
+                                    # leg that ends frees the whole gap on the next tick.
+                                    if (self._sell_target_usd > 0.0
+                                            and shortfall_or_excess < self.strategy._min_order_usd):
+                                        _arb_sell = self.c_arb_pending_base(canonical_asset, False)
+                                        if self._sell_wait_logged.get(canonical_asset) != _arb_sell:
+                                            self._sell_wait_logged[canonical_asset] = _arb_sell
+                                            self.strategy.logger().info(
+                                                f"Position balancer: {canonical_asset} sell waiting - resting orders "
+                                                f"cover ${val_result_actual.second - shortfall_or_excess:.2f} of the "
+                                                f"${val_result_actual.second:.2f} excess (arb sell legs {_arb_sell:.8g}), "
+                                                f"leaving ${shortfall_or_excess:.2f} < min_order_usd "
+                                                f"${self.strategy._min_order_usd:.2f}; nothing to place until they settle")
+                                        return False
+                                    self._sell_wait_logged.pop(canonical_asset, None)
                                     # Best market to sell on. The fuller-venue tie-break lives INSIDE
                                     # the selector and is always applied, so this and the CHECK 1 scan
                                     # ask the identical question — a "better market" signal can no

@@ -68,6 +68,8 @@ cdef class PositionBalancerHandler:
         dict _settle_gate_logged
         # asset -> id of the live sell we already logged as kept by c_reprice_would_strand
         dict _kept_sell_logged
+        # asset -> resting arb-sell base we already logged a placement wait for (one line per set of legs)
+        dict _sell_wait_logged
         # asset -> last time we warned that a computed position came out NEGATIVE (impossible state)
         dict _neg_position_warn_time
         # our own orders untracked by a stuck-cancel cleanup while still live on the venue
