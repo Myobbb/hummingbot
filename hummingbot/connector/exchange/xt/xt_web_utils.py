@@ -1,3 +1,5 @@
+import asyncio
+import time
 from typing import Any, Callable, Dict, Optional
 
 from hummingbot.connector.exchange.xt import xt_constants as CONSTANTS
@@ -78,13 +80,14 @@ async def get_current_server_time(
 
 class XtWSConnection(WSConnection):
     """
-    A WSConnection that negotiates permessage-deflate and refuses a connection without it.
+    A WSConnection that offers permessage-deflate, as XT documents, and accepts the answer either way.
 
     Hummingbot's WSConnection never passes `compress` to aiohttp, so no connector here has ever
-    requested deflate. XT documents it as a request header, and in P1 the nodes that did not grant
-    it pushed ~40% of the needed rate and served books minutes to hours old (2026-09-23). Raising
-    ConnectionError hands the connection back to the data source's reconnect loop, which retries
-    until a node grants it (1-3 attempts in P1).
+    requested deflate. From 2026-09-23 a connection without it was refused, because in P1 the nodes
+    that did not grant it pushed ~40% of the needed rate and served books minutes to hours old. On
+    2026-09-30 XT stopped granting it on every connection while un-deflated streams stayed healthy,
+    so the refusal only kept XT dark. The public stream's health is checked by XT's own sequence
+    instead (XtAPIOrderBookDataSource._freshness_loop).
 
     `heartbeat=None`: XT's keepalive is the text "ping"/"pong" exchange (Heartbeat), which the data
     sources send themselves; protocol-level PING frames are not documented for XT.
@@ -107,10 +110,6 @@ class XtWSConnection(WSConnection):
             max_msg_size=max_msg_size,
             compress=CONSTANTS.WS_COMPRESS,
         )
-        if not self._connection.compress:
-            await self._connection.close()
-            self._connection = None
-            raise ConnectionError(f"XT refused permessage-deflate on {ws_url} (lagging node); reconnecting")
         self._message_timeout = message_timeout
         self._connected = True
 
@@ -119,8 +118,34 @@ class XtWSConnection(WSConnection):
         return self._connection.compress if self._connection is not None else 0
 
 
+class XtReconnectBackoff:
+    """
+    The pause before a data source's next connection attempt. Hummingbot's listen loops reconnect at
+    once after a ConnectionError, so a refusal repeated at handshake speed (2026-09-30: 18,924 deflate
+    refusals in 2.6 h). A connection that failed, or died within WS_RETRY_RESET_SEC, waits
+    WS_RETRY_BASE, then twice as long each time, up to WS_RETRY_CAP. One that lived longer reconnects
+    at once, as before.
+    """
+
+    def __init__(self) -> None:
+        self._connected_at: Optional[float] = None
+        self._failures: int = 0
+
+    def connected(self) -> None:
+        self._connected_at = time.monotonic()
+
+    async def wait(self) -> None:
+        lived = time.monotonic() - self._connected_at if self._connected_at is not None else 0.0
+        self._connected_at = None
+        if lived >= CONSTANTS.WS_RETRY_RESET_SEC:
+            self._failures = 0
+            return
+        self._failures += 1
+        await asyncio.sleep(min(CONSTANTS.WS_RETRY_BASE * 2 ** (self._failures - 1), CONSTANTS.WS_RETRY_CAP))
+
+
 async def connected_ws_assistant(ws_url: str) -> WSAssistant:
-    """A WSAssistant over the shared aiohttp session, connected with deflate enforced."""
+    """A WSAssistant over the shared aiohttp session, connected with permessage-deflate offered."""
     base = await ConnectionsFactory().get_ws_connection()
     assistant = WSAssistant(connection=XtWSConnection(aiohttp_client_session=base._client_session))
     await assistant.connect(

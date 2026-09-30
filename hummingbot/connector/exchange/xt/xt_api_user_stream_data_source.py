@@ -45,6 +45,7 @@ class XtAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._listen_key_ts: float = 0.0
         self._ping_task: Optional[asyncio.Task] = None
         self._next_request_id: int = 0
+        self._backoff = web_utils.XtReconnectBackoff()
 
     def _request_id(self) -> str:
         self._next_request_id += 1
@@ -82,6 +83,7 @@ class XtAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 "id": self._request_id(),
             }))
             self.logger().info("Subscribed to XT private balance, order and trade channels.")
+            self._backoff.connected()
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(websocket_assistant))
@@ -134,3 +136,4 @@ class XtAPIUserStreamDataSource(UserStreamTrackerDataSource):
         if self._ping_task is not None:
             self._ping_task.cancel()
             self._ping_task = None
+        await self._backoff.wait()  # the listen loop reconnects right after this

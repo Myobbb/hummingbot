@@ -135,6 +135,13 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
     GET /v4/public/symbol every TRADING_SWITCH_INTERVAL and before a market's first snapshot. The local
     book is still kept, and the market's symbol and trading rule stay (the B2 KeyError), so switching
     back on shows the book at once.
+
+    The stream is the book (2026-09-30): while no connection is live, every tracked book is shown EMPTY,
+    like a halt. Before, a dropped stream left the tracker holding XT's last books for hours, and a
+    strategy placed XT orders off them (MEW, 02:37 UTC). A REST snapshot alone is never shown either,
+    since nothing would move it. The stream's health is XT's own sequence (_freshness_loop): REST's
+    lastUpdateId must reach the stream within FRESHNESS_MAX_LAG, or it is reconnected. That replaced
+    the permessage-deflate requirement (xt_web_utils.XtWSConnection).
     """
 
     def __init__(
@@ -165,6 +172,9 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._switch_known: set = set()
         self._switch_lock = asyncio.Lock()
         self._switch_failing: bool = False
+        # True from a connection's subscribe until its interruption: only then is a book kept current.
+        self._stream_live: bool = False
+        self._backoff = web_utils.XtReconnectBackoff()
 
     # ------------------------------------------------------------------ helpers
 
@@ -204,11 +214,11 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     # ------------------------------------------------------------------ REST snapshot
 
-    async def _request_depth(self, symbol: str) -> Dict[str, Any]:
+    async def _request_depth(self, symbol: str, limit: int = CONSTANTS.SNAPSHOT_DEPTH) -> Dict[str, Any]:
         rest_assistant = await self._api_factory.get_rest_assistant()
         response = await rest_assistant.execute_request(
             url=web_utils.public_rest_url(CONSTANTS.DEPTH_PATH, domain=self._domain),
-            params={"symbol": symbol, "limit": CONSTANTS.SNAPSHOT_DEPTH},
+            params={"symbol": symbol, "limit": limit},
             method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.DEPTH_PATH,
         )
@@ -230,6 +240,9 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         await self._ensure_switch_known(symbol)
         if book.synced:
             return self._snapshot_message(trading_pair, symbol, book)
+        if not self._stream_live:
+            # Nothing would keep a REST book current: empty until a connection is up and builds it.
+            return self._message(trading_pair, 0, [], [])
         result = await self._request_depth(symbol)
         if not book.synced:
             self._message_queue[self._diff_messages_queue_key].put_nowait(
@@ -399,6 +412,8 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._book(symbol).reset()
                 topics.extend(self._topics(symbol))
                 subscribed += 1
+            self._stream_live = True
+            self._backoff.connected()
             for i in range(0, len(topics), CONSTANTS.WS_TOPICS_PER_REQUEST):
                 await ws.send(WSJSONRequest(payload={
                     "method": CONSTANTS.WS_METHOD_SUBSCRIBE,
@@ -454,10 +469,55 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         self._diff_output = output
         switch_task = asyncio.ensure_future(self._trading_switch_loop())
+        freshness_task = asyncio.ensure_future(self._freshness_loop())
         try:
             await super().listen_for_order_book_diffs(ev_loop, output)
         finally:
             switch_task.cancel()
+            freshness_task.cancel()
+
+    async def _freshness_loop(self) -> None:
+        """The public stream's health, by XT's own sequence: every FRESHNESS_INTERVAL s, one synced market's
+        REST lastUpdateId (in rotation) must be reached by the stream within FRESHNESS_MAX_LAG s. A lagging node
+        fails it (P1 2026-09-23: books minutes to hours behind); FRESHNESS_BAD_PROBES misses in a row reconnect
+        the stream, and the interruption empties every XT book until the new connection rebuilds them. A probe
+        that errors, or whose book is rebuilt meanwhile, judges nothing."""
+        misses = 0
+        turn = 0
+        while True:
+            await asyncio.sleep(CONSTANTS.FRESHNESS_INTERVAL)
+            try:
+                ws = self._active_ws
+                live = [s for s, b in self._books.items() if b.synced and s in self._symbol_to_pair_cache]
+                if ws is None or not live:
+                    misses = 0
+                    continue
+                symbol = live[turn % len(live)]
+                turn += 1
+                target = int((await self._request_depth(symbol, limit=1))["lastUpdateId"])
+                deadline = time.monotonic() + CONSTANTS.FRESHNESS_MAX_LAG
+                book = self._books.get(symbol)
+                while book is not None and book.synced and book.last_id < target and time.monotonic() < deadline:
+                    await asyncio.sleep(0.25)
+                if book is None or not book.synced or self._active_ws is not ws:
+                    continue
+                if book.last_id >= target:
+                    misses = 0
+                    continue
+                misses += 1
+                behind = f"{target - book.last_id} updates behind REST after {CONSTANTS.FRESHNESS_MAX_LAG} s"
+                if misses < CONSTANTS.FRESHNESS_BAD_PROBES:
+                    self.logger().info(f"XT public stream: {symbol} is {behind} ({misses}/{CONSTANTS.FRESHNESS_BAD_PROBES}).")
+                    continue
+                misses = 0
+                compress = getattr(getattr(ws, "_connection", None), "negotiated_compress", "?")
+                self.logger().warning(f"XT public stream is lagging ({symbol} {behind}, {CONSTANTS.FRESHNESS_BAD_PROBES} "
+                                      f"probes in a row, permessage-deflate={compress}); reconnecting.")
+                await ws.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().debug(f"XT freshness probe skipped: {e}")
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant) -> None:
         diff_key = self._diff_messages_queue_key
@@ -500,6 +560,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None) -> None:
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
+        was_live, self._stream_live = self._stream_live, False
         if self._ping_task is not None:
             self._ping_task.cancel()
             self._ping_task = None
@@ -507,8 +568,17 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if not task.done():
                 task.cancel()
         self._snapshot_tasks.clear()
+        output = self._diff_output
+        if was_live and output is not None:
+            # Every book the tracker holds would stay frozen from here on: show them empty, a halt as for XT's
+            # trading switch, until the next connection rebuilds them.
+            for trading_pair in list(self._trading_pairs):
+                symbol = self._pair_to_symbol_cache.get(trading_pair)
+                book = self._books.get(symbol) if symbol is not None else None
+                output.put_nowait(self._message(trading_pair, (book.last_id if book else None) or 0, [], []))
         for book in self._books.values():
             book.reset()  # the next connection re-bootstraps every book from scratch
+        await self._backoff.wait()  # the listen loop reconnects right after this
 
     # ------------------------------------------------------------------ the local book
 
@@ -561,6 +631,8 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if book.synced:
             return  # a late or duplicate snapshot for a book that is already live
         book.bootstrapping = False
+        if not self._stream_live:
+            return  # the stream dropped while this was in flight: the next connection rebuilds every book
         last_update_id = int(result["lastUpdateId"])
         pending = [d for d in book.buffer if int(d["i"]) > last_update_id]
         if pending and int(pending[0]["fi"]) > last_update_id + 1:

@@ -16,11 +16,26 @@ WSS_PUBLIC_URL = "wss://stream.xt.com/public"
 WSS_PRIVATE_URL = "wss://stream.xt.com/private"
 
 # permessage-deflate window bits for the WS handshake. XT documents the request header
-# `Sec-WebSocket-Extensions: permessage-deflate` (wss-general), and P1 proved it is not optional:
-# nodes that do not grant it deliver ~40% of the push rate and fall further behind every second
-# (2026-09-23, Tracker ws_book_checker/exchanges/xt.py). A connection that is not granted deflate
-# is refused and retried, see xt_web_utils.XtWSConnection.
+# `Sec-WebSocket-Extensions: permessage-deflate` (wss-general). It is offered, no longer required:
+# from 2026-09-23 a connection without it was refused, because in P1 such nodes delivered ~40% of the
+# push rate and fell further behind every second. On 2026-09-30 XT stopped granting deflate on every
+# connection (0 of 54 handshakes), un-deflated streams were healthy, and the refusal left XT dark.
+# The public stream's health is now checked by XT's own sequence instead (FRESHNESS_*).
 WS_COMPRESS = 15
+
+# Freshness of the public stream (xt_api_order_book_data_source._freshness_loop): every FRESHNESS_INTERVAL
+# seconds, one synced market's REST lastUpdateId must be reached by the stream within FRESHNESS_MAX_LAG
+# seconds (it pushes every 100-500 ms). FRESHNESS_BAD_PROBES misses in a row reconnect the stream.
+FRESHNESS_INTERVAL = 10
+FRESHNESS_MAX_LAG = 5
+FRESHNESS_BAD_PROBES = 2
+
+# Reconnect pacing (xt_web_utils.XtReconnectBackoff). The fork's listen loops reconnect at once after a
+# ConnectionError, so the deflate refusals of 2026-09-30 ran as a hot loop (18,924 in 2.6 h, ~2 per second).
+# A connection that failed or lived less than WS_RETRY_RESET_SEC waits 1, 2, 4 ... WS_RETRY_CAP seconds.
+WS_RETRY_BASE = 1.0
+WS_RETRY_CAP = 30.0
+WS_RETRY_RESET_SEC = 30.0
 
 # clientOrderId: SubmitOrder documents ^[a-zA-Z0-9_]{4,22}$, SubmitBatchOrder and the SDK say 32.
 # The stricter one is used. get_new_client_order_id() then hashes the tail, which keeps ids unique.
