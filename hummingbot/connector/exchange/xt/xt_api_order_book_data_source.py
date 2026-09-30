@@ -138,10 +138,12 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     The stream is the book (2026-09-30): while no connection is live, every tracked book is shown EMPTY,
     like a halt. Before, a dropped stream left the tracker holding XT's last books for hours, and a
-    strategy placed XT orders off them (MEW, 02:37 UTC). A REST snapshot alone is never shown either,
-    since nothing would move it. The stream's health is XT's own sequence (_freshness_loop): REST's
-    lastUpdateId must reach the stream within FRESHNESS_MAX_LAG, or it is reconnected. That replaced
-    the permessage-deflate requirement (xt_web_utils.XtWSConnection).
+    strategy placed XT orders off them (MEW, 02:37 UTC). A REST snapshot that lands while the stream is
+    dark is dropped. With the stream live, a book is bootstrapped from REST as XT's procedure says, and a
+    book being rebuilt (sequence gap, crossed book, the orchestrator's repair) is shown empty until the
+    rebuilt one is emitted. The stream's health is XT's own sequence, per market (_freshness_loop): REST's
+    lastUpdateId must reach the stream within FRESHNESS_MAX_LAG, or it is reconnected. That replaced the
+    permessage-deflate requirement (xt_web_utils.XtWSConnection).
     """
 
     def __init__(
@@ -453,6 +455,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         task = self._snapshot_tasks.pop(symbol, None)
         if task is not None and not task.done():
             task.cancel()
+        self._show_empty(symbol, self._diff_output)
         book.reset()
         self._ensure_bootstrap(symbol)
 
@@ -477,24 +480,40 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             freshness_task.cancel()
 
     async def _freshness_loop(self) -> None:
-        """The public stream's health, by XT's own sequence: every FRESHNESS_INTERVAL s, one synced market's
-        REST lastUpdateId (in rotation) must be reached by the stream within FRESHNESS_MAX_LAG s. A lagging node
-        fails it (P1 2026-09-23: books minutes to hours behind); FRESHNESS_BAD_PROBES misses in a row reconnect
-        the stream, and the interruption empties every XT book until the new connection rebuilds them. A probe
-        that errors, or whose book is rebuilt meanwhile, judges nothing."""
-        misses = 0
+        """The public stream's health, by XT's own sequence, per market: every FRESHNESS_INTERVAL s, one synced
+        market's REST lastUpdateId must be reached by the stream within FRESHNESS_MAX_LAG s. Markets are probed in
+        rotation, and one that misses is probed again next, so FRESHNESS_BAD_PROBES misses in a row are that
+        market's own: a healthy market elsewhere can't reset them (before, one shared counter let a single frozen
+        market pass forever). A lagging node or a market the stream stopped serving fails it (P1 2026-09-23: books
+        minutes to hours behind); the stream is reconnected, and the interruption empties every XT book until the
+        new connection rebuilds them. A probe whose book is rebuilt meanwhile judges nothing; FRESHNESS_ERRORS_WARN
+        failed probes in a row are a WARNING (the stream is unchecked while they fail)."""
+        misses: Dict[str, int] = {}
+        errors = 0
         turn = 0
+        again: Optional[str] = None
+        probed_ws: Optional[WSAssistant] = None
         while True:
             await asyncio.sleep(CONSTANTS.FRESHNESS_INTERVAL)
             try:
                 ws = self._active_ws
                 live = [s for s, b in self._books.items() if b.synced and s in self._symbol_to_pair_cache]
+                if ws is not probed_ws:  # a new connection starts clean: an old connection's misses aren't its own
+                    misses.clear()
+                    again = None
+                    probed_ws = ws
                 if ws is None or not live:
-                    misses = 0
                     continue
-                symbol = live[turn % len(live)]
-                turn += 1
+                if again in live:
+                    symbol = again
+                else:
+                    symbol = live[turn % len(live)]
+                    turn += 1
+                again = None
                 target = int((await self._request_depth(symbol, limit=1))["lastUpdateId"])
+                if errors >= CONSTANTS.FRESHNESS_ERRORS_WARN:
+                    self.logger().info("XT freshness probes work again.")
+                errors = 0
                 deadline = time.monotonic() + CONSTANTS.FRESHNESS_MAX_LAG
                 book = self._books.get(symbol)
                 while book is not None and book.synced and book.last_id < target and time.monotonic() < deadline:
@@ -502,14 +521,16 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if book is None or not book.synced or self._active_ws is not ws:
                     continue
                 if book.last_id >= target:
-                    misses = 0
+                    misses.pop(symbol, None)
                     continue
-                misses += 1
+                misses[symbol] = misses.get(symbol, 0) + 1
                 behind = f"{target - book.last_id} updates behind REST after {CONSTANTS.FRESHNESS_MAX_LAG} s"
-                if misses < CONSTANTS.FRESHNESS_BAD_PROBES:
-                    self.logger().info(f"XT public stream: {symbol} is {behind} ({misses}/{CONSTANTS.FRESHNESS_BAD_PROBES}).")
+                if misses[symbol] < CONSTANTS.FRESHNESS_BAD_PROBES:
+                    self.logger().info(f"XT public stream: {symbol} is {behind} "
+                                       f"({misses[symbol]}/{CONSTANTS.FRESHNESS_BAD_PROBES}); probing it again.")
+                    again = symbol
                     continue
-                misses = 0
+                misses.clear()
                 compress = getattr(getattr(ws, "_connection", None), "negotiated_compress", "?")
                 self.logger().warning(f"XT public stream is lagging ({symbol} {behind}, {CONSTANTS.FRESHNESS_BAD_PROBES} "
                                       f"probes in a row, permessage-deflate={compress}); reconnecting.")
@@ -517,7 +538,12 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger().debug(f"XT freshness probe skipped: {e}")
+                errors += 1
+                if errors == CONSTANTS.FRESHNESS_ERRORS_WARN:
+                    self.logger().warning(f"XT freshness probes failing ({errors} in a row, last: {e}); "
+                                          f"the public stream is unchecked until they work again.")
+                else:
+                    self.logger().debug(f"XT freshness probe skipped: {e}")
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant) -> None:
         diff_key = self._diff_messages_queue_key
@@ -618,6 +644,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if fi > book.last_id + 1:
             self.logger().warning(
                 f"XT {symbol}: depth sequence gap (fi={fi}, expected {book.last_id + 1}); rebuilding the book.")
+            self._show_empty(symbol, output)
             book.reset()
             book.buffer.append(data)
             self._ensure_bootstrap(symbol)
@@ -653,6 +680,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             if fi > book.last_id + 1:
                 self.logger().warning(f"XT {symbol}: gap inside the buffered diffs; rebuilding the book.")
+                self._show_empty(symbol, output)
                 book.reset()
                 self._ensure_bootstrap(symbol)
                 return
@@ -686,10 +714,19 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if bids and asks and bids[0][0] >= asks[0][0]:
             # Cannot happen with an unbroken sequence; treat it as corruption and start over.
             self.logger().warning(f"XT {symbol}: crossed book (bid {bids[0][0]} >= ask {asks[0][0]}); rebuilding.")
+            self._show_empty(symbol, output)
             book.reset()
             self._ensure_bootstrap(symbol)
             return
         output.put_nowait(self._message(self._symbol_to_pair_cache[symbol], book.last_id, bids, asks))
+
+    def _show_empty(self, symbol: str, output: Optional[asyncio.Queue]) -> None:
+        """This market's book is being rebuilt, so the one the tracker holds is no longer kept current: show it
+        empty (a halt, as for XT's trading switch) until the rebuilt book is emitted. Call before book.reset()."""
+        pair = self._symbol_to_pair_cache.get(symbol)
+        if output is not None and pair is not None:
+            book = self._books.get(symbol)
+            output.put_nowait(self._message(pair, (book.last_id if book else None) or 0, [], []))
 
     # ------------------------------------------------------------------ trades
 

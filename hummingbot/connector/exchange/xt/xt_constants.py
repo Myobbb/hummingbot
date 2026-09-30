@@ -25,10 +25,12 @@ WS_COMPRESS = 15
 
 # Freshness of the public stream (xt_api_order_book_data_source._freshness_loop): every FRESHNESS_INTERVAL
 # seconds, one synced market's REST lastUpdateId must be reached by the stream within FRESHNESS_MAX_LAG
-# seconds (it pushes every 100-500 ms). FRESHNESS_BAD_PROBES misses in a row reconnect the stream.
+# seconds (it pushes every 100-500 ms). FRESHNESS_BAD_PROBES misses in a row by the same market (a market
+# that misses is probed again next) reconnect the stream. FRESHNESS_ERRORS_WARN failed probes in a row warn.
 FRESHNESS_INTERVAL = 10
 FRESHNESS_MAX_LAG = 5
 FRESHNESS_BAD_PROBES = 2
+FRESHNESS_ERRORS_WARN = 3
 
 # Reconnect pacing (xt_web_utils.XtReconnectBackoff). The fork's listen loops reconnect at once after a
 # ConnectionError, so the deflate refusals of 2026-09-30 ran as a hot loop (18,924 in 2.6 h, ~2 per second).
