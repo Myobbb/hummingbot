@@ -158,7 +158,7 @@ class XtExchange(ExchangePyBase):
             domain=self._domain,
         )
 
-    # ------------------------------------------------------------------ first-live-run audit
+    # ------------------------------------------------------------------ first-live-run audit + alarms
 
     def _audit(self, tag: str, **fields: Any) -> None:
         """One [XT-AUDIT] line. Only questions the docs cannot answer; never headers or credentials."""
@@ -166,6 +166,12 @@ class XtExchange(ExchangePyBase):
             return
         rendered = " ".join(f"{k}={v!r}" for k, v in fields.items())
         self.logger().info(f"[XT-AUDIT] {tag} {rendered}")
+
+    def _alarm(self, tag: str, **fields: Any) -> None:
+        """A money guard fired: one [XT-ALARM] WARNING, logged whatever LIVE_AUDIT_LOGGING says. Rare by
+        design (none in the first live week); each one is worth reading."""
+        rendered = " ".join(f"{k}={v!r}" for k, v in fields.items())
+        self.logger().warning(f"[XT-ALARM] {tag} {rendered}")
 
     def _audit_once(self, tag: str, **fields: Any) -> None:
         if not CONSTANTS.LIVE_AUDIT_LOGGING or tag in self._audit_seen:
@@ -313,7 +319,7 @@ class XtExchange(ExchangePyBase):
             # would mark it FAILED and stop tracking it, leaving a live order nobody watches. Ask XT by
             # client id first; only a confirmed absence lets the failure stand.
             exchange_order_id = await self._find_order_by_client_id(order_id)
-            self._audit("place-order-unanswered", client_id=order_id, error=repr(transport_error),
+            self._alarm("place-order-unanswered", client_id=order_id, error=repr(transport_error),
                         found_on_exchange=exchange_order_id)
             if exchange_order_id is not None:
                 return exchange_order_id, self.current_timestamp
@@ -479,7 +485,7 @@ class XtExchange(ExchangePyBase):
             if fill.trade_id in known:
                 continue
             if fill.fill_base_amount > room + CONSTANTS.FILL_AMOUNT_TOLERANCE:
-                self._audit("fill-capped", client_id=order.client_order_id, trade_id=fill.trade_id,
+                self._alarm("fill-capped", client_id=order.client_order_id, trade_id=fill.trade_id,
                             amount=str(fill.fill_base_amount), room=str(room))
                 continue
             counted.append(fill)
@@ -627,6 +633,36 @@ class XtExchange(ExchangePyBase):
                 self.logger().exception(f"Error parsing the XT trading rule {info.get('symbol')}. Skipping.")
         return rules
 
+    async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        """
+        One `symbols=` request per TICKER_PRICE_BATCH markets, not one per market. The order book tracker re-reads
+        the REST last price of every quiet book (no trade and no book change for 3 min) every 5 s, and with 10+
+        quiet XT books the per-market calls hit XT's 10/s limit on every pass (1,842 throttler warnings in 28 h,
+        2026-10-01). Live: an unknown symbol in the list is just left out of the answer.
+
+        Every requested pair gets a value, NaN (the order book's own "no price yet") when XT has none: the tracker
+        re-asks a pair it got nothing for at once, without pausing.
+        """
+        prices: Dict[str, float] = {trading_pair: float("nan") for trading_pair in trading_pairs}
+        symbol_to_pair: Dict[str, str] = {}
+        for trading_pair in trading_pairs:
+            try:
+                symbol_to_pair[await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)] = trading_pair
+            except KeyError:
+                continue  # not a market XT lists: stays NaN
+        symbols = list(symbol_to_pair)
+        for i in range(0, len(symbols), CONSTANTS.TICKER_PRICE_BATCH):
+            batch = symbols[i:i + CONSTANTS.TICKER_PRICE_BATCH]
+            response = self._raise_on_error(
+                await self._api_get(path_url=CONSTANTS.TICKER_PRICE_PATH, params={"symbols": ",".join(batch)}),
+                f"Error fetching the last XT prices of {len(batch)} markets",
+            )
+            for entry in response.get("result") or []:
+                trading_pair = symbol_to_pair.get(entry.get("s"))
+                if trading_pair is not None and entry.get("p") not in (None, ""):
+                    prices[trading_pair] = float(entry["p"])
+        return prices
+
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         response = self._raise_on_error(
@@ -705,7 +741,7 @@ class XtExchange(ExchangePyBase):
         await asyncio.sleep(0.5)   # give the trade push its chance first
         if order.executed_amount_base >= reported_executed:
             return
-        self._audit("fill-backfill", client_id=order.client_order_id, reported=str(reported_executed),
+        self._alarm("fill-backfill", client_id=order.client_order_id, reported=str(reported_executed),
                     held=str(order.executed_amount_base))
         try:
             for trade_update in await self._all_trade_updates_for_order(order):
@@ -728,7 +764,7 @@ class XtExchange(ExchangePyBase):
         tracked_order = self._locate_order("", exchange_order_id, fillable=True)
         if tracked_order is None:
             if exchange_order_id is None:
-                self._audit("fill-unattributed", data=data)
+                self._alarm("fill-unattributed", data=data)
                 return
             self._pending_fills.setdefault(exchange_order_id, []).append((time.time(), data))
             self._audit("fill-parked", order_id=exchange_order_id, trade_id=data.get("i"))
@@ -762,7 +798,7 @@ class XtExchange(ExchangePyBase):
         for exchange_order_id in list(self._pending_fills):
             kept = [(ts, d) for ts, d in self._pending_fills[exchange_order_id] if ts >= cutoff]
             if len(kept) != len(self._pending_fills[exchange_order_id]):
-                self._audit("fill-expired", order_id=exchange_order_id,
+                self._alarm("fill-expired", order_id=exchange_order_id,
                             dropped=len(self._pending_fills[exchange_order_id]) - len(kept))
             if kept:
                 self._pending_fills[exchange_order_id] = kept
@@ -781,7 +817,7 @@ class XtExchange(ExchangePyBase):
         if trade_update.trade_id in order.order_fills:
             return
         if order.executed_amount_base + trade_update.fill_base_amount > order.amount + CONSTANTS.FILL_AMOUNT_TOLERANCE:
-            self._audit("fill-over-amount", client_id=order.client_order_id, trade_id=trade_update.trade_id,
+            self._alarm("fill-over-amount", client_id=order.client_order_id, trade_id=trade_update.trade_id,
                         executed=str(order.executed_amount_base), fill=str(trade_update.fill_base_amount),
                         amount=str(order.amount))
             return
@@ -790,7 +826,7 @@ class XtExchange(ExchangePyBase):
                     and known.fill_base_amount == trade_update.fill_base_amount
                     and known.fill_price == trade_update.fill_price
                     and abs(known.fill_timestamp - trade_update.fill_timestamp) <= CONSTANTS.FILL_MATCH_SECONDS):
-                self._audit("fill-duplicate-of-rest", client_id=order.client_order_id, ws_id=trade_update.trade_id,
+                self._alarm("fill-duplicate-of-rest", client_id=order.client_order_id, ws_id=trade_update.trade_id,
                             rest_id=known_id)
                 return
         self._order_tracker.process_trade_update(trade_update)

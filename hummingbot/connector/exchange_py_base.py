@@ -692,6 +692,8 @@ class ExchangePyBase(ExchangeBase, ABC):
         - The polling loop to update order status and balance status using REST API (backup for main update process)
         - The background task to process the events received through the user stream tracker (websocket connection)
         """
+        # Rate-limit warnings come from the shared throttler code: name the connector in them.
+        self._throttler.label = getattr(self, "name", None)
         await self.stop_network()
         self.order_book_tracker.start()
         if self.is_trading_required:

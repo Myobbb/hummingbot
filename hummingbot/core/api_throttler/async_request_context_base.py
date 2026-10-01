@@ -3,7 +3,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from hummingbot.core.api_throttler.data_types import RateLimit, TaskLog
 from hummingbot.logger.logger import HummingbotLogger
@@ -34,6 +34,7 @@ class AsyncRequestContextBase(ABC):
                  lock: asyncio.Lock,
                  safety_margin_pct: float,
                  retry_interval: float = 0.1,
+                 throttler: Optional[Any] = None,
                  ):
         """
         Asynchronous context associated with each API request.
@@ -49,6 +50,8 @@ class AsyncRequestContextBase(ABC):
         self._lock: asyncio.Lock = lock
         self._safety_margin_pct: float = safety_margin_pct
         self._retry_interval: float = retry_interval
+        # The throttler that made this context: its label and warning time (None = the old class-wide one).
+        self._throttler: Optional[Any] = throttler
 
     def flush(self):
         """

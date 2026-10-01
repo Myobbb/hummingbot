@@ -51,6 +51,7 @@ SERVER_TIME_PATH = "/v4/public/time"
 SYMBOL_PATH = "/v4/public/symbol"
 DEPTH_PATH = "/v4/public/depth"
 TICKER_PRICE_PATH = "/v4/public/ticker/price"
+TICKER_PRICE_BATCH = 100      # markets per `symbols=` call; live 2026-10-01: 200 in one call all came back
 
 ORDER_PATH = "/v4/order"                        # POST place · GET query by orderId / clientOrderId
 CANCEL_ORDER_PATH = "/v4/order/{order_id}"      # DELETE
@@ -164,9 +165,10 @@ TRADE_PAGE_SIZE = 100          # documented max
 TRADE_MAX_PAGES = 10
 
 # --- First-live-run audit logging (same scheme as CoinEx's [CX-AUDIT]) -----------------------------
-# Every line is tagged [XT-AUDIT]; scoped to what the docs cannot settle. Switch off once settled:
-#     grep 'XT-AUDIT' ~/hummingbot/logs/logs_test_multi.log
-LIVE_AUDIT_LOGGING = True
+# Every line is tagged [XT-AUDIT]; scoped to what the docs could not settle. Off since 2026-10-01: the
+# live audits of 09-23 → 10-01 settled them (wiki trading/exchanges/xt-api). True brings them back.
+# Money-guard firings are not audit lines: they always log as [XT-ALARM] WARNINGs (XtExchange._alarm).
+LIVE_AUDIT_LOGGING = False
 AUDIT_ONCE_ORDER_KEYS = "order-push-key-set"
 AUDIT_ONCE_TRADE_KEYS = "trade-push-key-set"
 AUDIT_ONCE_REST_TRADE_KEYS = "rest-trade-key-set"

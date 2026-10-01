@@ -37,13 +37,20 @@ class AsyncRequestContext(AsyncRequestContextBase):
                                           Decimal(str(now)) - Decimal(str(task.timestamp)) - Decimal(str(task.rate_limit.time_interval * self._safety_margin_pct)) <= task.rate_limit.time_interval])
 
                 if capacity_used + weight > rate_limit.limit:
-                    if self._last_max_cap_warning_ts < now - MAX_CAPACITY_REACHED_WARNING_INTERVAL:
-                        msg = f"API rate limit on {rate_limit.limit_id} ({rate_limit.limit} calls per " \
-                              f"{rate_limit.time_interval}s) has almost reached. Limits used " \
-                              f"is {capacity_used} in the last " \
+                    owner = self._throttler
+                    last_warning = (owner._last_max_cap_warning_ts if owner is not None
+                                    else AsyncRequestContextBase._last_max_cap_warning_ts)
+                    if last_warning < now - MAX_CAPACITY_REACHED_WARNING_INTERVAL:
+                        label = getattr(owner, "label", None)
+                        msg = f"{label + ': ' if label else ''}API rate limit on {rate_limit.limit_id} " \
+                              f"({rate_limit.limit} calls per {rate_limit.time_interval}s) has almost reached. " \
+                              f"Limits used is {capacity_used} in the last " \
                               f"{rate_limit.time_interval} seconds"
                         self.logger().notify(msg)
-                        AsyncRequestContextBase._last_max_cap_warning_ts = now
+                        if owner is not None:
+                            owner._last_max_cap_warning_ts = now
+                        else:
+                            AsyncRequestContextBase._last_max_cap_warning_ts = now
                     return False
         return True
 
@@ -78,4 +85,5 @@ class AsyncThrottler(AsyncThrottlerBase):
             lock=self._lock,
             safety_margin_pct=self._safety_margin_pct,
             retry_interval=self._retry_interval,
+            throttler=self,
         )

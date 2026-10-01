@@ -56,6 +56,12 @@ class AsyncThrottlerBase(ABC):
         # Shared asyncio.Lock instance to prevent multiple async ContextManager from accessing the _task_logs variable
         self._lock = asyncio.Lock()
 
+        # Named in the capacity warning: the owning connector's name (set by ExchangePyBase.start_network).
+        self.label: Optional[str] = None
+        # When this throttler last warned. Per throttler, so one busy connector's warnings can't hide
+        # another's (a single class-wide timestamp let XT's suppress every venue's for 30 s, 2026-10-01).
+        self._last_max_cap_warning_ts: float = 0.0
+
     def set_rate_limits(self, rate_limits: List[RateLimit]):
         # Rate Limit Definitions
         self._rate_limits: List[RateLimit] = copy.deepcopy(rate_limits)
