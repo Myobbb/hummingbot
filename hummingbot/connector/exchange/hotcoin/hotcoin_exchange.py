@@ -85,15 +85,21 @@ class HotcoinExchange(ExchangePyBase):
         self._pending_pushes: Dict[str, List[Tuple[float, Dict[str, Any]]]] = {}
         # exchange order id -> (monotonic time, detailById data), shared by the fills poll and the status poll
         self._detail_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-        # exchange order ids that got at least one order push (bounded), for _expect_order_push
+        # exchange AND client order ids that got at least one order push (bounded), for _expect_order_push
         self._pushed_order_ids: Dict[str, None] = {}
         self._missing_pushes = 0
         self._last_push_alarm = 0.0
         self._balance_pushes_audited = 0
-        # client order id -> the base asset's total balance when the order was sent (_balance_shows_fills)
-        self._base_at_placement: Dict[str, Decimal] = {}
+        # asset -> net base change of every fill this process booked (_note_fill_booked, _balance_shows_fills)
+        self._booked_base: Dict[str, Decimal] = {}
+        # client order id -> (base asset total balance, _booked_base of that asset) when the order was sent
+        self._hold_baseline: Dict[str, Tuple[Decimal, Decimal]] = {}
         # client order ids whose terminal update is waiting for the balance (one waiter each)
         self._settling: set = set()
+        # asset -> monotonic time of its last balance push: an older REST snapshot doesn't overwrite it
+        self._balance_pushed_at: Dict[str, float] = {}
+        # exchange order ids an orphan alarm (and cancel) was raised for, once each (_check_orphan_push)
+        self._orphan_ids: Dict[str, None] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         # WS-authoritative until the fill test proves otherwise (runbook §6.3); one switch.
         self.real_time_balance_update = CONSTANTS.REAL_TIME_BALANCE_UPDATE
@@ -298,13 +304,32 @@ class HotcoinExchange(ExchangePyBase):
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         return CONSTANTS.MSG_TIMESTAMP_OUT_OF_RANGE.lower() in str(request_exception).lower()
 
+    @staticmethod
+    def _is_not_found(error: Exception) -> bool:
+        """Hotcoin's own "this order does not exist" (40010)."""
+        return isinstance(error, HotcoinBusinessError) and error.code in CONSTANTS.ORDER_NOT_FOUND_CODES
+
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return (isinstance(status_update_exception, HotcoinBusinessError)
-                and status_update_exception.code in CONSTANTS.ORDER_NOT_FOUND_CODES)
+        return self._is_not_found(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return (isinstance(cancelation_exception, HotcoinBusinessError)
-                and cancelation_exception.code in CONSTANTS.ORDER_NOT_FOUND_CODES)
+        return self._is_not_found(cancelation_exception)
+
+    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+        """
+        This fork's base counts EVERY failed status read toward failing the order (the 4th strike, never reset) and
+        runs no lost-order recovery: a FAILED order is forgotten while it may still rest on Hotcoin, and its later
+        fills are never booked. At the 10 s poll a 40 s REST outage would fail every open order. So only "the order
+        does not exist" counts: our own client-id lookup coming back empty (CODE_NOT_IN_ORDER_LIST) or 40010 for an
+        order with fills (one without is resolved as CANCELED before it gets here). Anything else is a WARNING and
+        the order stays tracked: the push or the next poll settles it.
+        """
+        if isinstance(error, HotcoinBusinessError) and (error.code == CONSTANTS.CODE_NOT_IN_ORDER_LIST
+                                                         or self._is_not_found(error)):
+            await self._order_tracker.process_order_not_found(order.client_order_id)
+            return
+        self.logger().warning(f"Hotcoin status read for {order.client_order_id} failed, the order stays tracked: "
+                              f"{error!r}")
 
     @staticmethod
     def _format_decimal(value: Decimal) -> str:
@@ -382,7 +407,7 @@ class HotcoinExchange(ExchangePyBase):
             self._alarm("place-order-unanswered", client_id=order_id, error=repr(transport_error),
                         found_on_exchange=exchange_order_id)
             if exchange_order_id is not None:
-                return exchange_order_id, self.current_timestamp
+                return exchange_order_id, self._now()
             raise
         self._audit("place-order", request=self._raw(params), response=self._raw(response))
         self._raise_on_error(response, f"Order {order_id} refused, request {self._raw(params)}")
@@ -392,14 +417,16 @@ class HotcoinExchange(ExchangePyBase):
             raise IOError(f"Error submitting order {order_id}: Hotcoin returned no order ID | "
                           f"Hotcoin response: {self._raw(response)}")
         self._audit_once("place-client-id-echo", sent=order_id, echoed=data.get("clientOrderId"))
-        return str(exchange_order_id), self.current_timestamp
+        return str(exchange_order_id), self._now()
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
-        # The baseline a terminal update compares the balance with (_balance_shows_fills).
-        self._base_at_placement[order.client_order_id] = self._account_balances.get(order.base_asset, Decimal("0"))
-        if len(self._base_at_placement) > 2000:
-            for client_order_id in list(self._base_at_placement)[:1000]:
-                del self._base_at_placement[client_order_id]
+        # The baseline the order's terminal update compares the balance with (_balance_shows_fills).
+        asset = order.base_asset
+        self._hold_baseline[order.client_order_id] = (self._account_balances.get(asset, Decimal("0")),
+                                                      self._booked_base.get(asset, Decimal("0")))
+        if len(self._hold_baseline) > 2000:
+            for client_order_id in list(self._hold_baseline)[:1000]:
+                del self._hold_baseline[client_order_id]
         exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
         if order.exchange_order_id is not None and str(order.exchange_order_id) != str(exchange_order_id):
             # A push beat this answer and gave the order its id first; the base never overwrites an id. If the two
@@ -437,30 +464,54 @@ class HotcoinExchange(ExchangePyBase):
 
     # ------------------------------------------------------------------ terminal updates wait for the balance
 
+    @staticmethod
+    def _base_delta(order: InFlightOrder, fills: List[TradeUpdate]) -> Decimal:
+        """What the fills change the base asset's balance by: + quantity on a buy, - on a sell, less any fee charged
+        in the base asset (a Hotcoin buy's fee is; a sell's is in the quote asset)."""
+        delta = Decimal("0")
+        for fill in fills:
+            base_fee = sum((fee.amount for fee in fill.fee.flat_fees if fee.token == order.base_asset), Decimal("0"))
+            delta += (fill.fill_base_amount if order.trade_type is TradeType.BUY else -fill.fill_base_amount) - base_fee
+        return delta
+
+    def _note_fill_booked(self, order: InFlightOrder, fill: TradeUpdate) -> None:
+        """Every fill this process books, summed per asset, so the hold can tell an order's own balance change from
+        other orders' (_balance_shows_fills)."""
+        asset = order.base_asset
+        self._booked_base[asset] = self._booked_base.get(asset, Decimal("0")) + self._base_delta(order, [fill])
+
     def _balance_shows_fills(self, order: InFlightOrder) -> bool:
-        """True once the base asset's total balance carries the order's fills: since the order was sent it has moved
-        by at least 99% of what the fills change it by (the slack absorbs Hotcoin's fee rounding). An order without
-        fills, or with no baseline (placed before this process, or never through _place_order_and_process_update),
-        needs no wait."""
-        baseline = self._base_at_placement.get(order.client_order_id)
+        """
+        True once the base asset's total balance carries the order's own fills. Since the order was sent the balance
+        has moved by its own fills and by other orders' fills booked meanwhile (landed or not): the others' are taken
+        off, and what is left must reach 99% of the order's own (the slack absorbs Hotcoin's fee rounding). So another
+        order's fill can't stand in for this one's, a fill that landed long ago passes at once however much the asset
+        traded since (the false holds of UP, 2026-10-06 08:07 and 09:17), and a lost balance push keeps holding until
+        the waiter reads REST. The one case left: a fill booked BEFORE this order was sent but landing after it can
+        still pass it early. An order without fills, or with no baseline (sent before this process), needs no wait.
+        """
+        baseline = self._hold_baseline.get(order.client_order_id)
         if baseline is None or order.executed_amount_base <= 0:
             return True
-        base_fees = sum((fee.amount for fill in order.order_fills.values() for fee in fill.fee.flat_fees
-                         if fee.token == order.base_asset), Decimal("0"))
-        if order.trade_type is TradeType.BUY:
-            expected = order.executed_amount_base - base_fees
-        else:
-            expected = -(order.executed_amount_base + base_fees)
-        if expected == 0:
+        own = self._base_delta(order, list(order.order_fills.values()))
+        if own == 0:
             return True
-        moved = self._account_balances.get(order.base_asset, Decimal("0")) - baseline
-        return moved / expected >= Decimal("0.99")
+        balance_then, booked_then = baseline
+        asset = order.base_asset
+        others = self._booked_base.get(asset, Decimal("0")) - booked_then - own
+        moved_own = self._account_balances.get(asset, Decimal("0")) - balance_then - others
+        return moved_own / own >= Decimal("0.99")
+
+    def _forget_settled(self, order: InFlightOrder) -> None:
+        self._hold_baseline.pop(order.client_order_id, None)
 
     async def _await_balance_showing_fills(self, order: InFlightOrder, source: str) -> None:
-        """Holds a terminal update until the balance shows the order's fills, at most FILL_BALANCE_WAIT_SECONDS; then
-        reads REST balances and lets it go anyway, with an [HC-ALARM]. Hotcoin pushes a fill before the balance that
-        holds it, and a strategy reads balances on completion: reported first, the hold-band read AEON as 0 and
-        bought it twice (2026-10-06)."""
+        """
+        Holds a terminal update until the balance shows the order's fills, at most FILL_BALANCE_WAIT_SECONDS; then
+        reads REST balances (bounded by the same time) and lets it go anyway, with an [HC-ALARM]. Hotcoin pushes a
+        fill before the balance that holds it, and a strategy reads balances on completion: reported first, the
+        hold-band read AEON as 0 and bought it twice (2026-10-06).
+        """
         if self._balance_shows_fills(order):
             return
         started = time.monotonic()
@@ -471,36 +522,37 @@ class HotcoinExchange(ExchangePyBase):
                             waited_s=round(time.monotonic() - started, 3))
                 return
         try:
-            await self._update_balances()
+            await asyncio.wait_for(self._update_balances(), timeout=CONSTANTS.FILL_BALANCE_WAIT_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self.logger().warning(f"Hotcoin balance read for {order.client_order_id} failed: {e}")
+            self.logger().warning(f"Hotcoin balance read for {order.client_order_id} failed: {e!r}")
         self._alarm("fill-balance-late", client_id=order.client_order_id, source=source,
                     waited_s=CONSTANTS.FILL_BALANCE_WAIT_SECONDS,
                     shows_fills_after_rest=self._balance_shows_fills(order))
 
-    def _process_terminal_update(self, order: InFlightOrder, update: OrderUpdate) -> None:
-        """The push path's order update: a terminal one is held until the balance shows the order's fills."""
-        if update.new_state not in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+    def _process_terminal_update(self, order: InFlightOrder, update: OrderUpdate, source: str = "push") -> None:
+        """An order update on its way to the tracker. A terminal one is held until the balance shows the order's
+        fills, by ONE waiter per order: the push and the status poll can both bring the same update."""
+        if update.new_state not in CONSTANTS.TERMINAL_STATES:
             self._order_tracker.process_order_update(update)
             return
         if self._balance_shows_fills(order):
-            self._base_at_placement.pop(order.client_order_id, None)
+            self._forget_settled(order)
             self._order_tracker.process_order_update(update)
             return
         if order.client_order_id in self._settling:
             return  # its waiter reports it
         self._settling.add(order.client_order_id)
-        safe_ensure_future(self._report_when_balance_shows_fills(order, update))
+        safe_ensure_future(self._report_when_balance_shows_fills(order, update, source))
 
-    async def _report_when_balance_shows_fills(self, order: InFlightOrder, update: OrderUpdate) -> None:
+    async def _report_when_balance_shows_fills(self, order: InFlightOrder, update: OrderUpdate, source: str) -> None:
         try:
-            await self._await_balance_showing_fills(order, source="push")
+            await self._await_balance_showing_fills(order, source)
             self._order_tracker.process_order_update(update)
         finally:
             self._settling.discard(order.client_order_id)
-            self._base_at_placement.pop(order.client_order_id, None)
+            self._forget_settled(order)
 
     async def _lookup_client_id(self, client_order_id: str, symbol: str) -> Optional[str]:
         """Exchange order id for a client id from GET /v1/order/entrust (current and history, 100 newest), or None.
@@ -547,12 +599,19 @@ class HotcoinExchange(ExchangePyBase):
         self._audit("cancel-order", client_id=order_id, exchange_order_id=exchange_order_id,
                     response=self._raw(response))
         self._raise_on_error(response, f"Hotcoin refused to cancel order {order_id} ({exchange_order_id})")
+        # A detail read just before the cancel would put the order back to OPEN over PENDING_CANCEL.
+        self._detail_cache.pop(str(exchange_order_id), None)
         return True
 
     async def _execute_order_cancel(self, order: InFlightOrder) -> Optional[str]:
-        """The base's cancel path, except for a Hotcoin refusal: that is a WARNING with Hotcoin's answer (no
-        traceback), and the order's status is read at once, since a refused cancel usually means the order already
-        filled or was cancelled."""
+        """
+        The base's cancel path, except:
+          - a Hotcoin refusal -- 40010 included (the order is gone) -- is a WARNING with Hotcoin's answer (no
+            traceback), and the order's status is read at once: a refused cancel usually means the order already
+            filled or was cancelled, and for an order cancelled without a fill the read confirms it (40010);
+          - a timeout counts toward failing the order only when it is the wait for an exchange id that never came;
+            an HTTP timeout on the cancel itself reads the order's status instead (the cancel may have landed).
+        """
         try:
             cancelled = await self._execute_order_cancel_and_process_update(order=order)
             if cancelled:
@@ -560,17 +619,18 @@ class HotcoinExchange(ExchangePyBase):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            self.logger().warning(
-                f"Failed to cancel the order {order.client_order_id} because it does not have an exchange order id yet")
-            await self._order_tracker.process_order_not_found(order.client_order_id)
-        except HotcoinBusinessError as refusal:
-            if self._is_order_not_found_during_cancelation_error(refusal):
-                self.logger().warning(f"Failed to cancel order {order.client_order_id} (order not found)")
+            if order.exchange_order_id is None:
+                self.logger().warning(f"Failed to cancel the order {order.client_order_id} because it does not have "
+                                      f"an exchange order id yet")
                 await self._order_tracker.process_order_not_found(order.client_order_id)
             else:
-                self.logger().warning(f"Hotcoin refused to cancel {order.client_order_id}: {refusal}. "
+                self.logger().warning(f"Hotcoin did not answer the cancel of {order.client_order_id} in time. "
                                       f"Reading its status now.")
                 safe_ensure_future(self._refresh_order(order))
+        except HotcoinBusinessError as refusal:
+            self.logger().warning(f"Hotcoin refused to cancel {order.client_order_id}: {refusal}. Reading its status "
+                                  f"now.")
+            safe_ensure_future(self._refresh_order(order))
         except Exception:
             self.logger().error(f"Failed to cancel order {order.client_order_id}", exc_info=True)
         return None
@@ -585,7 +645,8 @@ class HotcoinExchange(ExchangePyBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self.logger().debug(f"Hotcoin status read for {order.client_order_id} failed: {e}")
+            self.logger().warning(f"Hotcoin status read for {order.client_order_id} after its cancel failed; the "
+                                  f"next poll reads it again: {e!r}")
 
     def _order_state(self, status_code: Any, executed: Decimal, original: Decimal) -> OrderState:
         try:
@@ -615,7 +676,7 @@ class HotcoinExchange(ExchangePyBase):
             exchange_order_id = await self._lookup_client_id(order.client_order_id, symbol)
             if exchange_order_id is None:
                 raise HotcoinBusinessError(f"Order {order.client_order_id} is not in Hotcoin's order list "
-                                           f"(looked up by clientOrderId)", None)
+                                           f"(looked up by clientOrderId)", CONSTANTS.CODE_NOT_IN_ORDER_LIST)
         cached = self._detail_cache.get(exchange_order_id)
         if cached is not None and time.monotonic() - cached[0] <= CONSTANTS.ORDER_DETAIL_CACHE_SECONDS:
             return cached[1]
@@ -658,13 +719,36 @@ class HotcoinExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         if order.exchange_order_id is None:
             return []
-        detail = await self._fetch_order_detail(order)
+        try:
+            detail = await self._fetch_order_detail(order)
+        except HotcoinBusinessError as e:
+            if self._is_not_found(e) and order.executed_amount_base <= 0:
+                # Hotcoin drops an order cancelled without a fill (40010 from the moment of the cancel), and the fills
+                # poll still reads it for 30 s after (cached orders stay fillable): three WARNING tracebacks per
+                # timed-out order at the 10 s poll. No fill, nothing to fetch. An order WITH fills that answers this
+                # still raises.
+                return []
+            raise
         filled, value, fee = self._detail_cumulative(detail)
         fill = self._fill_from_cumulative(order, filled, value, fee, fill_time=self._now(), source="rest")
-        return [fill] if fill is not None else []
+        if fill is None:
+            return []
+        self._note_fill_booked(order, fill)   # the base books it right after this returns
+        return [fill]
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        detail = await self._fetch_order_detail(tracked_order)
+        try:
+            detail = await self._fetch_order_detail(tracked_order)
+        except HotcoinBusinessError as e:
+            if (self._is_not_found(e) and tracked_order.exchange_order_id is not None
+                    and tracked_order.executed_amount_base <= 0):
+                # Hotcoin deletes an order cancelled without a fill: 40010 from the moment of the cancel (5 of 5,
+                # 2026-10-06). The docs say to confirm a cancel with detailById, so this answer IS the confirmation;
+                # it settles an order whose `canceled` push was lost. Left to the base's not-found count, the order
+                # would be FAILED instead -- read by arb_l as a placement failure, with its cooldown.
+                self._forget_settled(tracked_order)
+                return self._order_update(tracked_order, OrderState.CANCELED)
+            raise
         if tracked_order.exchange_order_id is None and detail.get("id") is not None:
             # Found by client id: the order gets its exchange id before a fill is named after it.
             tracked_order.update_exchange_order_id(str(detail["id"]))
@@ -674,19 +758,29 @@ class HotcoinExchange(ExchangePyBase):
                                           source="rest")
         if fill is not None:
             self._order_tracker.process_trade_update(fill)
+            self._note_fill_booked(tracked_order, fill)
         status_code = detail.get("statusCode")
         new_state = self._order_state(status_code, filled, self._dec(detail.get("count")))
         self._audit_once(f"detail-status:{status_code}", status=detail.get("status"), mapped=str(new_state))
-        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
-            # As on the push path: the caller reports this at once, so it waits here for the balance first.
-            await self._await_balance_showing_fills(tracked_order, source="rest")
-            self._base_at_placement.pop(tracked_order.client_order_id, None)
+        update = self._order_update(tracked_order, new_state, exchange_order_id=detail.get("id"))
+        if new_state in CONSTANTS.TERMINAL_STATES:
+            if self._balance_shows_fills(tracked_order):
+                self._forget_settled(tracked_order)
+                return update
+            # The caller reports what this returns at once, and reads its orders one after another: a terminal update
+            # the balance doesn't show yet goes to the shared waiter instead, and this read reports the state the
+            # order already has (a no-op for the tracker).
+            self._process_terminal_update(tracked_order, update, source="rest")
+            return self._order_update(tracked_order, tracked_order.current_state)
+        return update
+
+    def _order_update(self, order: InFlightOrder, state: OrderState, exchange_order_id: Any = None) -> OrderUpdate:
         return OrderUpdate(
-            client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(detail.get("id") or tracked_order.exchange_order_id),
-            trading_pair=tracked_order.trading_pair,
+            client_order_id=order.client_order_id,
+            exchange_order_id=str(exchange_order_id or order.exchange_order_id),
+            trading_pair=order.trading_pair,
             update_timestamp=self._now(),
-            new_state=new_state,
+            new_state=state,
         )
 
     def _received_asset(self, order: InFlightOrder) -> str:
@@ -717,7 +811,9 @@ class HotcoinExchange(ExchangePyBase):
         average. The id is the order id plus the cumulative quantity, so the push and the poll name a fill alike.
         Guards, each an [HC-ALARM]: never past the order's size; never a quantity without value (the two fields
         disagree, e.g. a `leftcount` that stopped meaning "unfilled": booking it could invent a fill, so the next
-        push or poll decides); a price implausibly far from the limit (a field read wrong) books the limit price.
+        push or poll decides); a price implausibly far from the limit (a field read wrong) is refused on the REST
+        path and booked at the limit price on the push path; a falling cumulative fee books 0 (except REST's
+        4-decimal rounding below a push's exact fee, which is silent).
         """
         tolerance = CONSTANTS.FILL_AMOUNT_TOLERANCE
         held = order.executed_amount_base
@@ -750,8 +846,9 @@ class HotcoinExchange(ExchangePyBase):
             price, quote = limit, limit * base
         fee_amount = fee - self._fees_held(order)
         if fee_amount < 0:
-            self._alarm("fill-fee-decreased", client_id=order.client_order_id, source=source, cumulative_fee=str(fee),
-                        held=str(self._fees_held(order)))
+            if not (source == "rest" and fee_amount >= -CONSTANTS.REST_FEE_ROUNDING):
+                self._alarm("fill-fee-decreased", client_id=order.client_order_id, source=source,
+                            cumulative_fee=str(fee), held=str(self._fees_held(order)))
             fee_amount = Decimal("0")
         self._audit_once(f"fee-asset:{order.trade_type.name}", fee=str(fee), filled=str(filled), value=str(value),
                          per_filled=str(fee / filled) if filled > 0 else None,
@@ -771,7 +868,8 @@ class HotcoinExchange(ExchangePyBase):
             fill_quote_amount=quote,
             fill_price=price,
             fill_timestamp=fill_time,
-            # Hotcoin's push doesn't say; arb_l's legs are takers by design. The fee above is Hotcoin's own figure.
+            # Hotcoin's push doesn't say, and resting legs do fill as makers (UP 2026-10-06); nothing downstream
+            # reads it. The fee above is Hotcoin's own figure either way.
             is_taker=True,
         )
 
@@ -807,7 +905,9 @@ class HotcoinExchange(ExchangePyBase):
 
     async def _update_balances(self) -> None:
         """GET /v3/balance: data.assets[] = {currency, currencyId, free, frozen, total} as strings (Chinese docs, SDK).
-        The English page's /v1/balance calls `total` "Available", which is ambiguous; v3 names all three."""
+        The English page's /v1/balance calls `total` "Available", which is ambiguous; v3 names all three.
+        An asset whose balance push arrived after this request was sent keeps the push: the snapshot is older."""
+        requested_at = time.monotonic()
         response = self._raise_on_error(
             await self._api_get(path_url=CONSTANTS.BALANCE_PATH, is_auth_required=True,
                                 limit_id=CONSTANTS.BALANCE_PATH),
@@ -824,15 +924,19 @@ class HotcoinExchange(ExchangePyBase):
             asset = str(entry.get("currency") or "").upper()
             if not asset:
                 continue
+            remote_asset_names.add(asset)
+            if self._balance_pushed_at.get(asset, 0.0) > requested_at:
+                continue
             available = self._dec(entry.get("free"))
             total = (self._dec(entry.get("total")) if entry.get("total") is not None
                      else available + self._dec(entry.get("frozen")))
             self._account_available_balances[asset] = available
             self._account_balances[asset] = total
-            remote_asset_names.add(asset)
         for asset_name in local_asset_names.difference(remote_asset_names):
-            del self._account_available_balances[asset_name]
-            del self._account_balances[asset_name]
+            if self._balance_pushed_at.get(asset_name, 0.0) > requested_at:
+                continue
+            self._account_available_balances.pop(asset_name, None)
+            self._account_balances.pop(asset_name, None)
 
     # ------------------------------------------------------------------ symbols / rules
 
@@ -984,8 +1088,19 @@ class HotcoinExchange(ExchangePyBase):
                 self._audit("order-push-unmatched", client_id=client_order_id or None, order_id=exchange_order_id,
                             event=data.get("eventType"), status_code=data.get("statusCode"), source=data.get("source"),
                             age_s=self._push_age(data))
+                if (client_order_id.startswith(CONSTANTS.HBOT_ORDER_ID_PREFIX) and self._is_open_push(data)
+                        and exchange_order_id is not None and exchange_order_id not in self._orphan_ids):
+                    # One of ours, open on Hotcoin, that nothing tracks: its fills would never be booked. Said, not
+                    # cancelled -- it may be another process's (Pavel's call).
+                    self._orphan_ids[exchange_order_id] = None
+                    self._alarm("untracked-order-open", client_id=client_order_id, order_id=exchange_order_id,
+                                status_code=data.get("statusCode"))
             return
         self._apply_order_push(order, data)
+
+    @staticmethod
+    def _is_open_push(data: Dict[str, Any]) -> bool:
+        return str(data.get("statusCode")) in ("1", "2")   # open, partially filled
 
     def _push_age(self, data: Dict[str, Any]) -> Optional[float]:
         """Seconds from a push's eventTime (Hotcoin's clock, ms) to its arrival, on the synchronized clock."""
@@ -1020,9 +1135,19 @@ class HotcoinExchange(ExchangePyBase):
                                           self._dec(data.get("fees")), fill_time=fill_time, source="push", trade=trade)
         if fill is not None:
             self._order_tracker.process_trade_update(fill)
+            self._note_fill_booked(order, fill)
+        if order.is_failure and self._is_open_push(data) and exchange_order_id is not None:
+            self._cancel_failed_but_open(order, exchange_order_id, status_code)
+            return
         if order.client_order_id not in self._order_tracker.all_updatable_orders:
             return  # already final: a late push may still carry a fill (above), never a state
-        new_state = self._order_state(status_code, filled, self._dec(data.get("count"), default=str(order.amount)))
+        count = self._dec(data.get("count"), default=str(order.amount))
+        new_state = self._order_state(status_code, filled, count)
+        if new_state is OrderState.FILLED and order.executed_amount_base + CONSTANTS.FILL_AMOUNT_TOLERANCE < count:
+            # A guard refused (part of) the fill this FILLED push reports: let a REST read settle it rather than
+            # complete the order short.
+            self._poll_notifier.set()
+            return
         self._process_terminal_update(order, OrderUpdate(
             trading_pair=order.trading_pair,
             update_timestamp=int(data["eventTime"]) * 1e-3 if data.get("eventTime") else self._now(),
@@ -1030,6 +1155,29 @@ class HotcoinExchange(ExchangePyBase):
             client_order_id=order.client_order_id,
             exchange_order_id=exchange_order_id,
         ))
+
+    def _cancel_failed_but_open(self, order: InFlightOrder, exchange_order_id: str, status_code: Any) -> None:
+        """
+        HMB gave the order up (FAILED: its placement answer never came and the lookups missed it), yet Hotcoin reports
+        it open. Nothing tracks it once its 30 s in the cache are over, so it is cancelled now, with an [HC-ALARM].
+        A fill it already had was booked from this push; one after the cancel can't happen.
+        """
+        if exchange_order_id in self._orphan_ids:
+            return
+        self._orphan_ids[exchange_order_id] = None
+        self._alarm("failed-order-alive", client_id=order.client_order_id, order_id=exchange_order_id,
+                    status_code=status_code, action="cancelling")
+        safe_ensure_future(self._cancel_by_exchange_id(exchange_order_id))
+
+    async def _cancel_by_exchange_id(self, exchange_order_id: str) -> None:
+        try:
+            response = await self._api_post(path_url=CONSTANTS.CANCEL_ORDER_PATH, params={"id": exchange_order_id},
+                                            is_auth_required=True, limit_id=CONSTANTS.CANCEL_ORDER_PATH)
+            self._audit("cancel-untracked", order_id=exchange_order_id, response=self._raw(response))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().warning(f"Hotcoin cancel of the untracked order {exchange_order_id} failed: {e!r}")
 
     async def _retry_parked_pushes(self, exchange_order_id: str) -> None:
         for _ in range(5):
@@ -1084,6 +1232,7 @@ class HotcoinExchange(ExchangePyBase):
                      else available + self._dec(entry.get("frozen")))
             self._account_balances[asset] = total
             self._account_available_balances[asset] = available
+            self._balance_pushed_at[asset] = time.monotonic()
             if CONSTANTS.LIVE_AUDIT_LOGGING and self._balance_pushes_audited < CONSTANTS.BALANCE_AUDIT_PUSHES:
                 self._balance_pushes_audited += 1
                 safe_ensure_future(self._audit_balance_push(asset, entry))

@@ -53,12 +53,18 @@ CODE_API_NOT_OPEN = 10170        # unknown path
 CODE_INVALID_API_KEY = 10173     # "无效API KEY"
 CODE_SYMBOL_INVALID = 40008      # "symbol有误..." (the symbol is wrong, not listed or disabled)
 CODE_TOO_FREQUENT = 20724        # "API requests too frequent" (P1, 2026-09-27)
-# Order not found on detailById / cancel: NOT YET SEEN. Filled from the read-only key probe (S4) before go-live;
-# until then a not-found answer is handled as any other refusal (the order's status poll settles it).
-ORDER_NOT_FOUND_CODES: tuple = ()
-# Our own code for an answer that is code 200 with no data (detailById of an unknown order might answer so): it gets
-# its own number, so S4 shows it as such, and it can join ORDER_NOT_FOUND_CODES if that is Hotcoin's not-found.
+# Order not found: 40010 "委单不存在" ("order does not exist", live 2026-10-06). detailById answers it for every
+# order cancelled WITHOUT a fill, from the moment of the cancel: Hotcoin drops those (5 of 5 such orders; a
+# partially filled order cancelled at 05:35 stayed readable). So for an order with no fill it IS the cancel's
+# confirmation: the status read resolves it as CANCELED, the fills poll skips it, and a cancel answering it
+# reads the order's status (HotcoinExchange._request_order_status, _all_trade_updates_for_order,
+# _execute_order_cancel).
+ORDER_NOT_FOUND_CODES: tuple = (40010,)
+# Our own code for an answer that is code 200 with no data (never seen live).
 CODE_EMPTY_ANSWER = -1
+# Our own code for "the order list has no order with this clientOrderId" (an order whose placement answer never came).
+# It, not a code-less answer (an error page during an outage has no code either), counts as "not found".
+CODE_NOT_IN_ORDER_LIST = -2
 
 # The signed Timestamp is accepted up to at least 60 s off the server clock and refused at 90 s
 # (live 2026-10-05, a bogus key: the timestamp is checked before the key). ISO UTC with milliseconds, as the docs.
@@ -98,11 +104,16 @@ ORDER_PUSH_ALARM_INTERVAL = 600.0
 # Live 2026-10-06: created/trade pushes came for 2 of 7 orders (a cancel push did come). So while any order is open
 # the status poll runs every SHORT_POLL_INTERVAL (10 s) instead of 60 s (HotcoinExchange._get_poll_interval).
 
-# Hotcoin pushes an order's fill BEFORE the balance that holds it: 0.46 s and ~2.5 s later on 2026-10-06. A terminal
+# Hotcoin pushes an order's fill BEFORE the balance that holds it: 0.4-3.7 s later (51 waits, 2026-10-06). A terminal
 # update (FILLED, or CANCELED after fills) waits until the base asset's total balance shows the fills, at most this
-# long (s); then balances are read over REST and the update is reported anyway, with an [HC-ALARM]. Reported first,
-# the hold-band refreshed its total on completion, read AEON as 0 and bought it twice (2026-10-06).
+# long (s); then balances are read over REST (bounded by the same time) and the update is reported anyway, with an
+# [HC-ALARM]. Reported first, the hold-band refreshed its total on completion, read AEON as 0 and bought it twice.
 FILL_BALANCE_WAIT_SECONDS = 5.0
+TERMINAL_STATES = (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED)
+
+# detailById's `fees` is cut to 4 decimals (0.3993 for 0.399375, 2026-10-06; a known, accepted limitation): a REST
+# fee up to this much below the exact fee a push already booked is rounding, not a falling fee.
+REST_FEE_ROUNDING = Decimal("0.0001")
 
 # Fills: the order push and /v1/order/detailById carry the order's CUMULATIVE filled quantity, filled value and
 # fee, never a trade id. Each new cumulative total becomes one fill of the difference

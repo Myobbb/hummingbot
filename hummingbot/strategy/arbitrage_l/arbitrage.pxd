@@ -102,6 +102,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         public double _hold_target_usd   # centre of acceptable band, e.g. 1100.0
         public double _hold_band_usd     # half-width, e.g. 100.0 → band is [1000, 1200]
         double _cached_total_base_qty    # sum of base across all venues; refreshed every 60 s
+        dict _hold_dispatch_base         # order id -> (market, base, +1/-1, venue base TOTAL at dispatch, ts): correction legs
+        dict _hold_unsettled             # order id -> (market, base, +1/-1, filled, venue base at dispatch, deadline)
         double _cached_mid_price_usd     # position bid: each venue at its own top bid (c_get_position_bid, same as position balancer); refreshed every 60 s
         bint _hold_correction_active     # True while position is outside band (hysteresis flag)
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
@@ -165,6 +167,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_reconcile_orphan_orders(self)
     cdef void c_cleanup_old_orders(self)
     cdef double c_hold_inflight_base(self)
+    cdef double c_hold_unsettled_base(self)
     cdef void c_refresh_hold_cache(self)
     cdef void c_set_hold_correction(self, bint active, bint oversold)
 

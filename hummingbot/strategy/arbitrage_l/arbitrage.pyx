@@ -72,6 +72,12 @@ cdef:
     # That self-corrects in seconds and applies to both directions.
     int HOLD_BREACH_CYCLES_OVERSOLD = 15
     int HOLD_BREACH_CYCLES_OVERBOUGHT = 2
+    # A correction leg that completed before its venue's balance showed the fill stays credited
+    # until the balance has moved by this share of the fill (the slack absorbs fees charged in
+    # base), and no longer than HOLD_UNSETTLED_MAX_SECONDS (observed lags: gate_io ~1 s,
+    # Hotcoin up to 3.7 s). See c_hold_unsettled_base.
+    double HOLD_SETTLED_SHARE = 0.99
+    double HOLD_UNSETTLED_MAX_SECONDS = 30.0
     double DEFAULT_ORDER_TIMEOUT = 600.0  # 10 minutes timeout for unfilled orders
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
@@ -175,6 +181,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_target_usd = 0.0
         self._hold_band_usd = 100.0
         self._cached_total_base_qty = 0.0
+        self._hold_dispatch_base = {}
+        self._hold_unsettled = {}
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
         self._hold_correction_oversold = False
@@ -324,6 +332,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_enabled = hold_target_usd > 0.0
         self._hold_band_usd = hold_band_usd
         self._cached_total_base_qty = 0.0
+        self._hold_dispatch_base = {}
+        self._hold_unsettled = {}
         self._cached_mid_price_usd = 0.0
         self._hold_correction_active = False
         self._hold_correction_oversold = False
@@ -1517,6 +1527,42 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return inflight_buy - inflight_sell
         return 0.0
 
+    cdef double c_hold_unsettled_base(self):
+        """
+        Net base of correction legs that COMPLETED before their venue's balance showed the fill,
+        i.e. the fills neither the wallet nor c_hold_inflight_base can see (the order has left the
+        tracker). Signed: a buy adds, a sell subtracts -- these fills happened, so unlike the
+        in-flight credit there is nothing to clamp. Off the hot path: c_refresh_hold_cache only.
+
+        Each entry (written by c_handle_order_completion when the venue had not moved by
+        HOLD_SETTLED_SHARE of the fill since dispatch) is dropped as soon as the venue balance has
+        moved that far, or HOLD_UNSETTLED_MAX_SECONDS after the completion -- whichever comes first.
+        A partly visible fill is credited for the part still missing.
+        Stale dispatch records (legs cancelled or failed, so never completed) are pruned here too.
+        """
+        cdef:
+            double credit = 0.0
+            double moved
+            object oid
+            object entry
+        try:
+            for oid in list(self._hold_dispatch_base.keys()):
+                if self._current_timestamp - self._hold_dispatch_base[oid][4] > 3600.0:
+                    del self._hold_dispatch_base[oid]
+            for oid in list(self._hold_unsettled.keys()):
+                entry = self._hold_unsettled[oid]
+                try:
+                    moved = (float(entry[0].get_balance(entry[1])) - entry[4]) * entry[2]
+                except Exception:
+                    moved = entry[3]                  # can't read the venue: stop crediting
+                if moved >= HOLD_SETTLED_SHARE * entry[3] or self._current_timestamp > entry[5]:
+                    del self._hold_unsettled[oid]
+                    continue
+                credit += entry[2] * (entry[3] - max(moved, 0.0))
+        except Exception:
+            return 0.0                                # fail-open: behave exactly as before
+        return credit
+
     cdef void c_refresh_hold_cache(self):
         """
         Refresh cached total base quantity and mid-price used by the hold-band guardrail.
@@ -1584,6 +1630,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # _hold_enabled because every reader of _cached_total_base_qty is hold-band code.
             if self._hold_enabled:
                 total += self.c_hold_inflight_base()
+                total += self.c_hold_unsettled_base()
             self._cached_total_base_qty = total
 
             # Price: the position bid, each venue's balance at that venue's own top bid
@@ -2431,6 +2478,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # An async placement failure (MarketOrderFailureEvent) leaves this over-credited
                 # until the next refresh, which errs toward buying LESS -- the safe direction.
                 self._cached_total_base_qty += float(_final_buy_qty) - float(_final_sell_qty)
+                # Each leg's venue balance NOW, before any of its fill can show: at completion it
+                # tells whether that venue has credited the fill yet (c_hold_unsettled_base).
+                try:
+                    if _final_buy_qty > DECIMAL_ZERO and buy_order_id:
+                        self._hold_dispatch_base[buy_order_id] = (
+                            buy_market_tuple.market, buy_market_tuple.base_asset, 1.0,
+                            float(buy_market_tuple.market.get_balance(buy_market_tuple.base_asset)),
+                            self._current_timestamp)
+                    if _final_sell_qty > DECIMAL_ZERO and sell_order_id:
+                        self._hold_dispatch_base[sell_order_id] = (
+                            sell_market_tuple.market, sell_market_tuple.base_asset, -1.0,
+                            float(sell_market_tuple.market.get_balance(sell_market_tuple.base_asset)),
+                            self._current_timestamp)
+                except Exception:
+                    pass
                 self.logger().info(
                     f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
                     f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
@@ -2536,6 +2598,23 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if self._position_balancer is not None:
                 self._position_balancer.c_record_fill_pressure(order_id, is_buy)
                 self._position_balancer.handle_order_completion(order_id, is_buy)
+
+            # A correction leg can report completion before its venue's balance shows the fill
+            # (gate_io: 1.2 s on UP 2026-10-06 10:28:43). The refresh below would then lose the
+            # fill: the order has left the in-flight count and the wallet has not caught up. It
+            # read $441 instead of $479 and the next fire bought 162.4 UP again ($517 on a $500
+            # target). Until the venue shows the fill, it stays credited (c_hold_unsettled_base).
+            dispatched = self._hold_dispatch_base.pop(order_id, None)
+            if dispatched is not None:
+                try:
+                    filled = float(order_event.base_asset_amount)
+                    venue_moved = (float(dispatched[0].get_balance(dispatched[1])) - dispatched[3]) * dispatched[2]
+                    if filled > 0.0 and venue_moved < HOLD_SETTLED_SHARE * filled:
+                        self._hold_unsettled[order_id] = (dispatched[0], dispatched[1], dispatched[2], filled,
+                                                          dispatched[3],
+                                                          self._current_timestamp + HOLD_UNSETTLED_MAX_SECONDS)
+                except Exception:
+                    pass
 
             # Refresh hold-band cache after each trade only while a correction is in progress.
             # The 60s cycle handles activation (band breach detection); this handles deactivation
