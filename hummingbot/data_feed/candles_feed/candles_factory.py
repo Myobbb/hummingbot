@@ -2,9 +2,6 @@ from typing import Dict, Type
 
 from hummingbot.data_feed.candles_feed.binance_perpetual_candles import BinancePerpetualCandles
 from hummingbot.data_feed.candles_feed.binance_spot_candles import BinanceSpotCandles
-from hummingbot.data_feed.candles_feed.bitmart_perpetual_candles.bitmart_perpetual_candles import (
-    BitmartPerpetualCandles,
-)
 from hummingbot.data_feed.candles_feed.btc_markets_spot_candles.btc_markets_spot_candles import BtcMarketsSpotCandles
 from hummingbot.data_feed.candles_feed.bybit_perpetual_candles.bybit_perpetual_candles import BybitPerpetualCandles
 from hummingbot.data_feed.candles_feed.bybit_spot_candles.bybit_spot_candles import BybitSpotCandles
@@ -59,7 +56,6 @@ class CandlesFactory:
         "hyperliquid": HyperliquidSpotCandles,
         "hyperliquid_perpetual": HyperliquidPerpetualCandles,
         "dexalot": DexalotSpotCandles,
-        "bitmart_perpetual": BitmartPerpetualCandles,
         "btc_markets": BtcMarketsSpotCandles,
     }
 

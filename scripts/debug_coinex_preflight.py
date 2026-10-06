@@ -44,7 +44,7 @@ def main() -> int:
     chk("ascend_ex fully gone", "ascend_ex" not in s and "ascend_ex" not in RATE_ORACLE_SOURCES)
     chk("coinex registered", "coinex" in s)
     chk("live venues intact", all(x in s for x in
-        ["binance", "bybit", "kucoin", "gate_io", "mexc", "htx", "bing_x", "okx", "bitget", "bitmart"]))
+        ["binance", "bybit", "kucoin", "gate_io", "mexc", "htx", "bing_x", "okx", "bitget"]))
     # The check that was missing: HB does NOT construct a connector the way a test script does.
     # UserBalances.connect_market (user/user_balances.py:37) builds kwargs via
     # ConnectorSetting.conn_init_parameters -- which ALWAYS injects `balance_asset_limit` -- and

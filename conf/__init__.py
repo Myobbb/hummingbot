@@ -77,11 +77,6 @@ okx_api_key = os.getenv("OKX_API_KEY")
 okx_secret_key = os.getenv("OKX_SECRET_KEY")
 okx_passphrase = os.getenv("OKX_PASSPHRASE")
 
-# BitMart Test
-bitmart_api_key = os.getenv("BITMART_API_KEY")
-bitmart_secret_key = os.getenv("BITMART_SECRET_KEY")
-bitmart_memo = os.getenv("BITMART_MEMO")
-
 # BTC Markets Test
 btc_markets_api_key = os.getenv("BTC_MARKETS_API_KEY")
 btc_markets_secret_key = os.getenv("BTC_MARKETS_SECRET_KEY")

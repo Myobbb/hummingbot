@@ -44,12 +44,6 @@ binance_us_maker_percent_fee:
 binance_us_percent_fee_token:
 binance_us_taker_fixed_fees:
 binance_us_taker_percent_fee:
-bitmart_buy_percent_fee_deducted_from_returns:
-bitmart_maker_fixed_fees:
-bitmart_maker_percent_fee:
-bitmart_percent_fee_token:
-bitmart_taker_fixed_fees:
-bitmart_taker_percent_fee:
 bitstamp_buy_percent_fee_deducted_from_returns:
 bitstamp_maker_fixed_fees:
 bitstamp_maker_percent_fee:

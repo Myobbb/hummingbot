@@ -101,4 +101,3 @@ coverage.xml
 # NOT in this repo (run from the Mac, never deployed to the VPS). These ignore
 # entries are a safety net in case a copy is ever recreated under scripts/.
 scripts/pb_monitor.py
-scripts/bitmart_ob_test.py

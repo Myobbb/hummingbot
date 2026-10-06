@@ -127,7 +127,7 @@ control resume_all            # Resume all strategies
 control remove BSX            # Remove strategy (edits config file!)
 
 Commands work by name or token:
-control pause arb_bsx_gate_bitmart   # Full strategy name
+control pause arb_bsx_gate_kucoin   # Full strategy name
 control pause BSX                     # Or just token symbol
 control remove BSX                    # Same for remove
 
@@ -224,13 +224,13 @@ def pause(identifier: str) -> bool:
     Pause a strategy by name or token symbol.
 
     Args:
-        identifier: Full strategy name (e.g., 'arb_bsx_gate_bitmart') or token symbol (e.g., 'BSX')
+        identifier: Full strategy name (e.g., 'arb_bsx_gate_kucoin') or token symbol (e.g., 'BSX')
 
     Returns:
         True if successful
 
     Examples:
-        >>> pause("arb_bsx_gate_bitmart")  # By full name
+        >>> pause("arb_bsx_gate_kucoin")  # By full name
         >>> pause("BSX")                    # By token symbol
     """
     orchestrator = _get_orchestrator()
@@ -248,7 +248,7 @@ def resume(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> resume("arb_bsx_gate_bitmart")
+        >>> resume("arb_bsx_gate_kucoin")
         >>> resume("BSX")
     """
     orchestrator = _get_orchestrator()
@@ -266,7 +266,7 @@ def enable_buyin(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> enable_buyin("arb_bsx_gate_bitmart")  # By full name
+        >>> enable_buyin("arb_bsx_gate_kucoin")  # By full name
         >>> enable_buyin("BSX")                    # By token symbol
     """
     orchestrator = _get_orchestrator()
@@ -284,7 +284,7 @@ def disable_buyin(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> disable_buyin("arb_bsx_gate_bitmart")
+        >>> disable_buyin("arb_bsx_gate_kucoin")
         >>> disable_buyin("BSX")
     """
     orchestrator = _get_orchestrator()
@@ -302,7 +302,7 @@ def enable_selloff(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> enable_selloff("arb_bsx_gate_bitmart")
+        >>> enable_selloff("arb_bsx_gate_kucoin")
         >>> enable_selloff("BSX")
     """
     orchestrator = _get_orchestrator()
@@ -320,7 +320,7 @@ def disable_selloff(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> disable_selloff("arb_bsx_gate_bitmart")
+        >>> disable_selloff("arb_bsx_gate_kucoin")
         >>> disable_selloff("BSX")
     """
     orchestrator = _get_orchestrator()
@@ -338,7 +338,7 @@ def clean(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> clean("arb_bsx_gate_bitmart")
+        >>> clean("arb_bsx_gate_kucoin")
         >>> clean("BSX")
     """
     orchestrator = _get_orchestrator()
@@ -357,7 +357,7 @@ def set_min_profitability(identifier: str, value: float) -> bool:
         True if successful
 
     Examples:
-        >>> set_min_profitability("arb_bsx_gate_bitmart", 1.5)
+        >>> set_min_profitability("arb_bsx_gate_kucoin", 1.5)
         >>> set_min_profitability("BSX", 0.5)
     """
     orchestrator = _get_orchestrator()
@@ -422,7 +422,7 @@ def remove(identifier: str) -> bool:
         True if successful
 
     Examples:
-        >>> remove("arb_bsx_gate_bitmart")  # By full name
+        >>> remove("arb_bsx_gate_kucoin")  # By full name
         >>> remove("BSX")                    # By token symbol
     """
     orchestrator = _get_orchestrator()
@@ -444,7 +444,7 @@ def add_market(identifier: str, market_spec: str) -> bool:
         True if the task was scheduled successfully (actual result logs async)
 
     Examples:
-        >>> add_market("arb_bsx_gate_bitmart", "mexc:BSX-USDT")
+        >>> add_market("arb_bsx_gate_kucoin", "mexc:BSX-USDT")
         >>> add_market("BSX", "htx:BSX-USDT")
     """
     import asyncio
@@ -486,7 +486,7 @@ def remove_market(identifier: str, market_spec: str) -> bool:
         True if successful
 
     Examples:
-        >>> remove_market("arb_bsx_gate_bitmart", "mexc:BSX-USDT")
+        >>> remove_market("arb_bsx_gate_kucoin", "mexc:BSX-USDT")
         >>> remove_market("BSX", "htx:BSX-USDT")
     """
     orchestrator = _get_orchestrator()
@@ -2188,7 +2188,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     if hasattr(tracker, 'data_source'):
                         ds = tracker.data_source
                         
-                        # Method 1: BitMart-style per-pair refresh (preferred)
+                        # Method 1: the data source's own per-pair refresh (preferred)
                         if hasattr(ds, '_refresh_snapshot_for_pair') and hasattr(ds, '_pair_to_symbol_cache'):
                             symbol = ds._pair_to_symbol_cache.get(trading_pair)
                             if symbol is None and hasattr(ds, '_connector'):
@@ -5099,7 +5099,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
         # Lower index means higher priority
-        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bitmart', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin']
+        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin']
         return {name: idx for idx, name in enumerate(order)}
 
     def _display_exchange_name(self, name: str) -> str:

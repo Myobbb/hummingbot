@@ -95,6 +95,14 @@ PENDING_PUSH_TTL_SECONDS = 30.0
 # this, the server's 5 s pings keep the stream looking alive and the REST poll stays at its 60 s interval.
 ORDER_PUSH_EXPECTED_WITHIN = 3.0
 ORDER_PUSH_ALARM_INTERVAL = 600.0
+# Live 2026-10-06: created/trade pushes came for 2 of 7 orders (a cancel push did come). So while any order is open
+# the status poll runs every SHORT_POLL_INTERVAL (10 s) instead of 60 s (HotcoinExchange._get_poll_interval).
+
+# Hotcoin pushes an order's fill BEFORE the balance that holds it: 0.46 s and ~2.5 s later on 2026-10-06. A terminal
+# update (FILLED, or CANCELED after fills) waits until the base asset's total balance shows the fills, at most this
+# long (s); then balances are read over REST and the update is reported anyway, with an [HC-ALARM]. Reported first,
+# the hold-band refreshed its total on completion, read AEON as 0 and bought it twice (2026-10-06).
+FILL_BALANCE_WAIT_SECONDS = 5.0
 
 # Fills: the order push and /v1/order/detailById carry the order's CUMULATIVE filled quantity, filled value and
 # fee, never a trade id. Each new cumulative total becomes one fill of the difference

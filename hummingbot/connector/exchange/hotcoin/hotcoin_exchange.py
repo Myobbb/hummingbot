@@ -90,6 +90,10 @@ class HotcoinExchange(ExchangePyBase):
         self._missing_pushes = 0
         self._last_push_alarm = 0.0
         self._balance_pushes_audited = 0
+        # client order id -> the base asset's total balance when the order was sent (_balance_shows_fills)
+        self._base_at_placement: Dict[str, Decimal] = {}
+        # client order ids whose terminal update is waiting for the balance (one waiter each)
+        self._settling: set = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         # WS-authoritative until the fill test proves otherwise (runbook §6.3); one switch.
         self.real_time_balance_update = CONSTANTS.REAL_TIME_BALANCE_UPDATE
@@ -391,6 +395,11 @@ class HotcoinExchange(ExchangePyBase):
         return str(exchange_order_id), self.current_timestamp
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        # The baseline a terminal update compares the balance with (_balance_shows_fills).
+        self._base_at_placement[order.client_order_id] = self._account_balances.get(order.base_asset, Decimal("0"))
+        if len(self._base_at_placement) > 2000:
+            for client_order_id in list(self._base_at_placement)[:1000]:
+                del self._base_at_placement[client_order_id]
         exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
         if order.exchange_order_id is not None and str(order.exchange_order_id) != str(exchange_order_id):
             # A push beat this answer and gave the order its id first; the base never overwrites an id. If the two
@@ -417,6 +426,81 @@ class HotcoinExchange(ExchangePyBase):
             self._alarm("order-push-missing", client_id=client_order_id, order_id=exchange_order_id,
                         within_s=CONSTANTS.ORDER_PUSH_EXPECTED_WITHIN, missing_since_last_alarm=self._missing_pushes)
             self._missing_pushes = 0
+
+    def _get_poll_interval(self, timestamp: float) -> float:
+        """Order pushes can't be relied on (live 2026-10-06: created/trade pushes for 2 of 7 orders), and the server's
+        pings keep the stream looking alive, so the base stays on its 60 s poll. While any order is open the status
+        poll runs every SHORT_POLL_INTERVAL (10 s): a resting order's fill or cancel is seen within 10 s, not 60."""
+        if self.in_flight_orders:
+            return self.SHORT_POLL_INTERVAL
+        return super()._get_poll_interval(timestamp=timestamp)
+
+    # ------------------------------------------------------------------ terminal updates wait for the balance
+
+    def _balance_shows_fills(self, order: InFlightOrder) -> bool:
+        """True once the base asset's total balance carries the order's fills: since the order was sent it has moved
+        by at least 99% of what the fills change it by (the slack absorbs Hotcoin's fee rounding). An order without
+        fills, or with no baseline (placed before this process, or never through _place_order_and_process_update),
+        needs no wait."""
+        baseline = self._base_at_placement.get(order.client_order_id)
+        if baseline is None or order.executed_amount_base <= 0:
+            return True
+        base_fees = sum((fee.amount for fill in order.order_fills.values() for fee in fill.fee.flat_fees
+                         if fee.token == order.base_asset), Decimal("0"))
+        if order.trade_type is TradeType.BUY:
+            expected = order.executed_amount_base - base_fees
+        else:
+            expected = -(order.executed_amount_base + base_fees)
+        if expected == 0:
+            return True
+        moved = self._account_balances.get(order.base_asset, Decimal("0")) - baseline
+        return moved / expected >= Decimal("0.99")
+
+    async def _await_balance_showing_fills(self, order: InFlightOrder, source: str) -> None:
+        """Holds a terminal update until the balance shows the order's fills, at most FILL_BALANCE_WAIT_SECONDS; then
+        reads REST balances and lets it go anyway, with an [HC-ALARM]. Hotcoin pushes a fill before the balance that
+        holds it, and a strategy reads balances on completion: reported first, the hold-band read AEON as 0 and
+        bought it twice (2026-10-06)."""
+        if self._balance_shows_fills(order):
+            return
+        started = time.monotonic()
+        while time.monotonic() - started < CONSTANTS.FILL_BALANCE_WAIT_SECONDS:
+            await asyncio.sleep(0.05)
+            if self._balance_shows_fills(order):
+                self._audit("fill-balance-wait", client_id=order.client_order_id, source=source,
+                            waited_s=round(time.monotonic() - started, 3))
+                return
+        try:
+            await self._update_balances()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().warning(f"Hotcoin balance read for {order.client_order_id} failed: {e}")
+        self._alarm("fill-balance-late", client_id=order.client_order_id, source=source,
+                    waited_s=CONSTANTS.FILL_BALANCE_WAIT_SECONDS,
+                    shows_fills_after_rest=self._balance_shows_fills(order))
+
+    def _process_terminal_update(self, order: InFlightOrder, update: OrderUpdate) -> None:
+        """The push path's order update: a terminal one is held until the balance shows the order's fills."""
+        if update.new_state not in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+            self._order_tracker.process_order_update(update)
+            return
+        if self._balance_shows_fills(order):
+            self._base_at_placement.pop(order.client_order_id, None)
+            self._order_tracker.process_order_update(update)
+            return
+        if order.client_order_id in self._settling:
+            return  # its waiter reports it
+        self._settling.add(order.client_order_id)
+        safe_ensure_future(self._report_when_balance_shows_fills(order, update))
+
+    async def _report_when_balance_shows_fills(self, order: InFlightOrder, update: OrderUpdate) -> None:
+        try:
+            await self._await_balance_showing_fills(order, source="push")
+            self._order_tracker.process_order_update(update)
+        finally:
+            self._settling.discard(order.client_order_id)
+            self._base_at_placement.pop(order.client_order_id, None)
 
     async def _lookup_client_id(self, client_order_id: str, symbol: str) -> Optional[str]:
         """Exchange order id for a client id from GET /v1/order/entrust (current and history, 100 newest), or None.
@@ -555,7 +639,11 @@ class HotcoinExchange(ExchangePyBase):
     def _detail_cumulative(self, detail: Dict[str, Any]) -> Tuple[Decimal, Decimal, Decimal]:
         """(filled quantity, filled value, fee) from detailById: count - leftcount, successamount, fees (docs: count =
         order quantity, leftcount = unfilled, successamount = total traded value, fees = fee). A `successcount`
-        field, as on the push, is preferred if Hotcoin sends one."""
+        field, as on the push, is preferred if Hotcoin sends one.
+        Known, left as is (Pavel, 2026-10-06): detailById's `fees` is cut to 4 decimals (0.3993 for Hotcoin's
+        0.399375 USDT), so a fill settled over REST records its fee up to 0.0001 short. The pushed fees seen so far
+        (buys, 2026-10-06) matched Hotcoin's exactly. Balances always come from Hotcoin, so only the recorded fee is
+        short."""
         if detail.get("successcount") is not None:
             filled = self._dec(detail.get("successcount"))
         else:
@@ -589,6 +677,10 @@ class HotcoinExchange(ExchangePyBase):
         status_code = detail.get("statusCode")
         new_state = self._order_state(status_code, filled, self._dec(detail.get("count")))
         self._audit_once(f"detail-status:{status_code}", status=detail.get("status"), mapped=str(new_state))
+        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+            # As on the push path: the caller reports this at once, so it waits here for the balance first.
+            await self._await_balance_showing_fills(tracked_order, source="rest")
+            self._base_at_placement.pop(tracked_order.client_order_id, None)
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(detail.get("id") or tracked_order.exchange_order_id),
@@ -866,7 +958,7 @@ class HotcoinExchange(ExchangePyBase):
         Order push (WebSocket Account and Order, market.trade.entrust.change): id = exchange order id (a string),
         clientOrderId (if any), eventType created / trade / canceled, statusCode, count, successcount, successamount,
         fees (cumulative), and for a trade tradecount / tradeprice / tradeamount / tradetime. Pushes for orders HMB
-        did not place (source WEB, APP ...) are ignored.
+        did not place (source WEB, APP ...) or no longer tracks are not applied, only audit-logged with their age.
         """
         self._audit_once("order-push-key-set", keys=sorted(data.keys()))
         client_order_id = str(data.get("clientOrderId") or "")
@@ -885,8 +977,22 @@ class HotcoinExchange(ExchangePyBase):
                 self._audit("push-parked", order_id=exchange_order_id, event=data.get("eventType"))
                 self._prune_pending_pushes()
                 safe_ensure_future(self._retry_parked_pushes(exchange_order_id))
+            else:
+                # No order this connector tracks: one finished (and gone from the tracker) before its push came, or
+                # one HMB didn't place. The age tells a late push from a missing one (2026-10-06: created/trade pushes
+                # came for 2 of 7 orders).
+                self._audit("order-push-unmatched", client_id=client_order_id or None, order_id=exchange_order_id,
+                            event=data.get("eventType"), status_code=data.get("statusCode"), source=data.get("source"),
+                            age_s=self._push_age(data))
             return
         self._apply_order_push(order, data)
+
+    def _push_age(self, data: Dict[str, Any]) -> Optional[float]:
+        """Seconds from a push's eventTime (Hotcoin's clock, ms) to its arrival, on the synchronized clock."""
+        try:
+            return round(self._time_synchronizer.time() - int(data["eventTime"]) * 1e-3, 3)
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _apply_order_push(self, order: InFlightOrder, data: Dict[str, Any]) -> None:
         exchange_order_id = str(data["id"]) if data.get("id") is not None else order.exchange_order_id
@@ -900,7 +1006,7 @@ class HotcoinExchange(ExchangePyBase):
         self._audit("order-push", client_id=order.client_order_id, order_id=exchange_order_id, event=event,
                     status_code=status_code, successcount=data.get("successcount"),
                     successamount=data.get("successamount"), fees=data.get("fees"), tradecount=data.get("tradecount"),
-                    tradeprice=data.get("tradeprice"))
+                    tradeprice=data.get("tradeprice"), age_s=self._push_age(data))
         if order.exchange_order_id is None and exchange_order_id is not None:
             # The push beat the placement answer: give the order its id before a fill is named after it.
             order.update_exchange_order_id(exchange_order_id)
@@ -917,7 +1023,7 @@ class HotcoinExchange(ExchangePyBase):
         if order.client_order_id not in self._order_tracker.all_updatable_orders:
             return  # already final: a late push may still carry a fill (above), never a state
         new_state = self._order_state(status_code, filled, self._dec(data.get("count"), default=str(order.amount)))
-        self._order_tracker.process_order_update(OrderUpdate(
+        self._process_terminal_update(order, OrderUpdate(
             trading_pair=order.trading_pair,
             update_timestamp=int(data["eventTime"]) * 1e-3 if data.get("eventTime") else self._now(),
             new_state=new_state,
