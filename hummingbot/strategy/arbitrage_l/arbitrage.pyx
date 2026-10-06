@@ -1436,16 +1436,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
         therefore add nothing and would silently drop the second half of an alias pair
         (NODE/NODEOPS), which the aggregate on the other side of the sum does count.
 
-        SIZE = full `quantity`, same as PositionBalancerHandler.c_arb_pending_base and for the
-        same reason: OrderTracker builds its LimitOrder without a `filled_quantity` (defaults to
-        Decimal("NaN") and is never updated -- there is no setter), so partial-fill data is not
-        available on this object. `.is_nan()` guards it; a NaN would otherwise flow into
-        _cached_total_base_qty and silently poison every band comparison downstream.
-        The cost is a bounded, transient over-count: a fill the venue HAS already credited is
-        counted twice until its completion event arrives (seconds), and every completion
-        refreshes this cache while a correction is active. Over-counting reads the position
-        HIGHER, i.e. buy less / sell more -- convergent toward target, and the same trade-off
-        c_arb_pending_base already makes.
+        SIZE = the UNFILLED REMAINDER (since 2026-10-06). OrderTracker builds its LimitOrder without
+        a `filled_quantity` (Decimal("NaN"), never updated -- there is no setter), so the remainder
+        is read from the connector's own in-flight order (`executed_amount_base`). The filled part
+        is already in the venue balance; the full `quantity` counted it twice for as long as a
+        partially filled leg rested. That was not "bounded and convergent": on UP 2026-10-06 two
+        Hotcoin buys filled 859.8 of 1954.6 and rested 7 min (partial legs skip the 180 s timeout),
+        the guardrail read $671 -- overbought -- on a ~$143 position and sold 798.6 UP.
+        The full `quantity` is kept in two cases:
+          - an order fully executed but not yet completed: the WARD window (bitget completed 11.3s
+            after its fill), where the balance may not show the fill yet and a 60s refresh would
+            otherwise wipe the dispatch-time credit;
+          - an order the connector can't report (no `in_flight_orders`, not found there, or an
+            error): the old over-count, nothing worse.
+        `.is_nan()` guards both reads; a NaN would otherwise flow into _cached_total_base_qty and
+        silently poison every band comparison downstream.
+        PositionBalancerHandler.c_arb_pending_base still counts the full `quantity`.
 
         CLAMPED AT >= 0, deliberately asymmetric. Buys and sells are counted symmetrically first,
         so a round-trip arb nets to zero and this returns 0 -- the guardrail sees exactly what it
@@ -1467,13 +1473,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double inflight_buy = 0.0
             double inflight_sell = 0.0
             double qty
+            object market_pair
             object order_map
+            object venue_orders
+            object venue_order
+            object executed
             object lo
             object filled
             str oid
             string oid_str
         try:
-            for order_map in self._sb_order_tracker.tracked_limit_orders_map.values():
+            for market_pair, order_map in self._sb_order_tracker.tracked_limit_orders_map.items():
+                try:
+                    venue_orders = getattr(market_pair, "market", market_pair).in_flight_orders
+                except Exception:
+                    venue_orders = None
                 for oid, lo in order_map.items():
                     oid_str = self._to_cpp_str(oid)
                     if self._completed_orders.find(oid_str) != self._completed_orders.end():
@@ -1482,6 +1496,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     filled = lo.filled_quantity
                     if not filled.is_nan():
                         qty -= float(filled)
+                    elif venue_orders is not None:
+                        try:                          # the unfilled remainder (SIZE above)
+                            venue_order = venue_orders.get(oid)
+                            if venue_order is not None:
+                                executed = venue_order.executed_amount_base
+                                if not executed.is_nan() and 0 < executed < lo.quantity:
+                                    qty -= float(executed)
+                        except Exception:
+                            pass                      # keep the full quantity, as before
                     if not (qty > 0.0):               # also drops any NaN that slips through
                         continue
                     if lo.is_buy:
