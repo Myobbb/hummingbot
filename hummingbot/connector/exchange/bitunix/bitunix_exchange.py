@@ -52,8 +52,7 @@ class BitunixEmptyBalanceUnconfirmed(IOError):
 
 
 class _LookupInconclusive(Exception):
-    """The placement lookup could not tell: a list read failed, or another identical placement still awaits its
-    answer (the order found could be that one's)."""
+    """The placement lookup could not tell: a list read failed."""
 
 
 class BitunixExchange(ExchangePyBase):
@@ -68,8 +67,10 @@ class BitunixExchange(ExchangePyBase):
 
     What Bitunix does not have, and what stands in for it:
       - No private push. While any order is open, orders and balances are polled every ORDER_POLL_INTERVAL (1 s).
-      - No client order id. Orders are known by orderId alone; a placement that got no answer is looked up by symbol,
-        side, price, quantity and time (_find_placed_order).
+      - Client ids are undocumented but real (live 2026-10-07): place_order keeps a `clientId` and every order read
+        returns it, but it is no key — nothing reads or cancels by it, and a cancel by clientId stalls the order ~60 s.
+        Every order is placed with its Hummingbot client id; a placement that got no answer is found by that id in
+        the open orders and the recent history (_find_placed_order); cancels go by orderId only.
       - Silent not-found: an unknown order's detail answers code 0 with data null, and a cancel of an unknown id
         succeeds. "Not found" is decided here (_resolve_missing_order), never from a code.
       - Fills: order/deal/list gives each fill with Bitunix's own id (the trade id), quantity, price, fee and fee coin;
@@ -106,8 +107,7 @@ class BitunixExchange(ExchangePyBase):
         self._market_list_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         self._market_list_lock = asyncio.Lock()
         # Per-order state; entries of orders no longer tracked are dropped every poll (_purge_order_state).
-        # client id -> (pair, side, price, amount) while its placement awaits Bitunix's answer
-        self._placing: Dict[str, Tuple[str, TradeType, Decimal, Decimal]] = {}
+        self._placing: set = set()                           # client ids whose placement awaits Bitunix's answer
         self._volume_checked: set = set()                    # client ids whose quantity Bitunix confirmed
         self._sent_at_ms: Dict[str, int] = {}                # client id -> server ms just before its placement
         self._cancel_sent: set = set()                       # client ids we asked Bitunix to cancel
@@ -474,13 +474,16 @@ class BitunixExchange(ExchangePyBase):
             "volume": self._format_decimal(amount if CONSTANTS.LIMIT_VOLUME_IS_BASE else amount * price),
             "price": self._format_decimal(price),
             "symbol": symbol,
+            # Undocumented, kept by Bitunix (live 2026-10-07): the placement guard finds an unanswered order by it, and
+            # the asset_manager tells Hummingbot's fills by it. Never used to cancel (that stalls the order ~60 s).
+            "clientId": order_id,
         }
         sent_at_ms = self._server_ms()
         self._sent_at_ms[order_id] = sent_at_ms
-        # While the answer is awaited the status poll must not look the order up: it would adopt the very order this
-        # request creates, and this placement would then fail it as tracked by another (review 2026-10-07). Popped on
-        # return, and the base gives the order its id with no await in between (_place_order_and_process_update).
-        self._placing[order_id] = (trading_pair, trade_type, price, amount)
+        # While the answer is awaited only this placement looks the order up, not the status poll (review 2026-10-07).
+        # Discarded on return, and the base gives the order its id with no await in between
+        # (_place_order_and_process_update).
+        self._placing.add(order_id)
         try:
             try:
                 response = await self._api_post(path_url=CONSTANTS.PLACE_ORDER_PATH, data=body, is_auth_required=True,
@@ -490,7 +493,7 @@ class BitunixExchange(ExchangePyBase):
                 raise
             except Exception as transport_error:
                 # No answer: Bitunix may still have accepted the order (the base would mark it FAILED and stop tracking
-                # a live order). There is no client id to ask by: it is looked up by what it is.
+                # a live order). Bitunix can't be asked by client id, but its order lists carry it: looked up there.
                 return await self._locate_unconfirmed_placement(order_id, symbol, sent_at_ms,
                                                                 repr(transport_error)), self._now()
             self._audit("place-order", client_id=order_id, request=self._raw(body), response=self._raw(response))
@@ -509,7 +512,7 @@ class BitunixExchange(ExchangePyBase):
                             response=self._raw(response))
             return str(exchange_order_id), self._now()
         finally:
-            self._placing.pop(order_id, None)
+            self._placing.discard(order_id)
 
     async def _locate_unconfirmed_placement(self, order_id: str, symbol: str, sent_at_ms: int, cause: str) -> str:
         """A placement Bitunix may have accepted without telling us the order's id. Found on Bitunix -> its id. Not
@@ -535,11 +538,11 @@ class BitunixExchange(ExchangePyBase):
         self._hold_baseline[order.client_order_id] = (self._account_balances.get(asset, Decimal("0")),
                                                       self._booked_base_at_read.get(asset, Decimal("0")))
         # Registered from here, not only in _place_order: the symbol lookup before the request is an await too.
-        self._placing[order.client_order_id] = (order.trading_pair, order.trade_type, order.price, order.amount)
+        self._placing.add(order.client_order_id)
         try:
             exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
         finally:
-            self._placing.pop(order.client_order_id, None)
+            self._placing.discard(order.client_order_id)
         if order.exchange_order_id is not None and str(order.exchange_order_id) != str(exchange_order_id):
             # The base never overwrites an id: cancels and status reads would use the other one. _placing keeps the
             # poll's lookup away while the placement is awaited, so this should never fire.
@@ -584,54 +587,26 @@ class BitunixExchange(ExchangePyBase):
             return None
         return self._dec(row.get("dealVolume")) + self._dec(row.get("leftVolume"))
 
-    def _placement_key(self, client_order_id: str) -> Optional[Tuple[str, TradeType, Decimal, Decimal]]:
-        placing = self._placing.get(client_order_id)
-        if placing is not None:
-            return placing
-        order = self._order_tracker.fetch_order(client_order_id=client_order_id)
-        return None if order is None else (order.trading_pair, order.trade_type, order.price, order.amount)
-
-    def _tracked_exchange_ids(self, client_order_id: str) -> set:
-        """The exchange ids of every order tracked under another client id (active, recently done, lost)."""
-        return {str(o.exchange_order_id) for cid, o in self._order_tracker.all_fillable_orders.items()
-                if o.exchange_order_id is not None and cid != client_order_id}
-
     async def _find_placed_order(self, client_order_id: str, symbol: str, sent_at_ms: int,
                                  delays: Tuple[float, ...]) -> Optional[str]:
-        """The placement guard without a client id: an order on the market with our side, price and quantity, created
-        after the request went out (5 s clock slack) and tracked under no other client id, looked for after each delay
-        (s) with everything re-read. Exactly one -> it is ours. None -> the lists show none, or two or more: we can't
-        tell which, so every one still open is cancelled ([BU-ALARM] placement-ambiguous) and nothing of ours rests
-        untracked. _LookupInconclusive -> it could not tell: a list read failed, or another identical placement still
-        awaits its answer (the order found could be that one's)."""
-        key = self._placement_key(client_order_id)
-        if key is None:
-            raise _LookupInconclusive("the order is not tracked")
-        _, trade_type, price, amount = key
-        side = str(CONSTANTS.SIDE[trade_type])
+        """The placement guard: the order carrying our client id in the market's open orders or in its history since
+        the request went out (5 s clock slack), looked for after each delay (s). Exactly one -> it is ours. None -> none
+        (yet), or two or more under one id (never seen): every one still open is cancelled ([BU-ALARM]
+        placement-ambiguous). _LookupInconclusive -> a list read failed, so it could not tell. An order that merely
+        looks like ours (side, price, size) is never adopted: only the id counts."""
         for delay in delays:
             if delay > 0:
                 await asyncio.sleep(delay)
             own = self._order_tracker.fetch_order(client_order_id=client_order_id)
             if own is not None and own.exchange_order_id is not None:
                 return str(own.exchange_order_id)         # it got its id meanwhile
-            if any(other_id != client_order_id and other == key for other_id, other in self._placing.items()):
-                raise _LookupInconclusive("an identical placement still awaits Bitunix's answer")
             try:
                 rows = await self._list_orders(symbol, sent_at_ms - 5_000)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 raise _LookupInconclusive(f"listing {symbol}'s orders failed: {e!r}")
-            tracked = self._tracked_exchange_ids(client_order_id)
-            matches = []
-            for row in rows:
-                quantity = self._order_base_quantity(row)
-                if (str(row.get("orderId")) not in tracked and str(row.get("side")) == side
-                        and self._dec(row.get("price")) == price and quantity is not None
-                        and abs(quantity - amount) <= amount * CONSTANTS.VOLUME_MISMATCH_TOLERANCE
-                        and (web_utils.to_ms(row.get("ctime")) or 0) >= sent_at_ms - 5_000):
-                    matches.append(row)
+            matches = [row for row in rows if str(row.get("clientId") or "") == client_order_id]
             if len(matches) == 1:
                 return str(matches[0]["orderId"])
             if len(matches) > 1:
@@ -657,6 +632,8 @@ class BitunixExchange(ExchangePyBase):
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         exchange_order_id = await tracked_order.get_exchange_order_id()
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+        # By orderId only: a cancel by clientId answers success, does nothing, and stalls the order ~60 s against the
+        # cancels that follow (live 2026-10-07).
         body = {"orderIdList": [{"orderId": str(exchange_order_id), "symbol": symbol}]}
         response = await self._api_post(path_url=CONSTANTS.CANCEL_ORDER_PATH, data=body, is_auth_required=True,
                                         limit_id=CONSTANTS.CANCEL_ORDER_PATH)
@@ -796,11 +773,13 @@ class BitunixExchange(ExchangePyBase):
         return found
 
     def _check_volume(self, order: InFlightOrder, detail: Dict[str, Any]) -> bool:
-        """The volume guard (LIMIT_VOLUME_IS_BASE is unverified until the first real order): Bitunix's own base quantity
-        must be ours. A mismatch — e.g. Bitunix reading `volume` as a quote amount, which on a cheap token is an order
-        hundreds of times too big or small — cancels the order at once. True if the order may proceed."""
+        """The volume guard, a safety net since LIMIT_VOLUME_IS_BASE was verified live (2026-10-07): Bitunix's own base
+        quantity must be ours. A mismatch — e.g. Bitunix reading `volume` as a quote amount, which on a cheap token is
+        an order hundreds of times too big or small — cancels the order at once. True if the order may proceed. The
+        first reads also check that Bitunix kept the client id (_check_client_id)."""
         if order.client_order_id in self._volume_checked:
             return True
+        self._check_client_id(order, detail)
         status = str(detail.get("status"))
         quantity = self._order_base_quantity(detail)
         if status == "2" and detail.get("dealVolume") not in (None, ""):
@@ -819,6 +798,16 @@ class BitunixExchange(ExchangePyBase):
                                                        f"{order.base_asset}{order.quote_asset}"))
         self._volume_checked.add(order.client_order_id)
         return False
+
+    def _check_client_id(self, order: InFlightOrder, detail: Dict[str, Any]) -> None:
+        """Bitunix keeps the client id sent with an order (live 2026-10-07); the placement guard finds unanswered orders
+        by it, and the asset_manager tells Hummingbot's fills by it. An order read back without it means both are
+        blind: one [BU-ALARM] per session."""
+        kept = str(detail.get("clientId") or "")
+        if kept != order.client_order_id:
+            self._alarm_once("client-id-not-kept", "client-id-not-kept", client_id=order.client_order_id,
+                             exchange_order_id=order.exchange_order_id, bitunix_client_id=kept,
+                             action="unanswered placements can't be found by client id; check Bitunix's clientId")
 
     async def _fills_from_deals(self, order: InFlightOrder, cumulative: Decimal) -> List[TradeUpdate]:
         """Bitunix's own fill rows for the order, each a TradeUpdate named by Bitunix's fill id (the AM keys its ledger

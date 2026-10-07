@@ -21,8 +21,9 @@ REST_URL = "https://openapi.bitunix.com"
 # The website's market socket (P1's book source since 2026-09-26). Plain JSON once the site's `transfer=pb` is left out.
 WSS_URL = "wss://api.bitunix.com/ws-tide-batch/?from=trad"
 
-# Bitunix orders carry NO client order id (no such field on place, detail, history or deals): ids are local only, and
-# an order is known to Bitunix by its orderId alone.
+# Client ids: undocumented, but place_order keeps a `clientId` and every order read (detail, pending, history) returns
+# it (live 2026-10-07: a 32-char HBOT id kept). It is no key — no read or cancel by it; a cancel by clientId stalls
+# the order ~60 s — so the connector sends it and looks orders up by it in the lists, and cancels by orderId only.
 ORDER_ID_MAX_LEN = 32
 HBOT_ORDER_ID_PREFIX = "HBOT"
 
@@ -67,10 +68,11 @@ CODE_EMPTY_ANSWER = "-1"          # code "0" with data that should have been the
 # --- Orders --------------------------------------------------------------------------------------------------
 SIDE = {TradeType.SELL: 1, TradeType.BUY: 2}
 ORDER_TYPE_LIMIT = 1
-# ⚠ `volume` on a LIMIT order: the REST place_order page says it is the QUOTE amount; the batch page and the WS
-# order.place_order page (English and Chinese alike) say the BASE quantity; a third-party client reads base. Only a
-# real placement settles it (P2 §0.1, open). Sent as the base quantity; every order's first status read compares
-# Bitunix's own quantity with ours, and a mismatch cancels the order at once ([BU-ALARM] volume-semantics).
+# `volume` on a LIMIT order is the BASE quantity — settled live 2026-10-07 (P2 §0.1, bitunix_private_probe.py --trade
+# on myserver): volume 271 DOGEUSDT @ 0.0444 read back volume = leftVolume = 271, amount = 12.0324 (the quote notional).
+# The REST place_order page's "quote amount" is wrong; the batch and WS pages were right. The guard stays as a safety
+# net: every order's first status read compares Bitunix's own quantity with ours, and a mismatch cancels the order at
+# once ([BU-ALARM] volume-semantics).
 LIMIT_VOLUME_IS_BASE = True
 # A quantity mismatch beyond this fraction trips the guard above (precision rounding is far smaller).
 VOLUME_MISMATCH_TOLERANCE = Decimal("0.01")
@@ -86,10 +88,10 @@ ORDER_STATE = {
 }
 TERMINAL_STATES = (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED)
 
-# A placement Bitunix did not confirm (no answer, or "0" without an order id) is looked up (there is no client id) in
-# the open orders and the recent history by symbol + side + price + quantity, created after the request went out, after
-# these delays (s). Not found, it is NOT failed: it stays pending and every status poll looks once more, until the
-# not-found verdict below (and the tracker's 3 strikes) fails it. The poll never looks while a placement is awaited.
+# A placement Bitunix did not confirm (no answer, or "0" without an order id) is looked up by its client id in the
+# open orders and the recent history, after these delays (s). Not found, it is NOT failed: it stays pending and every
+# status poll looks once more, until the not-found verdict below (and the tracker's 3 strikes) fails it. The poll never
+# looks while a placement is awaited.
 PLACEMENT_LOOKUP_DELAYS = (0.5, 1.5)
 PLACE_ORDER_TIMEOUT = 10.0
 # The look-back for that lookup and for a not-found check: history/page filters on creation time.
