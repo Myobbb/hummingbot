@@ -122,9 +122,10 @@ ORDER_DETAIL_CACHE_SECONDS = 2.0
 # Fees: no fill carries one; each fill's fee = the account's rate for its pair (customer_trade_fee.do, maker or taker
 # by the push's `role`, taker when unknown) x the received asset (the base on a buy, the quote on a sell: CCXT, and
 # the docs' "the billing unit for buy orders is the transaction currency"). The first live fills are checked against
-# LBank's own per-trade commission (transaction_history.do, [LB-AUDIT] fee-check). The rates' unit (a fraction or a
-# percent: the docs' example reads "0.10") is settled live; FEE_RATE_IS_PERCENT says which.
-FEE_RATE_IS_PERCENT = True
+# LBank's own per-trade commission (transaction_history.do, [LB-AUDIT] fee-check). The rates are FRACTIONS: LIVE
+# 2026-10-07 btc_usdt reads "0.001" = 0.1%, LBank's standard spot rate and CCXT's default; the docs' example "0.10" is
+# not the live unit (as a percent, the live row would be 0.001%).
+FEE_RATE_IS_PERCENT = False
 FEE_CHECK_ORDERS = 10
 
 # --- Public WebSocket ------------------------------------------------------------------------------------------

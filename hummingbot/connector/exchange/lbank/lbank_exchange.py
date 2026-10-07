@@ -48,7 +48,8 @@ class _Trade(NamedTuple):
 
 class LbankExchange(ExchangePyBase):
     """
-    LBank spot connector (REST v2 + the V2 WebSocket, host api.lbkex.com).
+    LBank spot connector (REST v2 + the V2 WebSocket, host api.lbkex.com). DISABLED, kept as reference: LBank's API
+    trading is institutional-only (LBank support, 2026-10-07); see __init__.py.
 
     Reference: the docs (offline mirror VS_code_projects/MDs/lbank-api/, English and Chinese, which match), the four
     official SDKs and CCXT (MDs/lbank-api/sdk/), live probes from myserver (2026-10-07) and P1's (2026-10-04/05), and
@@ -363,6 +364,13 @@ class LbankExchange(ExchangePyBase):
             return Decimal(str(value)) if value is not None and value != "" else Decimal(default)
         except Exception:
             return Decimal(default)
+
+    @classmethod
+    def _is_zero(cls, value: Any) -> bool:
+        """LBank's zero amount: "0" on the fast path, any other spelling of zero through Decimal."""
+        if value in ("0", 0, None, ""):
+            return True
+        return cls._dec(value, default="NaN") == 0
 
     def _now(self) -> float:
         """The clock's time, or the wall clock before the first tick (current_timestamp is NaN until then: a
@@ -929,9 +937,9 @@ class LbankExchange(ExchangePyBase):
 
     async def _update_trading_fees(self) -> None:
         """The account's per-pair rates (POST /v2/supplement/customer_trade_fee.do, every pair in one call:
-        {symbol, makerCommission, takerCommission}). The docs' example reads "0.10"; FEE_RATE_IS_PERCENT says how it
-        is read, and the first fills are checked against LBank's own commission ([LB-AUDIT] fee-check). A rate that
-        reads outside 0-1% is not used for that pair (DEFAULT_FEES stays), with an [LB-ALARM]."""
+        {symbol, makerCommission, takerCommission}), fractions: btc_usdt reads "0.001" live (FEE_RATE_IS_PERCENT).
+        The first fills are checked against LBank's own commission ([LB-AUDIT] fee-check). A rate that reads outside
+        0-1% is not used for that pair (DEFAULT_FEES stays), with an [LB-ALARM]."""
         response = await self._api_post(path_url=CONSTANTS.FEE_RATE_PATH, is_auth_required=True,
                                         limit_id=CONSTANTS.FEE_RATE_PATH)
         if not web_utils.is_ok(response):
@@ -966,7 +974,9 @@ class LbankExchange(ExchangePyBase):
 
     async def _update_balances(self) -> None:
         """POST /v2/supplement/user_info_account.do: data.balances[] = {asset, free, locked}. total = free + locked.
-        An asset whose balance push arrived after this request was sent keeps the push: the snapshot is older."""
+        LBank lists EVERY asset, held or not (5,654 rows on 2026-10-07): a zero row is skipped before its numbers are
+        parsed and counts as absent, which reads 0 like any asset the connector doesn't hold. An asset whose balance push
+        arrived after this request was sent keeps the push: the snapshot is older."""
         requested_at = time.monotonic()
         response = self._raise_on_error(
             await self._api_post(path_url=CONSTANTS.ACCOUNT_PATH, is_auth_required=True,
@@ -983,7 +993,7 @@ class LbankExchange(ExchangePyBase):
         remote_asset_names = set()
         for entry in balances:
             asset = str(entry.get("asset") or "").upper()
-            if not asset:
+            if not asset or (self._is_zero(entry.get("free")) and self._is_zero(entry.get("locked"))):
                 continue
             remote_asset_names.add(asset)
             if self._balance_pushed_at.get(asset, (0.0, 0))[0] > requested_at:

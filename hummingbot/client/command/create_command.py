@@ -356,12 +356,14 @@ class CreateCommand:
                 'coinex': 'cx',
                 'xt': 'xt',
                 'hotcoin': 'hc',
+                # lbank: DISABLED 2026-10-07, kept as reference (see connector/exchange/lbank/__init__.py)
                 'lbank': 'lb',
+                'bitunix': 'bu',
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
-            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb"]
+            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu"]
             try:
                 return order.index(alias)
             except ValueError:
