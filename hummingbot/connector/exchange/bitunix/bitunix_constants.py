@@ -54,6 +54,10 @@ CODE_SIGN_ERROR = "100005"        # "result.api.parameter.sign.illegal"
 CODE_REQUEST_EXPIRED = "100008"   # "result.request.time.expired": refused before execution (live at -61 s)
 CODE_NO_AUTHORITY = "110033"      # "OPEN_API_KEY_NO_AUTHORITY": the key lacks that permission
 CODE_TOO_FAST = "110041"
+# A refused placement carries no error code (live 2026-10-09): code "0" ("result.success"), and in data orderId null,
+# placeStatus 0 and the reason in placeCode + placeMsg (Chinese). The placeCodes seen live:
+PLACE_STATUS_REFUSED = "0"
+PLACE_CODES = {"10034": "insufficient balance"}   # placeMsg "余额不足"
 # Not found is SILENT on Bitunix (live): detail of an unknown order id answers code "0" with data null, deal/list [],
 # and a cancel of an unknown id answers success. So a cancel's answer proves nothing, and "not found" is decided by the
 # connector (BitunixExchange._resolve_missing_order), not by a code. These are our own codes for it.

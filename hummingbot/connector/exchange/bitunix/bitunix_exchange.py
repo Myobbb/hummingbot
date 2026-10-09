@@ -500,14 +500,22 @@ class BitunixExchange(ExchangePyBase):
             self._raise_on_error(response, f"Order {order_id} refused, request {self._raw(body)}")
             data = response.get("data") or {}
             exchange_order_id = data.get("orderId") if isinstance(data, dict) else None
+            place_status = str(data.get("placeStatus")) if isinstance(data, dict) else "None"
+            if exchange_order_id in (None, "") and place_status == CONSTANTS.PLACE_STATUS_REFUSED:
+                # Bitunix's refusal (live 2026-10-09, 10034 insufficient balance): nothing was booked, so it fails now.
+                # Looked up as unconfirmed, it stayed pending and was failed 14 s later as "not found", with no reason.
+                code, msg = str(data.get("placeCode")), data.get("placeMsg")
+                meaning = CONSTANTS.PLACE_CODES.get(code)
+                raise BitunixBusinessError(
+                    f"Order {order_id} refused, request {self._raw(body)}: placeStatus 0, placeCode {code} ({msg}"
+                    f"{' = ' + meaning if meaning else ''}) | Bitunix response: {self._raw(response)}", code, msg)
             if exchange_order_id in (None, ""):
                 # "0" (accepted) without an order id: Bitunix may have the order; looked up the same way.
                 cause = f"code 0 without an order id | Bitunix response: {self._raw(response)}"
                 return await self._locate_unconfirmed_placement(order_id, symbol, sent_at_ms, cause), self._now()
-            place_status = str(data.get("placeStatus"))
             if place_status not in ("None", "1"):
-                # Docs: placeStatus "whether the order was successful, 1 success". Never seen otherwise; the order id
-                # says Bitunix has one, so it is tracked and its status read decides.
+                # Docs: placeStatus "whether the order was successful, 1 success". Seen otherwise only without an order
+                # id (the refusal above); with one, Bitunix has the order, so it is tracked and its status read decides.
                 self._alarm("place-status-not-1", client_id=order_id, exchange_order_id=exchange_order_id,
                             response=self._raw(response))
             return str(exchange_order_id), self._now()
