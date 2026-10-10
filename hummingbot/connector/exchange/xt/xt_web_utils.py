@@ -140,7 +140,9 @@ class XtReconnectBackoff:
         if lived >= CONSTANTS.WS_RETRY_RESET_SEC:
             self._failures = 0
             return
-        self._failures += 1
+        # Capped: 2 ** n overflows a float past n = 1023, and that OverflowError, raised in the listen loop's
+        # `finally`, ended the stream for good (XT 2026-10-10: 1,026 short-lived connections in a row).
+        self._failures = min(self._failures + 1, 16)
         await asyncio.sleep(min(CONSTANTS.WS_RETRY_BASE * 2 ** (self._failures - 1), CONSTANTS.WS_RETRY_CAP))
 
 

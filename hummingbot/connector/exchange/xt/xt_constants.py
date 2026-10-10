@@ -126,9 +126,11 @@ WS_TOPICS_PER_REQUEST = 50
 TRADING_SWITCH_INTERVAL = 30   # seconds between reads of the tracked markets
 TRADING_SWITCH_BATCH = 50      # markets per request
 
-# Client sends text "ping", server answers text "pong", and disconnects after 60 s without a ping
-# (Heartbeat). 20 s keeps a wide margin, as the P1 adapter does.
-WS_HEARTBEAT_INTERVAL = 20
+# Client sends text "ping", server answers text "pong" (Heartbeat). The docs say XT disconnects after 60 s without
+# a ping; live (2026-10-10, public stream from myserver) it closes a socket (1006) 30 s after the client's last
+# message, and 15 s after it while nothing is subscribed. Its own pushes don't count. 10 s keeps a market-less
+# connection open too: at 20 s, with no XT strategy, each one died at 15 s and reconnected for 13 h.
+WS_HEARTBEAT_INTERVAL = 10
 SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE = 60
 
 # --- Private WebSocket (WebSocket Private/*) -------------------------------------------------------
