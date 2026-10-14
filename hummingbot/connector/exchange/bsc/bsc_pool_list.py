@@ -1,11 +1,13 @@
 """P2-DEX (2026-10-14): the pools of the CAs P2 trades, as P1 handed them over, for the `bsc` connector.
 
-P1 tracks every pool. Its downstream lanes pick the worthy candidates and page them, and the watcher on myserver acts on the
-page, exactly as for CEX-CEX (Pavel 2026-10-14). A page with a DEX leg carries `dex`, copied from P1's `dex_pools.json` at
-page time: {chain, ca, ticker, decimals, reference_usd, written, pools}, where `pools` are P1's records of that CA's valid pools
-(route, key, counter and its quoted path to USDT `counter.hops`, taxes). The watcher writes that payload to `~/p2_dex/<ca>.json`
-before it types the `control create` line, and any later page for the CA rewrites it. P1 decides which pools are valid; P2
-decides which is best each poll (Q7).
+P1 tracks every pool, and records them with each opportunity it catches, exactly as for CEX-CEX (Pavel 2026-10-14):
+ws_book_checker ends a CEX<->DEX arb.log line with ` dex={...}`, the CA's records as it priced them: {chain, ca, ticker,
+decimals, reference_usd, written, pools}, where `pools` are P1's records of that CA's valid pools (route, key, counter and
+its quoted path to USDT `counter.hops`, taxes). The lanes on brr_ws carry it on the page record, and the watcher on
+myserver writes it to `~/p2_dex/<ca>.json` from every page that carries it. A strategy's leg names its CA
+(`control create … bsc:MUBARAK-USDT:0x5c85…`), and the orchestrator binds the pair to it (BscExchange.bind_ca). P1 decides
+which pools are valid; P2 decides which is best each poll (Q7). Once an asset is traded arb.log drops its lines, like any
+CEX-CEX asset, so its file stays as it was at the create.
 
 This module reads those files: per CA the pools P2 can trade, each with its DEX family and its counter's hop candidates inside
 that family; the pools left out with their reason, never silently (no router: decision 2; no hop inside its family: one
@@ -25,7 +27,7 @@ from hummingbot.connector.exchange.bsc.bsc_swap import no_executor
 
 DATA_DIR = os.path.expanduser("~/p2_dex")
 CHAIN = "BSC"
-STALE_AFTER_S = 6 * 3600.0     # WIP: a payload whose P1 stamp is older is stated as stale (pages refresh it)
+STALE_AFTER_S = 6 * 3600.0     # a payload whose P1 stamp is older is counted as stale in summary() (information only)
 
 # The quote routes an official router can execute. P1's own-model pools (routerless pairs, unlisted deployments) have no
 # router, so they stay out for now (decision 2).
@@ -162,13 +164,6 @@ class PoolList:
 
     def pools(self, ca: str) -> List[dict]:
         return (self.cas.get(ca.lower()) or {}).get("pools") or []
-
-    def ca_for(self, ticker: str) -> Tuple[Optional[str], str]:
-        """the CA behind a trading pair's base (P1's ticker) -> (ca, "") or (None, why)"""
-        found = [ca for ca, m in self.cas.items() if m["ticker"] == ticker.upper()]
-        if len(found) == 1:
-            return found[0], ""
-        return None, ("no payload for it" if not found else f"{len(found)} CAs share it")
 
     def age_s(self, ca: str) -> Optional[float]:
         written = (self.cas.get(ca.lower()) or {}).get("written")

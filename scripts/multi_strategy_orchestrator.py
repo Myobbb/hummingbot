@@ -188,6 +188,26 @@ HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_
 AUTO_REMOVE_RECHECK_INTERVAL = 60.0
 HOLD_ESCALATION_SKIP_LOG_INTERVAL = 900.0    # re-state a "ripe but skipped" reason at most once per window
 
+# P2-DEX (2026-10-14): a market spec is `exchange:PAIR`, or `exchange:PAIR:CA` for a swap venue's leg — the token P1 reported
+# the opportunity on (`bsc:MUBARAK-USDT:0x5c85…`). The pair stays P1's ticker + "-USDT", so the hold band, the balancer and
+# the Asset Manager see one asset across the legs; the CA tells the connector which token it is.
+_CA_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def split_market_spec(spec: str) -> Tuple[str, str, Optional[str]]:
+    """`exchange:PAIR[:CA]` -> (exchange lower-cased, PAIR, CA lower-cased or None). Raises ValueError naming the problem."""
+    parts = str(spec).strip().split(":")
+    if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
+        raise ValueError(f"'{spec}': expected exchange:PAIR, or exchange:PAIR:0x<CA> for a swap venue's leg")
+    if "-" not in parts[1]:
+        raise ValueError(f"'{spec}': the trading pair '{parts[1]}' is not BASE-QUOTE")
+    ca = None
+    if len(parts) == 3:
+        if not _CA_RE.match(parts[2]):
+            raise ValueError(f"'{spec}': '{parts[2]}' is not a token address (0x + 40 hex)")
+        ca = parts[2].lower()
+    return parts[0].lower(), parts[1], ca
+
 # Export convenience functions for easy import
 __all__ = [
     'pause', 'resume', 'list_arb', 'pause_all', 'resume_all', 'help_arb', 'remove',
@@ -630,6 +650,11 @@ class ArbitrageMInstanceConfig(BaseModel):
     secondary_market: str = Field(..., description="Secondary exchange name (e.g., 'kucoin')")
     primary_trading_pair: str = Field(..., description="Primary trading pair (e.g., 'BTC-USDT')")
     secondary_trading_pair: str = Field(..., description="Secondary trading pair (e.g., 'BTC-USDT')")
+
+    # P2-DEX (2026-10-14): a swap venue's leg names its token, the CA P1 reported it on (`bsc:MUBARAK-USDT:0x5c85…`);
+    # None for an exchange leg. Bound on the connector before the strategy is built (_bind_swap_legs).
+    primary_ca: Optional[str] = Field(default=None, description="The primary leg's token address, swap venues only")
+    secondary_ca: Optional[str] = Field(default=None, description="The secondary leg's token address, swap venues only")
 
     # Strategy type selection
     strategy_type: str = Field(
@@ -1104,6 +1129,35 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 f"requiring disabled exchange(s) {sorted(disabled)}: {skipped_disabled}"
             )
 
+    def _bind_swap_legs(self, config: ArbitrageMInstanceConfig) -> str:
+        """P2-DEX (2026-10-14): bind each swap-venue leg's pair to the CA its spec named, on the shared connector, before the
+        strategy is built (at start and at create). Returns why it can't, or "".
+
+        A swap venue's leg must name its CA and an exchange's leg must not. A pair another strategy has bound to a different
+        CA is refused: one pair, one token, per connector."""
+        legs = ((config.primary_market, config.primary_trading_pair, config.primary_ca),
+                (config.secondary_market, config.secondary_trading_pair, config.secondary_ca))
+        for exchange, pair, ca in legs:
+            swap = getattr(self.connectors.get(exchange), "is_swap_venue", False) is True
+            if ca and not swap:
+                return f"{exchange}:{pair}:{ca} names a token, but {exchange} is not a swap venue"
+            if swap and not ca:
+                return f"{exchange}:{pair} is a swap venue's leg without its token: name it as {exchange}:{pair}:0x<CA>"
+            if not swap:
+                continue
+            for other in self.strategies:
+                if other.name == config.name:
+                    continue
+                for side in ("primary", "secondary"):
+                    bound = str(other.config.get(f"{side}_ca") or "").lower()
+                    if (other.config.get(f"{side}_market") == exchange and other.config.get(f"{side}_trading_pair") == pair
+                            and bound != ca.lower()):
+                        return f"{exchange}:{pair} is bound to {bound or 'no token'} by strategy '{other.name}', not {ca}"
+        for exchange, pair, ca in legs:
+            if ca:
+                self.connectors[exchange].bind_ca(pair, ca)
+        return ""
+
     def _add_arbitrage_m_strategy(self, config: ArbitrageMInstanceConfig, paused: bool = False):
         """
         Add an arbitrage strategy instance (supports both arbitrage_m and arbitrage_l).
@@ -1141,6 +1195,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 f"Missing connectors: {', '.join(set(missing_connectors))}. "
                 f"Available: {', '.join(available)}"
             )
+
+        # P2-DEX: a swap venue's leg is bound to its token before the strategy is built (at start; create did it already)
+        why = self._bind_swap_legs(config)
+        if why:
+            raise ValueError(why)
 
         # Build market tuples from shared connectors
         market_tuples = []
@@ -3506,12 +3565,21 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         exchange, pair = market_spec.split(':', 1)
         exchange = exchange.lower()
 
+        if ':' in pair:
+            self.logger().error(f"'{market_spec}': a swap venue's leg (exchange:PAIR:CA) comes in with `control create`, "
+                                f"not add_market")
+            return False
+
         if '-' not in pair:
             self.logger().error(f"Invalid trading pair '{pair}'. Expected format: 'BASE-QUOTE' (e.g., 'BSX-USDT')")
             return False
 
         # Ensure connector exists (initialize at runtime if missing)
         if not await self._ensure_connector(exchange, pair):
+            return False
+        if getattr(self.connectors.get(exchange), "is_swap_venue", False) is True:
+            self.logger().error(f"'{market_spec}': {exchange} is a swap venue; its leg comes in with "
+                                f"`control create … {exchange}:{pair}:0x<CA>`, not add_market")
             return False
 
         # Get strategy instance
@@ -4021,26 +4089,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"Strategy name '{name}' already exists")
                 return False
 
-            # Validate and parse primary market spec
-            if ':' not in primary_spec:
-                self.logger().error(f"Invalid primary market spec '{primary_spec}'. Expected format: 'exchange:PAIR'")
-                return False
-            primary_exchange, primary_pair = primary_spec.split(':', 1)
-            primary_exchange = primary_exchange.lower()
-
-            if '-' not in primary_pair:
-                self.logger().error(f"Invalid primary trading pair '{primary_pair}'. Expected format: 'BASE-QUOTE'")
-                return False
-
-            # Validate and parse secondary market spec
-            if ':' not in secondary_spec:
-                self.logger().error(f"Invalid secondary market spec '{secondary_spec}'. Expected format: 'exchange:PAIR'")
-                return False
-            secondary_exchange, secondary_pair = secondary_spec.split(':', 1)
-            secondary_exchange = secondary_exchange.lower()
-
-            if '-' not in secondary_pair:
-                self.logger().error(f"Invalid secondary trading pair '{secondary_pair}'. Expected format: 'BASE-QUOTE'")
+            # Validate and parse the two market specs: exchange:PAIR, or exchange:PAIR:CA for a swap venue (P2-DEX)
+            try:
+                primary_exchange, primary_pair, primary_ca = split_market_spec(primary_spec)
+                secondary_exchange, secondary_pair, secondary_ca = split_market_spec(secondary_spec)
+            except ValueError as e:
+                self.logger().error(f"Failed to create strategy '{name}': invalid market spec {e}")
                 return False
 
             # Parse additional_markets
@@ -4049,6 +4103,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 for am in additional_markets.split(','):
                     am = am.strip()
                     if am and ':' in am:
+                        if am.count(':') > 1:
+                            self.logger().error(f"Failed to create strategy '{name}': '{am}': a swap venue's leg can't be "
+                                                f"an additional market")
+                            return False
                         additional_list.append(am)
 
             # Collect all exchange:pair combos
@@ -4075,6 +4133,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 secondary_market=secondary_exchange,
                 primary_trading_pair=primary_pair,
                 secondary_trading_pair=secondary_pair,
+                primary_ca=primary_ca,
+                secondary_ca=secondary_ca,
                 min_profitability=Decimal(str(min_profitability)),
                 buy_in_enabled=True,
                 buy_in_target_usd=500.0,
@@ -4086,6 +4146,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 hold_band_usd=50.0,
                 additional_markets=additional_list
             )
+
+            # P2-DEX: a swap venue's leg is bound to its token before anything else is touched
+            why = self._bind_swap_legs(config)
+            if why:
+                self.logger().error(f"Failed to create strategy '{name}': {why}")
+                return False
 
             # Update self.markets so the framework tracks the new pairs
             for exchange, pair in all_pairs:
@@ -4174,6 +4240,11 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             'primary_trading_pair': config.primary_trading_pair,
             'secondary_trading_pair': config.secondary_trading_pair,
         }
+        # P2-DEX: a swap venue's leg keeps its token, so a restart binds the same CA
+        if config.primary_ca:
+            strategy_dict['primary_ca'] = config.primary_ca
+        if config.secondary_ca:
+            strategy_dict['secondary_ca'] = config.secondary_ca
 
         # Only add min_profitability if different from default
         if config.min_profitability != Decimal("1.5"):
@@ -4248,6 +4319,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         connector = self.connectors.get(exchange_name)
         if connector is None:
             return
+        if callable(getattr(connector, "unbind_ca", None)):      # P2-DEX: a swap venue's pair leaves with its token
+            connector.unbind_ca(trading_pair)
 
         tp_list = getattr(connector, '_trading_pairs', None)
         if isinstance(tp_list, list) and trading_pair in tp_list:

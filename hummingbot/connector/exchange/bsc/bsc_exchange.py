@@ -71,7 +71,8 @@ class BscExchange(ExchangePyBase):
     - Books: the order book data source polls one eth_call a second (bsc_quoter.BscQuoter): per traded CA one book per side,
       from the depth-elected pool, with a $100 watch on its other pools, priced in USDT along each pool's path (Q5, Q7).
     - Pools: P1 hands over each candidate's pool records through the page -> watcher path; the watcher writes them to
-      ~/p2_dex/<ca>.json (bsc_pool_list.PoolList). A trading pair is P1's ticker + "-USDT".
+      ~/p2_dex/<ca>.json (bsc_pool_list.PoolList). A trading pair is P1's ticker + "-USDT", bound to the CA its strategy's
+      leg names (`bsc:MUBARAK-USDT:0x5c85…`, bind_ca by the orchestrator); an unbound pair has no book.
     - Balances: the wallet's BNB, USDT and traded tokens, one multicall every BALANCE_POLL_S, and each swap's receipt booked
       on them the moment it is read (a strategy sees a fill in the balances when its event fires).
     - Trading rules: from P1's records (the CA's decimals and reference price). No minimum notional: a DEX has none.
@@ -125,8 +126,9 @@ class BscExchange(ExchangePyBase):
         self._trading_pairs = list(trading_pairs or [])
         self._trading_required = trading_required
         self._pool_list = PoolList()
+        self._cas: Dict[str, str] = {}                 # trading pair -> the CA its leg names (bind_ca: the orchestrator)
         self._quoter = BscQuoter(self._post)
-        self._quoted_pairs: Optional[tuple] = None    # the trading pairs the quoter was last set for
+        self._quoted_pairs: Optional[tuple] = None    # the trading pairs and their CAs the quoter was last set for
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
         self._session: Optional[aiohttp.ClientSession] = None
         self._balance_task: Optional[asyncio.Task] = None
@@ -290,11 +292,27 @@ class BscExchange(ExchangePyBase):
             return NetworkStatus.NOT_CONNECTED
 
     # ---------------------------------------------------------------- P1's pools: quoter, symbol map, trading rules
+    def bind_ca(self, trading_pair: str, ca: str):
+        """the CA a strategy's leg names (`control create … bsc:MUBARAK-USDT:0x5c85…`, kept in test_multi.yml): the orchestrator
+        binds each bsc leg before its strategy is built, at start and at create. A pair is P1's ticker + "-USDT"; its CA is the
+        token, so two CAs sharing a ticker can't be confused. The orchestrator refuses a second strategy naming another CA
+        for a bound pair"""
+        self._cas[trading_pair] = ca.lower()           # the next poll sets the quoter up for it (_reload_pools)
+
+    def unbind_ca(self, trading_pair: str):
+        """the orchestrator, when no strategy trades the pair any more"""
+        self._cas.pop(trading_pair, None)
+
     def _ca_for_pair(self, trading_pair: str) -> Tuple[Optional[str], str]:
         base, _, quote = trading_pair.partition("-")
         if quote.upper() != CONSTANTS.QUOTE:
             return None, f"quote {quote}: bsc books are priced in {CONSTANTS.QUOTE}"
-        return self._pool_list.ca_for(base)
+        ca = self._cas.get(trading_pair)
+        if not ca:
+            return None, f"no CA bound: a bsc leg is created as bsc:{trading_pair}:0x<CA>"
+        if ca not in self._pool_list.cas:
+            return None, f"no P1 records for {ca} in {self._pool_list.data_dir} (the watcher writes them from the page)"
+        return ca, ""
 
     def _reload_pools(self):
         """the payloads in the pool directory: the quoter, the symbol map and the trading rules follow them, for the CAs of
@@ -304,11 +322,11 @@ class BscExchange(ExchangePyBase):
         except Exception as e:
             self.logger().warning(f"bsc: the pool payloads could not be read: {e}")
             return
-        pairs = tuple(sorted(self._trading_pairs))
+        pairs = tuple(sorted((tp, self._cas.get(tp) or "") for tp in self._trading_pairs))
         if not changed and pairs == self._quoted_pairs:
             return
         cas = {}
-        for trading_pair in pairs:
+        for trading_pair, _ in pairs:
             ca, why = self._ca_for_pair(trading_pair)
             self._report(trading_pair, f"CA {ca}, {len(self._pool_list.pools(ca))} tradable pools" if ca else f"no book: {why}")
             if ca:

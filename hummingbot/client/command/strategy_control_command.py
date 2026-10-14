@@ -193,6 +193,7 @@ class StrategyControlCommand:
                 self.notify("Error: Missing required arguments for create")
                 self.notify("Usage: control create <name> <primary_exchange:PAIR> <secondary_exchange:PAIR>")
                 self.notify("Example: control create arb_bsx_new gate:BSX-USDT kucoin:BSX-USDT")
+                self.notify("A swap venue's leg names its token: bsc:PAIR:0x<CA> (e.g. bsc:MUBARAK-USDT:0x5c85…)")
                 return
             # Check if create capability exists
             if not hasattr(strategy, 'create_strategy'):

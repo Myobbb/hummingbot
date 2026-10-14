@@ -22,12 +22,14 @@ STALE_S = 5.0                     # no good poll, or a block older than this: ev
 FIRST_POLL_WAIT_S = 10.0          # how long a pair's first book waits for the first poll before it starts empty
 SUMMARY_EVERY_S = 300.0           # the data source's summary line (DEBUG; a state change is INFO)
 
-# Trading is OFF until the first live swap (Pavel's) has proven the send path end to end. Off, the connector refuses every
-# order and every approval AND reports not ready (status_dict "trading_enabled"), so the orchestrator never ticks a strategy
-# with a bsc leg: arb_l fires both legs at once (decision 1) and must never fire a CEX leg against a DEX leg that cannot
-# execute. The orchestrator's all-connectors-ready gate (its one-time init) skips a connector whose `trading_enabled` is False,
-# so the never-ready connector holds back only its own strategies.
-TRADING_ENABLED = False
+# Trading ON since the first live swaps proved the send path end to end (2026-10-14, Pavel's first_swap_live.py on CAKE: the
+# connector's own 8 approvals, then a $2 buy and its sell, both landing at head +2, filled 0.71 / 0.60 s after the send).
+# False is the kill switch: the connector then refuses every order and every approval AND reports not ready (status_dict
+# "trading_enabled"), so the orchestrator never ticks a strategy with a bsc leg: arb_l fires both legs at once (decision 1)
+# and must never fire a CEX leg against a DEX leg that cannot execute. The orchestrator's all-connectors-ready gate (its
+# one-time init) skips a connector whose `trading_enabled` is False, so a never-ready connector holds back only its own
+# strategies.
+TRADING_ENABLED = True
 
 # Step 4: one swap transaction per order (bsc_swap builds it, bsc_tx signs it and reads its receipt).
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use; unused gas is not paid. Measured 2026-10-14 (eth_estimateGas, the
