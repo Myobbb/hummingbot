@@ -362,11 +362,13 @@ class CreateCommand:
                 # grovex: DISABLED 2026-10-09 (scrapped), kept as reference (see connector/exchange/grovex/__init__.py)
                 'grovex': 'gx',
                 'poloniex': 'plx',
+                # bsc: the P2-DEX leg (BNB Chain, priced from P1's pools); books only until its send path exists
+                'bsc': 'bsc',
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
-            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx"]
+            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx", "bsc"]
             try:
                 return order.index(alias)
             except ValueError:

@@ -1324,7 +1324,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self._refresh_connector_ready_cache()
 
         # Check if ALL connectors are ready using cached values (for coordinated initialization only)
-        all_connectors_ready = all(self._connector_ready_cache.values()) if self._connector_ready_cache else False
+        all_connectors_ready = self._all_connectors_ready()
 
         # Handle initial coordinated initialization
         if not self._markets_ready_notified and all_connectors_ready:
@@ -1479,6 +1479,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             name: (c.ready and c.network_status == NetworkStatus.CONNECTED)
             for name, c in self.connectors.items()
         }
+
+    def _all_connectors_ready(self) -> bool:
+        """
+        Every connector that can trade is ready (cached values).
+
+        A connector that declares trading off (`trading_enabled` False: the bsc DEX leg until its send path
+        exists, P2-DEX 2026-10-14) is never ready by design. It holds back only its own strategies
+        (_is_strategy_ready), never the coordinated initialization (_on_markets_ready).
+        """
+        ready = [is_ready for name, is_ready in self._connector_ready_cache.items()
+                 if getattr(self.connectors.get(name), "trading_enabled", True)]
+        return all(ready) if ready else False
 
     def _is_connector_ready_cached(self, connector_name: str) -> bool:
         """
@@ -4791,7 +4803,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         lines = []
 
         # Connector Status Summary using cached values
-        all_connectors_ready = all(self._connector_ready_cache.values()) if self._connector_ready_cache else False
+        all_connectors_ready = self._all_connectors_ready()
 
         # Strategy Status Summary
         # During normal operation: simple count of non-paused strategies
@@ -5099,7 +5111,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
         # Lower index means higher priority
-        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex']
+        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex', 'bsc']
         return {name: idx for idx, name in enumerate(order)}
 
     def _display_exchange_name(self, name: str) -> str:
