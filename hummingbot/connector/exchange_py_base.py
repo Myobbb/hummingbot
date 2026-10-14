@@ -43,6 +43,12 @@ class ExchangePyBase(ExchangeBase, ABC):
     TRADING_FEES_INTERVAL = TWELVE_HOURS
     TICK_INTERVAL_LIMIT = 60.0
 
+    # A SWAP venue (a DEX; P2-DEX 2026-10-14) takes every order as one immediate swap: it fills or fails within seconds,
+    # never rests on a book, can't be cancelled, and its limit price is the worst average price accepted. Strategies read
+    # it as getattr(market, "is_swap_venue", False) (a connector outside this base has no such attribute) and trade such a
+    # venue as a taker only (arbitrage_l's position balancer: PositionBalancerHandler.c_is_swap_venue).
+    is_swap_venue = False
+
     def __init__(self,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100")):

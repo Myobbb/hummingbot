@@ -177,6 +177,20 @@ class BscQuoter:
             v *= r[0]
         return v
 
+    def _hop_route(self, rates: dict, token: str, family: str, size: float, side: str) -> Optional[List[dict]]:
+        """the hop pools that priced _usd(...) at this size and side, link by link from the token toward the anchor (each a
+        hop record: pool, type, key, token0/1, from_token, to_token): the swap must run through these. [] for the anchor"""
+        path = self.paths.get((token, family))
+        if path is None:
+            return None
+        route = []
+        for k in path:
+            r = rates.get(k, {}).get(size, {}).get(side)
+            if r is None:
+                return None
+            route.append(self.links[k]["pools"][r[1]])
+        return route
+
     # ---------------------------------------------------------------- the poll
     async def poll(self) -> dict:
         now = time.time()
@@ -343,18 +357,22 @@ class BscQuoter:
                     continue
                 lad = self.ladders.get((pool, ca, side))
                 f = tax_factor(p, side)
-                levels, rungs = None, 0
+                levels, rungs, priced_at = None, 0, ()
                 if lad and lad["pts"] and lad["t"] == now and f:
                     usd_at = {rung: self._usd(rates, self._canon(p["counter"]["token"]), p["family"], rung, side) for _, _, rung in lad["pts"]}
                     if all(usd_at.values()):
                         levels = [[px * f, qty] for px, qty in to_levels(lad["pts"], m["decimals"], p["counter"]["decimals"], usd_at, side)]
-                        rungs = len(lad["pts"])
+                        rungs, priced_at = len(lad["pts"]), tuple(sorted(usd_at))
                 if not levels and pool in top_px.get((ca, side), {}):
                     px, qty = top_px[(ca, side)][pool]
-                    levels, rungs = [[px, qty]], 1
+                    levels, rungs, priced_at = [[px, qty]], 1, (RUNGS_USD[0],)
                 if levels:
+                    # what a swap must run through: the CA pool's record and, per rung, the hop pools that priced it
+                    counter = self._canon(p["counter"]["token"])
+                    routes = {rung: self._hop_route(rates, counter, p["family"], rung, side) for rung in priced_at}
                     books.setdefault(ca, {})[side] = {"pool": pool, "levels": levels, "rungs": rungs,
-                                                      "switched": (ca, side) in self.switched}
+                                                      "switched": (ca, side) in self.switched,
+                                                      "record": p, "routes": routes}
         return books
 
     def _resize(self, top_px: dict, rates: dict):

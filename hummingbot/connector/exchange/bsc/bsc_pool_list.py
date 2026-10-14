@@ -21,6 +21,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from hummingbot.connector.exchange.bsc.bsc_swap import no_executor
+
 DATA_DIR = os.path.expanduser("~/p2_dex")
 CHAIN = "BSC"
 STALE_AFTER_S = 6 * 3600.0     # WIP: a payload whose P1 stamp is older is stated as stale (pages refresh it)
@@ -133,7 +135,13 @@ class PoolList:
                     self.left_out[(p.get("pool"), ca)] = f"no router: {kind}"
                     continue
                 fam = family_of(p)
+                why = no_executor(dict(p, family=fam))               # step 4: a pool P2 can't swap is no book pool
+                if why:
+                    self.left_out[(p.get("pool"), ca)] = why
+                    continue
                 path_, gap = hop_path(p, fam)
+                path_ = [[c for c in link if not no_executor(dict(c, family=fam))] for link in path_]   # executable hops only
+                gap = next((i for i, link in enumerate(path_) if not link), gap)
                 if gap is not None:
                     self.left_out[(p.get("pool"), ca)] = f"no hop inside its family ({fam}) for link {gap + 1}"
                     continue

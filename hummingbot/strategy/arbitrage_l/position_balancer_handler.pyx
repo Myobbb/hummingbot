@@ -1395,6 +1395,10 @@ cdef class PositionBalancerHandler:
             if pend is None:
                 return
             asset_key = pend[0]
+            # A swap fills at once by design (a taker): that is no pressure on a resting order, and recording it would
+            # space the next placement on every venue of the asset.
+            if self.c_active_order_on_swap_venue(asset_key, is_buy):
+                return
             canonical = self._get_canonical_asset(asset_key)
 
             prior = self._last_fill_completion_time.get(canonical, 0.0)
@@ -1567,6 +1571,10 @@ cdef class PositionBalancerHandler:
             # Unknown order (already gone from active tracking) — let the backstop clean up.
             if asset is None:
                 return True
+
+            # A swap can't be cancelled, so it can't be refreshed: it ends on its own (c_is_swap_venue).
+            if self.c_active_order_on_swap_venue(asset, is_buy):
+                return False
 
             # A refresh is cancel + re-place too: veto it for a sell whose remainder (with the
             # venue's free base) could not be placed again (c_reprice_would_strand); the order
@@ -1743,6 +1751,45 @@ cdef class PositionBalancerHandler:
         except Exception:
             return False
 
+    cdef bint c_is_swap_venue(self, object market_tuple):
+        """
+        Is this a SWAP venue (a DEX: `is_swap_venue` on its connector, see ExchangePyBase)?
+
+        Every order there is one immediate swap: it fills or fails on chain within seconds, never rests and cannot be
+        cancelled (P2-DEX, 2026-10-14). The balancer's maker machinery therefore does not apply to it:
+          • it is priced as a TAKER in every spread mode: its ask to buy and its bid to sell when choosing the venue, and at
+            placement the deepest level the order's size reaches (c_swap_limit);
+          • its order is never chased, refreshed or re-placed (c_cancel_stale_orders, should_backstop_refresh): it ends on
+            its own, and its completion is what frees the side;
+          • its immediate fill is not market pressure on a resting order (c_record_fill_pressure).
+        Targets, sizing, completion, cooldowns and the hold band are shared with every other venue. One swap at a time per
+        wallet is the connector's: while one is out its available balances read 0, which the selectors already skip.
+        """
+        return getattr(market_tuple.market, "is_swap_venue", False) is True
+
+    cdef double c_swap_limit(self, object ob, double amount, bint is_buy):
+        """
+        The limit a swap of `amount` needs on this book: the price of the deepest level it reaches (the asks for a buy, the
+        bids for a sell). The swap venue takes an order whose book cost stays within amount x limit, so this is the tightest
+        limit that executes it on the book it was sized against: the levels it walks average better than their deepest.
+        A book shallower than `amount` gives its last level (the venue prices the rest at the limit). 0.0 = an empty side.
+        """
+        cdef:
+            double left = amount
+            double price = 0.0
+        for row in (ob.ask_entries() if is_buy else ob.bid_entries()):
+            price = float(row.price)
+            left -= float(row.amount)
+            if left <= EPSILON:
+                break
+        return price
+
+    cdef bint c_active_order_on_swap_venue(self, str asset, bint is_buy):
+        """Is the asset's live PB order on this side a swap (out on a swap venue)? It then ends on its own within seconds, so
+        nothing may chase, refresh or re-place it (see c_is_swap_venue)."""
+        cdef tuple details = (self._active_buy_order_details if is_buy else self._active_sell_order_details).get(asset)
+        return details is not None and self.c_is_swap_venue(details[0])
+
     cdef object c_find_best_buy_market(self, str asset):
         """
         NO balance-preference tie-break here, and that is DELIBERATE (confirmed 2026-08-18).
@@ -1802,8 +1849,8 @@ cdef class PositionBalancerHandler:
                             # Use C-level get_order_book for compatibility with all exchanges
                             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 
-                            if use_ask_price:
-                                # Aggressive mode (0%): select market with LOWEST ASK (taker)
+                            if use_ask_price or self.c_is_swap_venue(market_tuple):
+                                # Aggressive mode (0%), and a swap venue in every mode: LOWEST ASK (taker)
                                 if ob._ask_book.size() > 0:
                                     current_price = float(deref(ob._ask_book.begin()).getPrice())
                                 else:
@@ -2041,6 +2088,7 @@ cdef class PositionBalancerHandler:
             double ref_bid
             double fund_bal
             list funded = []          # candidates that can actually fund a minimum order
+            bint swap_venue
 
         # Get all aliases for this asset (includes asset itself)
         asset_aliases = self._get_all_asset_aliases(asset)
@@ -2055,11 +2103,20 @@ cdef class PositionBalancerHandler:
                             if self.c_market_in_failure_cooldown(market_tuple):
                                 continue
 
+                            # A swap venue sells only what it can pay NOW, since nothing rests there: one with no free
+                            # base (none held, or its wallet busy with another swap) is no candidate at all, rather
+                            # than winning on price and tripping the insufficient-balance back-off meant for resting
+                            # venues (the funding filter below keeps an unfunded best venue for exactly that).
+                            swap_venue = self.c_is_swap_venue(market_tuple)
+                            if swap_venue and float(market_tuple.market.get_available_balance(
+                                    market_tuple.base_asset)) <= 0.0:
+                                continue
+
                             # Use C-level get_order_book for compatibility with all exchanges
                             ob = (<ExchangeBase>market_tuple.market).c_get_order_book(market_tuple.trading_pair)
 
-                            if use_bid_price:
-                                # Aggressive mode (0%): select market with HIGHEST BID (taker)
+                            if use_bid_price or swap_venue:
+                                # Aggressive mode (0%), and a swap venue in every mode: HIGHEST BID (taker)
                                 if ob._bid_book.size() > 0:
                                     current_price = float(deref(ob._bid_book.rbegin()).getPrice())
                                 else:
@@ -2856,7 +2913,8 @@ cdef class PositionBalancerHandler:
         # ========================================================================
         if asset in self._active_buy_orders:
             order_id = self._active_buy_orders.get(asset)
-            if order_id:
+            # A swap (an order out on a swap venue) never rests: it ends on its own within seconds — nothing to chase.
+            if order_id and not self.c_active_order_on_swap_venue(asset, True):
                 # Check if order is already in cancellation state
                 should_process = True
                 if order_id in self.strategy._timeout_cancelled_orders:
@@ -2968,7 +3026,8 @@ cdef class PositionBalancerHandler:
         # ========================================================================
         if asset in self._active_sell_orders:
             order_id = self._active_sell_orders.get(asset)
-            if order_id:
+            # A swap never rests (see the buy side): nothing to chase.
+            if order_id and not self.c_active_order_on_swap_venue(asset, False):
                 # Check if order is already in cancellation state
                 should_process = True
                 if order_id in self.strategy._timeout_cancelled_orders:
@@ -3637,6 +3696,7 @@ cdef class PositionBalancerHandler:
         cdef:
             str asset_key = buy_market_tuple.base_asset
             ExchangeBase market = buy_market_tuple.market
+            bint is_swap = self.c_is_swap_venue(buy_market_tuple)
             double quote_bal = float(market.c_get_available_balance(buy_market_tuple.quote_asset))
             double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
             double base_bal_actual = self.c_get_actual_base_balance(asset_key)
@@ -3708,8 +3768,11 @@ cdef class PositionBalancerHandler:
                     f"Position balancer: BUY venue changed for {_canon_venue} "
                     f"{_prev_gone[2]} -> {buy_market_tuple.market.name} — streak and refuge reset (new book)")
 
-        # Calculate limit price based on spread mode
-        if self._buy_spread_is_min:
+        # Calculate limit price based on spread mode. A swap venue is a taker in every mode: its ask here, then the
+        # deepest ask the sized order reaches (c_swap_limit, after sizing).
+        if is_swap:
+            buy_price = top_ask
+        elif self._buy_spread_is_min:
             # 'min' mode: Place one tick above top bid (maker order)
             if top_bid <= 0:
                 return False
@@ -3813,6 +3876,14 @@ cdef class PositionBalancerHandler:
             max_affordable_base,
             max_order_base
         )
+
+        if is_swap and amount_to_buy > EPSILON:
+            # The swap's limit: the deepest ask this size reaches. It only prices up from the top ask, so re-capping at it
+            # only shrinks the amount, and a smaller amount never reaches deeper than this limit.
+            buy_price = self.c_swap_limit(ob, amount_to_buy, True)
+            if buy_price <= 0.0:
+                return False
+            amount_to_buy = min(amount_to_buy, effective_quote_bal / buy_price, self._order_size_usd / buy_price)
 
         if amount_to_buy <= EPSILON:
             return False
@@ -3941,7 +4012,11 @@ cdef class PositionBalancerHandler:
         # so the placed venue is explicit — a multi-venue asset (e.g. PANTHER htx↔mexc)
         # picks its best market per place via c_find_best_buy_market, and without the
         # venue here the place line couldn't be attributed to a leg from the log alone.
-        if self._buy_spread_is_min:
+        if is_swap:
+            self.strategy.logger().info(
+                f"[PB] Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"on {buy_market_tuple.market.name} at {buy_price:.8g} (swap: taker, the deepest ask it reaches)")
+        elif self._buy_spread_is_min:
             self.strategy.logger().info(
                 f"[PB] Placed buy limit order {buy_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {buy_market_tuple.market.name} at {buy_price:.8g} (spread: min tick)")
@@ -3985,6 +4060,7 @@ cdef class PositionBalancerHandler:
         cdef:
             str asset_key = sell_market_tuple.base_asset
             ExchangeBase market = sell_market_tuple.market
+            bint is_swap = self.c_is_swap_venue(sell_market_tuple)
             double base_bal_raw = float(market.c_get_available_balance(sell_market_tuple.base_asset))
             double base_bal_adjusted = self.c_get_adjusted_base_balance(asset_key)
             double base_bal_actual = self.c_get_actual_base_balance(asset_key)
@@ -4060,8 +4136,11 @@ cdef class PositionBalancerHandler:
                     f"Position balancer: SELL venue changed for {_canon_venue} "
                     f"{_prev_gone[2]} -> {sell_market_tuple.market.name} — streak and refuge reset (new book)")
 
-        # Calculate limit price based on spread mode
-        if self._sell_spread_is_min:
+        # Calculate limit price based on spread mode. A swap venue is a taker in every mode: its bid here, then the
+        # deepest bid the sized order reaches (c_swap_limit, after sizing).
+        if is_swap:
+            sell_price = top_bid
+        elif self._sell_spread_is_min:
             # 'min' mode: Place one tick below top ask (maker order)
             if top_ask <= 0:
                 return False
@@ -4169,6 +4248,13 @@ cdef class PositionBalancerHandler:
                 f"pending_sell={pending_sell_base:.8g}, effective_raw={effective_raw:.8g}, "
                 f"max_order_base={max_order_base:.6f}, sell_price={sell_price:.8g}")
             return False
+
+        if is_swap:
+            # The swap's limit: the deepest bid this size reaches. The amount stays as sized at the top bid: re-capping it
+            # at this lower price could only let it grow (and reach deeper).
+            sell_price = self.c_swap_limit(ob, amount_to_sell, False)
+            if sell_price <= 0.0:
+                return False
 
         # Quantize
         # The ONE test for "will this venue take it" — the same call c_find_best_sell_market's
@@ -4318,7 +4404,11 @@ cdef class PositionBalancerHandler:
         # so the placed venue is explicit — a multi-venue asset picks its best market per
         # place via c_find_best_sell_market, and without the venue here the place line
         # couldn't be attributed to a leg from the log alone.
-        if self._sell_spread_is_min:
+        if is_swap:
+            self.strategy.logger().info(
+                f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
+                f"on {sell_market_tuple.market.name} at {sell_price:.8g} (swap: taker, the deepest bid it reaches)")
+        elif self._sell_spread_is_min:
             self.strategy.logger().info(
                 f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {sell_market_tuple.market.name} at {sell_price:.8g} (spread: min tick)")
