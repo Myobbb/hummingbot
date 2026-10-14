@@ -11,7 +11,8 @@ Executors (decision 2: official routers; one call chains one family only, Q5):
   - pancakeswap: PancakeSwap's Universal Router (v2, v3, Infinity CL), paid through Permit2. (Infinity Bin: P1 lists no Bin pool
     as of 2026-10-14, so no encoding ships unproven; a Bin pool is left out as "no executor" until one exists to prove it on);
   - uniswap:     Uniswap's Universal Router (v2, v3, v4), paid through Permit2;
-  - route:<v2 router>: that router's swapExactTokensForTokensSupportingFeeOnTransferTokens, paid by ERC20 allowance.
+  - route:<v2 router>: that router's swapExactTokensForTokensSupportingFeeOnTransferTokens, paid by ERC20 allowance, for a
+    router pinned in PINNED_V2_ROUTERS only (none yet: Pavel 2026-10-14, PancakeSwap + Uniswap only).
 Native BNB: a v4 / Infinity pool may hold native BNB (address 0) where its neighbours hold WBNB; the router wraps or unwraps
 between them. Taxed tokens: v2 legs measure by balance (tax-safe); a taxed token paid into a v3 / v4 / Infinity pool makes the
 swap revert (decision 2's known downside), and a taxed output arrives short by the tax P1 already prices.
@@ -40,6 +41,10 @@ EXECUTORS = {
                 "types": ("v2", "v3", "uni-v4")},
 }
 V2_ROUTER_TYPES = ("v2",)                    # a family `route:<v2 router>`: that router, its fee-on-transfer swap
+# The v2 routers of single-router forks the wallet may approve and swap through. Pinned by hand, once each one is checked
+# (Pavel 2026-10-14: PancakeSwap + Uniswap only): none yet, so a `route:` pool is left out as "no executor". Every contract the
+# wallet ever approves comes from EXECUTORS or this set, never from P1's data.
+PINNED_V2_ROUTERS: Tuple[str, ...] = ()
 
 # Universal Router commands and their constants (both routers' Commands.sol / ActionConstants at the deployed commits)
 V3_SWAP_EXACT_IN, V2_SWAP_EXACT_IN, WRAP_ETH, UNWRAP_WETH, POOL_SWAP = 0x00, 0x08, 0x0b, 0x0c, 0x10   # 0x10: V4_SWAP / INFI_SWAP
@@ -91,12 +96,14 @@ def check_legs(path: List[Tuple[dict, str, str]], token_in: str, token_out: str)
 
 def executor(record: dict) -> Optional[Dict]:
     """the contract that executes a pool of this record's family -> {"router", "permit2" (None: paid by ERC20 allowance),
-    "types"}, or None when P2 has no executor for it yet"""
+    "types"}, or None when P2 has no executor for it: a family outside EXECUTORS, or a v2 router not in PINNED_V2_ROUTERS"""
     family = record.get("family") or ""
     if family in EXECUTORS:
         return EXECUTORS[family]
-    if family.startswith("route:") and (record.get("route") or {}).get("kind") == "v2 router":
-        return {"router": family[len("route:"):], "permit2": None, "types": V2_ROUTER_TYPES}
+    router = family[len("route:"):]
+    if (family.startswith("route:") and (record.get("route") or {}).get("kind") == "v2 router"
+            and router in PINNED_V2_ROUTERS):
+        return {"router": router, "permit2": None, "types": V2_ROUTER_TYPES}
     return None
 
 
@@ -104,7 +111,9 @@ def no_executor(record: dict) -> Optional[str]:
     """why P2 can't execute this pool, or None"""
     ex = executor(record)
     if ex is None:
-        return f"no executor for {record.get('type')} on {record.get('family') or (record.get('route') or {}).get('kind')}"
+        family = record.get("family") or (record.get("route") or {}).get("kind")
+        pin = " (its router is not pinned)" if (record.get("family") or "").startswith("route:") else ""
+        return f"no executor for {record.get('type')} on {family}{pin}"
     if record.get("type") not in ex["types"]:
         return f"no executor for {record.get('type')} on {record.get('family')}"
     return None

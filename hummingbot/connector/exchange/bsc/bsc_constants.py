@@ -22,26 +22,37 @@ STALE_S = 5.0                     # no good poll, or a block older than this: ev
 FIRST_POLL_WAIT_S = 10.0          # how long a pair's first book waits for the first poll before it starts empty
 SUMMARY_EVERY_S = 300.0           # the data source's summary line (DEBUG; a state change is INFO)
 
-# Step 3 ships books and balances only. An order needs the transaction path (step 4) and the send method (its own
-# session, Pavel 2026-10-14). Until both exist the connector refuses every order AND reports not ready (status_dict
-# "trading_enabled"), so the orchestrator never ticks a strategy with a bsc leg: arb_l fires both legs at once (decision 1)
-# and must never fire a CEX leg against a DEX leg that cannot execute. The orchestrator's all-connectors-ready gate (its
-# one-time init) skips a connector whose `trading_enabled` is False, so the never-ready connector holds back only its own
-# strategies.
+# Trading is OFF until the first live swap (Pavel's) has proven the send path end to end. Off, the connector refuses every
+# order and every approval AND reports not ready (status_dict "trading_enabled"), so the orchestrator never ticks a strategy
+# with a bsc leg: arb_l fires both legs at once (decision 1) and must never fire a CEX leg against a DEX leg that cannot
+# execute. The orchestrator's all-connectors-ready gate (its one-time init) skips a connector whose `trading_enabled` is False,
+# so the never-ready connector holds back only its own strategies.
 TRADING_ENABLED = False
 
-# Step 4: one swap transaction per order (bsc_swap builds it, bsc_tx signs it and reads its receipt). The nonce and gas
-# POLICIES are the Sending session's (Pavel 2026-10-14); these are its WIP defaults.
+# Step 4: one swap transaction per order (bsc_swap builds it, bsc_tx signs it and reads its receipt).
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use; unused gas is not paid. Measured 2026-10-14 (eth_estimateGas, the
                                   # 16 test books): 124-208k without a hop, 244-285k with one
-GAS_PRICE_WEI = 50_000_000        # 0.05 gwei: BSC's floor. 285k gas = 0.000014 BNB
+APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
+GAS_PRICE_WEI = 50_000_000        # 0.05 gwei: BSC's floor. All 35 of the Sending session's live sends landed at it
 SWAP_GAS_MAX_BNB = Decimal(SWAP_GAS_LIMIT * GAS_PRICE_WEI).scaleb(-18)   # the most one swap can cost: below it, nothing trades
 APPROVED_AT_LEAST = 1 << 128      # an allowance this large counts as approved (the approvals are for the maximum amount)
 
-# The order lifecycle (2026-10-14): one swap at a time per wallet, followed on chain until it ends.
-RECEIPT_POLL_S = 0.25             # a swap out has its receipt asked for this often (a block every 0.45 s): it ends ~a block
-                                  # after it is mined, not at the framework's 10 s status poll
-DROP_GRACE_S = 3.0                # this long past its deadline, a swap the node no longer knows is resolved as dropped
-STUCK_WARN_S = 30.0               # a swap still pending past its deadline is reported this often until it ends
+# Sending (the Sending session, Pavel 2026-10-14; measured from myserver -> wiki P2-DEX Overview §The send paths). Every
+# transaction (a swap, an approval) goes as a one-transaction BUNDLE to both builders at once: 48 Club and BlockRazor build
+# ~96% of BSC's blocks. It is valid up to its last block: it lands by then or never, and then nothing is paid and its nonce
+# stays free (nothing can get stuck holding the wallet); a transaction that would revert is not included. Live: 5/5 within
+# 2 blocks, receipt p50 0.53 s (the public paths were a block slower).
+BUILDERS = ("https://puissant-builder.48.club", "https://rpc.blockrazor.builders")   # 2.6 / 7.5 ms from myserver
+BLOCK_S = 0.45                    # BSC's block time since the Fermi hard fork (2026-01-14)
+BUNDLE_BLOCKS = 12                # valid for the 12 blocks after the head at the send (~5.4 s): just past the swap's 5 s deadline
+                                  # (bsc_swap.DEADLINE_S), so the deadline stays the swap's expiry
+# The order lifecycle's reads (receipts, the head, the nonce): BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms),
+# free, and asked only while a transaction is out. The book feed stays on BlockPI (decision 4).
+SWAP_READ_URL = "https://bsc-dataseed1.bnbchain.org"
+
+# The order lifecycle (2026-10-14): one transaction at a time per wallet, followed on chain until it ends.
+RECEIPT_POLL_S = 0.1              # a transaction out has its receipt asked for this often: it ends ~0.1 s after it is mined
+SEND_TIMEOUT_S = 2.0              # a builder that hasn't answered a bundle by then counts as silent (the other may have taken it)
+WARN_EVERY_S = 30.0               # a transaction's trouble (an unreadable receipt) is said at most this often
 PRICE_SLACK = Decimal("1e-6")     # the limit check's relative slack: a strategy's limit and the book's levels are the same
                                   # prices read through float and Decimal, which differ in the last digits

@@ -18,7 +18,7 @@ from hummingbot.connector.exchange.bsc.bsc_api_user_stream_data_source import Bs
 from hummingbot.connector.exchange.bsc.bsc_p1_quoter import adr, word
 from hummingbot.connector.exchange.bsc.bsc_pool_list import PoolList
 from hummingbot.connector.exchange.bsc.bsc_quoter import BscQuoter
-from hummingbot.connector.exchange.bsc.bsc_swap import build_swap, executor
+from hummingbot.connector.exchange.bsc.bsc_swap import EXECUTORS, build_swap, executor
 from hummingbot.connector.exchange.bsc.bsc_tx import (
     allowance_calls,
     build_tx,
@@ -77,16 +77,19 @@ class BscExchange(ExchangePyBase):
     - Trading rules: from P1's records (the CA's decimals and reference price). No minimum notional: a DEX has none.
     - Orders (step 4): one exact-input swap per order along the route that priced its book (bsc_swap), signed by the wallet
       (bsc_tx); the transaction hash is the exchange order id; the receipt gives the fill (what really moved at the wallet,
-      the gas in BNB) or a revert (a failed order). The send method is its own session's (`self._send`): until it is plugged
-      in, and while CONSTANTS.TRADING_ENABLED is False, every order is refused and the connector never reports ready, so the
-      orchestrator never ticks a strategy with a bsc leg.
+      the gas in BNB) or a revert (a failed order). While CONSTANTS.TRADING_ENABLED is False every order is refused and the
+      connector never reports ready, so the orchestrator never ticks a strategy with a bsc leg.
+    - Sending (the Sending session, Pavel 2026-10-14): every transaction goes as a one-transaction bundle to both builders
+      (CONSTANTS.BUILDERS), valid for BUNDLE_BLOCKS blocks: it lands by then or never (nothing paid, its nonce free again), and
+      one that would revert is not included. The lifecycle's reads (receipts, the head, the nonce) are on SWAP_READ_URL.
     - A swap venue (`is_swap_venue`, 2026-10-14): an order is one immediate swap, never resting, never cancelled; the limit
       price is the worst average price accepted (no price grid). ONE swap at a time per wallet: an order takes the wallet's
       turn when it is placed and every available balance reads 0 until it ends, so the strategies (arb_l, the balancer),
       which size by it, place nothing here meanwhile. Each swap out is followed on chain (_receipt_loop) and ends about a
-      block after it is mined: FILLED with what it really got, or FAILED (reverted, or dropped past its deadline).
+      block after it is mined: FILLED with what it really got, or FAILED (reverted, or not included by its last block).
     - Approvals are read with the balances. A book side the wallet can't pay into its executor is not shown, so no
-      strategy fires a CEX leg against a DEX leg that would be refused.
+      strategy fires a CEX leg against a DEX leg that would be refused. A missing approval is sent by the connector itself
+      (trading on), one at a time in the wallet's turn, to the pinned executors' contracts only (bsc_swap).
     - The wallet, like a CEX key pair: `bsc_wallet_address` names it, `bsc_private_key` (stored encrypted by `connect bsc`)
       must control it. The key lives only inside its signer (eth_account, local signing: no network hop). A key that is
       not valid, or controls another address, fails the balance read, so `connect bsc` reports it and keeps no bad key.
@@ -108,15 +111,16 @@ class BscExchange(ExchangePyBase):
         self._rpc_url = (bsc_rpc_url or "").strip()
         self._wallet = (bsc_wallet_address or "").strip().lower()
         self._account, self._key_problem = self._load_key(bsc_private_key)
-        self._send = None                              # async (raw tx hex) -> None: the Sending session's method; None = off.
-                                                       # Raises BscSendRefused when the node refused it (see there)
-        self._nonce: Optional[int] = None              # the wallet's next nonce (read before the first swap, then counted)
+        self._nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self._busy: Optional[str] = None               # the order holding the wallet's one turn (placed, not yet ended)
         self._swaps: Dict[str, dict] = {}              # client order id -> its swap out: tx hash, nonce, tokens, side, deadline
         self._swap_sent = asyncio.Event()              # wakes the receipt loop when a swap goes out
         self._receipt_task: Optional[asyncio.Task] = None
         self._balances_block = 0                       # the block the balances are known at (a read's, or a booked receipt's)
         self._approvals: Dict[tuple, bool] = {}        # (token, router) -> the wallet can pay the token into the router
+        self._missing_approvals: List[Tuple[str, bytes]] = []   # the approval calls the last balance read found missing
+        self._approved_sent: set = set()               # approval calls included this run (a read behind can't resend them)
+        self._approve_task: Optional[asyncio.Task] = None
         self._domain = domain
         self._trading_pairs = list(trading_pairs or [])
         self._trading_required = trading_required
@@ -226,18 +230,31 @@ class BscExchange(ExchangePyBase):
         return text
 
     async def _post(self, body: bytes) -> bytes:
-        """one JSON-RPC POST to the node: the quoter's transport and the balances'"""
+        """one JSON-RPC POST to the node (BlockPI): the quoter's transport, the balances' and check_network's"""
         if not self._rpc_url:
             raise RuntimeError("no BSC RPC URL: connect bsc")
+        return await self._post_to(self._rpc_url, body)
+
+    async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None) -> bytes:
+        """one JSON-RPC POST on the connector's kept-alive session: the node, the swap reads, the builders"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CONSTANTS.RPC_TIMEOUT_S))
         try:
-            async with self._session.post(self._rpc_url, data=body, headers={"Content-Type": "application/json"}) as r:
+            async with self._session.post(url, data=body, headers={"Content-Type": "application/json"},
+                                          timeout=aiohttp.ClientTimeout(total=timeout) if timeout else None) as r:
                 return await r.read()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             raise RuntimeError(self._mask(f"{type(e).__name__}: {e}")) from None
+
+    async def _read(self, method: str, params: list):
+        """one read on the swap lifecycle's endpoint (receipts, the head, the nonce): CONSTANTS.SWAP_READ_URL"""
+        ans = json.loads(await self._post_to(CONSTANTS.SWAP_READ_URL, json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()))
+        if "error" in ans:
+            raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
+        return ans.get("result")
 
     # ---------------------------------------------------------------- network
     async def start_network(self):
@@ -252,10 +269,10 @@ class BscExchange(ExchangePyBase):
 
     async def stop_network(self):
         await super().stop_network()
-        for task in (self._balance_task, self._receipt_task):
+        for task in (self._balance_task, self._receipt_task, self._approve_task):
             if task is not None:
                 task.cancel()
-        self._balance_task = self._receipt_task = None
+        self._balance_task = self._receipt_task = self._approve_task = None
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -372,9 +389,12 @@ class BscExchange(ExchangePyBase):
 
     # ---------------------------------------------------------------- balances
     async def _balance_loop(self):
+        """the balances every BALANCE_POLL_S; after each read, any missing approval is sent (_maybe_approve). Only a started
+        connector runs this loop, so a `connect bsc` key check never sends anything"""
         while True:
             try:
                 await self._update_balances()
+                self._maybe_approve()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -411,13 +431,15 @@ class BscExchange(ExchangePyBase):
             amount = Decimal(word(ret, 0)).scaleb(-decimals)
             self._account_balances[asset] = amount
             self._account_available_balances[asset] = amount
-        i, now = len(calls), int(time.time())
+        i, now, missing = len(calls), int(time.time()), []
         for key, ex, cs in approvals:
             answers, i = res[i:i + len(cs)], i + len(cs)
-            approved = not missing_approvals(self._wallet, key[0], ex, answers, CONSTANTS.APPROVED_AT_LEAST, now)
-            self._report(f"approval {key[0]} -> {key[1]}", "approved" if approved else
+            need = missing_approvals(self._wallet, key[0], ex, answers, CONSTANTS.APPROVED_AT_LEAST, now)
+            self._report(f"approval {key[0]} -> {key[1]}", "approved" if not need else
                          "MISSING: the wallet can't pay this token into this router (one-time approval transactions)")
-            self._approvals[key] = approved
+            self._approvals[key] = not need
+            missing += [c for c in need if c not in missing]            # a token -> Permit2 approve serves both routers
+        self._missing_approvals = missing
         if block is not None:
             self._balances_block = block
         self._balances_read = True
@@ -438,6 +460,75 @@ class BscExchange(ExchangePyBase):
                     for token in (CONSTANTS.USDT, ca):
                         pairs[(token, ex["router"])] = ex
         return pairs
+
+    def _maybe_approve(self):
+        """after a balance read: the approvals it found missing go out (_approve), when trading is on, the wallet has a key
+        and gas, and no earlier batch is still running. One that was included this run is not sent again, even if a read
+        from a node behind still shows it missing"""
+        todo = [c for c in self._missing_approvals if c not in self._approved_sent]
+        if (todo and CONSTANTS.TRADING_ENABLED and self._account is not None and self._gas_ok()
+                and (self._approve_task is None or self._approve_task.done())):
+            self._approve_task = safe_ensure_future(self._approve(todo))
+
+    async def _approve(self, calls: List[Tuple[str, bytes]]):
+        """the missing one-time approvals, sent by the connector itself (Pavel 2026-10-14), one at a time in the wallet's turn,
+        each a bundle like a swap. Every spender is a pinned executor's contract (bsc_swap.EXECUTORS, PINNED_V2_ROUTERS),
+        never one from data. One that doesn't land is tried again after a later balance read"""
+        landed = False
+        for to, data in calls:
+            while self._busy is not None:              # the wallet's one turn: after the swap (or approval) out
+                await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
+            turn = f"approval:{to}:{data[:36].hex()}"
+            self._busy = turn
+            what, record = self._approval_name(to, data), {}
+            try:
+                self.logger().info(f"bsc: sending a one-time approval: {what}")
+                await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT)
+                ended, receipt = False, None
+                while not ended:
+                    await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
+                    try:
+                        ended, receipt = await self._landed(record)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self._warn_swap(record, f"bsc: approval {record['tx_hash']}: its receipt could not be read: "
+                                                f"{self._mask(e)}")
+                if receipt is not None and int(receipt.get("status") or "0x0", 16) == 1:
+                    self._approved_sent.add((to, data))
+                    landed = True
+                    self.logger().info(f"bsc: approved in block {int(receipt['blockNumber'], 16)}: {what}")
+                else:
+                    if receipt is None:
+                        self._nonce = None             # it never landed: its nonce is free, read it anew
+                    self.logger().warning(f"bsc: the approval {what} did not land ("
+                                          f"{'reverted' if receipt else 'not included by its last block'}); it is tried again "
+                                          f"after a later balance read")
+            except BscOrderRefused as e:
+                self.logger().warning(f"bsc: the approval {what} was not sent: {self._mask(e)}")
+            finally:
+                if self._busy == turn:
+                    self._busy = None
+        if landed:                                    # the books show the approved sides at once, not a balance poll later
+            try:
+                await self._update_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass                                  # the balance loop reads again anyway
+
+    def _approval_name(self, to: str, data: bytes) -> str:
+        """an approval call in words: '<token> -> <spender>' (the pinned contracts and the traded tokens by name)"""
+        names = {CONSTANTS.USDT: CONSTANTS.QUOTE}
+        for fam, ex in EXECUTORS.items():
+            names[ex["router"]] = f"{fam} Universal Router"
+            names[ex["permit2"]] = f"{fam} Permit2"
+        for ca, meta in self._pool_list.cas.items():
+            names.setdefault(ca, meta.get("ticker") or ca)
+        name = (lambda a: names.get(a.lower(), a.lower()))
+        first, second = "0x" + data[16:36].hex(), "0x" + data[48:68].hex()
+        return f"{name(first)} -> {name(second)} (via {name(to)})" if to in names and "Permit2" in name(to) else \
+            f"{name(to)} -> {name(first)}"
 
     # ---------------------------------------------------------------- orders: one swap each, one at a time
     def _get_fee(self, base_currency: str, quote_currency: str, order_type: OrderType, order_side: TradeType,
@@ -577,46 +668,95 @@ class BscExchange(ExchangePyBase):
             raise BscOrderRefused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"])
 
-    async def _rpc(self, method: str, params: list):
-        ans = json.loads(await self._post(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()))
-        if "error" in ans:
-            raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
-        return ans.get("result")
-
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                            order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
         """build, sign and send one swap -> (its transaction hash = the exchange order id, the time). Off while
-        TRADING_ENABLED is False or no send method is plugged in (the Sending session's). The swap is followed on chain
-        from here (_receipt_loop) whatever the send call says, unless the node refused it (BscSendRefused)"""
-        if not CONSTANTS.TRADING_ENABLED or self._send is None:
-            raise BscTradingDisabled("bsc: orders are off until the send method exists (its own session)")
+        CONSTANTS.TRADING_ENABLED is False. The swap goes as a bundle to the builders (_send_tx) and is followed on chain
+        from here (_receipt_loop) whatever they answered, unless nothing went out (BscOrderRefused)"""
+        if not CONSTANTS.TRADING_ENABLED:
+            raise BscTradingDisabled("bsc: orders are off (bsc_constants.TRADING_ENABLED)")
         if self._busy != order_id:
-            raise BscOrderRefused(f"one swap at a time: {self._busy} is still out")
+            raise BscOrderRefused("one swap at a time: it was placed while another transaction was out")
         if self._account is None:
             raise BscOrderRefused(self._key_problem or "no wallet key: connect bsc with bsc_private_key")
         swap = self._swap_for(trading_pair, amount, trade_type, price)
         if not self._approvals.get((swap["token_in"], swap["executor"]["router"])):
             raise BscOrderRefused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
-        if self._nonce is None:
-            self._nonce = int(await self._rpc("eth_getTransactionCount", [self._wallet, "pending"]), 16)
-        nonce = self._nonce
-        tx = build_tx(swap["to"], swap["data"], swap["value"], nonce, CONSTANTS.SWAP_GAS_LIMIT, CONSTANTS.GAS_PRICE_WEI)
-        raw, tx_hash = sign(self._account, tx)
-        self._nonce = nonce + 1                       # taken before the send: the transaction may be out even if the call fails
-        self._swaps[order_id] = dict(swap, tx_hash=tx_hash, nonce=nonce, trading_pair=trading_pair)
+        record = dict(swap, trading_pair=trading_pair)
         try:
-            await self._send(raw)
-        except BscSendRefused:                        # nothing went out: the nonce is free again, read it anew
-            self._swaps.pop(order_id, None)
-            self._nonce = None
-            raise
-        except Exception as e:                        # no answer: it may be out, so it is followed like any other
-            self.logger().warning(f"bsc: {order_id}: the send of {tx_hash} did not answer ({self._mask(e)}); "
-                                  f"following it on chain")
+            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT)
         finally:
-            if order_id in self._swaps:
+            if "tx_hash" in record:                   # it may be out (even if this task was cancelled): followed to its end
+                self._swaps[order_id] = record
                 self._swap_sent.set()
-        return tx_hash, time.time()
+        return record["tx_hash"], time.time()
+
+    async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int):
+        """sign the wallet's next transaction and send it as a bundle to every builder, valid for BUNDLE_BLOCKS blocks after
+        the head; its hash, nonce, last block and send time go into `record` (what the lifecycle follows).
+        Raises BscOrderRefused when nothing went out: the nonce or the head unreadable, or every builder refused it
+        (BscSendRefused: the nonce is read anew, and `record` gets no hash). Any other error is an unknown outcome: it may be
+        out, so it is followed."""
+        try:
+            if self._nonce is None:
+                self._nonce = int(await self._read("eth_getTransactionCount", [self._wallet, "pending"]), 16)
+            last_block = int(await self._read("eth_blockNumber", []), 16) + CONSTANTS.BUNDLE_BLOCKS
+            nonce = self._nonce
+            raw, tx_hash = sign(self._account, build_tx(to, data, value, nonce, gas, CONSTANTS.GAS_PRICE_WEI))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise BscOrderRefused(f"not sent: {self._mask(e)}") from None
+        self._nonce = nonce + 1                       # taken before the send: the transaction may be out even if the call fails
+        record.update(tx_hash=tx_hash, nonce=nonce, last_block=last_block, sent=time.time())
+        try:
+            await self._send_bundle(raw, last_block)
+        except BscSendRefused:
+            self._nonce = None                        # nothing went out: its nonce is free again, read it anew
+            for k in ("tx_hash", "nonce", "last_block", "sent"):
+                record.pop(k, None)                   # nothing to follow
+            raise
+        except Exception as e:
+            self.logger().warning(f"bsc: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it on chain")
+
+    async def _send_bundle(self, raw: str, last_block: int):
+        """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
+        one builder takes it. Raises BscSendRefused when every builder refused it (each answered with an error: nothing is
+        out), and RuntimeError when none took it and at least one never answered (unknown: it may be out)"""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle",
+                           "params": [{"txs": [raw], "maxBlockNumber": last_block}]}).encode()
+
+        async def ask(url):
+            try:
+                return url, json.loads(await self._post_to(url, body, timeout=CONSTANTS.SEND_TIMEOUT_S)), None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return url, None, e
+        refused, silent = [], []
+        for answer in asyncio.as_completed([asyncio.ensure_future(ask(url)) for url in CONSTANTS.BUILDERS]):
+            url, ans, err = await answer
+            host = url.split("//", 1)[-1]
+            if err is not None or not isinstance(ans, dict):
+                silent.append(f"{host}: {err or 'not JSON'}")
+            elif "error" not in ans:
+                return                                # taken: anything but an error (the other's answer finishes on its own)
+            else:
+                refused.append(f"{host}: {ans['error']}")
+        if refused and not silent:
+            raise BscSendRefused("every builder refused it: " + "; ".join(refused))
+        raise RuntimeError("no builder took it: " + "; ".join(silent + refused))
+
+    async def _landed(self, record: dict) -> Tuple[bool, Optional[dict]]:
+        """one look at a transaction out -> (ended, its receipt): mined (the receipt), or ended without one when the head is
+        past its last block (a bundle lands by then or never; +1 for a receipt a node behind). The head is asked only once
+        the window can have passed, so a transaction that lands costs one read a look"""
+        receipt = await self._read("eth_getTransactionReceipt", [record["tx_hash"]])
+        if receipt is not None:
+            return True, receipt
+        if time.time() - record["sent"] < CONSTANTS.BUNDLE_BLOCKS * CONSTANTS.BLOCK_S:
+            return False, None
+        return int(await self._read("eth_blockNumber", []), 16) > record["last_block"] + 1, None
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """False, quietly: a sent swap can't be called back. It ends on its own within seconds (its receipt, or its
@@ -650,38 +790,27 @@ class BscExchange(ExchangePyBase):
             await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
 
     def _warn_swap(self, swap: dict, text: str):
-        """a swap's trouble, said once per STUCK_WARN_S (the loop looks at it four times a second)"""
+        """a transaction's trouble, said at most once per WARN_EVERY_S (the loop looks at it ten times a second)"""
         now = time.time()
-        if now - swap.get("warned", 0.0) >= CONSTANTS.STUCK_WARN_S:
+        if now - swap.get("warned", 0.0) >= CONSTANTS.WARN_EVERY_S:
             swap["warned"] = now
             self.logger().warning(text)
 
     async def _follow(self, order_id: str, swap: dict):
-        """one look at a swap out. Mined: it ends (_settle). Not mined DROP_GRACE_S past its deadline: asked for by hash; gone
-        from the node, it ends as dropped (mined later, it could only revert); still pending, the wallet waits for it (its
-        nonce) and says so"""
-        receipt = await self._rpc("eth_getTransactionReceipt", [swap["tx_hash"]])
-        if receipt is not None:
+        """one look at a swap out: mined, or past its last block without a receipt -> it ends (_settle)"""
+        ended, receipt = await self._landed(swap)
+        if ended:
             await self._settle(order_id, swap, receipt)
-            return
-        late = time.time() - swap["deadline"]
-        if late < CONSTANTS.DROP_GRACE_S:
-            return
-        tx = await self._rpc("eth_getTransactionByHash", [swap["tx_hash"]])
-        if tx is None:
-            await self._settle(order_id, swap, None)
-        elif not tx.get("blockNumber"):               # (mined: its receipt is a node behind, the next look has it)
-            self._warn_swap(swap, f"bsc: {order_id} {swap['tx_hash']} is still pending {late:.0f}s past its deadline: it "
-                                  f"can only revert now, and no other swap goes out before it ends (its nonce)")
 
     async def _settle(self, order_id: str, swap: dict, receipt: Optional[dict]):
         """a swap's end (receipt None: dropped). Its receipt's moves go on the balances first, so whoever reads them at the
         fill event sees the trade (the hold band, the balancer); then the fill and FILLED with what it really got, or FAILED,
         processed in place (no 5 s wait: what the swap got IS the order); then the wallet's turn is free"""
         if receipt is None:
-            self._nonce = None                        # its nonce may be free again: read it anew
+            self._nonce = None                        # it never landed, so its nonce is free: read it anew
             state, fill, problem = OrderState.FAILED, None, (
-                "BscSwapDropped", f"not mined {CONSTANTS.DROP_GRACE_S:.0f} s past its deadline and gone from the node")
+                "BscSwapDropped", f"not included by its last block {swap['last_block']}: no builder took it in time, or it "
+                                  f"would have reverted (nothing paid)")
         else:
             parsed = parse_receipt(receipt, self._wallet, swap["token_in"], swap["token_out"])
             self._book_receipt(swap, parsed)
@@ -748,7 +877,7 @@ class BscExchange(ExchangePyBase):
         swap = self._swaps.get(client_order_id)
         if swap is None:
             raise BscOrderRefused(f"no swap out for {client_order_id}")
-        receipt = await self._rpc("eth_getTransactionReceipt", [swap["tx_hash"]])
+        receipt = await self._read("eth_getTransactionReceipt", [swap["tx_hash"]])
         return swap, None if receipt is None else parse_receipt(receipt, self._wallet, swap["token_in"], swap["token_out"])
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
