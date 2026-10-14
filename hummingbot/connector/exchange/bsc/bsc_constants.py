@@ -38,6 +38,11 @@ APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-6
 GAS_PRICE_WEI = 50_000_000        # 0.05 gwei: BSC's floor. All 35 of the Sending session's live sends landed at it
 SWAP_GAS_MAX_BNB = Decimal(SWAP_GAS_LIMIT * GAS_PRICE_WEI).scaleb(-18)   # the most one swap can cost: below it, nothing trades
 APPROVED_AT_LEAST = 1 << 128      # an allowance this large counts as approved (the approvals are for the maximum amount)
+# an approval that did not land (reverted, not included, or refused by every builder) is tried again only after a back-off
+# that starts here and doubles each time, up to the cap: one that can never land (a token whose approve always reverts)
+# would otherwise hold the wallet's one turn for up to BUNDLE_BLOCKS x BLOCK_S at every balance read (Pavel 2026-10-15)
+APPROVE_RETRY_S = 300.0
+APPROVE_RETRY_MAX_S = 3600.0
 
 # Sending (the Sending session, Pavel 2026-10-14; measured from myserver -> wiki P2-DEX Overview §The send paths). Every
 # transaction (a swap, an approval) goes as a one-transaction BUNDLE to both builders at once: 48 Club and BlockRazor build

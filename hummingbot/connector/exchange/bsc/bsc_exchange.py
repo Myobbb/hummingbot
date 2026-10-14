@@ -121,6 +121,7 @@ class BscExchange(ExchangePyBase):
         self._approvals: Dict[tuple, bool] = {}        # (token, router) -> the wallet can pay the token into the router
         self._missing_approvals: List[Tuple[str, bytes]] = []   # the approval calls the last balance read found missing
         self._approved_sent: set = set()               # approval calls included this run (a read behind can't resend them)
+        self._approve_retry: Dict[tuple, Tuple[float, float]] = {}   # approval call -> (not before, its last back-off), after a failure
         self._approve_task: Optional[asyncio.Task] = None
         self._domain = domain
         self._trading_pairs = list(trading_pairs or [])
@@ -482,16 +483,27 @@ class BscExchange(ExchangePyBase):
     def _maybe_approve(self):
         """after a balance read: the approvals it found missing go out (_approve), when trading is on, the wallet has a key
         and gas, and no earlier batch is still running. One that was included this run is not sent again, even if a read
-        from a node behind still shows it missing"""
-        todo = [c for c in self._missing_approvals if c not in self._approved_sent]
+        from a node behind still shows it missing; one that failed waits out its back-off (_approve_back_off)"""
+        now = time.time()
+        todo = [c for c in self._missing_approvals
+                if c not in self._approved_sent and self._approve_retry.get(c, (0.0, 0.0))[0] <= now]
         if (todo and CONSTANTS.TRADING_ENABLED and self._account is not None and self._gas_ok()
                 and (self._approve_task is None or self._approve_task.done())):
             self._approve_task = safe_ensure_future(self._approve(todo))
 
+    def _approve_back_off(self, call: Tuple[str, bytes]) -> float:
+        """an approval that failed (reverted, not included, or not sent) is tried again only after a back-off: APPROVE_RETRY_S
+        the first time, doubled each time after, at most APPROVE_RETRY_MAX_S (Pavel 2026-10-15). One that can never land then
+        can't hold the wallet's turn at every balance read. -> the back-off, in s"""
+        last = self._approve_retry.get(call, (0.0, 0.0))[1]
+        delay = min(last * 2, CONSTANTS.APPROVE_RETRY_MAX_S) if last else CONSTANTS.APPROVE_RETRY_S
+        self._approve_retry[call] = (time.time() + delay, delay)
+        return delay
+
     async def _approve(self, calls: List[Tuple[str, bytes]]):
         """the missing one-time approvals, sent by the connector itself (Pavel 2026-10-14), one at a time in the wallet's turn,
         each a bundle like a swap. Every spender is a pinned executor's contract (bsc_swap.EXECUTORS, PINNED_V2_ROUTERS),
-        never one from data. One that doesn't land is tried again after a later balance read"""
+        never one from data. One that doesn't land is tried again after its back-off (_approve_back_off)"""
         landed = False
         for to, data in calls:
             while self._busy is not None:              # the wallet's one turn: after the swap (or approval) out
@@ -514,16 +526,20 @@ class BscExchange(ExchangePyBase):
                                                 f"{self._mask(e)}")
                 if receipt is not None and int(receipt.get("status") or "0x0", 16) == 1:
                     self._approved_sent.add((to, data))
+                    self._approve_retry.pop((to, data), None)
                     landed = True
                     self.logger().info(f"bsc: approved in block {int(receipt['blockNumber'], 16)}: {what}")
                 else:
                     if receipt is None:
                         self._nonce = None             # it never landed: its nonce is free, read it anew
+                    delay = self._approve_back_off((to, data))
                     self.logger().warning(f"bsc: the approval {what} did not land ("
                                           f"{'reverted' if receipt else 'not included by its last block'}); it is tried again "
-                                          f"after a later balance read")
+                                          f"in {delay / 60:.0f} min")
             except BscOrderRefused as e:
-                self.logger().warning(f"bsc: the approval {what} was not sent: {self._mask(e)}")
+                delay = self._approve_back_off((to, data))
+                self.logger().warning(f"bsc: the approval {what} was not sent: {self._mask(e)}; it is tried again in "
+                                      f"{delay / 60:.0f} min")
             finally:
                 if self._busy == turn:
                     self._busy = None
