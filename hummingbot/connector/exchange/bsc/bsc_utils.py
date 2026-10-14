@@ -37,6 +37,19 @@ class BscConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    # The wallet's credential, like a CEX API secret: stored encrypted with the Hummingbot password (the Ethereum v3
+    # keyfile format, config_crypt). It is checked by the connector, never here: at login HMB validates this model while
+    # the secret fields still hold their encrypted text, so a format check here would refuse every stored key and stop
+    # HMB's login. The empty default keeps a bsc.yml written before this field loading (books and balances only).
+    bsc_private_key: SecretStr = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Enter the private key of that wallet (stored encrypted with your Hummingbot password)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
     model_config = ConfigDict(title="bsc")
 
 

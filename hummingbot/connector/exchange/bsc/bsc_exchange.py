@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import types
 from decimal import Decimal
@@ -7,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from bidict import bidict
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.exchange.bsc import bsc_constants as CONSTANTS
@@ -54,13 +57,18 @@ class BscExchange(ExchangePyBase):
     - Trading rules: from P1's records (the CA's decimals and reference price).
     - Orders: OFF in step 3. Every order is refused and the connector never reports ready (CONSTANTS.TRADING_ENABLED), so
       the orchestrator never ticks a strategy with a bsc leg.
-    The node URL carries its key: it never reaches a log (_mask)."""
+    - The wallet, like a CEX key pair: `bsc_wallet_address` names it, `bsc_private_key` (stored encrypted by `connect bsc`)
+      must control it. The key lives only inside its signer (eth_account, local signing: no network hop). A key that is
+      not valid, or controls another address, fails the balance read, so `connect bsc` reports it and keeps no bad key.
+      No key: books and balances only, never ready.
+    The node URL carries its key, and the wallet key is a key: neither reaches a log (_mask)."""
 
     web_utils = None
 
     def __init__(self,
                  bsc_rpc_url: str,
                  bsc_wallet_address: str,
+                 bsc_private_key: str = "",
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -68,6 +76,7 @@ class BscExchange(ExchangePyBase):
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
         self._rpc_url = (bsc_rpc_url or "").strip()
         self._wallet = (bsc_wallet_address or "").strip().lower()
+        self._account, self._key_problem = self._load_key(bsc_private_key)
         self._domain = domain
         self._trading_pairs = list(trading_pairs or [])
         self._trading_required = trading_required
@@ -145,8 +154,24 @@ class BscExchange(ExchangePyBase):
             "order_books_initialized": self.order_book_tracker.ready,
             "account_balance": not self.is_trading_required or self._balances_read,
             "trading_rule_initialized": len(self._trading_rules) > 0 if self.is_trading_required else True,
+            "wallet_key": self._account is not None,          # a key that controls the wallet: no key, no trading
             "trading_enabled": self.trading_enabled,          # step 3: books and balances only (bsc_constants)
         }
+
+    # ---------------------------------------------------------------- the wallet
+    def _load_key(self, private_key: str) -> Tuple[Optional[LocalAccount], str]:
+        """-> (the wallet's signer, "") or (None, why). The key is never kept as text, printed or put in a message: only
+        the signer holds it. No key: (None, "")."""
+        private_key = (private_key or "").strip()
+        if not private_key:
+            return None, ""
+        try:
+            account = Account.from_key(private_key)
+        except Exception:
+            return None, "bsc_private_key is not a valid private key"
+        if account.address.lower() != self._wallet:
+            return None, f"bsc_private_key does not control {self._wallet or 'bsc_wallet_address (empty)'}"
+        return account, ""
 
     # ---------------------------------------------------------------- the node
     def _mask(self, text: Any) -> str:
@@ -156,6 +181,8 @@ class BscExchange(ExchangePyBase):
             key = self._rpc_url.rstrip("/").rsplit("/", 1)[-1]
             if len(key) >= 16:
                 text = text.replace(key, "<key>")
+        if self._account is not None:
+            text = re.sub(self._account.key.hex().removeprefix("0x"), "<pk>", text, flags=re.IGNORECASE)
         return text
 
     async def _post(self, body: bytes) -> bytes:
@@ -300,6 +327,8 @@ class BscExchange(ExchangePyBase):
 
     async def _update_balances(self):
         """the wallet's BNB, USDT and traded tokens in one multicall; an asset whose call fails keeps its last value"""
+        if self._key_problem:
+            raise ValueError(self._key_problem)       # `connect bsc` shows it and keeps no bad key
         if not self._wallet:
             return
         tokens = {CONSTANTS.QUOTE: (CONSTANTS.USDT, CONSTANTS.USDT_DECIMALS)}
