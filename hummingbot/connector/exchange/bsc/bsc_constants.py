@@ -16,9 +16,13 @@ SEL_ETH_BALANCE = "4d2301cc"      # Multicall3.getEthBalance(address)
 SEL_BLOCK_NUMBER = "42cbb15c"     # Multicall3.getBlockNumber(): the block a balance read saw
 SEL_BALANCE_OF = "70a08231"       # ERC-20 balanceOf(address)
 
-RPC_TIMEOUT_S = 10.0
+# Every request has a timeout (audit 2026-10-15: aiohttp takes timeout=None as no timeout at all, and none was ever set,
+# so one stalled connection could hold the book poll, or the wallet's turn, until TCP gave up)
+RPC_TIMEOUT_S = 2.0               # a node request (BlockPI: the book poll, the balances, check_network): p50 0.2 s from myserver
+READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle on SWAP_READ_URL (receipts, the head, the nonce): 3 ms away
 BALANCE_POLL_S = 15.0             # WIP (Pavel 2026-10-14: relaxed for now, tuned later)
-STALE_S = 5.0                     # no good poll, or a block older than this: every book goes empty (P1's B7: never a kept price)
+STALE_S = 5.0                     # a book whose block is older than this goes empty, however its poll ended (P1's B7: never a
+                                  # kept price); a poll is never waited for past that moment
 FIRST_POLL_WAIT_S = 10.0          # how long a pair's first book waits for the first poll before it starts empty
 SUMMARY_EVERY_S = 300.0           # the data source's summary line (DEBUG; a state change is INFO)
 
@@ -63,3 +67,9 @@ SEND_TIMEOUT_S = 2.0              # a builder that hasn't answered a bundle by t
 WARN_EVERY_S = 30.0               # a transaction's trouble (an unreadable receipt) is said at most this often
 PRICE_SLACK = Decimal("1e-6")     # the limit check's relative slack: a strategy's limit and the book's levels are the same
                                   # prices read through float and Decimal, which differ in the last digits
+# The room a swap's minimum output leaves past its limit price (Pavel 2026-10-15: "build it with 0.3%"). arb_l's limit is the
+# deepest level its scan touched, so an order inside one level had a minimum equal to the book's own output, and any adverse
+# tick between the book's block and the swap's (the WBNB/USDT hop moves in about half of all blocks) made it revert, leaving
+# its CEX leg alone: 21-26% of such legs never landed, even with the bundle's retries (audit 2026-10-15, finding 2). Ticks
+# go both ways, so on average the fill is still the book's; this is only how far one may slip instead of failing.
+SWAP_SLIPPAGE = Decimal("0.003")

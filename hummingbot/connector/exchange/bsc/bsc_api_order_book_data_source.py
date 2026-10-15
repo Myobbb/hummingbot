@@ -12,8 +12,9 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """The chain's books, polled (P2-DEX step 3, 2026-10-14). listen_for_subscriptions, which the tracker runs where a socket
     would be, runs the connector's poll every POLL_S: one eth_call (bsc_quoter.BscQuoter). Each poll hands the tracker a
     SNAPSHOT per trading pair, never a diff (the runbook: never mix the two). A pair with no book gets an empty one: a market
-    that is off looks empty, never dropped. No good poll for STALE_S, or a block older than that: every book goes empty, so a
-    DEX price is never kept alive (P1's B7)."""
+    that is off looks empty, never dropped. Every book goes empty once the block it was priced at is STALE_S old, however
+    its poll ended (a failed call, an answer from an old block, a node too slow to answer: a poll is never waited for past
+    that moment), so a DEX price is never kept alive (P1's B7)."""
 
     def __init__(self, trading_pairs: List[str], connector):
         super().__init__(trading_pairs)
@@ -24,6 +25,8 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._stale = False
         self._last_summary = time.time()
         self.last_ok = 0.0
+        self.book_ts = time.time()                    # the timestamp of the block the books on show were priced at (a
+                                                      # start counts as one: no good poll within STALE_S of it is an outage)
         self.last_block: Optional[int] = None
         self.last_error: Optional[str] = None
         self.polls = 0
@@ -32,7 +35,7 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
     def reset(self):
         """a (re)start never shows an earlier run's books: each pair's first snapshot waits for a fresh poll (HMB's network
         iterator stops and starts the connector on every reconnect)"""
-        self._books, self._stale = {}, False
+        self._books, self._stale, self.book_ts = {}, False, time.time()
         self._first_poll.clear()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
@@ -60,17 +63,48 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _parse_order_book_snapshot_message(self, raw_message: Any, message_queue: asyncio.Queue):
         message_queue.put_nowait(raw_message)         # already an OrderBookMessage
 
+    def _life(self) -> Optional[float]:
+        """how long the books on show stay fresh: until the block they were priced at is STALE_S old (None: none on show)"""
+        return None if self._stale else self.book_ts + CONSTANTS.STALE_S - time.time()
+
+    def _expire(self) -> bool:
+        """the books on show go empty once the block they were priced at is STALE_S old, whatever the poll is doing (audit
+        2026-10-15: they went empty only STALE_S after the last good poll, ~10 s in all, and never while a poll hung).
+        -> True when they just did; the empty books are handed to the tracker at once"""
+        life = self._life()
+        if life is None or life > 0:
+            return False
+        self._stale, self._books = True, {}
+        self.logger().warning(f"bsc: no fresh poll for {CONSTANTS.STALE_S:.0f} s, every book is empty: {self.last_error}")
+        self._push()
+        return True
+
+    def _push(self):
+        """one SNAPSHOT per trading pair of the books on show"""
+        queue = self._message_queue[self._snapshot_messages_queue_key]
+        for trading_pair in list(self._trading_pairs):
+            queue.put_nowait(self._snapshot(trading_pair))
+
     async def listen_for_subscriptions(self):
-        """the poll loop, in place of a socket"""
+        """the poll loop, in place of a socket. A poll is never waited for past the moment the books on show turn stale, and
+        the loop never sleeps past it either; each node call has its own timeout (RPC_TIMEOUT_S)"""
         while True:
             t0 = time.time()
+            self._expire()                                    # they may have turned stale while the loop slept
             try:
-                last = await self._connector._poll_books()
+                poll, life = self._connector._poll_books(), self._life()
+                if life is None:
+                    last = await poll                         # no book on show: each node call's own timeout bounds it
+                else:
+                    try:
+                        last = await asyncio.wait_for(poll, timeout=life)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"no answer before the books turned {CONSTANTS.STALE_S:.0f} s old") from None
                 age = t0 - last["ts"] if last.get("ts") else 0.0
                 if age > CONSTANTS.STALE_S:
                     raise RuntimeError(f"block {last.get('block')} is {age:.1f} s old")
                 self._books = self._connector._books_by_pair(last)
-                self.last_ok, self.last_block = time.time(), last.get("block")
+                self.last_ok, self.last_block, self.book_ts = time.time(), last.get("block"), last.get("ts") or t0
                 self.polls += 1
                 self._first_poll.set()
                 if self._stale:
@@ -81,14 +115,11 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception as e:
                 self.failed += 1
                 self.last_error = self._connector._mask(f"{type(e).__name__}: {e}")[:300]
-                if time.time() - self.last_ok > CONSTANTS.STALE_S and not self._stale:
-                    self._stale, self._books = True, {}
-                    self.logger().warning(f"bsc: no fresh poll for {CONSTANTS.STALE_S:.0f} s, every book is empty: {self.last_error}")
-            queue = self._message_queue[self._snapshot_messages_queue_key]
-            for trading_pair in list(self._trading_pairs):
-                queue.put_nowait(self._snapshot(trading_pair))
+            if not self._expire():
+                self._push()
             self._summary()
-            await asyncio.sleep(max(0.0, POLL_S - (time.time() - t0)))
+            life = self._life()
+            await asyncio.sleep(max(0.0, min(POLL_S - (time.time() - t0), life if life is not None else POLL_S)))
 
     def _summary(self):
         now = time.time()

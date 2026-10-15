@@ -84,10 +84,11 @@ class BscExchange(ExchangePyBase):
       (CONSTANTS.BUILDERS), valid for BUNDLE_BLOCKS blocks: it lands by then or never (nothing paid, its nonce free again), and
       one that would revert is not included. The lifecycle's reads (receipts, the head, the nonce) are on SWAP_READ_URL.
     - A swap venue (`is_swap_venue`, 2026-10-14): an order is one immediate swap, never resting, never cancelled; the limit
-      price is the worst average price accepted (no price grid). ONE swap at a time per wallet: an order takes the wallet's
-      turn when it is placed and every available balance reads 0 until it ends, so the strategies (arb_l, the balancer),
-      which size by it, place nothing here meanwhile. Each swap out is followed on chain (_receipt_loop) and ends about a
-      block after it is mined: FILLED with what it really got, or FAILED (reverted, or not included by its last block).
+      price plus the SWAP_SLIPPAGE room is the worst average price accepted (no price grid). ONE swap at a time per
+      wallet: an order takes the wallet's turn when it is placed and every available balance reads 0 until it ends, so
+      the strategies (arb_l, the balancer), which size by it, place nothing here meanwhile. Each swap out is followed on
+      chain (_receipt_loop) and ends about a block after it is mined: FILLED with what it really got, or FAILED (reverted,
+      or not included by its last block).
     - Approvals are read with the balances. A book side the wallet can't pay into its executor is not shown, so no
       strategy fires a CEX leg against a DEX leg that would be refused. A missing approval is sent by the connector itself
       (trading on), one at a time in the wallet's turn, to the pinned executors' contracts only (bsc_swap).
@@ -239,12 +240,13 @@ class BscExchange(ExchangePyBase):
         return await self._post_to(self._rpc_url, body)
 
     async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None) -> bytes:
-        """one JSON-RPC POST on the connector's kept-alive session: the node, the swap reads, the builders"""
+        """one JSON-RPC POST on the connector's kept-alive session: the node, the swap reads, the builders. Every request has
+        a timeout, RPC_TIMEOUT_S unless the caller gives its own (aiohttp takes timeout=None as no timeout at all)"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CONSTANTS.RPC_TIMEOUT_S))
         try:
             async with self._session.post(url, data=body, headers={"Content-Type": "application/json"},
-                                          timeout=aiohttp.ClientTimeout(total=timeout) if timeout else None) as r:
+                                          timeout=aiohttp.ClientTimeout(total=timeout or CONSTANTS.RPC_TIMEOUT_S)) as r:
                 return await r.read()
         except asyncio.CancelledError:
             raise
@@ -254,7 +256,7 @@ class BscExchange(ExchangePyBase):
     async def _read(self, method: str, params: list):
         """one read on the swap lifecycle's endpoint (receipts, the head, the nonce): CONSTANTS.SWAP_READ_URL"""
         ans = json.loads(await self._post_to(CONSTANTS.SWAP_READ_URL, json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()))
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=CONSTANTS.READ_TIMEOUT_S))
         if "error" in ans:
             raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
         return ans.get("result")
@@ -632,9 +634,10 @@ class BscExchange(ExchangePyBase):
 
     def _book_route(self, ca: str, side: str, usd: float) -> Tuple[dict, dict, List[dict]]:
         """the current (ca, side) book, its CA pool's record and its hop route at the smallest priced rung of at least `usd`
-        (else the largest): the swap runs exactly where its book was priced"""
+        (else the largest): the swap runs exactly where its book was priced. A book whose block is STALE_S old is no book,
+        the rule that empties the books on show"""
         last = self._quoter.last
-        if not last or time.time() - self._orderbook_ds.last_ok > CONSTANTS.STALE_S:
+        if not last or time.time() - (last.get("ts") or 0) > CONSTANTS.STALE_S:
             raise BscOrderRefused("no fresh book")
         book = (last.get("books") or {}).get(ca, {}).get(side)
         if not book:
@@ -659,13 +662,16 @@ class BscExchange(ExchangePyBase):
         return value + max(left, Decimal(0)) * price
 
     def _swap_for(self, trading_pair: str, amount: Decimal, trade_type: TradeType, price: Decimal) -> dict:
-        """the order as one exact-input swap along its book's route. The limit price is the worst AVERAGE price accepted
-        (Pavel 2026-10-14: output at least x is the protection):
+        """the order as one exact-input swap along its book's route. The limit price, plus the SWAP_SLIPPAGE room, is the worst
+        AVERAGE price accepted (Pavel 2026-10-14: output at least x is the protection; 2026-10-15: "build it with 0.3%"):
           - a buy spends the book's own cost of `amount` (not amount x limit, which bought past `amount` from the curve's
-            tail) and must receive at least cost / limit CA;
-          - a sell spends `amount` CA and must receive at least amount x limit USDT.
-        An order the current book already prices past its limit (beyond PRICE_SLACK) is refused: it could only revert. Within
-        the slack the minimum is the book's own output: the limit's, uncapped, would ask for more than the book gives."""
+            tail) and must receive at least cost / (limit x (1 + room)) CA;
+          - a sell spends `amount` CA and must receive at least amount x limit x (1 - room) USDT.
+        Without the room, an order inside one level of the book (its limit is that level's price) had a minimum equal to
+        the book's own output, so any adverse tick before it landed made it revert (CONSTANTS.SWAP_SLIPPAGE).
+        An order the current book already prices past its limit and the room (beyond PRICE_SLACK) is refused: it could only
+        revert. Within the slack the minimum is the book's own output: the limit's, uncapped, would ask for more than the
+        book gives."""
         ca, why = self._ca_for_pair(trading_pair)
         if not ca:
             raise BscOrderRefused(why)
@@ -680,19 +686,24 @@ class BscExchange(ExchangePyBase):
                 raise BscOrderRefused(f"{amount} at {price} is nothing to swap")
             value = self._book_value(book["levels"], amount, price)      # the book's cost (buy) / proceeds (sell) of `amount`
             slack = at_limit * CONSTANTS.PRICE_SLACK
+            room = f"{CONSTANTS.SWAP_SLIPPAGE * 100:g}%"
             if side == "buy":
-                if value > at_limit + slack:
-                    raise BscOrderRefused(f"the book moved past the limit: {amount} costs {value:.8g} > {at_limit:.8g} USDT")
+                worst_px = price * (1 + CONSTANTS.SWAP_SLIPPAGE)              # the worst average price accepted
+                if value > amount * worst_px + slack:
+                    raise BscOrderRefused(f"the book moved past the limit and its {room} room: {amount} costs {value:.8g} > "
+                                          f"{amount * worst_px:.8g} USDT")
                 amount_in = int((value * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
-                min_out = int((min(value / price, amount) * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
+                min_out = int((min(value / worst_px, amount) * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
                 tax = Decimal(str((record.get("tax_pct") or {}).get("buy") or 0)) / 100
                 if tax and record.get("type") != "v2":  # the router checks a v3 / v4 / Infinity pool's output before the tax
                     min_out = int((min_out / (1 - tax)).to_integral_value(rounding=ROUND_DOWN)) + 1
             else:
-                if value < at_limit - slack:
-                    raise BscOrderRefused(f"the book moved past the limit: {amount} brings {value:.8g} < {at_limit:.8g} USDT")
+                worst_px = price * (1 - CONSTANTS.SWAP_SLIPPAGE)              # the worst average price accepted
+                if value < amount * worst_px - slack:
+                    raise BscOrderRefused(f"the book moved past the limit and its {room} room: {amount} brings {value:.8g} < "
+                                          f"{amount * worst_px:.8g} USDT")
                 amount_in = qty
-                min_out = int((min(at_limit, value) * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(
+                min_out = int((min(amount * worst_px, value) * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(
                     rounding=ROUND_DOWN))
         if amount_in <= 0 or min_out <= 0:
             raise BscOrderRefused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
