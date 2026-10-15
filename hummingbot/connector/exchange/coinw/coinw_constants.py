@@ -217,6 +217,12 @@ EMPTY_BALANCE_SECONDS = 60.0
 # An asset missing from a non-empty answer is dropped (CoinW lists held coins only) once it has been missing from this
 # many answers in a row: one partial answer would zero a held position, and the hold-band would buy it back.
 BALANCE_MISSING_READS = 2
+# CoinW pushes NO balance for an order's hold (placement, cancel): the `assets` channel fires only with trading or a
+# transfer (docs "Subscribe Assets"; the placement probe, 2026-10-16), and no other private channel exists (the docs,
+# live and the P1 copy: `order` + `assets`; the website subscribes to the same). So each order push (RECEIVED: a hold
+# placed; DONE: a hold released) triggers one REST balance read, this long after the last push of a burst; without
+# it the available balance would wait for the status poll (up to 60 s once no order is open).
+BALANCE_REFRESH_DEBOUNCE_S = 0.3
 
 # --- First-live-run audit logging ----------------------------------------------------------------------------
 # Every line is tagged [CW-AUDIT]; scoped to what the docs could not settle. Money-guard firings always log as

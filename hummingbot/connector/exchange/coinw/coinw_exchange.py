@@ -130,6 +130,9 @@ class CoinwExchange(ExchangePyBase):
         # assets whose push asked for a fills read (debounced)
         self._fills_check_pending: Set[str] = set()
         self._fills_check_task: Optional[asyncio.Task] = None
+        # a REST balance read asked by an order push (CoinW pushes no balance for a hold), debounced
+        self._balance_refresh_task: Optional[asyncio.Task] = None
+        self._balance_refresh_again = False
         # per asset: answers in a row it was missing from (dropped at BALANCE_MISSING_READS)
         self._missing_balance_reads: Dict[str, int] = {}
         # client ids this process gave up (failed, or struck as not found): a later push for one is ours, untracked
@@ -1437,6 +1440,8 @@ class CoinwExchange(ExchangePyBase):
             for seen in list(self._pushed_order_ids)[:2000]:
                 del self._pushed_order_ids[seen]
         event = str(data.get("type") or "").upper()
+        if event in (CONSTANTS.PUSH_RECEIVED, CONSTANTS.PUSH_DONE):
+            self._schedule_balance_refresh()
         reason = str(data.get("reason") or "").upper()
         size, remaining = self._dec(data.get("size")), self._dec(data.get("remaining_size"))
         has_amounts = data.get("size") not in (None, "") and data.get("remaining_size") not in (None, "")
@@ -1600,6 +1605,29 @@ class CoinwExchange(ExchangePyBase):
             self._fills_check_pending.add(asset)
             if self._fills_check_task is None or self._fills_check_task.done():
                 self._fills_check_task = safe_ensure_future(self._fills_check_after_push())
+
+    def _schedule_balance_refresh(self) -> None:
+        """An order push (a hold placed or released) asks for one REST balance read: CoinW pushes no balance for a hold
+        (BALANCE_REFRESH_DEBOUNCE_S). Not while rate-limited: the slowed poll reads balances then."""
+        if self._rate_limited():
+            return
+        if self._balance_refresh_task is not None and not self._balance_refresh_task.done():
+            self._balance_refresh_again = True
+            return
+        self._balance_refresh_task = safe_ensure_future(self._refresh_balances_after_push())
+
+    async def _refresh_balances_after_push(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(CONSTANTS.BALANCE_REFRESH_DEBOUNCE_S)
+                self._balance_refresh_again = False      # pushes during the wait are covered by this read
+                await self._update_balances()
+                if not self._balance_refresh_again:      # one landed while the read was in flight: read again
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().warning(f"CoinW balance read after an order push failed; the poll reads them: {self._scrub(e)}")
 
     async def _fills_check_after_push(self) -> None:
         """Debounced: the open orders on coins whose balance moved get their state and fills read now; a push that
