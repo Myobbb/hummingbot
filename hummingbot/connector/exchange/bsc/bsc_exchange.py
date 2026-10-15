@@ -73,8 +73,9 @@ class BscExchange(ExchangePyBase):
     - Pools: P1 hands over each candidate's pool records through the page -> watcher path; the watcher writes them to
       ~/p2_dex/<ca>.json (bsc_pool_list.PoolList). A trading pair is P1's ticker + "-USDT", bound to the CA its strategy's
       leg names (`bsc:MUBARAK-USDT:0x5c85…`, bind_ca by the orchestrator); an unbound pair has no book.
-    - Balances: the wallet's BNB, USDT and traded tokens, one multicall every BALANCE_POLL_S, and each swap's receipt booked
-      on them the moment it is read (a strategy sees a fill in the balances when its event fires).
+    - Balances: the wallet's BNB, USDT and traded tokens (and its approvals), read inside each book poll's one eth_call at
+      the books' block, with no request of their own (Pavel 2026-10-15), and each swap's receipt booked on them the moment
+      it is read (a strategy sees a fill in the balances when its event fires).
     - Trading rules: from P1's records (the CA's decimals and reference price). No minimum notional: a DEX has none.
     - Orders (step 4): one exact-input swap per order along the route that priced its book (bsc_swap), signed by the wallet
       (bsc_tx); the transaction hash is the exchange order id; the receipt gives the fill (what really moved at the wallet,
@@ -83,6 +84,10 @@ class BscExchange(ExchangePyBase):
     - Sending (the Sending session, Pavel 2026-10-14): every transaction goes as a one-transaction bundle to both builders
       (CONSTANTS.BUILDERS), valid for BUNDLE_BLOCKS blocks: it lands by then or never (nothing paid, its nonce free again), and
       one that would revert is not included. The lifecycle's reads (receipts, the head, the nonce) are on SWAP_READ_URL.
+    - Placing a swap is ONE request, its bundle (Pavel 2026-10-15: an arb leg's placement must not wait on anything else):
+      its last block comes from its book's block and age (no head read), and the wallet's nonce is known beforehand, read off
+      the order path after a wallet read, or the moment a transaction ends without landing, in its turn. The balances it is
+      sized by are memory: the receipts' moves booked as each swap ends, and each poll's wallet read for the rest.
     - A swap venue (`is_swap_venue`, 2026-10-14): an order is one immediate swap, never resting, never cancelled; the limit
       price plus the SWAP_SLIPPAGE room is the worst average price accepted (no price grid). ONE swap at a time per
       wallet: an order takes the wallet's turn when it is placed and every available balance reads 0 until it ends, so
@@ -133,7 +138,8 @@ class BscExchange(ExchangePyBase):
         self._quoted_pairs: Optional[tuple] = None    # the trading pairs and their CAs the quoter was last set for
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._balance_task: Optional[asyncio.Task] = None
+        self._nonce_task: Optional[asyncio.Task] = None   # the nonce read in the background after a wallet read
+        self._idle = False                             # the last poll found no DEX pair to quote (and made no call)
         self._balances_read = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -267,24 +273,26 @@ class BscExchange(ExchangePyBase):
         await self.stop_network()
         self._reload_pools()
         self._orderbook_ds.reset()
-        self.order_book_tracker.start()            # its data source runs the poll loop
+        self.order_book_tracker.start()            # its data source runs the poll loop, the wallet read in each poll
         if self.is_trading_required:
-            self._balance_task = safe_ensure_future(self._balance_loop())
             self._receipt_task = safe_ensure_future(self._receipt_loop())   # also picks up swaps still out from before
 
     async def stop_network(self):
         await super().stop_network()
-        for task in (self._balance_task, self._receipt_task, self._approve_task):
+        for task in (self._receipt_task, self._approve_task, self._nonce_task):
             if task is not None:
                 task.cancel()
-        self._balance_task = self._receipt_task = self._approve_task = None
+        self._receipt_task = self._approve_task = self._nonce_task = None
+        self._idle = False                             # a restart's first network check reads the node again
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
 
     async def check_network(self) -> NetworkStatus:
-        """a fresh poll answers by itself; otherwise one eth_blockNumber (the poll only runs after start_network)"""
-        if time.time() - self._orderbook_ds.last_ok < CONSTANTS.STALE_S:
+        """a fresh poll answers by itself; so does an idle connector (no DEX pair to quote: nothing is polled, and the first
+        poll when a pair comes checks the node itself); otherwise one eth_blockNumber (the poll only runs after
+        start_network)"""
+        if self._idle or time.time() - self._orderbook_ds.last_ok < CONSTANTS.STALE_S:
             return NetworkStatus.CONNECTED
         try:
             ans = json.loads(await self._post(b'{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'))
@@ -361,9 +369,50 @@ class BscExchange(ExchangePyBase):
         return TradingRule(trading_pair=trading_pair, min_order_size=step, min_price_increment=price_step,
                            min_base_amount_increment=step, min_notional_size=Decimal(0))
 
-    async def _poll_books(self) -> dict:
+    async def _poll_books(self) -> Optional[dict]:
+        """one eth_call: the books, and the wallet's balances and approvals at the same block (Pavel 2026-10-15: the wallet
+        read rides along, no request of its own; BlockPI bills an eth_call 20 RU whatever it carries, up to a 1 MB answer).
+        None, and no call at all, while no traded pair has a CA to quote (Pavel 2026-10-15: "obviously we should stop
+        polling when no dex strategy is left"; audit finding 9: the orchestrator evicts a pair, not the connector, so an
+        empty poll went out every second, ~52M RU a month). The next poll after a pair is bound quotes it"""
         self._reload_pools()
-        return await self._quoter.poll()
+        if not self._quoter.cas:
+            self._idle = True
+            self._report("poll", "idle: no DEX pair to quote, nothing is polled")
+            return None
+        if self._idle:
+            self._idle = False
+            self._report("poll", f"polling again: {len(self._quoter.cas)} CA(s) to quote")
+        self._quoter.caps = self._ladder_caps()
+        trading = self.is_trading_required and bool(self._wallet)
+        if trading and self._key_problem:
+            self._report("wallet", f"not read: {self._key_problem}")
+        plan = self._wallet_plan() if trading and not self._key_problem else None
+        self._quoter.extra = plan["calls"] if plan else []
+        last = await self._quoter.poll()
+        got = last.get("extra") or []
+        if plan and [c for c, _ in got] == plan["calls"]:   # this poll's answers (an older block's poll gives back the last)
+            self._apply_wallet(plan, [a for _, a in got], last.get("block"))
+            self._after_wallet_read()
+        return last
+
+    def _ladder_caps(self) -> Dict[str, dict]:
+        """per traded CA what the wallet can put into one swap, where its book's ladders end (Pavel 2026-10-15: 350 USDT ->
+        "100 / 250 / 325 quotes and executables"): {"buy": the USDT less arb_l's ARB_QUOTE_RESERVE (the most arb_l spends),
+        "sell": the CA held, raw}. From the TOTAL balances: a swap out reads 0 available, and its book must not collapse
+        meanwhile. {} until the first balance read (the quoter then quotes the $100 rung only)"""
+        if not self._balances_read:
+            return {}
+        usdt = float(self._account_balances.get(CONSTANTS.QUOTE, Decimal(0)) - CONSTANTS.ARB_QUOTE_RESERVE)
+        caps = {}
+        for trading_pair in self._trading_pairs:
+            ca, _ = self._ca_for_pair(trading_pair)
+            if ca:
+                held = self._account_balances.get(trading_pair.split("-")[0].upper(), Decimal(0))
+                caps[ca] = {"buy": max(usdt, 0.0),
+                            "sell": int(held.scaleb(int(self._pool_list.cas[ca]["decimals"])).to_integral_value(
+                                rounding=ROUND_DOWN))}
+        return caps
 
     def _books_by_pair(self, last: dict) -> Dict[str, tuple]:
         """trading pair -> (bids, asks) as [[price, qty], ...]: the asks are the CA bought on the DEX ("buy"), the bids sold"""
@@ -409,27 +458,10 @@ class BscExchange(ExchangePyBase):
         return []
 
     # ---------------------------------------------------------------- balances
-    async def _balance_loop(self):
-        """the balances every BALANCE_POLL_S; after each read, any missing approval is sent (_maybe_approve). Only a started
-        connector runs this loop, so a `connect bsc` key check never sends anything"""
-        while True:
-            try:
-                await self._update_balances()
-                self._maybe_approve()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().warning(f"bsc: balance read failed: {self._mask(e)}")
-            await asyncio.sleep(CONSTANTS.BALANCE_POLL_S)
-
-    async def _update_balances(self):
-        """the wallet's BNB, USDT and traded tokens, and whether each token it may pay is approved for its router, in one
-        multicall; an asset whose call fails keeps its last value. The read says which block it saw: one older than a receipt
-        already booked on the balances (a node behind the one that served the receipt) is dropped, as it would undo the fill"""
-        if self._key_problem:
-            raise ValueError(self._key_problem)       # `connect bsc` shows it and keeps no bad key
-        if not self._wallet:
-            return
+    def _wallet_plan(self) -> dict:
+        """the wallet's reads: its BNB, USDT and traded tokens, and whether each token it may pay is approved for its router.
+        A started connector has them answered inside each book poll's one eth_call, at the books' block (_poll_books; Pavel
+        2026-10-15: no request of their own); `connect bsc` reads them once (_update_balances)"""
         tokens = {CONSTANTS.QUOTE: (CONSTANTS.USDT, CONSTANTS.USDT_DECIMALS)}
         for trading_pair in self._trading_pairs:
             ca, _ = self._ca_for_pair(trading_pair)
@@ -438,22 +470,48 @@ class BscExchange(ExchangePyBase):
         calls = [(CONSTANTS.MULTICALL3, bytes.fromhex(CONSTANTS.SEL_ETH_BALANCE) + adr(self._wallet))]
         calls += [(address, bytes.fromhex(CONSTANTS.SEL_BALANCE_OF) + adr(self._wallet)) for address, _ in tokens.values()]
         approvals = [(key, ex, allowance_calls(self._wallet, key[0], ex)) for key, ex in self._approval_pairs().items()]
-        res = await self._quoter._call(calls + [c for _, _, cs in approvals for c in cs]
-                                       + [(CONSTANTS.MULTICALL3, bytes.fromhex(CONSTANTS.SEL_BLOCK_NUMBER))])
+        return {"tokens": tokens, "approvals": approvals, "calls": calls + [c for _, _, cs in approvals for c in cs]}
+
+    async def _update_balances(self):
+        """one wallet read of its own, the block with it: `connect bsc`'s key check, where no poll runs. A started connector
+        never calls it: its wallet rides in every book poll (_poll_books)"""
+        if self._key_problem:
+            raise ValueError(self._key_problem)       # `connect bsc` shows it and keeps no bad key
+        if not self._wallet:
+            return
+        plan = self._wallet_plan()
+        res = await self._quoter._call(plan["calls"] + [(CONSTANTS.MULTICALL3, bytes.fromhex(CONSTANTS.SEL_BLOCK_NUMBER))])
         ok, ret = res[-1]
-        block = word(ret, 0) if ok and len(ret) >= 32 else None
+        self._apply_wallet(plan, res[:-1], word(ret, 0) if ok and len(ret) >= 32 else None)
+
+    def _after_wallet_read(self):
+        """after each poll's wallet read: the approvals it found missing go out (_maybe_approve); and the nonce, while it is
+        unknown and the wallet idle, is read in the background, never inside the poll (the books don't wait for it), so the
+        run's first order finds it"""
+        self._maybe_approve()
+        if (self._nonce is None and self._busy is None and self._account is not None and CONSTANTS.TRADING_ENABLED
+                and (self._nonce_task is None or self._nonce_task.done())):
+            self._nonce_task = safe_ensure_future(self._read_nonce())
+
+    def _apply_wallet(self, plan: dict, res: list, block: Optional[int]):
+        """one read's answers onto the balances and the approvals; an asset whose call failed keeps its last value (said
+        once, not every poll). A read older than a receipt already booked on the balances (a node behind the one that
+        served the receipt) is dropped, as it would undo the fill"""
         if block is not None and block < self._balances_block:
             return
+        tokens = plan["tokens"]
         read = [(CONSTANTS.NATIVE_ASSET, 18, res[0])] + [(asset, dec, r) for (asset, (_, dec)), r in zip(tokens.items(), res[1:])]
         for asset, decimals, (ok, ret) in read:
             if not ok or len(ret) < 32:
-                self.logger().warning(f"bsc: no balance for {asset} this read")
+                self._report(f"balance {asset}", "not read: its last value kept")
                 continue
+            if f"balance {asset}" in self._reported:
+                self._report(f"balance {asset}", "read again")
             amount = Decimal(word(ret, 0)).scaleb(-decimals)
             self._account_balances[asset] = amount
             self._account_available_balances[asset] = amount
-        i, now, missing = len(calls), int(time.time()), []
-        for key, ex, cs in approvals:
+        i, now, missing = 1 + len(tokens), int(time.time()), []
+        for key, ex, cs in plan["approvals"]:
             answers, i = res[i:i + len(cs)], i + len(cs)
             need = missing_approvals(self._wallet, key[0], ex, answers, CONSTANTS.APPROVED_AT_LEAST, now)
             self._report(f"approval {key[0]} -> {key[1]}", "approved" if not need else
@@ -483,7 +541,7 @@ class BscExchange(ExchangePyBase):
         return pairs
 
     def _maybe_approve(self):
-        """after a balance read: the approvals it found missing go out (_approve), when trading is on, the wallet has a key
+        """after a wallet read: the approvals it found missing go out (_approve), when trading is on, the wallet has a key
         and gas, and no earlier batch is still running. One that was included this run is not sent again, even if a read
         from a node behind still shows it missing; one that failed waits out its back-off (_approve_back_off)"""
         now = time.time()
@@ -505,8 +563,8 @@ class BscExchange(ExchangePyBase):
     async def _approve(self, calls: List[Tuple[str, bytes]]):
         """the missing one-time approvals, sent by the connector itself (Pavel 2026-10-14), one at a time in the wallet's turn,
         each a bundle like a swap. Every spender is a pinned executor's contract (bsc_swap.EXECUTORS, PINNED_V2_ROUTERS),
-        never one from data. One that doesn't land is tried again after its back-off (_approve_back_off)"""
-        landed = False
+        never one from data. One that doesn't land is tried again after its back-off (_approve_back_off). The next poll's
+        wallet read (within POLL_S) shows the approved sides"""
         for to, data in calls:
             while self._busy is not None:              # the wallet's one turn: after the swap (or approval) out
                 await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
@@ -529,11 +587,10 @@ class BscExchange(ExchangePyBase):
                 if receipt is not None and int(receipt.get("status") or "0x0", 16) == 1:
                     self._approved_sent.add((to, data))
                     self._approve_retry.pop((to, data), None)
-                    landed = True
                     self.logger().info(f"bsc: approved in block {int(receipt['blockNumber'], 16)}: {what}")
                 else:
                     if receipt is None:
-                        self._nonce = None             # it never landed: its nonce is free, read it anew
+                        await self._nonce_lost()       # it never landed: its nonce is free, read anew in this turn
                     delay = self._approve_back_off((to, data))
                     self.logger().warning(f"bsc: the approval {what} did not land ("
                                           f"{'reverted' if receipt else 'not included by its last block'}); it is tried again "
@@ -545,13 +602,6 @@ class BscExchange(ExchangePyBase):
             finally:
                 if self._busy == turn:
                     self._busy = None
-        if landed:                                    # the books show the approved sides at once, not a balance poll later
-            try:
-                await self._update_balances()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass                                  # the balance loop reads again anyway
 
     def _approval_name(self, to: str, data: bytes) -> str:
         """an approval call in words: '<token> -> <spender>' (the pinned contracts and the traded tokens by name)"""
@@ -678,6 +728,11 @@ class BscExchange(ExchangePyBase):
         dec = int(self._pool_list.cas[ca]["decimals"])
         side = "buy" if trade_type == TradeType.BUY else "sell"
         book, record, hops = self._book_route(ca, side, float(amount * price))
+        last = self._quoter.last                                         # fresh: _book_route refuses a stale one
+        book_block, book_at = last["block"], last["at"]                  # the block that book was priced at; its poll's send
+        # the chain's head now: that block plus the blocks since (Pavel 2026-10-15: the send reads nothing). A node behind
+        # makes it low by its lag, and the bundle's window (BUNDLE_BLOCKS) then ends that many blocks sooner
+        head = book_block + int(max(time.time() - book_at, 0.0) / CONSTANTS.BLOCK_S)
         with localcontext() as ctx:
             ctx.prec = 60
             qty = int((amount * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
@@ -694,6 +749,7 @@ class BscExchange(ExchangePyBase):
                                           f"{amount * worst_px:.8g} USDT")
                 amount_in = int((value * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
                 min_out = int((min(value / worst_px, amount) * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
+                expected_out = qty                                            # the book: `value` buys `amount`
                 tax = Decimal(str((record.get("tax_pct") or {}).get("buy") or 0)) / 100
                 if tax and record.get("type") != "v2":  # the router checks a v3 / v4 / Infinity pool's output before the tax
                     min_out = int((min_out / (1 - tax)).to_integral_value(rounding=ROUND_DOWN)) + 1
@@ -705,19 +761,21 @@ class BscExchange(ExchangePyBase):
                 amount_in = qty
                 min_out = int((min(amount * worst_px, value) * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(
                     rounding=ROUND_DOWN))
+                expected_out = int((value * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
         if amount_in <= 0 or min_out <= 0:
             raise BscOrderRefused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
         try:
             swap = build_swap(record, hops, side, amount_in, min_out, self._wallet)
         except ValueError as e:
             raise BscOrderRefused(str(e)) from None
-        return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"])
+        return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
+                    book_block=book_block, book_at=book_at, head=head, expected_out=expected_out)
 
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                            order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
         """build, sign and send one swap -> (its transaction hash = the exchange order id, the time). Off while
-        CONSTANTS.TRADING_ENABLED is False. The swap goes as a bundle to the builders (_send_tx) and is followed on chain
-        from here (_receipt_loop) whatever they answered, unless nothing went out (BscOrderRefused)"""
+        CONSTANTS.TRADING_ENABLED is False. The swap goes as a bundle to the builders (_send_tx), its only request, and is
+        followed on chain from here (_receipt_loop) whatever they answered, unless nothing went out (BscOrderRefused)"""
         if not CONSTANTS.TRADING_ENABLED:
             raise BscTradingDisabled("bsc: orders are off (bsc_constants.TRADING_ENABLED)")
         if self._busy != order_id:
@@ -729,23 +787,27 @@ class BscExchange(ExchangePyBase):
             raise BscOrderRefused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
         record = dict(swap, trading_pair=trading_pair)
         try:
-            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT)
+            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT, head=swap["head"])
         finally:
             if "tx_hash" in record:                   # it may be out (even if this task was cancelled): followed to its end
                 self._swaps[order_id] = record
                 self._swap_sent.set()
         return record["tx_hash"], time.time()
 
-    async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int):
+    async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int, head: Optional[int] = None):
         """sign the wallet's next transaction and send it as a bundle to every builder, valid for BUNDLE_BLOCKS blocks after
-        the head; its hash, nonce, last block and send time go into `record` (what the lifecycle follows).
+        the head; its hash, nonce, last block and send time go into `record` (what the lifecycle follows). A swap gives the
+        head (its book's, _swap_for) and finds the nonce known (_read_nonce), so its bundle is its one request; an approval
+        has no book and reads the head. The nonce is read here only while it is still unknown.
         Raises BscOrderRefused when nothing went out: the nonce or the head unreadable, or every builder refused it
-        (BscSendRefused: the nonce is read anew, and `record` gets no hash). Any other error is an unknown outcome: it may be
-        out, so it is followed."""
+        (BscSendRefused: the nonce is read anew in this turn, and `record` gets no hash). Any other error is an unknown
+        outcome: it may be out, so it is followed."""
         try:
             if self._nonce is None:
                 self._nonce = int(await self._read("eth_getTransactionCount", [self._wallet, "pending"]), 16)
-            last_block = int(await self._read("eth_blockNumber", []), 16) + CONSTANTS.BUNDLE_BLOCKS
+            if head is None:
+                head = int(await self._read("eth_blockNumber", []), 16)
+            last_block = head + CONSTANTS.BUNDLE_BLOCKS
             nonce = self._nonce
             raw, tx_hash = sign(self._account, build_tx(to, data, value, nonce, gas, CONSTANTS.GAS_PRICE_WEI))
         except asyncio.CancelledError:
@@ -757,12 +819,31 @@ class BscExchange(ExchangePyBase):
         try:
             await self._send_bundle(raw, last_block)
         except BscSendRefused:
-            self._nonce = None                        # nothing went out: its nonce is free again, read it anew
             for k in ("tx_hash", "nonce", "last_block", "sent"):
                 record.pop(k, None)                   # nothing to follow
+            await self._nonce_lost()                  # nothing went out: its nonce is free again, read anew in this turn
             raise
         except Exception as e:
             self.logger().warning(f"bsc: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it on chain")
+
+    async def _read_nonce(self):
+        """the wallet's next nonce, read OFF the order path (Pavel 2026-10-15): after a wallet read while it is unknown and
+        the wallet idle (so the run's first order finds it), and the moment a transaction ends without landing (_nonce_lost).
+        Kept only if no send took a nonce meanwhile; a read that fails leaves it unknown, for the next send to read"""
+        try:
+            nonce = int(await self._read("eth_getTransactionCount", [self._wallet, "pending"]), 16)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        if self._nonce is None:
+            self._nonce = nonce
+
+    async def _nonce_lost(self):
+        """a transaction that never went out, or never landed, leaves its nonce free: it is forgotten and read anew at once,
+        in the wallet's turn (no send can race the read), so the next order doesn't read it on its way out"""
+        self._nonce = None
+        await self._read_nonce()
 
     async def _send_bundle(self, raw: str, last_block: int):
         """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
@@ -851,8 +932,9 @@ class BscExchange(ExchangePyBase):
         """a swap's end (receipt None: dropped). Its receipt's moves go on the balances first, so whoever reads them at the
         fill event sees the trade (the hold band, the balancer); then the fill and FILLED with what it really got, or FAILED,
         processed in place (no 5 s wait: what the swap got IS the order); then the wallet's turn is free"""
+        parsed = None
         if receipt is None:
-            self._nonce = None                        # it never landed, so its nonce is free: read it anew
+            self._nonce = None                        # it never landed, so its nonce is free: read anew before the turn ends
             state, fill, problem = OrderState.FAILED, None, (
                 "BscSwapDropped", f"not included by its last block {swap['last_block']}: no builder took it in time, or it "
                                   f"would have reverted (nothing paid)")
@@ -865,13 +947,40 @@ class BscExchange(ExchangePyBase):
             order = self._order_tracker.fetch_order(client_order_id=order_id)
             if order is not None and order.executed_amount_base < order.amount:
                 order.amount = order.executed_amount_base     # an exact-input buy may get less than its amount: no more comes
-        if problem is not None:
-            self.logger().warning(f"bsc: {order_id} {swap['tx_hash']}: {problem[1]}")
-        else:
-            self.logger().debug(f"bsc: {order_id} {swap['tx_hash']} filled: {fill.fill_base_amount} at {fill.fill_price}")
+        try:
+            line = self._swap_line(order_id, swap, receipt, parsed, problem)
+        except Exception as e:                        # the line is information only: it never holds the settle up
+            line = f"bsc: {order_id} {swap.get('tx_hash')}: {problem[1] if problem else 'filled'} ({type(e).__name__} in its line)"
+        (self.logger().warning if problem is not None else self.logger().info)(line)
         await self._order_tracker._process_order_update(self._order_update(order_id, swap, state, problem))
+        if receipt is None:
+            await self._read_nonce()                  # its nonce, read anew in its turn, not on the next order's path
         self._swaps.pop(order_id, None)
         self._free_turn(order_id)
+
+    def _swap_line(self, order_id: str, swap: dict, receipt: Optional[dict], parsed: Optional[dict],
+                   problem: Optional[tuple]) -> str:
+        """one line per swap's end (Pavel 2026-10-15; audit finding 7: the data the room, a gas bid and the cadence are tuned
+        on): what it got against its book, where it landed against its book's block (+N, its index in the block), the
+        seconds from the send, how old its book was at the send, the gas. The send reads no head, so the book's block is
+        the line's reference: +N covers the book's age and the wait for inclusion"""
+        book = swap["book_block"]
+        where = f"its book (block {book}) {swap['sent'] - swap['book_at']:.2f} s old at the send"
+        what = f"bsc: {swap['trading_pair']} {swap['side']} ({order_id})"
+        if receipt is None:
+            return f"{what} DROPPED: {problem[1]}; {where}; {swap['tx_hash']}"
+        landed, index = int(receipt["blockNumber"], 16), receipt.get("transactionIndex")
+        at = (f"landed +{landed - book} blocks after its book (block {landed}, tx #{int(index, 16) if index else '?'}), "
+              f"{time.time() - swap['sent']:.2f} s after the send")
+        if problem is not None:                                             # its text carries the gas
+            return f"{what} {problem[0]}: {problem[1]}; {at}; {where}; {swap['tx_hash']}"
+        got, expected = parsed["amount_out"], swap.get("expected_out")
+        decimals, unit = ((swap["ca_decimals"], swap["trading_pair"].split("-")[0]) if swap["side"] == "buy" else
+                          (CONSTANTS.USDT_DECIMALS, CONSTANTS.QUOTE))
+        versus = f"{(got / expected - 1) * 1e4:+.1f} bps vs its book" if expected else "no book figure"
+        return (f"{what} filled: got {got / 10 ** decimals:.8g} {unit} ({versus}, room "
+                f"{CONSTANTS.SWAP_SLIPPAGE * 10000:.0f} bps); {at}; {where}; gas "
+                f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} BNB ({int(receipt['gasUsed'], 16):,}); {swap['tx_hash']}")
 
     def _outcome(self, order_id: str, swap: dict, parsed: dict) -> Tuple[OrderState, Optional[TradeUpdate], Optional[tuple]]:
         """a mined swap -> (FILLED, its one fill, None) or (FAILED, None, (error type, why)): reverted (its gas still paid),

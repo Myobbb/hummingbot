@@ -3,11 +3,17 @@
 For the CAs P2 trades (bsc_pool_list.PoolList: P1's records, handed over by the page -> watcher path), each poll is ONE
 Multicall3 aggregate3 eth_call built with P1's own call encoding: bsc_p1_quoter.py is P1's ws_book_checker/core/dex_quoter.py,
 copied unchanged (md5 0621aeea…, 2026-10-14) so a later sync can be checked by md5. The call holds:
-  - getBlockNumber + getCurrentBlockTimestamp: every book carries its block;
+  - getBlockNumber + getCurrentBlockTimestamp: every book carries its block, and the poll its own send time (`at`): a swap's
+    send estimates the chain's head from these, so placing an order reads nothing (Pavel 2026-10-15);
+  - the caller's own reads (`extra`: the connector's wallet, its balances and approvals), at the books' block, in the same
+    call: they cost no request of their own (Pavel 2026-10-15; BlockPI bills an eth_call 20 RU whatever it carries);
   - $100 on both sides of EVERY tradable pool: the watch (Q7);
   - the ladder ($100 ... $1,000) of each (CA, side)'s book pool only, every poll: with a few pools, a ladder from the poll's
     own block costs ~8 quotes a CA, and P1's cache (keep a ladder while its $100 quote is unchanged) left a busy pool's book at
-    its $100 level every other poll (test 2026-10-14);
+    its $100 level every other poll (test 2026-10-14). Since 2026-10-15 a ladder ends at what the wallet can put into one swap
+    (Pavel: 350 USDT -> "100 / 250 / 325 quotes and executables"; the connector's caps, ladder_rungs): its buys spend the
+    rung's USD of the counter and its sells sell the rung's CA, both exact INPUT as the swap runs, the cap rung exactly the
+    wallet's USDT less arb_l's 25 reserve / its whole CA; no balance on a side: the $100 rung only, the price;
   - the hops, inside each pool's own DEX family (one router call chains one family): every link at $100, and at every rung
     for the counters of the pools whose ladder is in use (the hop pools move every block). D31's method: the best candidate
     per link, size and side; a counter's USD to pay / to receive is its links' rates multiplied;
@@ -27,6 +33,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from hummingbot.connector.exchange.bsc.bsc_p1_quoter import (
     CHAINS,
+    MAX_SQ,
+    MIN_SQ,
     NATIVE,
     SEL,
     dec_agg3,
@@ -40,12 +48,30 @@ from hummingbot.connector.exchange.bsc.bsc_p1_quoter import (
     word,
 )
 
-RUNGS_USD = (100, 250, 500, 1000)   # P1's rungs, capped at $1,000 (Pavel 2026-10-14)
+RUNGS_USD = (100, 250, 500, 1000)   # P1's rungs, capped at $1,000 (Pavel 2026-10-14); a side's ladder ends at the wallet's
+                                    # balance (ladder_rungs), and the hops are quoted at these sizes
 # WIP values (Pavel 2026-10-14: "cadence 1 second is fine for starters ... the rest relaxed, we will tune it later")
 POLL_S = 1.0
 SWITCH_BPS = 50.0
 REELECT_S = 900.0
 SIDES = ("buy", "sell")
+
+
+def ladder_rungs(cap_usd: Optional[float]) -> List[Tuple[float, bool]]:
+    """a side's ladder, ending at what the wallet can put into one swap (Pavel 2026-10-15: "325 gives us 100 / 250 / 325
+    quotes and executables"): the standard rungs under the cap, then the cap itself -> [(USD, it is the cap)]. Under the
+    $100 minimum, or with nothing held, only the $100 rung (the price); from $1,000 the standard four"""
+    if not cap_usd or cap_usd < RUNGS_USD[0]:
+        return [(RUNGS_USD[0], False)]
+    if cap_usd >= RUNGS_USD[-1]:
+        return [(r, False) for r in RUNGS_USD]
+    return [(r, False) for r in RUNGS_USD if r < cap_usd] + [(cap_usd, True)]
+
+
+def ran_to_limit(p: dict, ok: bool, ret: bytes) -> bool:
+    """a QuoterV2 exact-input quote that stopped at its price limit: the pool could not take the whole input (P1's rule for
+    its sells, in quote_amount; the ladder's buys are exact input too)"""
+    return bool(ok) and p["route"]["kind"] == "QuoterV2" and len(ret) >= 64 and word(ret, 1) in (MIN_SQ, MAX_SQ)
 
 
 def tax_factor(p: dict, side: str) -> Optional[float]:
@@ -64,6 +90,9 @@ class BscQuoter:
         self.cas: Dict[str, dict] = {}            # ca -> {"decimals", "pools": [PoolList's tradable pools]}
         self.size_px: Dict[str, float] = {}       # ca -> USD: the sizing price of a rung's CA amount (follows the mid)
         self.tsize: Dict[str, float] = {}         # token -> USD: the sizing price of a counter or a hop token
+        self.tbuy: Dict[tuple, float] = {}        # (token, family, hop size) -> USD to buy one along its path at that size, the
+                                                  # last poll's: a buy rung's counter amount, at the size its hop is valued at
+                                                  # (_hop_size), so the cap rung costs the cap (tsize moves only past RESIZE)
         self.links: Dict[tuple, dict] = {}        # (from, to, family) -> {"fd", "td", "pools": {pool: hop}}
         self.paths: Dict[tuple, list] = {}        # (token, family) -> the link keys from it to the anchor
         self.buy_in: Set[str] = set()             # pools whose route refuses exact output: bought by exact input of the counter
@@ -72,6 +101,12 @@ class BscQuoter:
         self.switched: Dict[tuple, str] = {}      # (ca, side) -> pool, while its $100 beats the elected one by > SWITCH_BPS
         self.elected_at: Dict[str, float] = {}    # ca -> when its pools were last elected
         self.electing: Set[str] = set()           # CAs whose every pool gets its full ladder in the next poll
+        self.caps: Dict[str, dict] = {}           # ca -> {"buy": USD the wallet can spend, "sell": raw CA it holds}: the
+                                                  # connector sets it before each poll ({}: none known, the $100 rung only)
+        self.rungs: Dict[tuple, list] = {}        # (ca, side) -> [(USD, raw CA amount or None)]: this poll's ladder
+        self.extra: List[Tuple[str, bytes]] = []  # the caller's own reads (the connector's wallet), answered inside the
+                                                  # poll's one eth_call at its block: no request of their own (Pavel
+                                                  # 2026-10-15). -> self.last["extra"]: [(call, (ok, data)), ...]
         self.last: Optional[dict] = None
         self.stats = {"polls": 0, "failed": 0, "older block": 0, "ru": 0, "quotes": 0, "elections": 0, "switches": 0}
 
@@ -128,7 +163,36 @@ class BscQuoter:
         a = self._ca_amount(ca, usd)
         return (side, a) if a else None
 
+    def _rung_leg(self, p: dict, ca: str, side: str, usd: float, raw: Optional[int]) -> Optional[Tuple[str, int]]:
+        """(call side, amount) of one ladder rung, exact INPUT on both sides, as the swap runs: a buy spends the rung's USD
+        worth of the counter (so the cap rung spends exactly what the wallet can), a sell the rung's CA (the cap rung: the
+        wallet's whole balance, `raw`)"""
+        if side == "buy":                         # at the counter's live rate: the cap rung costs the cap, not +/- RESIZE
+            counter = self._canon(p["counter"]["token"])
+            px = self.tbuy.get((counter, p["family"], self._hop_size(usd))) or self.tsize.get(counter)
+            a = int(usd / px * 10 ** p["counter"]["decimals"]) if px else None
+            return ("buy_in", a) if a else None
+        a = raw or self._ca_amount(ca, usd)
+        return ("sell", a) if a else None
+
+    def _set_rungs(self):
+        """each (CA, side)'s ladder for this poll, from the wallet's caps (ladder_rungs); a sell's cap rung sells exactly the
+        CA held, its USD at the sizing price"""
+        self.rungs = {}
+        for ca, m in self.cas.items():
+            cap, px = self.caps.get(ca) or {}, self.size_px.get(ca)
+            held = cap.get("sell")
+            held_usd = held / 10 ** m["decimals"] * px if held and px else None
+            self.rungs[(ca, "buy")] = [(usd, None) for usd, _ in ladder_rungs(cap.get("buy"))]
+            self.rungs[(ca, "sell")] = [(usd, held if is_cap else None) for usd, is_cap in ladder_rungs(held_usd)]
+
     # ---------------------------------------------------------------- hops (D31's method, inside each pool's family)
+    @staticmethod
+    def _hop_size(usd: float) -> float:
+        """the hops are quoted at the standard rungs: a cap rung converts at the next one up (the hops are deep; that one
+        is the conservative side), past $1,000 at $1,000"""
+        return next((r for r in RUNGS_USD if r >= usd), RUNGS_USD[-1])
+
     def _hop_calls(self, calls: list, items: list, sizes) -> list:
         plan = []
         for k, sides in items:
@@ -169,7 +233,7 @@ class BscQuoter:
         path = self.paths.get((token, family))
         if path is None:
             return None
-        v = 1.0
+        v, size = 1.0, self._hop_size(size)
         for k in path:
             r = rates.get(k, {}).get(size, {}).get(side)
             if r is None:
@@ -183,7 +247,7 @@ class BscQuoter:
         path = self.paths.get((token, family))
         if path is None:
             return None
-        route = []
+        route, size = [], self._hop_size(size)
         for k in path:
             r = rates.get(k, {}).get(size, {}).get(side)
             if r is None:
@@ -194,7 +258,9 @@ class BscQuoter:
     # ---------------------------------------------------------------- the poll
     async def poll(self) -> dict:
         now = time.time()
-        calls = [(self.mc3, SEL["block"]), (self.mc3, SEL["ts"])]
+        self._set_rungs()
+        extra = list(self.extra)                     # with the top: a retry without the ladders keeps them
+        calls = [(self.mc3, SEL["block"]), (self.mc3, SEL["ts"])] + extra
         top = []
         for ca, m in self.cas.items():
             for p in m["pools"]:
@@ -213,10 +279,11 @@ class BscQuoter:
         deep = []
         for p, ca, side in in_use:
             k = (p["pool"], ca, side)
-            legs = [self._leg(p, ca, side, usd) for usd in RUNGS_USD]
+            rungs = self.rungs.get((ca, side)) or [(RUNGS_USD[0], None)]
+            legs = [self._rung_leg(p, ca, side, usd, raw) for usd, raw in rungs]
             if not all(legs):
                 continue
-            for (s, amt), usd in zip(legs, RUNGS_USD):
+            for (s, amt), (usd, _) in zip(legs, rungs):
                 deep.append((p, k, s, amt, usd, len(calls)))
                 calls.append(quote_call(p, s, amt, self.mc3))
         need = {}
@@ -252,6 +319,8 @@ class BscQuoter:
             q = quote_amount(p, s, *res[i])
             if isinstance(q, tuple):                      # an own-model answer (PoolList keeps none): a partial fill is no fill
                 q = q[0] if q[1] == amt else None
+            if s == "buy_in" and ran_to_limit(p, *res[i]):
+                q = None                                  # the pool could not take the rung's whole input: no such level
             got.setdefault(k, [])
             if q:
                 got[k].append((q, amt, usd) if s == "buy_in" else (amt, q, usd))
@@ -269,9 +338,10 @@ class BscQuoter:
         books = self._books(rates, top_px, now)
         self._resize(top_px, rates)
         self.stats["polls"] += 1
-        self.stats["quotes"] += len(calls) - 2
-        self.last = {"block": block, "ts": ts, "books": books, "seconds": round(time.time() - now, 3), "calls": len(calls),
-                     "ladder quotes": len(deep), "hop quotes": len(hop_top) + len(hop_deep), "electing": len(self.electing)}
+        self.stats["quotes"] += len(calls) - 2 - len(extra)
+        self.last = {"block": block, "ts": ts, "at": now, "books": books, "seconds": round(time.time() - now, 3),
+                     "calls": len(calls), "ladder quotes": len(deep), "hop quotes": len(hop_top) + len(hop_deep),
+                     "electing": len(self.electing), "extra": list(zip(extra, res[2:2 + len(extra)]))}
         return self.last
 
     async def _call(self, calls: list) -> list:
@@ -385,6 +455,11 @@ class BscQuoter:
         for token, family in self.paths:
             if token == self.anchor:
                 continue
+            for size in RUNGS_USD:                # each hop size a rung is valued at (2026-10-15: sized at the $100 rate, a
+                                                  # hop pool's $325 cap rung cost $325.011, over what the wallet can spend)
+                rate = self._usd(rates, token, family, size, "buy")
+                if rate:
+                    self.tbuy[(token, family, size)] = rate
             b = self._usd(rates, token, family, RUNGS_USD[0], "buy")
             s = self._usd(rates, token, family, RUNGS_USD[0], "sell")
             if b and s:

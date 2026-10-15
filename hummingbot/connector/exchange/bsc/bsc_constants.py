@@ -8,6 +8,9 @@ HBOT_ORDER_ID_PREFIX = "BSC-"
 MAX_ORDER_ID_LEN = 32
 
 QUOTE = "USDT"                    # every book is priced along its pools' paths to USDT (Q5)
+# arb_l keeps 25 USDT of a buy venue's balance aside (arbitrage.pyx `buy_quote_balance = available - 25.0`, a legacy CEX rule
+# kept by Pavel 2026-10-15). The buy ladder ends at the wallet's USDT less this: the most arb_l can spend there
+ARB_QUOTE_RESERVE = Decimal(25)
 NATIVE_ASSET = "BNB"              # gas
 USDT = "0x55d398326f99059ff775485246999027b3197955"         # BSC-USD, 18 decimals
 USDT_DECIMALS = 18
@@ -20,7 +23,6 @@ SEL_BALANCE_OF = "70a08231"       # ERC-20 balanceOf(address)
 # so one stalled connection could hold the book poll, or the wallet's turn, until TCP gave up)
 RPC_TIMEOUT_S = 2.0               # a node request (BlockPI: the book poll, the balances, check_network): p50 0.2 s from myserver
 READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle on SWAP_READ_URL (receipts, the head, the nonce): 3 ms away
-BALANCE_POLL_S = 15.0             # WIP (Pavel 2026-10-14: relaxed for now, tuned later)
 STALE_S = 5.0                     # a book whose block is older than this goes empty, however its poll ended (P1's B7: never a
                                   # kept price); a poll is never waited for past that moment
 FIRST_POLL_WAIT_S = 10.0          # how long a pair's first book waits for the first poll before it starts empty

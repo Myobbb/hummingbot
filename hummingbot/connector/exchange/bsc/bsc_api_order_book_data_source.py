@@ -8,13 +8,18 @@ from hummingbot.core.data_type.order_book_message import OrderBookMessage, Order
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 
 
+class _Idle(Exception):
+    """the connector's poll had nothing to quote and made no call: not a failure"""
+
+
 class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """The chain's books, polled (P2-DEX step 3, 2026-10-14). listen_for_subscriptions, which the tracker runs where a socket
     would be, runs the connector's poll every POLL_S: one eth_call (bsc_quoter.BscQuoter). Each poll hands the tracker a
     SNAPSHOT per trading pair, never a diff (the runbook: never mix the two). A pair with no book gets an empty one: a market
     that is off looks empty, never dropped. Every book goes empty once the block it was priced at is STALE_S old, however
     its poll ended (a failed call, an answer from an old block, a node too slow to answer: a poll is never waited for past
-    that moment), so a DEX price is never kept alive (P1's B7)."""
+    that moment), so a DEX price is never kept alive (P1's B7). With no DEX pair to quote the connector makes no call
+    (idle, Pavel 2026-10-15): nothing is on show, no stale clock runs, and the loop only looks again each POLL_S."""
 
     def __init__(self, trading_pairs: List[str], connector):
         super().__init__(trading_pairs)
@@ -100,6 +105,9 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         last = await asyncio.wait_for(poll, timeout=life)
                     except asyncio.TimeoutError:
                         raise RuntimeError(f"no answer before the books turned {CONSTANTS.STALE_S:.0f} s old") from None
+                if last is None:                              # idle: no DEX pair to quote, no call made (Pavel 2026-10-15):
+                    self._books, self._stale, self.book_ts = {}, False, time.time()    # nothing on show, no stale clock
+                    raise _Idle()
                 age = t0 - last["ts"] if last.get("ts") else 0.0
                 if age > CONSTANTS.STALE_S:
                     raise RuntimeError(f"block {last.get('block')} is {age:.1f} s old")
@@ -112,6 +120,8 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().info(f"bsc: books back (block {self.last_block})")
             except asyncio.CancelledError:
                 raise
+            except _Idle:
+                pass
             except Exception as e:
                 self.failed += 1
                 self.last_error = self._connector._mask(f"{type(e).__name__}: {e}")[:300]
