@@ -41,8 +41,11 @@ CMD_USER_TRADES = "getUserTrades"                  # 10 / 2 s: the account's fil
 #                                                    (tradeId, orderId, price, size, side, fee, time), <= 100 a page
 CMD_ORDER_HISTORY = "returnUTradeHistory"          # 5 / 2 s: executed orders with `out_trade_no`, <= 30 days
 CMD_BALANCES = "returnCompleteBalances"            # 5 / 2 s: {asset: {available, onOrders}}; held assets only
-CMD_BATCH_HISTORY = "getBatchHistoryOrders"        # 1 / 2 s: orders by orderNumber (<= 50, <= 3 months): status,
-#                                                    dealSize, dealFunds, fee; -110 for an id it has no record of
+CMD_BATCH_HISTORY = "getBatchHistoryOrders"        # 1 / 2 s: CLOSED orders by orderNumber (<= 50, <= 3 months):
+#                                                    dealSize, dealFunds, fee, status; -110 for an id it has no row
+#                                                    for YET (live 2026-10-16: an open order, and one cancelled 3 s
+#                                                    earlier; listed 3 min later). Its `status` is not returnOrderTrades'
+#                                                    enum: that cancelled order with no fill read 2 here, 4 there.
 
 # --- Responses (live 2026-10-15 from myserver; every answer HTTP 200) ---------------------------------------
 # Success: {"code":"200","data":…,"msg":"SUCCESS","success":true,"failed":false} — `code` is the STRING "200".
@@ -169,12 +172,23 @@ USER_TRADES_MAX_PAGES = 5
 # An order's fill rows are read from this long before its creation (this host's clock vs CoinW's fill times: the
 # pushes' `time` is ~145 ms behind receipt on myserver, transit included).
 FILL_ROWS_LOOKBACK_S = 10.0
-# A not-found answer counts toward failing an order only once the order is this old: a fresh order may not be
-# readable yet.
-NOT_FOUND_MIN_AGE_S = 10.0
-# The lookup of an order by its client id (returnUTradeHistory, executed orders, 5 / 2 s) starts this long before the
-# order was sent: a read with no startAt returns 30 days of the market's orders.
+# A not-found answer counts toward failing an order only once the order is this old. CoinW's two order histories
+# (returnUTradeHistory, getBatchHistoryOrders) list a CLOSED order only after a lag: the placement probe's order
+# (2026-10-16) was in neither 0.5–3 s after its cancel, and in both 3 min later. An order that closed at once (a taker
+# fill) whose answer and push were both lost can be found by its client id only there, so nothing is "not found"
+# before this long. (One observation; the first measured lag tightens it.)
+NOT_FOUND_MIN_AGE_S = 180.0
+# The lookup of an order by its client id (returnUTradeHistory: CLOSED orders, cancelled ones with no fill included,
+# listed after the lag above; open orders never; 5 / 2 s) starts this long before the order was sent: a read with no
+# startAt returns 30 days of the market's orders.
 CLIENT_ID_LOOKBACK_S = 60.0
+# A terminal update with fills (FILLED, or CANCELED after fills) is held until the base asset's total balance shows
+# the order's own fills: a strategy reads balances on completion. CoinW's `assets` push comes only with trading (docs;
+# the placement probe saw none for an order's hold, 2026-10-16), on its own schedule. Reported first, a stale total
+# makes the hold-band buy twice (Hotcoin's AEON, 2026-10-06). The push is awaited this long, then balances are read
+# over REST (up to BALANCE_MISSING_READS times: a sold-out coin leaves the answer); still short -> [CW-ALARM]
+# fill-balance-late and the update goes anyway.
+FILL_BALANCE_PUSH_WAIT_S = 1.0
 
 # --- Request timeouts ----------------------------------------------------------------------------------------
 # aiohttp's session default is 300 s: a hung doTrade would leave the order without an id (no cancel, no fill) that

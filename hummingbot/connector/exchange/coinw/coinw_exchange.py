@@ -137,6 +137,13 @@ class CoinwExchange(ExchangePyBase):
         # a 29001 answer slows the connector's own reads until this monotonic time
         self._rate_limited_until = 0.0
         self._last_rate_limit_alarm = 0.0
+        # client id -> (the base asset's total, _booked_base of it) when the order was sent: the baseline its terminal
+        # update compares the balance with (_balance_shows_fills)
+        self._hold_baseline: Dict[str, Tuple[Decimal, Decimal]] = {}
+        # asset -> net base change of every fill this process booked (_note_fill_booked)
+        self._booked_base: Dict[str, Decimal] = {}
+        # client ids whose terminal update waits for the balance to show its fills (one waiter per order)
+        self._balance_waiting: Set[str] = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = CONSTANTS.REAL_TIME_BALANCE_UPDATE
 
@@ -564,8 +571,9 @@ class CoinwExchange(ExchangePyBase):
         return None, verdict
 
     async def _find_by_client_id(self, client_order_id: str, symbol: str, since: float) -> Optional[str]:
-        """The order's id among the market's executed orders by its client id, read from CLIENT_ID_LOOKBACK_S before
-        `since` (no startAt would read 30 days of the market's orders)."""
+        """The order's id among the market's CLOSED orders by its client id (returnUTradeHistory: tradeID = the order
+        id, out_trade_no = the client id; a cancelled order with no fill is listed too, after a lag: see
+        NOT_FOUND_MIN_AGE_S), read from CLIENT_ID_LOOKBACK_S before `since` (no startAt would read 30 days)."""
         rows = await self._private(CONSTANTS.CMD_ORDER_HISTORY, {
             "currencyPair": symbol, "startAt": int((since - CONSTANTS.CLIENT_ID_LOOKBACK_S) * 1e3)})
         for row in rows if isinstance(rows, list) else []:
@@ -615,6 +623,13 @@ class CoinwExchange(ExchangePyBase):
         this answer arrives; this fork's update_with_order_update sets any state it is given, and an OPEN then would set
         the finished order back to open.
         """
+        # The baseline the order's terminal update compares the balance with (_balance_shows_fills).
+        asset = order.base_asset
+        self._hold_baseline[order.client_order_id] = (self._account_balances.get(asset, Decimal("0")),
+                                                      self._booked_base.get(asset, Decimal("0")))
+        if len(self._hold_baseline) > 2000:
+            for client_order_id in list(self._hold_baseline)[:1000]:
+                del self._hold_baseline[client_order_id]
         exchange_order_id, update_timestamp = await self._place_order(
             order_id=order.client_order_id,
             trading_pair=order.trading_pair,
@@ -742,7 +757,7 @@ class CoinwExchange(ExchangePyBase):
 
     async def _refresh_order(self, order: InFlightOrder) -> None:
         try:
-            self._order_tracker.process_order_update(await self._request_order_status(tracked_order=order))
+            self._forward_update(order, await self._request_order_status(tracked_order=order), source="refresh")
         except asyncio.CancelledError:
             raise
         except CoinwStatusDeferred:
@@ -779,7 +794,7 @@ class CoinwExchange(ExchangePyBase):
                 continue
             try:
                 update = await self._request_order_status(tracked_order=order)
-                self._order_tracker.process_order_update(update)
+                self._forward_update(order, update, source="poll")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -892,6 +907,7 @@ class CoinwExchange(ExchangePyBase):
         self._alarm("fill-from-cumulative", client_id=order.client_order_id, order_id=order.exchange_order_id,
                     source=source, held_s=held_s, booked_from_rows=str(order.executed_amount_base),
                     added=str(missing), quote=str(quote_amount), fee=str(fee), fee_known=fee_total >= 0)
+        self._note_fill_booked(order, update)
         self._order_tracker.process_trade_update(update)
         return True
 
@@ -917,10 +933,12 @@ class CoinwExchange(ExchangePyBase):
         """CoinW can't read the order's state (-200: also its maintenance answer). Open on the market -> it lives (a
         blip: deferred). Not open -> its fills decide: all of its size filled -> FILLED. Otherwise CoinW's order history
         (getBatchHistoryOrders) decides: a row gives the state and the cumulative fill (the rest booked from it, like a
-        held terminal state); -110 (no record at all), once the order has been gone for NOT_FOUND_MIN_AGE_S on two
-        reads: CANCELED (with the fills it has) if we cancelled it, else a not-found strike with a [CW-ALARM] (the
-        tracker fails it after its limit) -- never a silent settle of an order nobody cancelled. Any other answer of the
-        history (maintenance) decides nothing. The DONE push normally settles every order before this ever runs."""
+        held terminal state); -110 (no row YET: the history lists a closed order minutes later, see
+        NOT_FOUND_MIN_AGE_S), once the order has been gone for NOT_FOUND_MIN_AGE_S on two reads: CANCELED (with the
+        fills it has) if we cancelled it, else a not-found strike with a [CW-ALARM] (the tracker fails it after its
+        limit) -- never a silent settle of an order nobody cancelled. Any other answer of the history (maintenance)
+        decides nothing. The DONE push normally settles every order before this ever runs, and returnOrderTrades still
+        reads a cancelled order minutes later (live 2026-10-16): this is for its -200, maintenance."""
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
         rows = await self._private(CONSTANTS.CMD_OPEN_ORDERS, {"currencyPair": symbol})
         if not isinstance(rows, list):
@@ -958,15 +976,20 @@ class CoinwExchange(ExchangePyBase):
         raise CoinwStatusDeferred(f"{order.client_order_id}: gone from CoinW without a state or a cancel of ours")
 
     def _settle_from_history(self, order: InFlightOrder, row: Dict[str, Any], reason: str) -> OrderUpdate:
-        """The order's row in CoinW's history (getBatchHistoryOrders: status 1-4, dealSize, dealFunds, fee): still
-        open -> deferred; FILLED / CANCELED -> that state, once the fill rows (or, after the hold, the row's own
-        cumulative totals) cover what it says filled."""
+        """The order's row in CoinW's history (getBatchHistoryOrders: CLOSED orders; dealSize, dealFunds, fee, status).
+        Its `status` is not returnOrderTrades' enum (live 2026-10-16: a cancelled order with no fill read 2 there, 4 on
+        returnOrderTrades), so the state comes from the amounts: a full fill (or status 3, "completely filled") ->
+        FILLED; anything short -> CANCELED (the order is in the history and not open). Status 1 ("unfilled": never
+        seen in the history) -> deferred. Settled once the fill rows (or, after the hold, the row's own cumulative
+        totals) cover what it says filled."""
         deal = self._dec(row.get("dealSize"))
-        state = self._order_state(row.get("status"), deal, order.amount)
+        raw_status = row.get("status")
         self._audit_once("order-history-row", keys=sorted(row.keys()), sample=self._raw(row))
-        if state not in CONSTANTS.TERMINAL_STATES:
+        if str(raw_status) == "1":
             self._gone_since.pop(order.client_order_id, None)
-            raise CoinwStatusDeferred(f"{order.client_order_id}: {reason}; its history says {state.name}")
+            raise CoinwStatusDeferred(f"{order.client_order_id}: {reason}; its history says status 1 (unfilled)")
+        filled = str(raw_status) == "3" or deal + self._fill_tolerance(order) >= order.amount
+        state = OrderState.FILLED if filled else OrderState.CANCELED
         reported = order.amount if state is OrderState.FILLED else deal
         self._hold_terminal_if_short(order, reported, state, source="history",
                                      cumulative=(deal, self._dec(row.get("dealFunds")),
@@ -982,6 +1005,88 @@ class CoinwExchange(ExchangePyBase):
             update_timestamp=self._now(),
             new_state=state,
         )
+
+    # ------------------------------------------------------------------ terminal updates wait for the balance
+
+    def _forward_update(self, order: InFlightOrder, update: OrderUpdate, source: str) -> None:
+        """An order update on its way to the tracker. A terminal one is held until the base asset's balance shows the
+        order's own fills, by ONE waiter per order: the DONE push and the status poll can both bring it."""
+        if update.new_state not in CONSTANTS.TERMINAL_STATES or self._balance_shows_fills(order):
+            if update.new_state in CONSTANTS.TERMINAL_STATES:
+                self._hold_baseline.pop(order.client_order_id, None)
+            self._order_tracker.process_order_update(update)
+            return
+        if order.client_order_id in self._balance_waiting:
+            return  # its waiter reports it
+        self._balance_waiting.add(order.client_order_id)
+        safe_ensure_future(self._report_when_balance_shows_fills(order, update, source))
+
+    async def _report_when_balance_shows_fills(self, order: InFlightOrder, update: OrderUpdate, source: str) -> None:
+        """Waits FILL_BALANCE_PUSH_WAIT_S for the balance push, then reads balances over REST (up to
+        BALANCE_MISSING_READS times: a sold-out coin leaves the answer and is dropped on its second miss), then reports
+        the update anyway: shown -> audit fill-balance-wait; still short -> [CW-ALARM] fill-balance-late."""
+        started = time.monotonic()
+        via = "push"
+        try:
+            while (not self._balance_shows_fills(order)
+                   and time.monotonic() - started < CONSTANTS.FILL_BALANCE_PUSH_WAIT_S):
+                await asyncio.sleep(0.05)
+            for _ in range(CONSTANTS.BALANCE_MISSING_READS):
+                if self._balance_shows_fills(order):
+                    break
+                via = "rest"
+                try:
+                    await self._update_balances()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger().warning(f"CoinW balance read for {order.client_order_id} failed: {self._scrub(e)}")
+                    break
+            waited_s = round(time.monotonic() - started, 3)
+            if self._balance_shows_fills(order):
+                self._audit("fill-balance-wait", client_id=order.client_order_id, source=source, via=via,
+                            waited_s=waited_s)
+            else:
+                self._alarm("fill-balance-late", client_id=order.client_order_id, source=source, waited_s=waited_s,
+                            asset=order.base_asset, total=str(self._account_balances.get(order.base_asset)))
+            if order.client_order_id in self._order_tracker.all_updatable_orders:
+                self._order_tracker.process_order_update(update)
+        finally:
+            self._balance_waiting.discard(order.client_order_id)
+            self._hold_baseline.pop(order.client_order_id, None)
+
+    def _base_delta(self, order: InFlightOrder, fills: List[TradeUpdate]) -> Decimal:
+        """The fills' net change of the base asset's total: + on a buy less its fee (CoinW charges the received asset,
+        the base), - on a sell (its fee is in the quote)."""
+        delta = Decimal("0")
+        for fill in fills:
+            base_fee = sum((fee.amount for fee in fill.fee.flat_fees if fee.token == order.base_asset), Decimal("0"))
+            delta += (fill.fill_base_amount if order.trade_type is TradeType.BUY else -fill.fill_base_amount) - base_fee
+        return delta
+
+    def _note_fill_booked(self, order: InFlightOrder, fill: TradeUpdate) -> None:
+        """Every fill this process books, summed per asset, so a held terminal update can tell the order's own balance
+        change from other orders' (_balance_shows_fills)."""
+        asset = order.base_asset
+        self._booked_base[asset] = self._booked_base.get(asset, Decimal("0")) + self._base_delta(order, [fill])
+
+    def _balance_shows_fills(self, order: InFlightOrder) -> bool:
+        """True once the base asset's total balance carries the order's own fills (Hotcoin's rule, 2026-10-06). Since the
+        order was sent the balance moved by its own fills and by other orders' fills booked meanwhile: the others' are
+        taken off, and what is left must reach 99% of the order's own (fee rounding). So another order's fill can't
+        stand in for this one's, and a fill that landed long ago passes at once however much the asset traded since. An
+        order without fills, or with no baseline (sent before this process), needs no wait."""
+        baseline = self._hold_baseline.get(order.client_order_id)
+        if baseline is None or order.executed_amount_base <= 0:
+            return True
+        own = self._base_delta(order, list(order.order_fills.values()))
+        if own == 0:
+            return True
+        balance_then, booked_then = baseline
+        asset = order.base_asset
+        others = self._booked_base.get(asset, Decimal("0")) - booked_then - own
+        moved_own = self._account_balances.get(asset, Decimal("0")) - balance_then - others
+        return moved_own / own >= Decimal("0.99")
 
     # ------------------------------------------------------------------ fills (REST rows)
 
@@ -1084,6 +1189,7 @@ class CoinwExchange(ExchangePyBase):
         """Book the order's new fill rows now. `reported` = what CoinW says the order filled (a push or a REST read):
         rows that stay short of it after the read are audit-logged (CoinW's rows can trail its order state)."""
         for update in await self._fill_updates(order):
+            self._note_fill_booked(order, update)
             self._order_tracker.process_trade_update(update)
         if not quiet_cap and order.executed_amount_base + self._fill_tolerance(order) < reported:
             self._audit("fills-behind-state", client_id=order.client_order_id, source=source, reported=str(reported),
@@ -1434,7 +1540,7 @@ class CoinwExchange(ExchangePyBase):
                 return
             if order.client_order_id not in self._order_tracker.all_updatable_orders:
                 return
-            self._order_tracker.process_order_update(self._order_update(order, state))
+            self._forward_update(order, self._order_update(order, state), source="done-push")
         finally:
             self._settling.discard(order.client_order_id)
 
@@ -1487,7 +1593,9 @@ class CoinwExchange(ExchangePyBase):
             self._balance_pushes_audited += 1
             safe_ensure_future(self._audit_balance_push(asset, data))
         # The BASE coin only: every fill moves it (a buy's arrives, a sell's hold leaves), while a quote push (USDT)
-        # comes with every placement and cancel on every market. Not while rate-limited: the poll books them then.
+        # can come from any market's fill. (No push comes for an order's hold: placement and cancel pushed nothing in
+        # the placement probe, 2026-10-16; the docs: trading activity only.) Not while rate-limited: the poll books
+        # them then.
         if not self._rate_limited() and any(asset == o.base_asset for o in self.in_flight_orders.values()):
             self._fills_check_pending.add(asset)
             if self._fills_check_task is None or self._fills_check_task.done():
