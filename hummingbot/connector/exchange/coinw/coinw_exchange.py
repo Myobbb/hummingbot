@@ -887,15 +887,15 @@ class CoinwExchange(ExchangePyBase):
         """Book what CoinW's rows still lack of the order's fill as ONE fill from its cumulative totals; True if done.
 
         The fill: the size `reported` - booked, the quote the cumulative quote - booked (else the size x the cumulative
-        average, else the order's price), the fee the cumulative fee - booked (in the received asset, like every CoinW
-        fill; 0 when unknown), named <orderNumber>:<cumulative size>. Booked in one go with the terminal state that
+        average, else the order's price), the fee the cumulative fee - booked (in the quote, like every CoinW fill; 0
+        when unknown), named <orderNumber>:<cumulative size>. Booked in one go with the terminal state that
         follows (no await between), so no row read can add the same quantity again; later rows find no room."""
         size, quote_total, fee_total = cumulative
         missing = min(reported, order.amount) - order.executed_amount_base
         if missing <= self._fill_tolerance(order) or order.exchange_order_id is None:
             return False
         booked_quote = sum((f.fill_quote_amount for f in order.order_fills.values()), Decimal("0"))
-        token = self._received_asset(order)
+        token = self._fee_asset(order)
         booked_fee = sum((fee.amount for f in order.order_fills.values() for fee in f.fee.flat_fees
                           if fee.token == token), Decimal("0"))
         if quote_total > booked_quote and size > 0:
@@ -1070,8 +1070,8 @@ class CoinwExchange(ExchangePyBase):
             self._hold_baseline.pop(order.client_order_id, None)
 
     def _base_delta(self, order: InFlightOrder, fills: List[TradeUpdate]) -> Decimal:
-        """The fills' net change of the base asset's total: + on a buy less its fee (CoinW charges the received asset,
-        the base), - on a sell (its fee is in the quote)."""
+        """The fills' net change of the base asset's total: + on a buy, - on a sell (CoinW charges every fee in the quote,
+        so no fee comes off the base; a base fee, were one booked, is taken off)."""
         delta = Decimal("0")
         for fill in fills:
             base_fee = sum((fee.amount for fee in fill.fee.flat_fees if fee.token == order.base_asset), Decimal("0"))
@@ -1148,9 +1148,9 @@ class CoinwExchange(ExchangePyBase):
         quantity = self._dec(row.get("size"))
         price = self._dec(row.get("price"))
         fee = self._dec(row.get("fee"))
-        # The row names no fee asset. CoinW charges the received asset (to be confirmed on the first fills against the
-        # balances: [CW-AUDIT] fee-asset).
-        token = self._received_asset(order)
+        # The row names no fee asset. CoinW charges the QUOTE on both sides (live 2026-10-16: a BTC_USDT maker buy's
+        # 0.0494 fee came off USDT, the BTC credited in full; the sells' fees are USDT too) -- not the received asset.
+        token = self._fee_asset(order)
         self._audit_once(f"fee-asset:{order.trade_type.name}", fee=str(fee), quantity=str(quantity), price=str(price),
                          per_quantity=str(fee / quantity) if quantity > 0 else None,
                          per_value=str(fee / (quantity * price)) if quantity > 0 and price > 0 else None, token=token)
@@ -1212,8 +1212,10 @@ class CoinwExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         return await self._fill_updates(order)
 
-    def _received_asset(self, order: InFlightOrder) -> str:
-        return order.base_asset if order.trade_type is TradeType.BUY else order.quote_asset
+    @staticmethod
+    def _fee_asset(order: InFlightOrder) -> str:
+        """CoinW charges every spot fee in the quote, a buy's too (the partial-fill probe, 2026-10-16)."""
+        return order.quote_asset
 
     def _get_fee(
         self,
@@ -1254,7 +1256,8 @@ class CoinwExchange(ExchangePyBase):
 
     def _own_locked(self, asset: str) -> Decimal:
         """What HMB's own open CoinW orders lock of `asset`: a buy its unfilled size x price in the quote, a sell its
-        unfilled size in the base (CoinW charges the fee in the received asset, so nothing more is held). An order this
+        unfilled size in the base (a buy's fee is CoinW's to hold too, ~0.1% more: left out, it only shows as CoinW's
+        `locked` exceeding ours, which takes nothing off). An order this
         process gave up (failed, or not found) locks nothing from that moment -- the tracker applies its FAILED state a
         moment later."""
         locked = Decimal("0")
