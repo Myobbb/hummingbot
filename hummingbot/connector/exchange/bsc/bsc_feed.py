@@ -7,7 +7,8 @@ which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5
 20, and 0.42 ms per swap. The child does:
   - the 1 s book poll (bsc_quoter: the call built, BlockPI asked, the answer decoded into books), the wallet's reads riding in
     it, and the books gated by the approvals (a side the wallet can't pay into its executor is not shown);
-  - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's;
+  - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's; each signed
+    transaction's line in the swap ledger first (the asset manager's tag for the wallet's fills, P3-DEX decision 3);
   - the wallet's nonce, and every transaction it sends followed to its receipt or its last block.
 HMB's side (bsc_exchange.BscExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
 approvals' back-off. They exchange one small message per poll and per transaction (FeedClient <-> Feed): framed pickles on
@@ -38,7 +39,8 @@ from hummingbot.connector.exchange.bsc.bsc_p1_quoter import adr, word
 from hummingbot.connector.exchange.bsc.bsc_pool_list import PoolList
 from hummingbot.connector.exchange.bsc.bsc_quoter import BscQuoter
 from hummingbot.connector.exchange.bsc.bsc_swap import build_swap, executor
-from hummingbot.connector.exchange.bsc.bsc_tx import allowance_calls, build_tx, missing_approvals, parse_receipt, sign
+from hummingbot.connector.exchange.bsc.bsc_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
+                                                       parse_receipt, sign)
 
 FEED_NICE = 10            # the child's niceness: under CPU contention HMB's own process goes first
 FEED_RESTART_S = 5.0      # a child that ended on its own is started again no sooner than this after it ended
@@ -49,6 +51,10 @@ WORKER_MODULES = ("bsc_constants", "bsc_p1_quoter", "bsc_swap", "bsc_pool_list",
 # what HMB keeps of a swap out (its settle, its line): the rest of the swap (its calldata, its executor) stays in the child
 SWAP_KEYS = ("side", "ca", "ca_decimals", "token_in", "token_out", "amount_in", "min_out", "pool", "book_block", "book_at",
              "head", "expected_out")
+# the swap ledger's line (contract v1, P3-DEX decision 3): v, ts, nonce, hash, kind, by, then these by kind. Nothing else: no
+# key material, no raw transaction
+LEDGER_FIELDS = {"swap": ("order_id", "pair", "side", "ca"), "approve": ("ca", "spender"), "send": ("ca", "to", "amount")}
+LEDGER_BY = ("strategy", "manual")
 
 
 class Refused(Exception):
@@ -167,6 +173,10 @@ class Feed:
         self.approvals: Dict[tuple, bool] = {}
         self.nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self.out: Dict[str, dict] = dict(init.get("follow") or {})   # order id -> a swap out (HMB's, after a restart too)
+        self.ledger_path = init.get("ledger")         # the swap ledger: every transaction signed gets its line before it goes out
+        self.ledger_by = init.get("ledger_by") or "strategy"         # whose transactions: HMB's, or the DEX manual's
+        if self.ledger_by not in LEDGER_BY:
+            raise ValueError(f"ledger_by {self.ledger_by!r} is not one of {LEDGER_BY}")
         self.reported: Dict[str, str] = {}
         self._quoted: Optional[tuple] = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -428,8 +438,10 @@ class Feed:
             if not self.approvals.get((swap["token_in"], swap["executor"]["router"])):
                 raise Refused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
             record.update({k: swap[k] for k in SWAP_KEYS}, trading_pair=p["trading_pair"])
-            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT, head=swap["head"],
-                                on_signed=signed)
+            ledger = {"kind": "swap", "order_id": order_id, "pair": p["trading_pair"], "side": swap["side"],
+                      "ca": swap["ca"].lower()}
+            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT, ledger,
+                                head=swap["head"], on_signed=signed)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -440,15 +452,16 @@ class Feed:
         self.send(("swap", order_id, "sent", dict(record)))
         self._spawn(self._follow(order_id, record))
 
-    async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int, head: Optional[int] = None,
-                       on_signed: Optional[Callable[[], None]] = None):
+    async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int, ledger: dict,
+                       head: Optional[int] = None, on_signed: Optional[Callable[[], None]] = None):
         """sign the wallet's next transaction and send it as a bundle to every builder, valid for BUNDLE_BLOCKS blocks after
         the head; its hash, nonce, last block and send time go into `record` (what the lifecycle follows). A swap gives the
         head (its book's, _swap_for) and finds the nonce known (_read_nonce), so its bundle is its one request; an approval
-        has no book and reads the head. The nonce is read here only while it is still unknown.
-        Raises Refused when nothing went out: the nonce or the head unreadable, or every builder refused it (SendRefused: the
-        nonce is read anew, and `record` gets no hash). Any other error is an unknown outcome: it may be out, so it is
-        followed."""
+        has no book and reads the head. The nonce is read here only while it is still unknown. Signed, it gets its line in
+        the swap ledger (`ledger`: its kind and fields, _ledger) before anything goes out.
+        Raises Refused when nothing went out: the nonce or the head unreadable, its ledger line not written, or every builder
+        refused it (SendRefused: the nonce is read anew, and `record` gets no hash). Any other error is an unknown outcome:
+        it may be out, so it is followed."""
         try:
             if self.nonce is None:
                 self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
@@ -457,6 +470,7 @@ class Feed:
             last_block = head + CONSTANTS.BUNDLE_BLOCKS
             nonce = self.nonce
             raw, tx_hash = sign(self.account, build_tx(to, data, value, nonce, gas, CONSTANTS.GAS_PRICE_WEI))
+            self._ledger(nonce, tx_hash, ledger)     # before it goes out: a nonce the chain shows used has its line
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -474,6 +488,27 @@ class Feed:
             raise
         except Exception as e:
             self._log("warning", f"bsc: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it on chain")
+
+    def _ledger(self, nonce: int, tx_hash: str, entry: dict):
+        """the swap ledger's line for a transaction just signed (contract v1; P3-DEX decision 3, Pavel 2026-10-16: the asset
+        manager books the wallet's fills from the chain and tags them by it): v, ts (ms), nonce, hash, kind, by, and the
+        kind's own fields. One unbuffered append, so the line is in the file before the bundle leaves, whoever else appends
+        (the DEX manual); never a rewrite. Raises when it can't write it: the caller then refuses the transaction, its nonce
+        unused (a transaction out without its line could not be told from a manual one)"""
+        if not self.ledger_path:
+            raise RuntimeError("no swap ledger to record it in")
+        line = {"v": 1, "ts": int(time.time() * 1000), "nonce": int(nonce), "hash": tx_hash.lower(), "kind": entry["kind"],
+                "by": self.ledger_by}
+        line.update((k, entry.get(k)) for k in LEDGER_FIELDS[entry["kind"]])
+        if line["kind"] == "swap" and self.ledger_by != "strategy":
+            line["order_id"] = None                   # only HMB's own swaps carry a BSC- id: the asset manager's Hummingbot tag
+        data = (json.dumps(line, separators=(",", ":")) + "\n").encode()
+        fd = os.open(self.ledger_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError(f"the swap ledger {self.ledger_path} took only part of the line")
+        finally:
+            os.close(fd)
 
     async def _read_nonce(self):
         """the wallet's next nonce, read OFF the order path (Pavel 2026-10-15): after a wallet read while it is unknown and
@@ -577,7 +612,9 @@ class Feed:
         try:
             if self.account is None:
                 raise Refused("no wallet key: connect bsc with bsc_private_key")
-            await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT)
+            token, spender = approval_parties(to, data)
+            await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT,
+                                {"kind": "approve", "ca": token, "spender": spender})
         except asyncio.CancelledError:
             raise
         except Exception as e:

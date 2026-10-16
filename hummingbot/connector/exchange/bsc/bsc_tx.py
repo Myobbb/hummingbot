@@ -41,6 +41,15 @@ def permit2_approve_call(permit2: str, token: str, spender: str, amount: int = M
     return permit2, SEL_P2_APPROVE + _a(token) + _a(spender) + _w(amount) + _w(expiration)
 
 
+def approval_parties(to: str, data: bytes) -> Tuple[str, str]:
+    """(the token, the spender) an approve_call or permit2_approve_call grants, lowercase: what the swap ledger records"""
+    if data[:4] == SEL_APPROVE:
+        return to.lower(), "0x" + data[16:36].hex()
+    if data[:4] == SEL_P2_APPROVE:
+        return "0x" + data[16:36].hex(), "0x" + data[48:68].hex()
+    raise ValueError(f"not an approval call: {data[:4].hex()}")
+
+
 def allowance_calls(wallet: str, token: str, executor: dict) -> List[Tuple[str, bytes]]:
     """the reads that tell whether `wallet` can pay `token` into `executor` ({"router", "permit2" or None})"""
     if executor.get("permit2"):

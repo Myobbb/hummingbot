@@ -238,6 +238,13 @@ BALANCE_MISSING_READS = 2
 # placed; DONE: a hold released) triggers one REST balance read, this long after the last push of a burst; without
 # it the available balance would wait for the status poll (up to 60 s once no order is open).
 BALANCE_REFRESH_DEBOUNCE_S = 0.3
+# The same missing hold push, the other way round: from its send until CoinW's next figures show its hold (~0.6 s: the
+# RECEIVED push, the debounce, the read), an order's coins would still read as free, and a second order spending them
+# would be refused (the order/balance review's gap 2, 2026-10-16). So the available balance HMB reads is CoinW's
+# available less whatever HMB's own open orders lock beyond CoinW's reported `locked` (REST onOrders, push hold) --
+# applied at the send, on every read and push, and undone when an order fails. Below this the two are the same
+# (rounding of size x price).
+OWN_LOCK_TOLERANCE = Decimal("1e-8")
 
 # --- First-live-run audit logging ----------------------------------------------------------------------------
 # Every line is tagged [CW-AUDIT]; scoped to what the docs could not settle. Money-guard firings always log as

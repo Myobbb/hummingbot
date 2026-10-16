@@ -1,5 +1,6 @@
 """P2-DEX `bsc` connector (build step 3, 2026-10-14). The DEX knobs live with the code that uses them: bsc_quoter (cadence,
 rungs, switch, re-election) and bsc_pool_list (the payload files the watcher writes)."""
+import os
 from decimal import Decimal
 
 EXCHANGE_NAME = "bsc"
@@ -66,6 +67,11 @@ SWAP_READ_URL = "https://bsc-dataseed1.bnbchain.org"
 # The order lifecycle (2026-10-14): one transaction at a time per wallet, followed on chain until it ends.
 RECEIPT_POLL_S = 0.1              # a transaction out has its receipt asked for this often: it ends ~0.1 s after it is mined
 SEND_TIMEOUT_S = 2.0              # a builder that hasn't answered a bundle by then counts as silent (the other may have taken it)
+# The swap ledger (P3-DEX decision 3, Pavel 2026-10-16: "if AM can re-use it it's great"): one JSON line per transaction signed
+# for the wallet, appended before it goes out. The asset manager books the wallet's fills from the chain and tags them by it
+# (the chain can't tell HMB's swaps from manual ones, and the public node can't give a transaction's hash from its nonce).
+# Contract v1 -> wiki P3-DEX Overview §The swap ledger. Beside P1's records; `.jsonl`, so no `*.json` glob takes it.
+SWAP_LEDGER_PATH = os.path.expanduser("~/p2_dex/swaps.jsonl")
 WARN_EVERY_S = 30.0               # a transaction's trouble (an unreadable receipt) is said at most this often
 PRICE_SLACK = Decimal("1e-6")     # the limit check's relative slack: a strategy's limit and the book's levels are the same
                                   # prices read through float and Decimal, which differ in the last digits

@@ -123,6 +123,7 @@ class BscExchange(ExchangePyBase):
         self._caps_dirty = True                        # a balance moved since the ladders' ends were last worked out
         self._cas: Dict[str, str] = {}                 # trading pair -> the CA its leg names (bind_ca: the orchestrator)
         self._feed = FeedClient(self._on_feed, self._log, self._mask)
+        self._ledger_by = "strategy"                   # whose transactions the swap ledger records: the DEX manual's "manual"
         self._sent: Dict[str, Any] = {}                # what the feed was last told: "cas", "caps"
         self._feed_stats: Dict[str, int] = {}          # the feed's quoter counters, from its last poll
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
@@ -392,13 +393,14 @@ class BscExchange(ExchangePyBase):
 
     def _feed_init(self, cas: List[str], caps: Dict[str, dict]) -> dict:
         """what the feed process starts with: the node, the wallet and its key (on its stdin, never in its arguments), what
-        to quote, and the swaps still out (followed again)"""
+        to quote, the swaps still out (followed again), and the swap ledger with whose transactions it records"""
         return {"rpc_url": self._rpc_url, "wallet": self._wallet,
                 "key": bytes(self._account.key) if self._account is not None else None,
                 "read_wallet": self.is_trading_required and bool(self._wallet) and not self._key_problem,
                 "gate": self.is_trading_required, "data_dir": self._pool_list.data_dir, "poll_s": POLL_S,
                 "builders": list(CONSTANTS.BUILDERS), "swap_read_url": CONSTANTS.SWAP_READ_URL,
-                "cas": cas, "caps": caps, "follow": dict(self._swaps)}
+                "cas": cas, "caps": caps, "follow": dict(self._swaps),
+                "ledger": CONSTANTS.SWAP_LEDGER_PATH, "ledger_by": self._ledger_by}
 
     def _send_changed(self, kind: str, value):
         """the feed told only what changed: the CAs to quote, the ladders' ends"""

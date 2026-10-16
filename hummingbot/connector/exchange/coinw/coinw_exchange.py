@@ -123,6 +123,9 @@ class CoinwExchange(ExchangePyBase):
         self._balance_pushed_at: Dict[str, float] = {}
         # per asset: the last assets push's ledger_id (an older one is not applied)
         self._ledger_ids: Dict[str, int] = {}
+        # per asset: CoinW's last (available, locked) -- REST onOrders, push hold -- as reported; the available balance
+        # HMB reads also loses what HMB's own open orders lock beyond `locked` (_apply_balance)
+        self._reported_balances: Dict[str, Tuple[Decimal, Decimal]] = {}
         self._balance_pushes_audited = 0
         # empty balance answers in a row (an empty answer is believed only after a run of them)
         self._empty_balance_reads = 0
@@ -331,12 +334,18 @@ class CoinwExchange(ExchangePyBase):
 
     def _update_order_after_failure(self, order_id: str, trading_pair: str, exception: Optional[Exception] = None):
         self._give_up(order_id)
+        tracked = self._order_tracker.fetch_tracked_order(order_id)
         super()._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
+        if tracked is not None:
+            self._reapply_balances(self._spend_asset(tracked))     # a failed order holds nothing
 
     async def _strike_not_found(self, client_order_id: str) -> None:
         """A not-found strike (the tracker fails the order, and purges it, after its limit)."""
         self._give_up(client_order_id)
+        tracked = self._order_tracker.fetch_tracked_order(client_order_id)
         await self._order_tracker.process_order_not_found(client_order_id)
+        if tracked is not None:
+            self._reapply_balances(self._spend_asset(tracked))
 
     async def _public(self, command: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return await self._request(command, params, private=False)
@@ -633,6 +642,8 @@ class CoinwExchange(ExchangePyBase):
         if len(self._hold_baseline) > 2000:
             for client_order_id in list(self._hold_baseline)[:1000]:
                 del self._hold_baseline[client_order_id]
+        # The order is tracked already: its hold leaves the available balance now, as a hold push would elsewhere.
+        self._reapply_balances(self._spend_asset(order))
         exchange_order_id, update_timestamp = await self._place_order(
             order_id=order.client_order_id,
             trading_pair=order.trading_pair,
@@ -1241,6 +1252,46 @@ class CoinwExchange(ExchangePyBase):
             return None
         return coin.upper() or None
 
+    def _own_locked(self, asset: str) -> Decimal:
+        """What HMB's own open CoinW orders lock of `asset`: a buy its unfilled size x price in the quote, a sell its
+        unfilled size in the base (CoinW charges the fee in the received asset, so nothing more is held). An order this
+        process gave up (failed, or not found) locks nothing from that moment -- the tracker applies its FAILED state a
+        moment later."""
+        locked = Decimal("0")
+        for order in self.in_flight_orders.values():
+            if order.is_done or order.is_failure or order.is_cancelled or order.client_order_id in self._given_up:
+                continue
+            rest = max(order.amount - order.executed_amount_base, Decimal("0"))
+            if order.trade_type is TradeType.BUY:
+                if order.quote_asset == asset:
+                    locked += rest * order.price
+            elif order.base_asset == asset:
+                locked += rest
+        return locked
+
+    def _apply_balance(self, asset: str, available: Decimal, locked: Decimal) -> None:
+        """CoinW's figures for `asset` -> the balances HMB reads. Total = available + locked. Available also loses what
+        HMB's own open orders lock beyond `locked`: CoinW pushes nothing for an order's hold, so a REST answer or push
+        from before CoinW took an order's hold still counts its coins as free, and a second order sized on them would
+        be refused (the order/balance review's gap 2, 2026-10-16). Other processes' orders only raise `locked`."""
+        self._reported_balances[asset] = (available, locked)
+        self._account_balances[asset] = available + locked
+        shortfall = self._own_locked(asset) - locked
+        self._account_available_balances[asset] = (max(available - shortfall, Decimal("0"))
+                                                   if shortfall > CONSTANTS.OWN_LOCK_TOLERANCE else available)
+
+    def _reapply_balances(self, *assets: str) -> None:
+        """HMB's own orders changed (one sent, one failed): CoinW's last figures re-applied, so a new order's hold shows
+        at once and a refused one's coins come back -- no push or read is needed for either."""
+        for asset in assets:
+            reported = self._reported_balances.get(asset)
+            if reported is not None:
+                self._apply_balance(asset, *reported)
+
+    @staticmethod
+    def _spend_asset(order: InFlightOrder) -> str:
+        return order.quote_asset if order.trade_type is TradeType.BUY else order.base_asset
+
     async def _update_balances(self) -> None:
         """returnCompleteBalances ({coin: {available, onOrders}}, held coins only). An asset whose push arrived after
         this request was sent keeps the push (runbook §1.5; Hotcoin's rule). An EMPTY answer is believed only after
@@ -1270,9 +1321,7 @@ class CoinwExchange(ExchangePyBase):
             remote_asset_names.add(asset)
             if self._balance_pushed_at.get(asset, 0.0) > requested_at:
                 continue
-            available, on_orders = self._dec(row.get("available")), self._dec(row.get("onOrders"))
-            self._account_available_balances[asset] = available
-            self._account_balances[asset] = available + on_orders
+            self._apply_balance(asset, self._dec(row.get("available")), self._dec(row.get("onOrders")))
         for asset_name in remote_asset_names:
             self._missing_balance_reads.pop(asset_name, None)
         for asset_name in local_asset_names.difference(remote_asset_names):
@@ -1286,6 +1335,7 @@ class CoinwExchange(ExchangePyBase):
             self._missing_balance_reads.pop(asset_name, None)
             self._account_available_balances.pop(asset_name, None)
             self._account_balances.pop(asset_name, None)
+            self._reported_balances.pop(asset_name, None)
 
     # ------------------------------------------------------------------ symbols / rules
 
@@ -1590,9 +1640,7 @@ class CoinwExchange(ExchangePyBase):
             return
         if ledger:
             self._ledger_ids[asset] = ledger
-        available, hold = self._dec(data.get("available")), self._dec(data.get("hold"))
-        self._account_available_balances[asset] = available
-        self._account_balances[asset] = available + hold
+        self._apply_balance(asset, self._dec(data.get("available")), self._dec(data.get("hold")))
         self._balance_pushed_at[asset] = time.monotonic()
         if CONSTANTS.LIVE_AUDIT_LOGGING and self._balance_pushes_audited < CONSTANTS.BALANCE_AUDIT_PUSHES:
             self._balance_pushes_audited += 1
