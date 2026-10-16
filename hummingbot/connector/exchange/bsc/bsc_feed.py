@@ -9,7 +9,9 @@ which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5
     it, and the books gated by the approvals (a side the wallet can't pay into its executor is not shown);
   - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's; each signed
     transaction's line in the swap ledger first (the asset manager's tag for the wallet's fills, P3-DEX decision 3);
-  - the wallet's nonce, and every transaction it sends followed to its receipt or its last block.
+  - the wallet's nonce, and every transaction it sends followed to its receipt or its last block;
+  - the wallet lease (P3-DEX decision 2): a heartbeat each poll; while another sender (the asset manager's withdraw) holds a
+    valid request, no book shown and nothing signed, the grant once nothing signed is out, the nonce read anew at release.
 HMB's side (bsc_exchange.BscExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
 approvals' back-off. They exchange one small message per poll and per transaction (FeedClient <-> Feed): framed pickles on
 the child's stdin and stdout.
@@ -55,6 +57,11 @@ SWAP_KEYS = ("side", "ca", "ca_decimals", "token_in", "token_out", "amount_in", 
 # key material, no raw transaction
 LEDGER_FIELDS = {"swap": ("order_id", "pair", "side", "ca"), "approve": ("ca", "spender"), "send": ("ca", "to", "amount")}
 LEDGER_BY = ("strategy", "manual")
+# the wallet lease (contract v1, P3-DEX decision 2, Pavel 2026-10-16: "when we do it's good to block the DEX strategies from
+# trading while transfer is processing"): three files beside the swap ledger, each one JSON object written atomically
+# (<name>.tmp, then os.replace), each by its one writer. The requester (the asset manager's withdraw, later the DEX manual)
+# writes the request; HMB's feed the grant and the heartbeat. Contract -> wiki P3-DEX Overview §The lease, contract v1
+LEASE_REQUEST, LEASE_GRANTED, HEARTBEAT = "lease.request", "lease.granted", "feed.heartbeat"
 
 
 class Refused(Exception):
@@ -177,6 +184,11 @@ class Feed:
         self.ledger_by = init.get("ledger_by") or "strategy"         # whose transactions: HMB's, or the DEX manual's
         if self.ledger_by not in LEDGER_BY:
             raise ValueError(f"ledger_by {self.ledger_by!r} is not one of {LEDGER_BY}")
+        # the wallet lease: HMB's feed only (the DEX manual's feeds neither grant nor heed it: each file keeps one writer)
+        self.lease_dir = os.path.dirname(self.ledger_path) if init.get("lease") and self.ledger_path else None
+        self.lease: Optional[dict] = None             # the request the wallet is leased to: no book shown, nothing signed
+        self.granted: Optional[str] = None            # the request id granted (once per id)
+        self._approving = 0                           # approvals signed and not yet ended: the grant waits for them too (F2)
         self.reported: Dict[str, str] = {}
         self._quoted: Optional[tuple] = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -186,7 +198,10 @@ class Feed:
 
     # ---------------------------------------------------------------- the loop
     async def serve(self, reader: asyncio.StreamReader):
-        """until HMB says stop or its end of the pipe closes: the poll loop, the swaps out followed, each command as it comes"""
+        """until HMB says stop or its end of the pipe closes: the poll loop, the swaps out followed, each command as it comes.
+        A standing wallet lease is read first, before the first quote or signature (F6); a clean stop takes the heartbeat
+        down (no feed runs), and leaves a grant to the next feed's release"""
+        self._lease_resume()
         self._spawn(self._poll_loop())
         for order_id, record in list(self.out.items()):
             self._spawn(self._follow(order_id, record))
@@ -199,6 +214,8 @@ class Feed:
         finally:
             for task in list(self._tasks):
                 task.cancel()
+            if self.lease_dir:
+                self._lease_delete(HEARTBEAT)
             if self._session is not None and not self._session.closed:
                 await self._session.close()
 
@@ -274,9 +291,10 @@ class Feed:
         while True:
             t0 = time.time()
             try:
+                leased = await self._lease_step()
                 self._load_pools()
                 if self.quoter.cas:
-                    await self._poll()
+                    await self._poll(leased)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -298,7 +316,9 @@ class Feed:
             self.quoter.set_pools(types.SimpleNamespace(cas={ca: self.pool_list.cas[ca] for ca in wanted}), changed)
             self._quoted = wanted
 
-    async def _poll(self):
+    async def _poll(self, leased: bool = False):
+        """one poll: the books and the wallet's reads in one call. While the wallet is leased the wallet is still read (HMB's
+        balances follow the requester's transfer), but no book is shown: HMB empties every bsc book at this poll (F1, F4)"""
         self.quoter.caps = self.caps
         plan = wallet_plan(self.wallet, list(self.quoter.cas), self.pool_list) if self.read_wallet else None
         self.quoter.extra = plan["calls"] if plan else []
@@ -308,10 +328,10 @@ class Feed:
         if plan and [c for c, _ in got] == plan["calls"]:   # this poll's answers (an older block's poll gives back the last)
             wallet = decode_wallet(plan, [a for _, a in got], last.get("block"), self.wallet)
             self.approvals.update(wallet["approvals"])
-        books = {ca: {side: self._side(ca, side, book) for side, book in sides.items()}
-                 for ca, sides in (last.get("books") or {}).items()}
+        books = {} if leased else {ca: {side: self._side(ca, side, book) for side, book in sides.items()}
+                                   for ca, sides in (last.get("books") or {}).items()}
         self.send(("poll", {"block": last["block"], "ts": last["ts"], "at": last["at"], "books": books, "wallet": wallet,
-                            "stats": dict(self.quoter.stats)}))
+                            "stats": dict(self.quoter.stats), "lease": self.lease["id"] if leased and self.lease else None}))
         if wallet is not None:
             self._after_wallet_read()
 
@@ -331,8 +351,8 @@ class Feed:
         """the nonce, while it is unknown and nothing is out, is read in the background, never inside the poll (the books
         don't wait for it), so the run's first order finds it"""
         if (self.nonce is None and not self.out and self.account is not None and CONSTANTS.TRADING_ENABLED
-                and (self._nonce_task is None or self._nonce_task.done())):
-            self._nonce_task = asyncio.ensure_future(self._read_nonce())
+                and self.lease is None and (self._nonce_task is None or self._nonce_task.done())):
+            self._nonce_task = asyncio.ensure_future(self._read_nonce())     # (never while leased: the release reads it)
 
     # ---------------------------------------------------------------- a swap: one exact-input swap along its book's route
     def _book_route(self, ca: str, side: str, usd: float) -> Tuple[dict, dict, List[dict]]:
@@ -463,12 +483,14 @@ class Feed:
         refused it (SendRefused: the nonce is read anew, and `record` gets no hash). Any other error is an unknown outcome:
         it may be out, so it is followed."""
         try:
+            self._lease_check()                      # leased: nothing to read either
             if self.nonce is None:
                 self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
             if head is None:
                 head = int(await self._read("eth_blockNumber", []), 16)
             last_block = head + CONSTANTS.BUNDLE_BLOCKS
             nonce = self.nonce
+            self._lease_check()                      # F4: the lease read again right before the signature (no await between)
             raw, tx_hash = sign(self.account, build_tx(to, data, value, nonce, gas, CONSTANTS.GAS_PRICE_WEI))
             self._ledger(nonce, tx_hash, ledger)     # before it goes out: a nonce the chain shows used has its line
         except asyncio.CancelledError:
@@ -528,6 +550,104 @@ class Feed:
         before HMB hears the transaction ended (so before the wallet's turn is free: no send can race the read)"""
         self.nonce = None
         await self._read_nonce()
+
+    # ---------------------------------------------------------------- the wallet lease (contract v1: F1-F6)
+    def _lease_path(self, name: str) -> str:
+        return os.path.join(self.lease_dir, name)
+
+    def _lease_request(self) -> Optional[dict]:
+        """the requester's lease.request, or None: it counts only while it parses, v == 1 and now < expires"""
+        if not self.lease_dir:
+            return None
+        try:
+            with open(self._lease_path(LEASE_REQUEST)) as f:
+                req = json.load(f)
+            if req.get("v") == 1 and req.get("id") and time.time() < float(req["expires"]):
+                return req
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass
+        return None
+
+    def _lease_write(self, name: str, body: dict):
+        """one of the feed's files, whole or not at all: <name>.tmp, then os.replace"""
+        tmp = self._lease_path(name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(body, f, separators=(",", ":"))
+        os.replace(tmp, self._lease_path(name))
+
+    def _lease_delete(self, name: str):
+        try:
+            os.remove(self._lease_path(name))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self._report("lease", f"{name} could not be deleted: {e}", "warning")
+
+    def _lease_check(self):
+        """F4, right before every signature: nothing is signed while the wallet is leased (until the release has read the
+        nonce anew), nor while a valid request stands, one written since the last poll included"""
+        if not self.lease_dir:
+            return
+        req = self.lease or self._lease_request()
+        if req is not None:
+            raise Refused(f"the wallet is leased to {req.get('by')} ({str(req.get('id'))[:8]}): nothing is signed until "
+                          f"it is released")
+
+    def _lease_resume(self):
+        """F6, at the feed's start: the request is read before the first quote or signature. A grant an earlier feed wrote
+        for that same request is kept (once per id); any other grant is released"""
+        if not self.lease_dir:
+            return
+        req = self._lease_request()
+        try:
+            with open(self._lease_path(LEASE_GRANTED)) as f:
+                granted = json.load(f).get("id")
+        except (OSError, ValueError, AttributeError):
+            granted = None
+        if req is not None:
+            self.lease, self.granted = req, (granted if granted == req["id"] else None)
+            self._log("info", f"bsc: the wallet is leased to {req.get('by')} ({req['id'][:8]}) at the feed's start: no DEX "
+                              f"book or signature until it is released")
+        if granted is not None and (req is None or granted != req["id"]):
+            self._lease_delete(LEASE_GRANTED)
+
+    async def _lease_step(self) -> bool:
+        """the wallet lease at each poll (F1-F5) -> True while it is leased: no book shown, nothing signed. The heartbeat
+        first: a requester takes a feed that hasn't written it for 10 s for none running"""
+        if not self.lease_dir:
+            return False
+        try:
+            self._lease_write(HEARTBEAT, {"v": 1, "pid": os.getpid(), "ts": int(time.time())})
+        except OSError as e:
+            self._report("heartbeat", f"not written: {e}", "warning")
+        req, held = self._lease_request(), self.lease
+        if held is not None and (req is None or req["id"] != held["id"]):       # F5: gone, expired or replaced
+            self._lease_delete(LEASE_GRANTED)
+            self.lease, self.granted = None, None
+            if self._nonce_task is not None and not self._nonce_task.done():
+                self._nonce_task.cancel()               # a read from before the requester's transaction must not land after
+            await self._nonce_lost()                    # the nonce read anew, and only then a book is shown again
+            self._log("info", f"bsc: the wallet lease {held['id'][:8]} is released: quoting again")
+        if req is None:
+            return False
+        if self.lease is None:                          # F1, from this poll on (a new id starts here again)
+            self.lease = req
+            self._log("info", f"bsc: the wallet is leased to {req.get('by')} ({req['id'][:8]}): no DEX book or signature "
+                              f"until it is released")
+        if self.granted != req["id"] and not self.out and not self._approving:   # F2: nothing signed is out; F3, once per id
+            try:
+                head = int(await self._read("eth_blockNumber", []), 16)
+                nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
+                self._lease_write(LEASE_GRANTED, {"v": 1, "id": req["id"], "ts": int(time.time()), "block": head,
+                                                  "nonce": nonce})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._report("lease", f"the grant for {req['id'][:8]} waits for the next poll: {self._mask(e)}", "warning")
+                return True
+            self.granted, self.nonce = req["id"], None  # the requester takes that nonce: read anew at the release
+            self._log("info", f"bsc: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
+        return True
 
     async def _send_bundle(self, raw: str, last_block: int):
         """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
@@ -609,25 +729,29 @@ class Feed:
         """one one-time approval, sent like a swap (its turn taken in HMB) and followed to its end here"""
         to, data = call
         record = {}
+        self._approving += 1                          # in flight until it ends: a lease's grant waits for it (F2)
         try:
-            if self.account is None:
-                raise Refused("no wallet key: connect bsc with bsc_private_key")
-            token, spender = approval_parties(to, data)
-            await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT,
-                                {"kind": "approve", "ca": token, "spender": spender})
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            why = str(e) if isinstance(e, Refused) else f"{type(e).__name__}: {e}"
-            self.send(("approval", call_id, "refused", self._mask(why)))
-            return
-        receipt = await self._until_ended(record, f"approval {record['tx_hash']}")
-        if receipt is None:
-            await self._nonce_lost()                  # it never landed: its nonce is free, read anew before the turn ends
-            self.send(("approval", call_id, "dropped", None))
-        else:
-            landed = int(receipt.get("status") or "0x0", 16) == 1
-            self.send(("approval", call_id, "landed" if landed else "reverted", int(receipt["blockNumber"], 16)))
+            try:
+                if self.account is None:
+                    raise Refused("no wallet key: connect bsc with bsc_private_key")
+                token, spender = approval_parties(to, data)
+                await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT,
+                                    {"kind": "approve", "ca": token, "spender": spender})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                why = str(e) if isinstance(e, Refused) else f"{type(e).__name__}: {e}"
+                self.send(("approval", call_id, "refused", self._mask(why)))
+                return
+            receipt = await self._until_ended(record, f"approval {record['tx_hash']}")
+            if receipt is None:
+                await self._nonce_lost()              # it never landed: its nonce is free, read anew before the turn ends
+                self.send(("approval", call_id, "dropped", None))
+            else:
+                landed = int(receipt.get("status") or "0x0", 16) == 1
+                self.send(("approval", call_id, "landed" if landed else "reverted", int(receipt["blockNumber"], 16)))
+        finally:
+            self._approving -= 1
 
 
 # ---------------------------------------------------------------- HMB's side: the child, started, stopped, spoken to

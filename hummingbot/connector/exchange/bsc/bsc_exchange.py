@@ -382,7 +382,8 @@ class BscExchange(ExchangePyBase):
         self._feed_stats = last.get("stats") or {}
         if last.get("wallet") is not None:
             self._apply_wallet(last["wallet"])
-            self._maybe_approve()
+            if not last.get("lease"):                  # leased (another sender holds the wallet): no approval is due
+                self._maybe_approve()
         self._send_caps()
         return last
 
@@ -393,14 +394,16 @@ class BscExchange(ExchangePyBase):
 
     def _feed_init(self, cas: List[str], caps: Dict[str, dict]) -> dict:
         """what the feed process starts with: the node, the wallet and its key (on its stdin, never in its arguments), what
-        to quote, the swaps still out (followed again), and the swap ledger with whose transactions it records"""
+        to quote, the swaps still out (followed again), the swap ledger with whose transactions it records, and whether it
+        holds the wallet lease (P3-DEX: the asset manager's withdrawals; its files beside the ledger)"""
         return {"rpc_url": self._rpc_url, "wallet": self._wallet,
                 "key": bytes(self._account.key) if self._account is not None else None,
                 "read_wallet": self.is_trading_required and bool(self._wallet) and not self._key_problem,
                 "gate": self.is_trading_required, "data_dir": self._pool_list.data_dir, "poll_s": POLL_S,
                 "builders": list(CONSTANTS.BUILDERS), "swap_read_url": CONSTANTS.SWAP_READ_URL,
                 "cas": cas, "caps": caps, "follow": dict(self._swaps),
-                "ledger": CONSTANTS.SWAP_LEDGER_PATH, "ledger_by": self._ledger_by}
+                "ledger": CONSTANTS.SWAP_LEDGER_PATH, "ledger_by": self._ledger_by,
+                "lease": self._ledger_by == "strategy"}   # HMB's feed holds the wallet lease; the DEX manual's never does
 
     def _send_changed(self, kind: str, value):
         """the feed told only what changed: the CAs to quote, the ladders' ends"""
