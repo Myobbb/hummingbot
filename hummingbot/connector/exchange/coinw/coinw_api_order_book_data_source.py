@@ -373,8 +373,14 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if await self._send_market(ws, symbol, "sub"):
                     self._subscribed.add(symbol)
                     self._book(symbol).last_frame = now
-            self.logger().info(f"Subscribed to CoinW depth_sync, depth_snapshot and fills for "
-                               f"{len(self._subscribed)} markets.")
+            message = (f"Subscribed to CoinW depth_sync, depth_snapshot and fills for {len(self._subscribed)} "
+                       f"markets{web_utils.path_note(ws)}.")
+            if web_utils.path_is_slow(ws):
+                self.logger().warning(f"{message} No connection in {CONSTANTS.WS_PATH_ATTEMPTS} answered a ping within "
+                                      f"{CONSTANTS.WS_FAST_PATH_RTT * 1e3:.0f} ms: this socket's frames may arrive "
+                                      f"~100 ms late (the fastest one tried is kept).")
+            else:
+                self.logger().info(message)
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))

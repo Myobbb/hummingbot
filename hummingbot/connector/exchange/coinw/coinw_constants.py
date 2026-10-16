@@ -122,10 +122,20 @@ MARKET_SILENCE_S = 3.0
 RESUBSCRIBE_MIN_INTERVAL = 5.0
 # A socket that delivered nothing for this long while markets are subscribed is half-open: reconnected.
 SOCKET_SILENCE_S = 5.0
-# The client pings ({"event":"ping"} -> {"event":"pong"}, ~165 ms RTT from myserver); the server does not require it.
+# The client pings ({"event":"ping"} -> {"event":"pong"}); the server does not require it.
 WS_HEARTBEAT_INTERVAL = 10
 WS_PONG_TIMEOUT = 10
 SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE = 60
+# The socket's path. ws.futurescw.com is a CDN that routes each CONNECTION to an upstream path of its own, kept for the
+# connection's life: from myserver (2026-10-16) a fast path answered pings in 53-69 ms and a slow one in 156-179 ms, and
+# a slow socket received every frame ~100 ms after a fast one (p50 98-102 ms, p99 115-130 ms over 15,084 identical
+# frames; its order pushes ~110 ms later). Each new connection is a fresh roll (5 of 6 slow at one moment, 7 of 20 at
+# another): a socket is kept once its first ping answers within WS_FAST_PATH_RTT; otherwise the next connection is tried,
+# up to WS_PATH_ATTEMPTS, and the fastest seen is kept. A first ping unanswered in WS_PATH_PING_TIMEOUT counts as slowest.
+# (hmb_local_tools/coinw/debug_coinw_ws_edges.py, debug_coinw_ws_paths.py)
+WS_FAST_PATH_RTT = 0.1
+WS_PATH_ATTEMPTS = 10
+WS_PATH_PING_TIMEOUT = 1.0
 # CoinW's per-market switches: returnSymbol `state` (1 normal, 2 disabled) and returnTicker `isFrozen` (1 = frozen).
 # A market that is off is shown EMPTY while its symbol and trading rule stay (non-negotiable 3). Read with the ticker.
 TRADING_SWITCH_INTERVAL = 30

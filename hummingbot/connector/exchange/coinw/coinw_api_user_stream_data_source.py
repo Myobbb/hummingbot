@@ -97,7 +97,14 @@ class CoinwAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await websocket_assistant.send(WSJSONRequest(payload={
                     "event": "sub", "params": {"biz": "exchange", "type": kind}}))
                 await self._await_ack(websocket_assistant, channel="subscribe", kind=kind, deadline=deadline)
-            self.logger().info("Logged in and subscribed to the CoinW private order and assets channels.")
+            message = (f"Logged in and subscribed to the CoinW private order and assets channels"
+                       f"{web_utils.path_note(websocket_assistant)}.")
+            if web_utils.path_is_slow(websocket_assistant):
+                self.logger().warning(f"{message} No connection in {CONSTANTS.WS_PATH_ATTEMPTS} answered a ping within "
+                                      f"{CONSTANTS.WS_FAST_PATH_RTT * 1e3:.0f} ms: this socket's pushes may arrive "
+                                      f"~100 ms late (the fastest one tried is kept).")
+            else:
+                self.logger().info(message)
             self._backoff.connected()
             self._last_pong = time.monotonic()
             if self._ping_task is not None:

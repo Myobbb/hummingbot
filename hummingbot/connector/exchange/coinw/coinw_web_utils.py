@@ -11,7 +11,7 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
-from hummingbot.core.web_assistant.connections.data_types import WSResponse
+from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest, WSResponse
 from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -136,8 +136,8 @@ class CoinwReconnectBackoff:
         await asyncio.sleep(min(CONSTANTS.WS_RETRY_BASE * 2 ** (self._failures - 1), CONSTANTS.WS_RETRY_CAP))
 
 
-async def connected_ws_assistant(ws_url: str = CONSTANTS.WSS_URL, raw: bool = False) -> WSAssistant:
-    """A WSAssistant over the shared aiohttp session, with CoinW's Origin header and no protocol pings."""
+async def _connect_once(ws_url: str, raw: bool) -> WSAssistant:
+    """One socket over the shared aiohttp session, with CoinW's Origin header and no protocol pings."""
     base = await ConnectionsFactory().get_ws_connection()
     assistant = WSAssistant(connection=CoinwWSConnection(aiohttp_client_session=base._client_session, raw=raw))
     await assistant.connect(
@@ -146,3 +146,94 @@ async def connected_ws_assistant(ws_url: str = CONSTANTS.WSS_URL, raw: bool = Fa
         message_timeout=CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE,
     )
     return assistant
+
+
+async def path_rtt(assistant: WSAssistant) -> float:
+    """One {"event":"ping"} -> {"event":"pong"} round trip on a fresh socket (nothing subscribed yet), in seconds; inf
+    when no pong comes within WS_PATH_PING_TIMEOUT. A raw socket hands frames over as text, a parsed one as dicts."""
+    sent = time.perf_counter()
+    await assistant.send(WSJSONRequest(payload={"event": "ping"}))
+    deadline = sent + CONSTANTS.WS_PATH_PING_TIMEOUT
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return float("inf")
+        try:
+            response = await asyncio.wait_for(assistant.receive(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return float("inf")
+        data = response.data if response is not None else None
+        if isinstance(data, str):
+            event = "pong" if '"pong"' in data[:40] else ("ping" if '"ping"' in data[:40] else None)
+        else:
+            event = data.get("event") if isinstance(data, dict) else None
+        if event == "pong":
+            return time.perf_counter() - sent
+        if event == "ping":
+            await assistant.send(WSJSONRequest(payload={"event": "pong"}))
+
+
+async def _close(assistant: WSAssistant) -> None:
+    """A socket the search doesn't keep, closed within WS_PATH_PING_TIMEOUT: aiohttp waits up to 10 s for the server's
+    close frame, and one that never answers must not hold up the search."""
+    try:
+        await asyncio.wait_for(assistant.disconnect(), timeout=CONSTANTS.WS_PATH_PING_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+async def connected_ws_assistant(ws_url: str = CONSTANTS.WSS_URL, raw: bool = False) -> WSAssistant:
+    """A socket on a FAST path (see WS_FAST_PATH_RTT): connections are tried one after another until one's first ping
+    answers within WS_FAST_PATH_RTT, at most WS_PATH_ATTEMPTS; failing that, the fastest seen is kept. Every other socket
+    is closed. The chosen path is on the assistant as `coinw_path_rtt` (s) and `coinw_path_attempts`, for the caller's
+    log. A failed first connection raises (the caller's reconnect loop); a later one ends the search with the best."""
+    best: Optional[WSAssistant] = None
+    best_rtt = float("inf")
+    attempts = 0
+    try:
+        while attempts < CONSTANTS.WS_PATH_ATTEMPTS and best_rtt > CONSTANTS.WS_FAST_PATH_RTT:
+            attempts += 1
+            try:
+                assistant = await _connect_once(ws_url, raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if best is None:
+                    raise
+                break
+            try:
+                rtt = await path_rtt(assistant)
+            except asyncio.CancelledError:
+                await _close(assistant)
+                raise
+            except Exception:
+                rtt = float("inf")
+            if best is None or rtt < best_rtt:
+                if best is not None:
+                    await _close(best)
+                best, best_rtt = assistant, rtt
+            else:
+                await _close(assistant)
+    except asyncio.CancelledError:
+        if best is not None:
+            await _close(best)
+        raise
+    best.coinw_path_rtt = best_rtt
+    best.coinw_path_attempts = attempts
+    return best
+
+
+def path_note(assistant: Any) -> str:
+    """' (path RTT 58 ms, connection 3)' for a socket chosen by connected_ws_assistant; '' for any other."""
+    rtt = getattr(assistant, "coinw_path_rtt", None)
+    if rtt is None:
+        return ""
+    shown = f"{rtt * 1e3:.0f} ms" if rtt != float("inf") else "no pong"
+    return f" (path RTT {shown}, connection {getattr(assistant, 'coinw_path_attempts', '?')})"
+
+
+def path_is_slow(assistant: Any) -> bool:
+    rtt = getattr(assistant, "coinw_path_rtt", None)
+    return rtt is not None and rtt > CONSTANTS.WS_FAST_PATH_RTT
