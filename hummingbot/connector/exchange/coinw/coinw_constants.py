@@ -247,9 +247,11 @@ BALANCE_REFRESH_DEBOUNCE_S = 0.3
 OWN_LOCK_TOLERANCE = Decimal("1e-8")
 
 # --- First-live-run audit logging ----------------------------------------------------------------------------
-# Every line is tagged [CW-AUDIT]; scoped to what the docs could not settle. Money-guard firings always log as
-# [CW-ALARM] WARNINGs, whatever this says.
-LIVE_AUDIT_LOGGING = True
+# Every line is tagged [CW-AUDIT]; scoped to what the docs could not settle. Off since 2026-10-16 (Pavel): the live
+# audits of 10-15 → 10-16 settled them -- the fee asset (the quote, buys too), the pushes' keys, a resting order's
+# partial fills listed while open (wiki trading/exchanges/coinw-api). True brings them back. Money-guard firings are
+# not audit lines: they always log as [CW-ALARM] WARNINGs (CoinwExchange._alarm).
+LIVE_AUDIT_LOGGING = False
 
 # --- Rate limits ---------------------------------------------------------------------------------------------
 # Per command (docs "Frequency Limit"), linked to the global per-user budget (300/s) and the per-IP one (100/s), each
