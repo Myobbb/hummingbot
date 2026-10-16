@@ -61,9 +61,14 @@ CODE_RATE_LIMIT = "29001"                          # "API access frequently"
 CODE_METHOD = "405"                                # a GET to a POST command
 # An unauthenticated private request (no api_key) answers HTTP 200 with an EMPTY body (live): no envelope at all.
 CODE_EMPTY_ANSWER = "no-envelope"
-# A placement answered -200 (also CoinW's maintenance answer) or with an empty body (proven only for an unauthenticated
-# call) has NOT been refused: CoinW may have taken the order. It is looked up like an unanswered placement.
-PLACE_UNKNOWN_CODES = (CODE_BUSINESS, CODE_EMPTY_ANSWER)
+# "API access" in the Error Code Guide, also an unknown symbol — and, LIVE 2026-10-16 11:00:50 UTC, doTrade's answer
+# {"code":"-3","msg":"spot服务下单接口异常,uid:…"} ("spot order interface exception") for an order CoinW then CREATED:
+# its RECEIVED push is stamped ~0.45 s after the answer (HMB had failed it; the failed-order-alive guard cancelled it).
+CODE_API_ACCESS = "-3"
+# A placement answered -200 (also CoinW's maintenance answer), -3 (see above) or with an empty body (proven only for an
+# unauthenticated call) has NOT been refused: CoinW may have taken the order. It is looked up like an unanswered
+# placement (its push, executed orders by client id, open orders by content); not found, it stays pending.
+PLACE_UNKNOWN_CODES = (CODE_BUSINESS, CODE_EMPTY_ANSWER, CODE_API_ACCESS)
 # Refusal codes worth naming in a WARNING (Error Code Guide; the order-specific ones are audit-logged as seen).
 REFUSAL_CODES = {
     "-105": "wrong signature", "-104": "parameter type error", "-103": "user API error (parameters or signature)",
