@@ -58,8 +58,12 @@ APPROVE_RETRY_MAX_S = 3600.0
 # 2 blocks, receipt p50 0.53 s (the public paths were a block slower).
 BUILDERS = ("https://puissant-builder.48.club", "https://rpc.blockrazor.builders")   # 2.6 / 7.5 ms from myserver
 BLOCK_S = 0.45                    # BSC's block time since the Fermi hard fork (2026-01-14)
-BUNDLE_BLOCKS = 12                # valid for the 12 blocks after the head at the send (~5.4 s): just past the swap's 5 s deadline
-                                  # (bsc_swap.DEADLINE_S), so the deadline stays the swap's expiry
+BUNDLE_BLOCKS = 4                 # valid for the 4 blocks after the head at the send (~1.8 s; Pavel 2026-10-17, was 12). Each of
+                                  # the 42 swaps landed by then landed within 3 blocks of the head at its send (+1: 6, +2: 30,
+                                  # +3: 6), so blocks +4..+12 only kept a swap that lost its race holding the wallet's one turn
+                                  # (~6.5 s from the order to "dropped"; ~2.5 s now). The drop check (bsc_feed._landed) scales
+                                  # with it, and the bundle's last block, not the swap's 5 s deadline (bsc_swap.DEADLINE_S), is
+                                  # now the swap's expiry
 # The order lifecycle's reads (receipts, the head, the nonce): BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms),
 # free, and asked only while a transaction is out. The book feed stays on BlockPI (decision 4).
 SWAP_READ_URL = "https://bsc-dataseed1.bnbchain.org"
@@ -80,4 +84,6 @@ PRICE_SLACK = Decimal("1e-6")     # the limit check's relative slack: a strategy
 # tick between the book's block and the swap's (the WBNB/USDT hop moves in about half of all blocks) made it revert, leaving
 # its CEX leg alone: 21-26% of such legs never landed, even with the bundle's retries (audit 2026-10-15, finding 2). Ticks
 # go both ways, so on average the fill is still the book's; this is only how far one may slip instead of failing.
-SWAP_SLIPPAGE = Decimal("0.003")
+# 1% since Pavel 2026-10-17 (was 0.3%): the minimum is only a floor (a swap fills at the pool's own price at inclusion), and
+# the DEX legs that lost their races on 2026-10-16 were 0.5-4.4% past the 0.3% (ALEO's 20:02 buy, +0.74%, fills at 1%)
+SWAP_SLIPPAGE = Decimal("0.01")
