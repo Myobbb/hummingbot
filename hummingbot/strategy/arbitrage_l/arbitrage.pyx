@@ -110,6 +110,24 @@ cdef:
 DECIMAL_ZERO = Decimal("0")
 QUANTIZATION_EPSILON_DEC = Decimal("1e-12")
 
+
+cpdef object dex_first_cex_amount(object cex_planned, object dex_planned, object dex_filled):
+    """DEX first's CEX leg (Pavel 2026-10-17): its plan less the swap's shortfall (an exact-input DEX buy may get a little
+    less than its amount, and that much less is hedged), never more than planned (a swap that got more keeps the extra),
+    never below 0. Untrimmed (CEX plan = DEX plan) it is min(plan, fill); a hold-band trim keeps its intended difference
+    between the legs (Pavel: "fix dex-first sizing but for hold-band affected orders")"""
+    shortfall = dex_planned - dex_filled if dex_filled < dex_planned else DECIMAL_ZERO
+    return cex_planned - shortfall if cex_planned > shortfall else DECIMAL_ZERO
+
+
+cpdef double dex_first_cache_after_failure(double cache, tuple plan):
+    """the hold band's cached base after a DEX-first leg failed: the arb's credit (buy - sell, taken at its dispatch) undone,
+    since neither leg moved (Pavel 2026-10-17: a failed attempt left it credited, so its retries went out untrimmed)"""
+    if plan is not None and len(plan) > 6 and plan[6]:
+        return cache - <double>plan[6]
+    return cache
+
+
 cdef class ArbitrageLStrategy(StrategyBase):
     """
     Limit order arbitrage strategy (LIMIT ORDERS ONLY).
@@ -1189,7 +1207,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # NOTE: _min_order_usd should match quote currency units
             if avg_sell_price_orig * total_base >= self._min_order_usd:
                 # Return worst prices for limit order placement (not averages)
-                return (total_base, profitability, worst_sell_price, worst_buy_price)
+                # + the averages: DEX first holds its swap to min_profitability against the CEX leg's average (2026-10-17)
+                return (total_base, profitability, worst_sell_price, worst_buy_price, avg_sell_price_orig, avg_buy_price)
 
         return (0.0, 0.0, 0.0, 0.0)
 
@@ -2416,6 +2435,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef bint sell_is_swap = getattr(sell_market, "is_swap_venue", False) is True
         cdef bint dex_first = (buy_is_swap != sell_is_swap and _final_buy_qty > DECIMAL_ZERO
                                and _final_sell_qty > DECIMAL_ZERO)
+        # ... and its DEX leg's limit (Pavel 2026-10-17: the swap's room = "minimum profitability that is already set by the
+        # strategy"): the price at which the arb still makes min_profitability against its CEX leg's average from this scan,
+        # in place of the book's own limit and the swap's 1% room (c_dex_first_limit). None: the book's limit, as before
+        cdef object dex_limit = None
+        cdef object hold_trimmed
+        cdef double hold_credit = 0.0
+        if dex_first:
+            dex_limit = self.c_dex_first_limit(
+                buy_market if buy_is_swap else sell_market, buy_is_swap,
+                (<double>result[4] if buy_is_swap else <double>result[5]) if len(result) > 5 else 0.0,
+                self._conv_rate(buy_market_tuple, sell_market_tuple))
 
         if _final_buy_qty > DECIMAL_ZERO or _final_sell_qty > DECIMAL_ZERO:
             # Log timing for latency monitoring
@@ -2439,7 +2469,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     buy_order_id = self.c_buy_with_specific_market(
                         buy_market_tuple, _final_buy_qty,
                         order_type=buy_order_type,
-                        price=buy_price_decimal,
+                        price=dex_limit if (buy_is_swap and dex_limit is not None) else buy_price_decimal,
                         expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error (e.g. invalid type, market not whitelisted)
@@ -2458,7 +2488,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     sell_order_id = self.c_sell_with_specific_market(
                         sell_market_tuple, _final_sell_qty,
                         order_type=sell_order_type,
-                        price=sell_price_decimal,
+                        price=dex_limit if (sell_is_swap and dex_limit is not None) else sell_price_decimal,
                         expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error - buy order may have been submitted (will timeout/cancel)
@@ -2470,24 +2500,32 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 ))
                 return
 
-            # DEX first: the CEX leg that waits for the DEX leg's fill (c_fire_dex_first_cex_leg), at this arb's own limit
+            # DEX first: the CEX leg that waits for the DEX leg's fill (c_fire_dex_first_cex_leg), at this arb's own limit.
+            # The plan also holds the DEX leg's own amount (a hold-band trim keeps its CEX leg's size, less only the swap's
+            # shortfall) and the hold band's credit for this arb (undone if the DEX leg fails: nothing moved)
             if dex_first:
+                hold_trimmed = self._hold_correction_active and _final_buy_qty != _final_sell_qty
+                hold_credit = (float(_final_buy_qty) - float(_final_sell_qty)) if hold_trimmed else 0.0
                 if buy_is_swap and buy_order_id:
                     self._dex_first_pending[buy_order_id] = (
-                        sell_market_tuple, False, _final_sell_qty, sell_price_decimal,
-                        self._hold_correction_active and _final_buy_qty != _final_sell_qty)
+                        sell_market_tuple, False, _final_sell_qty, sell_price_decimal, hold_trimmed, _final_buy_qty,
+                        hold_credit)
                     self.logger().info(
                         f"DEX first: {buy_market.name} buy {_final_buy_qty} {buy_market_tuple.trading_pair} sent "
                         f"({buy_order_id}); its {sell_market.name} sell {_final_sell_qty} at {sell_price_decimal} "
-                        f"waits for its fill | profit {profitability * 100:.3f}%")
+                        f"waits for its fill | profit {profitability * 100:.3f}%; the swap's limit "
+                        f"{dex_limit if dex_limit is not None else buy_price_decimal} holds "
+                        f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
                 elif sell_is_swap and sell_order_id:
                     self._dex_first_pending[sell_order_id] = (
-                        buy_market_tuple, True, _final_buy_qty, buy_price_decimal,
-                        self._hold_correction_active and _final_buy_qty != _final_sell_qty)
+                        buy_market_tuple, True, _final_buy_qty, buy_price_decimal, hold_trimmed, _final_sell_qty,
+                        hold_credit)
                     self.logger().info(
                         f"DEX first: {sell_market.name} sell {_final_sell_qty} {sell_market_tuple.trading_pair} sent "
                         f"({sell_order_id}); its {buy_market.name} buy {_final_buy_qty} at {buy_price_decimal} "
-                        f"waits for its fill | profit {profitability * 100:.3f}%")
+                        f"waits for its fill | profit {profitability * 100:.3f}%; the swap's limit "
+                        f"{dex_limit if dex_limit is not None else sell_price_decimal} holds "
+                        f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
 
             # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
             # sizes (or a lone sell) with nothing saying why.
@@ -2668,16 +2706,39 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
+    cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv):
+        """DEX first (Pavel 2026-10-17: the swap's room = "minimum profitability that is already set by the strategy. simple
+        and robust"): the DEX leg's worst AVERAGE price is where the arb, against its CEX leg's average from the same scan,
+        still makes min_profitability. arb_l's profitability is gross (sell x conv / buy - 1, conv the sell market's price in
+        the buy market's quote), so the bar means at the fill what it meant at the fire. The swap venue turns that price into
+        its order's limit (limit_for_worst_price: its own min-out room folded in), so the swap reverts only below the bar.
+        None (the book's own limit and room) when the venue can't or the scan gave no average"""
+        cdef double worst
+        to_limit = getattr(dex_market, "limit_for_worst_price", None)
+        if to_limit is None or cex_avg <= 0.0 or conv <= 0.0:
+            return None
+        if dex_is_buy:          # the CEX sells at cex_avg: (cex_avg x conv) / p - 1 >= bar
+            worst = cex_avg * conv / (1.0 + self._min_profitability)
+        else:                   # the CEX buys at cex_avg: (p x conv) / cex_avg - 1 >= bar
+            worst = cex_avg * (1.0 + self._min_profitability) / conv
+        try:
+            return to_limit(dex_is_buy, Decimal(repr(worst)))
+        except Exception:
+            return None
+
     cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object order_event):
         """DEX first (Pavel 2026-10-17): its DEX leg filled, so the CEX leg goes out now, at the arb's own limit (Pavel: "the
-        arb's original CEX limit"), for no more than the base the DEX fill moved: an exact-input DEX buy may get a little
-        less than its amount, and the CEX leg never hedges more than was filled. Tracked like any leg of c_execute_arbitrage"""
+        arb's original CEX limit"). Its size is its plan less the swap's shortfall: an exact-input DEX buy may get a little
+        less than its amount, and that much less is hedged. Never more than planned (a swap that got more keeps the extra).
+        For an untrimmed arb that is min(plan, fill); a hold-band trim keeps its intended difference between the legs (Pavel:
+        "fix dex-first sizing but for hold-band affected orders"). Tracked like any leg of c_execute_arbitrage"""
         cdef:
             object cex_tuple = plan[0]
             bint cex_is_buy = plan[1]
             object amount = plan[2]
             object price = plan[3]
             bint hold_trimmed = plan[4]
+            object dex_amount = plan[5] if len(plan) > 5 else plan[2]
             object filled
             object qty
             object cex_order_id = None
@@ -2685,8 +2746,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         try:
             filled = Decimal(str(order_event.base_asset_amount))
         except Exception:
-            filled = amount
-        qty = self.c_safe_quantize_order_amount(cex_tuple.market, cex_tuple.trading_pair, min(amount, filled), price)
+            filled = dex_amount
+        qty = self.c_safe_quantize_order_amount(cex_tuple.market, cex_tuple.trading_pair,
+                                                dex_first_cex_amount(amount, dex_amount, filled), price)
         if qty is None or qty <= DECIMAL_ZERO:
             self.logger().warning(
                 f"DEX first: {dex_order_id} filled {filled} {cex_tuple.base_asset}, but its {cex_tuple.market.name} leg "
@@ -2900,6 +2962,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # failure"); the global trade gate is reset so the 2 s between trades doesn't delay it. The cap ("3 per 10 s") hands
         # a failure that is no lost race to the usual cooldown below
         dex_first_plan = self._dex_first_pending.pop(order_id, None)
+        if dex_first_plan is not None:                              # its hold-band credit undone: neither leg moved
+            self._cached_total_base_qty = dex_first_cache_after_failure(self._cached_total_base_qty, dex_first_plan)
         if dex_first_plan is not None and market_pair_tuple is not None:
             fails = [t for t in self._dex_first_failures.get(market_pair_tuple, [])
                      if self._current_timestamp - t < DEX_FIRST_WINDOW_S]

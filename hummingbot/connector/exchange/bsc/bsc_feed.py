@@ -386,6 +386,15 @@ class Feed:
         rung = next((r for r in rungs if r >= usd), rungs[-1])
         return book, book["record"], book["routes"][rung]
 
+    def _trade_usd(self, ca: str, side: str, amount: Decimal, price: Decimal) -> float:
+        """the trade's own USD size, for its route's rung: its book's value of `amount`, not amount x limit. The limit can sit
+        far from the book (arb_l's DEX-first floor, 2026-10-17), and the rung must be the one priced for this trade's size.
+        The limit's value without a book (_book_route then refuses it anyway)"""
+        levels = ((((self.quoter.last or {}).get("books") or {}).get(ca) or {}).get(side) or {}).get("levels") or []
+        if not levels:
+            return float(amount * price)
+        return float(self._book_value(levels, amount, Decimal(str(levels[-1][0]))))
+
     @staticmethod
     def _book_value(levels: List[list], amount: Decimal, price: Decimal) -> Decimal:
         """the USD the book's side gives for `amount` CA: its levels walked best first; any part past its depth at the limit
@@ -413,7 +422,7 @@ class Feed:
         if ca not in self.quoter.cas:
             raise Refused(f"{ca} is not quoted")
         dec = int(self.quoter.cas[ca]["decimals"])
-        book, record, hops = self._book_route(ca, side, float(amount * price))
+        book, record, hops = self._book_route(ca, side, self._trade_usd(ca, side, amount, price))
         last = self.quoter.last                                          # fresh: _book_route refuses a stale one
         book_block, book_at = last["block"], last["at"]                  # the block that book was priced at; its poll's send
         # the chain's head now: that block plus the blocks since (Pavel 2026-10-15: the send reads nothing). A node behind

@@ -296,6 +296,14 @@ class BscExchange(ExchangePyBase):
         self._cas.pop(trading_pair, None)
         self._pools_stale = True
 
+    def limit_for_worst_price(self, is_buy: bool, worst: Decimal) -> Decimal:
+        """the limit to give an order so that its worst accepted AVERAGE price is exactly `worst`: the swap takes its limit and
+        the SWAP_SLIPPAGE room on top (bsc_feed._swap_for), so the room is folded in here. arb_l's DEX first gives `worst` as
+        the price at which the arb still makes the strategy's min_profitability against its CEX leg (Pavel 2026-10-17:
+        "keep it at minimum profitability that is already set by the strategy"), in place of the book's limit and the room"""
+        room = CONSTANTS.SWAP_SLIPPAGE
+        return worst / (1 + room) if is_buy else worst / (1 - room)
+
     def _ca_for_pair(self, trading_pair: str) -> Tuple[Optional[str], str]:
         base, _, quote = trading_pair.partition("-")
         if quote.upper() != CONSTANTS.QUOTE:
@@ -804,8 +812,10 @@ class BscExchange(ExchangePyBase):
         decimals, unit = ((swap["ca_decimals"], swap["trading_pair"].split("-")[0]) if swap["side"] == "buy" else
                           (CONSTANTS.USDT_DECIMALS, CONSTANTS.QUOTE))
         versus = f"{(got / expected - 1) * 1e4:+.1f} bps vs its book" if expected else "no book figure"
-        return (f"{what} filled: got {got / 10 ** decimals:.8g} {unit} ({versus}, room "
-                f"{CONSTANTS.SWAP_SLIPPAGE * 10000:.0f} bps); {at}; {where}; gas "
+        minimum = swap.get("min_out")                                       # its own minimum: the room, or a DEX-first floor
+        floor = (f"its minimum {(minimum / expected - 1) * 1e4:+.0f} bps" if expected and minimum else
+                 f"room {CONSTANTS.SWAP_SLIPPAGE * 10000:.0f} bps")
+        return (f"{what} filled: got {got / 10 ** decimals:.8g} {unit} ({versus}, {floor}); {at}; {where}; gas "
                 f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} BNB ({info['gas_used']:,}); {swap['tx_hash']}")
 
     def _outcome(self, order_id: str, swap: dict, parsed: dict) -> Tuple[OrderState, Optional[TradeUpdate], Optional[tuple]]:
