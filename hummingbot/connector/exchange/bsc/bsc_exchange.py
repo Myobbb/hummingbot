@@ -71,7 +71,8 @@ class BscExchange(ExchangePyBase):
       connector never reports ready, so the orchestrator never ticks a strategy with a bsc leg.
     - Sending (the Sending session, Pavel 2026-10-14): every transaction goes as a one-transaction bundle to both builders
       (CONSTANTS.BUILDERS), valid for BUNDLE_BLOCKS blocks: it lands by then or never (nothing paid, its nonce free again), and
-      one that would revert is not included. The lifecycle's reads (receipts, the head, the nonce) are on SWAP_READ_URL.
+      one that would revert is not included. A transaction out is followed on SWAP_STATUS_URL (the head, its receipt, the
+      nonce at its last block); the wallet's nonce for a send is read on SWAP_READ_URL (the asset manager's node).
     - Placing a swap is ONE request, its bundle (Pavel 2026-10-15: an arb leg's placement must not wait on anything else):
       its last block comes from its book's block and age (no head read), and the wallet's nonce is known beforehand, read off
       the order path. Here an order is one message to the child and one back; the DEX leg also yields first, so every CEX
@@ -129,6 +130,8 @@ class BscExchange(ExchangePyBase):
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
         self._session: Optional[aiohttp.ClientSession] = None
         self._idle = False                             # the last poll found no DEX pair to quote (and made no call)
+        self._fresh_after: Dict[str, float] = {}       # trading pair -> when its last DEX order failed: its book shows again
+                                                       # only from a poll sent after that (DEX first, Pavel 2026-10-17)
         self._balances_read = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -401,6 +404,7 @@ class BscExchange(ExchangePyBase):
                 "read_wallet": self.is_trading_required and bool(self._wallet) and not self._key_problem,
                 "gate": self.is_trading_required, "data_dir": self._pool_list.data_dir, "poll_s": POLL_S,
                 "builders": list(CONSTANTS.BUILDERS), "swap_read_url": CONSTANTS.SWAP_READ_URL,
+                "swap_status_url": CONSTANTS.SWAP_STATUS_URL,
                 "cas": cas, "caps": caps, "follow": dict(self._swaps),
                 "ledger": CONSTANTS.SWAP_LEDGER_PATH, "ledger_by": self._ledger_by,
                 "lease": self._ledger_by == "strategy"}   # HMB's feed holds the wallet lease; the DEX manual's never does
@@ -452,10 +456,17 @@ class BscExchange(ExchangePyBase):
 
     def _books_by_pair(self, last: dict) -> Dict[str, tuple]:
         """trading pair -> (bids, asks) as [[price, qty], ...]: the asks are the CA bought on the DEX ("buy"), the bids sold;
-        each side as the feed shows it (merged; empty while the wallet can't pay into its executor)"""
+        each side as the feed shows it (merged; empty while the wallet can't pay into its executor). A pair whose DEX order
+        failed shows no book until a poll sent after the failure (_after_failure)"""
         out = {}
         books = last.get("books") or {}
         for trading_pair in self._trading_pairs:
+            failed_at = self._fresh_after.get(trading_pair)
+            if failed_at is not None:
+                if (last.get("at") or 0.0) <= failed_at:
+                    out[trading_pair] = ([], [])           # this poll went out before the failure: its price is the old one
+                    continue
+                del self._fresh_after[trading_pair]
             book = books.get(self._pair_ca.get(trading_pair)) or {}
             out[trading_pair] = (book.get("sell") or [], book.get("buy") or [])
         return out
@@ -671,8 +682,21 @@ class BscExchange(ExchangePyBase):
 
     def _update_order_after_failure(self, order_id: str, trading_pair: str, exception: Optional[Exception] = None):
         """an order refused before or at its send (the framework's checks, _place_order): it ends here"""
+        self._after_failure(trading_pair)              # before the failure event reaches the strategy
         super()._update_order_after_failure(order_id, trading_pair, exception)
         self._free_turn(order_id)
+
+    def _after_failure(self, trading_pair: str):
+        """a DEX order that failed (refused, dropped, reverted): the pair's book is hidden at once and shown again only from a
+        poll sent after the failure (Pavel 2026-10-17: "Refire only on a DEX price snapshot taken after the failure"), and
+        that poll goes out now rather than at the next POLL_S, so the next attempt waits one round trip, not up to a poll"""
+        self._fresh_after[trading_pair] = time.time()
+        self._orderbook_ds.hide(trading_pair)
+        if self._feed.running:
+            try:
+                self._feed.send(("poll_now",))
+            except Exception:
+                pass
 
     def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                           order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
@@ -748,6 +772,8 @@ class BscExchange(ExchangePyBase):
             order = self._order_tracker.fetch_order(client_order_id=order_id)
             if order is not None and order.executed_amount_base < order.amount:
                 order.amount = order.executed_amount_base     # an exact-input buy may get less than its amount: no more comes
+        if state == OrderState.FAILED:
+            self._after_failure(swap["trading_pair"])    # before the failure event reaches the strategy
         try:
             line = self._swap_line(order_id, swap, info, parsed, problem)
         except Exception as e:                        # the line is information only: it never holds the settle up

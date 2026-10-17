@@ -173,6 +173,7 @@ class Feed:
         self.poll_s = init["poll_s"]
         self.builders = tuple(init["builders"])
         self.read_url = init["swap_read_url"]
+        self.status_url = init["swap_status_url"]
         self.pool_list = PoolList(init["data_dir"])
         self.quoter = BscQuoter(self._post)
         self.wanted: List[str] = list(init.get("cas") or [])
@@ -193,6 +194,7 @@ class Feed:
         self._quoted: Optional[tuple] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._nonce_task: Optional[asyncio.Task] = None
+        self._wake = asyncio.Event()                  # HMB's ("poll_now",): the next poll goes out now (a DEX order failed)
         self._tasks: set = set()
         self._key_hex = self.account.key.hex().removeprefix("0x") if self.account is not None else None
 
@@ -231,6 +233,8 @@ class Feed:
             self._spawn(self._approve(message[1], message[2]))
         elif kind == "nonce_lost":
             self.nonce = None                         # read anew after the next wallet read (_after_wallet_read)
+        elif kind == "poll_now":
+            self._wake.set()                          # a DEX order failed: a book taken after it, at once
 
     def _spawn(self, coro):
         task = asyncio.ensure_future(coro)
@@ -276,8 +280,15 @@ class Feed:
             raise RuntimeError(self._mask(f"{type(e).__name__}: {e}")) from None
 
     async def _read(self, method: str, params: list):
-        """one read on the swap lifecycle's endpoint (receipts, the head, the nonce): SWAP_READ_URL"""
-        ans = json.loads(await self._post_to(self.read_url, json.dumps(
+        """one read of the wallet's nonce or an approval's head: SWAP_READ_URL"""
+        return await self._read_at(self.read_url, method, params)
+
+    async def _status(self, method: str, params: list):
+        """one read on a transaction out (the head, its receipt, the wallet's nonce at its last block): SWAP_STATUS_URL"""
+        return await self._read_at(self.status_url, method, params)
+
+    async def _read_at(self, url: str, method: str, params: list):
+        ans = json.loads(await self._post_to(url, json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=CONSTANTS.READ_TIMEOUT_S))
         if "error" in ans:
             raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
@@ -299,7 +310,11 @@ class Feed:
                 raise
             except Exception as e:
                 self.send(("poll_failed", self._mask(f"{type(e).__name__}: {e}")[:300]))
-            await asyncio.sleep(max(0.0, self.poll_s - (time.time() - t0)))
+            try:                                      # the next poll at POLL_S, or at once on HMB's ("poll_now",)
+                await asyncio.wait_for(self._wake.wait(), max(0.0, self.poll_s - (time.time() - t0)))
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
 
     def _load_pools(self):
         """the payloads of the CAs HMB's pairs are bound to: a file that changed is read again (HMB is told, for its trading
@@ -679,18 +694,26 @@ class Feed:
 
     # ---------------------------------------------------------------- a transaction out, followed to its end
     async def _landed(self, record: dict) -> Tuple[bool, Optional[dict]]:
-        """one look at a transaction out -> (ended, its receipt): mined (the receipt), or ended without one when the head is
-        past its last block (a bundle lands by then or never; +1 for a receipt a node behind). The head is asked only once
-        the window can have passed, so a transaction that lands costs one read a look"""
-        receipt = await self._read("eth_getTransactionReceipt", [record["tx_hash"]])
-        if receipt is not None:
-            return True, receipt
-        if time.time() - record["sent"] < CONSTANTS.BUNDLE_BLOCKS * CONSTANTS.BLOCK_S:
-            return False, None
-        return int(await self._read("eth_blockNumber", []), 16) > record["last_block"] + 1, None
+        """one look at a transaction out, on SWAP_STATUS_URL -> (ended, its receipt). The head first, and the receipt only on
+        a new block (a node serves a block's receipts with its head: 802/802 on 2026-10-17), so a look is one read until a
+        block comes. Ended: mined (the receipt), or not included by its last block: the head at that block, no receipt when
+        asked after it, and the wallet's nonce AT that block (a read pinned to it, which a node without the block refuses)
+        still this transaction's. Nothing can include it later (a bundle lands by its last block or never), so it ends as soon
+        as the node has that block (Pavel 2026-10-17, DEX first: "if it did not we need to minimize the wait time"). A nonce
+        used there with no receipt is a receipt still to come, or another transaction's: two blocks on it ends, as before"""
+        head = int(await self._status("eth_blockNumber", []), 16)
+        if head <= record.get("seen", -1):
+            return False, None                                  # no new block since the last look
+        receipt = await self._status("eth_getTransactionReceipt", [record["tx_hash"]])
+        ended = receipt is not None
+        if not ended and head >= record["last_block"]:
+            ended = head > record["last_block"] + 1 or int(await self._status(
+                "eth_getTransactionCount", [self.wallet, hex(record["last_block"])]), 16) <= record["nonce"]
+        record["seen"] = head
+        return ended, receipt
 
     async def _until_ended(self, record: dict, what: str) -> Optional[dict]:
-        """its receipt asked for every RECEIPT_POLL_S until it ends -> the receipt, or None (not included by its last block)"""
+        """looked at every RECEIPT_POLL_S (_landed) until it ends -> its receipt, or None (not included by its last block)"""
         while True:
             await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
             try:
@@ -704,7 +727,7 @@ class Feed:
                 return receipt
 
     def _warn(self, record: dict, text: str):
-        """a transaction's trouble, said at most once per WARN_EVERY_S (it is looked at ten times a second)"""
+        """a transaction's trouble, said at most once per WARN_EVERY_S (it is looked at forty times a second)"""
         now = time.time()
         if now - record.get("warned", 0.0) >= CONSTANTS.WARN_EVERY_S:
             record["warned"] = now

@@ -87,6 +87,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         double _last_orphan_scan
         # Track position balancer orders (to prevent main strategy from canceling them)
         set _position_balancer_orders
+        # DEX first (Pavel 2026-10-17): a DEX-CEX arb sends its DEX leg alone; its CEX leg waits for the DEX fill
+        dict _dex_first_pending          # DEX order id -> (CEX market tuple, is_buy, amount, limit price, hold-trimmed)
+        dict _dex_first_failures         # market tuple -> the times its DEX-first legs failed (the 3-in-10-s cap)
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode
@@ -155,6 +158,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *
+    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object order_event)
     cdef c_did_fill_order(self, object order_filled_event)
     cdef c_did_fail_order(self, object order_failed_event)
     cdef c_did_complete_buy_order(self, object buy_order_completed_event)

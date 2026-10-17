@@ -51,6 +51,12 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._pushed = {}
         self._first_poll.clear()
 
+    def hide(self, trading_pair: str):
+        """a pair's book emptied at once (its DEX order failed: bsc_exchange._after_failure), until a fresh poll shows it"""
+        if trading_pair in self._books:
+            self._books[trading_pair] = ([], [])
+            self._push()
+
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         """the book's mid for every pair asked (NaN without a two-sided book): the tracker re-asks at once on a missing pair"""
         out = {}

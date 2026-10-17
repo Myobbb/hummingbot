@@ -82,6 +82,11 @@ cdef:
     double DEFAULT_FILLED_ORDER_TIMEOUT = 3600.0  # 1 hour timeout for orders with fills
     double ESCALATION_WINDOW = 3600.0  # 60 min window to detect repeat failures
     double ESCALATED_COOLDOWN = 3600.0  # 60 min extended timeout for repeat failures
+    # DEX first (Pavel 2026-10-17): a DEX leg that fails before its CEX leg went out leaves nothing open, so it sets no
+    # cooldown, until it is the DEX_FIRST_MAX_FAILURES-th such failure within DEX_FIRST_WINDOW_S ("Cap the attempts (for
+    # example 3 per 10 s)"): then the usual cooldown applies, so a failure that is no lost race can't loop
+    double DEX_FIRST_WINDOW_S = 10.0
+    int DEX_FIRST_MAX_FAILURES = 3
     # A timeout-cancel is FIRE-AND-FORGET: c_cancel_order does not raise when the venue
     # rejects the cancel asynchronously, and the connector emits NO event on that path
     # (exchange_py_base: logs "Failed to cancel order", returns None). We therefore retry
@@ -142,6 +147,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}  # market_tuple -> cooldown END timestamp (when cooldown expires)
         self._failure_first_timestamps = {}  # market_tuple -> first failure timestamp (for escalation detection)
+        self._dex_first_pending = {}  # DEX first: DEX order id -> the CEX leg that waits for its fill
+        self._dex_first_failures = {}  # DEX first: market tuple -> the times its DEX legs failed (the cap)
         self._position_balancer = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
@@ -254,6 +261,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._last_global_trade_timestamp = 0.0
         self._last_failure_timestamps = {}
         self._failure_first_timestamps = {}
+        self._dex_first_pending = {}
+        self._dex_first_failures = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
         
@@ -2398,6 +2407,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef object sell_order_type
         cdef double placement_latency
         cdef str dummy_order_id
+        # DEX first (Pavel 2026-10-17: "we have to switch to DEX first, CEX after in our arb_l core, but only for DEX-CEX
+        # strategies, CEX-CEX should still fire both at the same time"). When exactly one of the two venues is a swap venue
+        # and both legs go out, only the DEX leg is sent now. Its CEX leg waits for the DEX fill (c_handle_order_completion)
+        # at this arb's own limit (Pavel: "the arb's original CEX limit"), and is dropped if the DEX leg fails
+        # (c_did_fail_order): a lost race then leaves nothing open. One-legged corrections and CEX-CEX arbs are unchanged.
+        cdef bint buy_is_swap = getattr(buy_market, "is_swap_venue", False) is True
+        cdef bint sell_is_swap = getattr(sell_market, "is_swap_venue", False) is True
+        cdef bint dex_first = (buy_is_swap != sell_is_swap and _final_buy_qty > DECIMAL_ZERO
+                               and _final_sell_qty > DECIMAL_ZERO)
 
         if _final_buy_qty > DECIMAL_ZERO or _final_sell_qty > DECIMAL_ZERO:
             # Log timing for latency monitoring
@@ -2417,7 +2435,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Actual exchange failures are handled via MarketOrderFailureEvent -> c_did_fail_order
             # The try/except here only catches rare synchronous validation errors (e.g. TypeError)
             try:
-                if _final_buy_qty > DECIMAL_ZERO:
+                if _final_buy_qty > DECIMAL_ZERO and not (dex_first and sell_is_swap):    # DEX first: the buy waits
                     buy_order_id = self.c_buy_with_specific_market(
                         buy_market_tuple, _final_buy_qty,
                         order_type=buy_order_type,
@@ -2436,7 +2454,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Immediately place the sell order - minimal delay
             try:
-                if _final_sell_qty > DECIMAL_ZERO:
+                if _final_sell_qty > DECIMAL_ZERO and not (dex_first and buy_is_swap):    # DEX first: the sell waits
                     sell_order_id = self.c_sell_with_specific_market(
                         sell_market_tuple, _final_sell_qty,
                         order_type=sell_order_type,
@@ -2451,6 +2469,25 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self._current_timestamp, dummy_order_id, sell_order_type, f"Sync error: {str(e)}"
                 ))
                 return
+
+            # DEX first: the CEX leg that waits for the DEX leg's fill (c_fire_dex_first_cex_leg), at this arb's own limit
+            if dex_first:
+                if buy_is_swap and buy_order_id:
+                    self._dex_first_pending[buy_order_id] = (
+                        sell_market_tuple, False, _final_sell_qty, sell_price_decimal,
+                        self._hold_correction_active and _final_buy_qty != _final_sell_qty)
+                    self.logger().info(
+                        f"DEX first: {buy_market.name} buy {_final_buy_qty} {buy_market_tuple.trading_pair} sent "
+                        f"({buy_order_id}); its {sell_market.name} sell {_final_sell_qty} at {sell_price_decimal} "
+                        f"waits for its fill | profit {profitability * 100:.3f}%")
+                elif sell_is_swap and sell_order_id:
+                    self._dex_first_pending[sell_order_id] = (
+                        buy_market_tuple, True, _final_buy_qty, buy_price_decimal,
+                        self._hold_correction_active and _final_buy_qty != _final_sell_qty)
+                    self.logger().info(
+                        f"DEX first: {sell_market.name} sell {_final_sell_qty} {sell_market_tuple.trading_pair} sent "
+                        f"({sell_order_id}); its {buy_market.name} buy {_final_buy_qty} at {buy_price_decimal} "
+                        f"waits for its fill | profit {profitability * 100:.3f}%")
 
             # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
             # sizes (or a lone sell) with nothing saying why.
@@ -2532,7 +2569,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
             string order_id_str = self._to_cpp_str(order_id)
             str order_type = "Buy" if is_buy else "Sell"
             object cooldown_tuple = market_pair_tuple
-            
+            tuple dex_first_plan = self._dex_first_pending.pop(order_id, None)
+
+        # DEX first: the DEX leg filled, so its CEX leg goes out now, before any bookkeeping (Pavel 2026-10-17: the time to
+        # the CEX leg is what DEX first costs). A duplicate completion finds no plan left
+        if dex_first_plan is not None:
+            self.c_fire_dex_first_cex_leg(order_id, dex_first_plan, order_event)
+
         if market_pair_tuple is None:
             # Try to get from recent mapping for late events
             try:
@@ -2624,6 +2667,61 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
+
+    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object order_event):
+        """DEX first (Pavel 2026-10-17): its DEX leg filled, so the CEX leg goes out now, at the arb's own limit (Pavel: "the
+        arb's original CEX limit"), for no more than the base the DEX fill moved: an exact-input DEX buy may get a little
+        less than its amount, and the CEX leg never hedges more than was filled. Tracked like any leg of c_execute_arbitrage"""
+        cdef:
+            object cex_tuple = plan[0]
+            bint cex_is_buy = plan[1]
+            object amount = plan[2]
+            object price = plan[3]
+            bint hold_trimmed = plan[4]
+            object filled
+            object qty
+            object cex_order_id = None
+            string id_str
+        try:
+            filled = Decimal(str(order_event.base_asset_amount))
+        except Exception:
+            filled = amount
+        qty = self.c_safe_quantize_order_amount(cex_tuple.market, cex_tuple.trading_pair, min(amount, filled), price)
+        if qty is None or qty <= DECIMAL_ZERO:
+            self.logger().warning(
+                f"DEX first: {dex_order_id} filled {filled} {cex_tuple.base_asset}, but its {cex_tuple.market.name} leg "
+                f"quantizes to 0: not sent")
+            return
+        try:
+            if cex_is_buy:
+                cex_order_id = self.c_buy_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
+                                                               expiration_seconds=self._next_trade_delay)
+            else:
+                cex_order_id = self.c_sell_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
+                                                                expiration_seconds=self._next_trade_delay)
+        except Exception as e:
+            self.logger().error(f"DEX first: {dex_order_id} filled, but its {cex_tuple.market.name} leg could not be sent: {e}",
+                                exc_info=True)
+            return
+        if not cex_order_id:
+            return
+        id_str = self._to_cpp_str(cex_order_id)
+        self._order_timestamps[id_str] = self._current_timestamp
+        try:
+            pending = self._pending_buy_orders_by_market if cex_is_buy else self._pending_sell_orders_by_market
+            if cex_tuple not in pending:
+                pending[cex_tuple] = set()
+            pending[cex_tuple].add(cex_order_id)
+            self._placed_order_ids[cex_order_id] = self._current_timestamp
+            if hold_trimmed:          # a correction's leg: as c_execute_arbitrage records it at dispatch
+                self._hold_dispatch_base[cex_order_id] = (
+                    cex_tuple.market, cex_tuple.base_asset, 1.0 if cex_is_buy else -1.0,
+                    float(cex_tuple.market.get_balance(cex_tuple.base_asset)), self._current_timestamp)
+        except Exception as e:
+            self.logger().warning(f"Failed to track the DEX-first CEX leg {cex_order_id}: {e}")
+        self.logger().info(
+            f"DEX first: {dex_order_id} filled {filled} {cex_tuple.base_asset}; its {cex_tuple.market.name} "
+            f"{'buy' if cex_is_buy else 'sell'} {qty} at {price} sent ({cex_order_id})")
 
     cdef c_did_fill_order(self, object order_filled_event):
         """Track that an order has received at least one fill."""
@@ -2795,6 +2893,30 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self._position_balancer.handle_order_failure(order_id)
         # A rejected placement never rested on the venue — drop ownership.
         self._placed_order_ids.pop(order_id, None)
+
+        # DEX first (Pavel 2026-10-17): the DEX leg failed before its CEX leg went out, so nothing is open: the CEX leg is
+        # dropped and, below the cap, no cooldown is set. The next attempt waits only for a DEX book taken after the
+        # failure, which the swap venue holds back until then (Pavel: "Refire only on a DEX price snapshot taken after the
+        # failure"); the global trade gate is reset so the 2 s between trades doesn't delay it. The cap ("3 per 10 s") hands
+        # a failure that is no lost race to the usual cooldown below
+        dex_first_plan = self._dex_first_pending.pop(order_id, None)
+        if dex_first_plan is not None and market_pair_tuple is not None:
+            fails = [t for t in self._dex_first_failures.get(market_pair_tuple, [])
+                     if self._current_timestamp - t < DEX_FIRST_WINDOW_S]
+            fails.append(self._current_timestamp)
+            if len(fails) < DEX_FIRST_MAX_FAILURES:
+                self._dex_first_failures[market_pair_tuple] = fails
+                self._last_global_trade_timestamp = 0.0
+                self.logger().warning(
+                    f"DEX first: {market_pair_tuple[0].name} order {order_id} for {market_pair_tuple.trading_pair} failed"
+                    f"{': ' + error_msg if error_msg else ''}; its {dex_first_plan[0].market.name} leg was not sent, "
+                    f"nothing is open. The next attempt waits for a fresh DEX book ({len(fails)}/{DEX_FIRST_MAX_FAILURES} "
+                    f"in {DEX_FIRST_WINDOW_S:.0f} s)")
+                return
+            self._dex_first_failures.pop(market_pair_tuple, None)
+            self.logger().warning(
+                f"DEX first: {len(fails)} failures of {market_pair_tuple.trading_pair} on {market_pair_tuple[0].name} within "
+                f"{DEX_FIRST_WINDOW_S:.0f} s: the usual cooldown applies")
 
         if market_pair_tuple is None:
             return

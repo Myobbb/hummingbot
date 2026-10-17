@@ -23,7 +23,7 @@ SEL_BALANCE_OF = "70a08231"       # ERC-20 balanceOf(address)
 # Every request has a timeout (audit 2026-10-15: aiohttp takes timeout=None as no timeout at all, and none was ever set,
 # so one stalled connection could hold the book poll, or the wallet's turn, until TCP gave up)
 RPC_TIMEOUT_S = 2.0               # a node request (BlockPI: the book poll, the balances, check_network): p50 0.2 s from myserver
-READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle on SWAP_READ_URL (receipts, the head, the nonce): 3 ms away
+READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle (SWAP_READ_URL, SWAP_STATUS_URL): each a few ms away
 STALE_S = 5.0                     # a book whose block is older than this goes empty, however its poll ended (P1's B7: never a
                                   # kept price); a poll is never waited for past that moment
 FIRST_POLL_WAIT_S = 10.0          # how long a pair's first book waits for the first poll before it starts empty
@@ -61,15 +61,22 @@ BLOCK_S = 0.45                    # BSC's block time since the Fermi hard fork (
 BUNDLE_BLOCKS = 4                 # valid for the 4 blocks after the head at the send (~1.8 s; Pavel 2026-10-17, was 12). Each of
                                   # the 42 swaps landed by then landed within 3 blocks of the head at its send (+1: 6, +2: 30,
                                   # +3: 6), so blocks +4..+12 only kept a swap that lost its race holding the wallet's one turn
-                                  # (~6.5 s from the order to "dropped"; ~2.5 s now). The drop check (bsc_feed._landed) scales
-                                  # with it, and the bundle's last block, not the swap's 5 s deadline (bsc_swap.DEADLINE_S), is
-                                  # now the swap's expiry
-# The order lifecycle's reads (receipts, the head, the nonce): BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms),
-# free, and asked only while a transaction is out. The book feed stays on BlockPI (decision 4).
+                                  # (~6.5 s from the order to "dropped"; ~2 s now: it ends as soon as SWAP_STATUS_URL has its
+                                  # last block, bsc_feed._landed). The bundle's last block, not the swap's 5 s deadline
+                                  # (bsc_swap.DEADLINE_S), is the swap's expiry
+# The wallet's nonce (the lease's too: the asset manager sends on this node, so its pending transactions show here) and an
+# approval's head: BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms), free. The book feed stays on BlockPI (decision 4).
 SWAP_READ_URL = "https://bsc-dataseed1.bnbchain.org"
+# A transaction out is followed here: the head, its receipt, the wallet's nonce at its last block (Pavel 2026-10-17, DEX first:
+# "minimize the time it takes for us to confirm that our DEX order got placed, and if it did not we need to minimize the wait
+# time"). BlockRazor's public RPC, ~8 ms from myserver: a block's receipts readable p50 0.149 s after its timestamp (p90 0.185),
+# each one there as soon as the head showed it (802/802); the seed shows a head p50 0.41 s after it, and refuses ~14% of reads
+# at 10/s (measured 2026-10-17: hmb_local_tools p2_dex/receipt_sources_probe.py, block_sources_probe.py)
+SWAP_STATUS_URL = "https://bsc.blockrazor.xyz"
 
 # The order lifecycle (2026-10-14): one transaction at a time per wallet, followed on chain until it ends.
-RECEIPT_POLL_S = 0.1              # a transaction out has its receipt asked for this often: it ends ~0.1 s after it is mined
+RECEIPT_POLL_S = 0.025            # a transaction out is looked at this often (the head; on a new block, its receipt): it ends
+                                  # ~0.03 s after its block shows on SWAP_STATUS_URL (0.1 s on the seed before 2026-10-17)
 SEND_TIMEOUT_S = 2.0              # a builder that hasn't answered a bundle by then counts as silent (the other may have taken it)
 # The swap ledger (P3-DEX decision 3, Pavel 2026-10-16: "if AM can re-use it it's great"): one JSON line per transaction signed
 # for the wallet, appended before it goes out. The asset manager books the wallet's fills from the chain and tags them by it
