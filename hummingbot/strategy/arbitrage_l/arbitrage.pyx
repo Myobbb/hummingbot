@@ -6,6 +6,7 @@
 # cython: boundscheck=False
 # cython: wraparound=False
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import List, Tuple, Optional
@@ -126,6 +127,36 @@ cpdef double dex_first_cache_after_failure(double cache, tuple plan):
     if plan is not None and len(plan) > 6 and plan[6]:
         return cache - <double>plan[6]
     return cache
+
+
+class EagerNextTask:
+    """DEX first's CEX leg (Pavel 2026-10-17: "issue CEX order as fast as possible after we confirmed that DEX side filled"):
+    inside the block, the first task created (the connector's order coroutine: ExchangePyBase.buy/sell) starts eagerly
+    (Python 3.12), so it runs to its request on the wire before the order call returns, ahead of any work the loop has
+    ready. Only that one: the factory puts the loop's own back before the coroutine runs, so whatever the order's first
+    step schedules (a pre-send failure's update) is an ordinary task, never run inside the strategy's dispatch"""
+    __slots__ = ("_loop", "_previous")
+
+    def __enter__(self):
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:                        # no loop running: an ordinary order
+            self._loop = None
+            return self
+        self._previous = self._loop.get_task_factory()
+        self._loop.set_task_factory(self._create)
+        return self
+
+    def _create(self, loop, coro, **kwargs):
+        loop.set_task_factory(self._previous)
+        if self._previous is not None:              # a factory of the loop's own: kept as it is
+            return self._previous(loop, coro, **kwargs)
+        return asyncio.Task(coro, loop=loop, eager_start=True, **kwargs)
+
+    def __exit__(self, *exc):
+        if self._loop is not None and self._loop.get_task_factory() == self._create:
+            self._loop.set_task_factory(self._previous)      # no task was created: the loop's own back
+        return False
 
 
 cdef class ArbitrageLStrategy(StrategyBase):
@@ -2428,8 +2459,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         cdef str dummy_order_id
         # DEX first (Pavel 2026-10-17: "we have to switch to DEX first, CEX after in our arb_l core, but only for DEX-CEX
         # strategies, CEX-CEX should still fire both at the same time"). When exactly one of the two venues is a swap venue
-        # and both legs go out, only the DEX leg is sent now. Its CEX leg waits for the DEX fill (c_handle_order_completion)
-        # at this arb's own limit (Pavel: "the arb's original CEX limit"), and is dropped if the DEX leg fails
+        # and both legs go out, only the DEX leg is sent now. Its CEX leg waits for the DEX fill, handed over by the swap venue
+        # before its own work (dex_first_filled), at this arb's own limit (Pavel: "the arb's original CEX limit"), and is
+        # dropped if the DEX leg fails
         # (c_did_fail_order): a lost race then leaves nothing open. One-legged corrections and CEX-CEX arbs are unchanged.
         cdef bint buy_is_swap = getattr(buy_market, "is_swap_venue", False) is True
         cdef bint sell_is_swap = getattr(sell_market, "is_swap_venue", False) is True
@@ -2510,6 +2542,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self._dex_first_pending[buy_order_id] = (
                         sell_market_tuple, False, _final_sell_qty, sell_price_decimal, hold_trimmed, _final_buy_qty,
                         hold_credit)
+                    self.c_dex_first_watch(buy_market, buy_order_id)
                     self.logger().info(
                         f"DEX first: {buy_market.name} buy {_final_buy_qty} {buy_market_tuple.trading_pair} sent "
                         f"({buy_order_id}); its {sell_market.name} sell {_final_sell_qty} at {sell_price_decimal} "
@@ -2520,6 +2553,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     self._dex_first_pending[sell_order_id] = (
                         buy_market_tuple, True, _final_buy_qty, buy_price_decimal, hold_trimmed, _final_sell_qty,
                         hold_credit)
+                    self.c_dex_first_watch(sell_market, sell_order_id)
                     self.logger().info(
                         f"DEX first: {sell_market.name} sell {_final_sell_qty} {sell_market_tuple.trading_pair} sent "
                         f"({sell_order_id}); its {buy_market.name} buy {_final_buy_qty} at {buy_price_decimal} "
@@ -2609,10 +2643,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object cooldown_tuple = market_pair_tuple
             tuple dex_first_plan = self._dex_first_pending.pop(order_id, None)
 
-        # DEX first: the DEX leg filled, so its CEX leg goes out now, before any bookkeeping (Pavel 2026-10-17: the time to
-        # the CEX leg is what DEX first costs). A duplicate completion finds no plan left
+        # DEX first: the swap venue hands the fill over before this event (dex_first_filled), which takes the plan. One left
+        # here (a venue without on_filled) goes out now, before any bookkeeping. A duplicate completion finds no plan left
         if dex_first_plan is not None:
-            self.c_fire_dex_first_cex_leg(order_id, dex_first_plan, order_event)
+            self.c_fire_dex_first_cex_leg(order_id, dex_first_plan, getattr(order_event, "base_asset_amount", None))
 
         if market_pair_tuple is None:
             # Try to get from recent mapping for late events
@@ -2706,6 +2740,27 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
 
+    cdef c_dex_first_watch(self, object dex_market, str dex_order_id):
+        """DEX first (Pavel 2026-10-17: "issue CEX order as fast as possible after we confirmed that DEX side filled"): the
+        swap venue hands the DEX leg's fill to dex_first_filled the moment it knows it, before its own work on the swap's end
+        (on_filled). A venue without it: the CEX leg goes on the completion event (c_handle_order_completion)"""
+        on_filled = getattr(dex_market, "on_filled", None)
+        if on_filled is None:
+            return
+        try:
+            on_filled(dex_order_id, self.dex_first_filled)
+        except Exception as e:
+            self.logger().warning(f"DEX first: {dex_order_id}'s fill can't be taken first ({e}): its CEX leg goes on its "
+                                  f"completion")
+
+    def dex_first_filled(self, str order_id, object filled):
+        """the swap venue's call the moment a DEX-first DEX leg filled (on_filled): its CEX leg goes out now, ahead of the
+        venue's own work on the swap's end (its balances, events, the trade recorder, its line). The plan is taken here,
+        so the completion event that follows finds none"""
+        cdef tuple plan = self._dex_first_pending.pop(order_id, None)
+        if plan is not None:
+            self.c_fire_dex_first_cex_leg(order_id, plan, filled)
+
     cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv):
         """DEX first (Pavel 2026-10-17: the swap's room = "minimum profitability that is already set by the strategy. simple
         and robust"): the DEX leg's worst AVERAGE price is where the arb, against its CEX leg's average from the same scan,
@@ -2726,12 +2781,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
         except Exception:
             return None
 
-    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object order_event):
+    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object filled_amount):
         """DEX first (Pavel 2026-10-17): its DEX leg filled, so the CEX leg goes out now, at the arb's own limit (Pavel: "the
         arb's original CEX limit"). Its size is its plan less the swap's shortfall: an exact-input DEX buy may get a little
         less than its amount, and that much less is hedged. Never more than planned (a swap that got more keeps the extra).
         For an untrimmed arb that is min(plan, fill); a hold-band trim keeps its intended difference between the legs (Pavel:
-        "fix dex-first sizing but for hold-band affected orders"). Tracked like any leg of c_execute_arbitrage"""
+        "fix dex-first sizing but for hold-band affected orders"). Its order starts eagerly (EagerNextTask): the request is
+        on the wire before the order call returns. Tracked like any leg of c_execute_arbitrage, after it went out"""
         cdef:
             object cex_tuple = plan[0]
             bint cex_is_buy = plan[1]
@@ -2744,7 +2800,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object cex_order_id = None
             string id_str
         try:
-            filled = Decimal(str(order_event.base_asset_amount))
+            filled = filled_amount if isinstance(filled_amount, Decimal) else Decimal(str(filled_amount))
         except Exception:
             filled = dex_amount
         qty = self.c_safe_quantize_order_amount(cex_tuple.market, cex_tuple.trading_pair,
@@ -2755,12 +2811,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 f"quantizes to 0: not sent")
             return
         try:
-            if cex_is_buy:
-                cex_order_id = self.c_buy_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
-                                                               expiration_seconds=self._next_trade_delay)
-            else:
-                cex_order_id = self.c_sell_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
-                                                                expiration_seconds=self._next_trade_delay)
+            with EagerNextTask():
+                if cex_is_buy:
+                    cex_order_id = self.c_buy_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
+                                                                   expiration_seconds=self._next_trade_delay)
+                else:
+                    cex_order_id = self.c_sell_with_specific_market(cex_tuple, qty, order_type=OrderType.LIMIT, price=price,
+                                                                    expiration_seconds=self._next_trade_delay)
         except Exception as e:
             self.logger().error(f"DEX first: {dex_order_id} filled, but its {cex_tuple.market.name} leg could not be sent: {e}",
                                 exc_info=True)

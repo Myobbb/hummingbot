@@ -160,7 +160,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *
     cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv)
-    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object order_event)
+    cdef c_dex_first_watch(self, object dex_market, str dex_order_id)
+    cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object filled_amount)
     cdef c_did_fill_order(self, object order_filled_event)
     cdef c_did_fail_order(self, object order_failed_event)
     cdef c_did_complete_buy_order(self, object buy_order_completed_event)

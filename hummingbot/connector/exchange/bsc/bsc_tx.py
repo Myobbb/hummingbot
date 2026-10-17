@@ -5,12 +5,20 @@ are the nonce and gas POLICIES; this module only takes a nonce, a gas limit and 
 - Approvals. A v2-style router pulls the input token by ERC20 allowance (token -> router). A Universal Router pulls it through
   Permit2: ERC20 allowance token -> Permit2, then Permit2's own allowance (wallet, token, router), with an expiry. Each is one
   transaction per token, once (max amounts, the expiry at its maximum).
-- The transaction: legacy type 0, EIP-155 (chain id 56), signed locally by the wallet's signer (eth_account).
+- The transaction: legacy type 0, EIP-155 (chain id 56), signed locally with the wallet's key: by libsecp256k1 directly
+  (coincurve), the same bytes as eth_account at a third of its time, or by eth_account when that does not check out
+  at import (sign, SIGNER).
 - The receipt: status 0 = the swap reverted (a failed order; the gas is still paid). Otherwise the fill is read from the ERC20
   Transfer logs of the two tokens to and from the wallet, so it is what really moved, net of any token tax."""
 from typing import Dict, List, Optional, Tuple
 
+from eth_hash.auto import keccak
 from eth_utils import to_checksum_address
+
+try:
+    from coincurve import PrivateKey
+except ImportError:                                  # sign() falls back to eth_account
+    PrivateKey = None
 
 CHAIN_ID = 56
 MAX_UINT256 = (1 << 256) - 1
@@ -85,10 +93,68 @@ def build_tx(to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: 
 
 
 def sign(account, tx: Dict) -> Tuple[str, str]:
-    """-> (raw transaction hex, transaction hash hex), signed locally by the wallet's signer"""
+    """-> (raw transaction hex, transaction hash hex), a build_tx transaction signed locally with the wallet's key: by
+    libsecp256k1 directly when it gave eth_account's exact bytes at import (SIGNER), else by eth_account (Pavel 2026-10-17:
+    "might as well improve ... signer"; eth_account took 0.36 ms p50 of a swap's placement, nearly all of the child's)"""
+    if FAST_SIGNER:
+        return _sign_direct(bytes(account.key), tx)
+    return _sign_eth_account(account, tx)
+
+
+def _sign_eth_account(account, tx: Dict) -> Tuple[str, str]:
     signed = account.sign_transaction(tx)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction        # eth_account >= 0.13 / older
     return "0x" + bytes(raw).hex(), "0x" + bytes(signed.hash).hex()
+
+
+def _rlp_head(length: int, offset: int) -> bytes:
+    if length < 56:
+        return bytes((offset + length,))
+    size = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes((offset + 55 + len(size),)) + size
+
+
+def _rlp_bytes(b: bytes) -> bytes:
+    return b if len(b) == 1 and b[0] < 0x80 else _rlp_head(len(b), 0x80) + b
+
+
+def _rlp_int(v: int) -> bytes:
+    return _rlp_bytes(v.to_bytes((v.bit_length() + 7) // 8, "big"))           # 0 is the empty string
+
+
+def _rlp_list(items: List[bytes]) -> bytes:
+    body = b"".join(items)
+    return _rlp_head(len(body), 0xc0) + body
+
+
+def _sign_direct(key: bytes, tx: Dict) -> Tuple[str, str]:
+    """a legacy EIP-155 transaction as eth_account signs it, without its object model: the RLP of its fields with the chain
+    id, its keccak signed by libsecp256k1 (RFC 6979 nonce, low s: eth_keys' own backend), v = recovery id + 35 + 2 x chain"""
+    fields = [_rlp_int(tx["nonce"]), _rlp_int(tx["gasPrice"]), _rlp_int(tx["gas"]), _rlp_bytes(bytes.fromhex(tx["to"][2:])),
+              _rlp_int(tx["value"]), _rlp_bytes(bytes.fromhex(tx["data"][2:]))]
+    chain = tx["chainId"]
+    sig = PrivateKey(key).sign_recoverable(keccak(_rlp_list(fields + [_rlp_int(chain), b"\x80", b"\x80"])), hasher=None)
+    raw = _rlp_list(fields + [_rlp_int(sig[64] + 35 + 2 * chain), _rlp_int(int.from_bytes(sig[:32], "big")),
+                              _rlp_int(int.from_bytes(sig[32:64], "big"))])
+    return "0x" + raw.hex(), "0x" + keccak(raw).hex()
+
+
+def _check_direct() -> Tuple[bool, str]:
+    """the direct signer is used only if it gives eth_account's exact bytes here, at import: a few transactions shaped like
+    ours (a swap's calldata, an approval's, none) with a throwaway key -> (used, the signer in words)"""
+    if PrivateKey is None:
+        return False, "eth_account (coincurve is not installed)"
+    try:
+        from eth_account import Account
+        account = Account.from_key(bytes(range(1, 33)))
+        for tx in (build_tx("0x" + "5c" * 20, bytes(range(256)) * 2 + bytes(68), 0, 0, 350_000, 50_000_000),
+                   build_tx("0x00000000000000000000000000000000000000ff", bytes(68), 0, 127, 70_000, 1),
+                   build_tx("0x" + "ff" * 20, b"", 10 ** 18, 2 ** 40, 21_000, 10 ** 12)):
+            if _sign_direct(bytes(account.key), tx) != _sign_eth_account(account, tx):
+                return False, "eth_account (the direct signer's bytes differ from eth_account's)"
+    except Exception as e:
+        return False, f"eth_account (the direct signer did not check out: {type(e).__name__}: {e})"
+    return True, "libsecp256k1 (coincurve), the same bytes as eth_account"
 
 
 # ---------------------------------------------------------------- the receipt
@@ -125,3 +191,6 @@ def receipt_problem(parsed: Dict) -> Optional[str]:
     if parsed["amount_in"] <= 0 or parsed["amount_out"] <= 0:
         return f"no transfer of both tokens to and from the wallet (in {parsed['amount_in']}, out {parsed['amount_out']})"
     return None
+
+
+FAST_SIGNER, SIGNER = _check_direct()

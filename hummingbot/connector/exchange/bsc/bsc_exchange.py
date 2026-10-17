@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 from bidict import bidict
@@ -28,7 +28,7 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.async_utils import safe_ensure_future, safe_wrapper
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -75,14 +75,16 @@ class BscExchange(ExchangePyBase):
       nonce at its last block); the wallet's nonce for a send is read on SWAP_READ_URL (the asset manager's node).
     - Placing a swap is ONE request, its bundle (Pavel 2026-10-15: an arb leg's placement must not wait on anything else):
       its last block comes from its book's block and age (no head read), and the wallet's nonce is known beforehand, read off
-      the order path. Here an order is one message to the child and one back; the DEX leg also yields first, so every CEX
-      order of the same tick is on the wire before it (_create_order).
+      the order path. Here an order is one message to the child and one back. It no longer yields to the CEX orders of its
+      tick (2026-10-15 to 10-17): under DEX first its arb's CEX leg waits for its fill, so it is the leg the hedge waits on.
     - A swap venue (`is_swap_venue`, 2026-10-14): an order is one immediate swap, never resting, never cancelled; the limit
       price plus the SWAP_SLIPPAGE room is the worst average price accepted (no price grid). ONE swap at a time per
       wallet: an order takes the wallet's turn when it is placed and every available balance reads 0 until it ends, so
       the strategies (arb_l, the balancer), which size by it, place nothing here meanwhile. The child follows each swap out
-      and says when it ended (_settle): FILLED with what it really got, or FAILED (reverted, or not included by its last
-      block).
+      and says when it ended: FILLED with what it really got, or FAILED (reverted, or not included by its last block).
+    - A swap's fill comes first to whoever waits on it (on_filled, Pavel 2026-10-17: "issue CEX order as fast as possible
+      after we confirmed that DEX side filled ... all the dex housekeepings and recordings can happen after we sent CEX
+      side"): arb_l's DEX first sends its CEX leg from there, before any of this side's work on the swap's end (_ended).
     - Approvals are read with the balances. A missing approval is sent by the connector itself (trading on), one at a time
       in the wallet's turn, to the pinned executors' contracts only (bsc_swap).
     - The wallet, like a CEX key pair: `bsc_wallet_address` names it, `bsc_private_key` (stored encrypted by `connect bsc`)
@@ -132,6 +134,7 @@ class BscExchange(ExchangePyBase):
         self._idle = False                             # the last poll found no DEX pair to quote (and made no call)
         self._fresh_after: Dict[str, float] = {}       # trading pair -> when its last DEX order failed: its book shows again
                                                        # only from a poll sent after that (DEX first, Pavel 2026-10-17)
+        self._on_filled: Dict[str, Callable[[str, Decimal], None]] = {}   # order id -> who takes its fill first (on_filled)
         self._balances_read = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -304,6 +307,13 @@ class BscExchange(ExchangePyBase):
         room = CONSTANTS.SWAP_SLIPPAGE
         return worst / (1 + room) if is_buy else worst / (1 - room)
 
+    def on_filled(self, order_id: str, callback: Callable[[str, Decimal], None]):
+        """`callback(order_id, the base filled)` runs the moment the feed says the swap filled, before any of this side's
+        work on its end: its receipt on the balances, the fill and completion events (and the trade recorder on them), its
+        line, the wallet's turn (Pavel 2026-10-17: "issue CEX order as fast as possible after we confirmed that DEX side
+        filled"). arb_l's DEX first sends its CEX leg from there. Forgotten when the order ends any other way"""
+        self._on_filled[order_id] = callback
+
     def _ca_for_pair(self, trading_pair: str) -> Tuple[Optional[str], str]:
         base, _, quote = trading_pair.partition("-")
         if quote.upper() != CONSTANTS.QUOTE:
@@ -437,7 +447,7 @@ class BscExchange(ExchangePyBase):
         elif kind == "signed":                     # it may be out from here: known before its send is answered
             self._swaps[message[1]] = message[2]
         elif kind == "ended":
-            safe_ensure_future(self._settle(message[1], message[2], message[3]))
+            self._ended(message[1], message[2], message[3])
         elif kind == "pools_changed":
             self._pools_stale = True
         elif kind == "swap":                       # an answer no placement waits for any more (its task ended)
@@ -677,20 +687,20 @@ class BscExchange(ExchangePyBase):
 
     async def _create_order(self, trade_type: TradeType, order_id: str, trading_pair: str, amount: Decimal,
                             order_type: OrderType, price: Optional[Decimal] = None, **kwargs):
+        # No yield first any more (2026-10-15 to 10-17 it yielded, so the CEX leg fired in the same tick went out before it).
+        # Under DEX first (arb_l, Pavel 2026-10-17) a DEX-CEX arb sends its DEX leg alone and its CEX leg on the fill, so
+        # this is the leg the hedge waits on: it goes out at its turn (Pavel 2026-10-17: "might as well improve yield")
         try:
-            # The DEX leg yields once first, so every CEX order fired in the same tick has its request on the wire before
-            # this one does any work (Pavel 2026-10-15: "DEX tasks should not hold anything on CEX side"; a DEX buy held
-            # the CEX sell arb_l fires after it ~0.7 ms). It relies on aiohttp writing a warm connection's request within
-            # the CEX task's first step, as it does on Python 3.12 (an eager body writer): S9 checks it at the socket.
-            await asyncio.sleep(0)
             await super()._create_order(trade_type, order_id, trading_pair, amount, order_type, price, **kwargs)
         finally:
             if self._order_tracker.fetch_order(client_order_id=order_id) is None:
                 self._free_turn(order_id)            # an error before it was tracked: no event will ever end it
+                self._on_filled.pop(order_id, None)
 
     def _update_order_after_failure(self, order_id: str, trading_pair: str, exception: Optional[Exception] = None):
         """an order refused before or at its send (the framework's checks, _place_order): it ends here"""
         self._after_failure(trading_pair)              # before the failure event reaches the strategy
+        self._on_filled.pop(order_id, None)
         super()._update_order_after_failure(order_id, trading_pair, exception)
         self._free_turn(order_id)
 
@@ -760,30 +770,62 @@ class BscExchange(ExchangePyBase):
         return [CancellationResult(oid, oid not in self.in_flight_orders) for oid in waiting]
 
     # ---------------------------------------------------------------- a swap's end, as the feed process saw it
-    async def _settle(self, order_id: str, parsed: Optional[dict], info: Optional[dict]):
-        """a swap's end (parsed None: dropped, its nonce already read anew by the feed). Its receipt's moves go on the balances
-        first, so whoever reads them at the fill event sees the trade (the hold band, the balancer); then the fill and FILLED
-        with what it really got, or FAILED, processed in place (no 5 s wait: what the swap got IS the order); then the
-        wallet's turn is free"""
+    def _ended(self, order_id: str, parsed: Optional[dict], info: Optional[dict]):
+        """a swap's end, the moment its message is read (parsed None: dropped, its nonce already read anew by the feed).
+        What it got is worked out first, and a fill goes straight to whoever waits on it (on_filled: arb_l's DEX first sends
+        its CEX leg there), before anything else; a failure has its pair's book hidden and a fresh poll asked for. Then the
+        rest (_settle), started eagerly: it runs to its end here, with no wait for the loop, so no tick sees the swap ended
+        and its fill not yet on the balances"""
         swap = self._swaps.get(order_id)
         if swap is None:
             return
+        read_at = time.perf_counter()
+        first = self._on_filled.pop(order_id, None)          # taken here, whatever the end: never called twice, never left
+        end = handed = None
+        try:
+            end = self._end_of(order_id, swap, parsed)
+            if end[1] is not None and first is not None:
+                try:
+                    first(order_id, end[1].fill_base_amount)
+                except Exception:
+                    self.logger().error(f"bsc: {order_id} filled, but whoever waited on its fill failed", exc_info=True)
+                handed = time.perf_counter() - read_at
+            if end[0] == OrderState.FAILED:
+                self._after_failure(swap["trading_pair"])    # before the failure event reaches the strategy
+        except Exception:                                    # never the feed's reader: the settle works it out again
+            self.logger().error(f"bsc: {order_id}: its end could not be worked out at once", exc_info=True)
+        # (the loop given: Python 3.12's C Task starts eagerly on the loop it is GIVEN, and fails without one)
+        asyncio.Task(safe_wrapper(self._settle(order_id, swap, parsed, info, end, handed)), loop=asyncio.get_running_loop(),
+                     eager_start=True)
+
+    def _end_of(self, order_id: str, swap: dict, parsed: Optional[dict]) -> Tuple[OrderState, Optional[TradeUpdate],
+                                                                                    Optional[tuple]]:
         if parsed is None:
-            state, fill, problem = OrderState.FAILED, None, (
+            return OrderState.FAILED, None, (
                 "BscSwapDropped", f"not included by its last block {swap['last_block']}: no builder took it in time, or it "
                                   f"would have reverted (nothing paid)")
-        else:
+        return self._outcome(order_id, swap, parsed)
+
+    async def _settle(self, order_id: str, swap: dict, parsed: Optional[dict], info: Optional[dict], end: Optional[tuple],
+                      handed: Optional[float]):
+        """a swap's end, after its fill was handed on (_ended): this side's own work. Its receipt's moves go on the balances
+        first, so whoever reads them at the fill event sees the trade (the hold band, the balancer); then the fill and FILLED
+        with what it really got, or FAILED, processed in place (no 5 s wait: what the swap got IS the order); then the
+        wallet's turn is free"""
+        if end is None:
+            end = self._end_of(order_id, swap, parsed)
+            if end[0] == OrderState.FAILED:
+                self._after_failure(swap["trading_pair"])
+        state, fill, problem = end
+        if parsed is not None:
             self._book_receipt(swap, parsed)
-            state, fill, problem = self._outcome(order_id, swap, parsed)
         if fill is not None:
             self._order_tracker.process_trade_update(fill)
             order = self._order_tracker.fetch_order(client_order_id=order_id)
             if order is not None and order.executed_amount_base < order.amount:
                 order.amount = order.executed_amount_base     # an exact-input buy may get less than its amount: no more comes
-        if state == OrderState.FAILED:
-            self._after_failure(swap["trading_pair"])    # before the failure event reaches the strategy
         try:
-            line = self._swap_line(order_id, swap, info, parsed, problem)
+            line = self._swap_line(order_id, swap, info, parsed, problem, handed)
         except Exception as e:                        # the line is information only: it never holds the settle up
             line = f"bsc: {order_id} {swap.get('tx_hash')}: {problem[1] if problem else 'filled'} ({type(e).__name__} in its line)"
         (self.logger().warning if problem is not None else self.logger().info)(line)
@@ -793,11 +835,12 @@ class BscExchange(ExchangePyBase):
         self._send_caps()                                   # its moves are on the balances: the ladders end there now
 
     def _swap_line(self, order_id: str, swap: dict, info: Optional[dict], parsed: Optional[dict],
-                   problem: Optional[tuple]) -> str:
+                   problem: Optional[tuple], handed: Optional[float] = None) -> str:
         """one line per swap's end (Pavel 2026-10-15; audit finding 7: the data the room, a gas bid and the cadence are tuned
         on): what it got against its book, where it landed against its book's block (+N, its index in the block), the
         seconds from the send, how old its book was at the send, the gas. The send reads no head, so the book's block is
-        the line's reference: +N covers the book's age and the wait for inclusion"""
+        the line's reference: +N covers the book's age and the wait for inclusion. A fill someone waited on (on_filled)
+        also says how long from its end read to that taker done ("handed on in": arb_l's CEX leg sent, Pavel 2026-10-17)"""
         book = swap["book_block"]
         where = f"its book (block {book}) {swap['sent'] - swap['book_at']:.2f} s old at the send"
         what = f"bsc: {swap['trading_pair']} {swap['side']} ({order_id})"
@@ -815,8 +858,9 @@ class BscExchange(ExchangePyBase):
         minimum = swap.get("min_out")                                       # its own minimum: the room, or a DEX-first floor
         floor = (f"its minimum {(minimum / expected - 1) * 1e4:+.0f} bps" if expected and minimum else
                  f"room {CONSTANTS.SWAP_SLIPPAGE * 10000:.0f} bps")
+        first = f"; its fill handed on in {handed * 1e3:.2f} ms" if handed is not None else ""
         return (f"{what} filled: got {got / 10 ** decimals:.8g} {unit} ({versus}, {floor}); {at}; {where}; gas "
-                f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} BNB ({info['gas_used']:,}); {swap['tx_hash']}")
+                f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} BNB ({info['gas_used']:,}){first}; {swap['tx_hash']}")
 
     def _outcome(self, order_id: str, swap: dict, parsed: dict) -> Tuple[OrderState, Optional[TradeUpdate], Optional[tuple]]:
         """a mined swap -> (FILLED, its one fill, None) or (FAILED, None, (error type, why)): reverted (its gas still paid),

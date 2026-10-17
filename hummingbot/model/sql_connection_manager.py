@@ -3,7 +3,7 @@ from enum import Enum
 from os.path import join
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import MetaData, create_engine, inspect
+from sqlalchemy import MetaData, create_engine, event, inspect
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.schema import DropConstraint, ForeignKeyConstraint, Table
@@ -73,6 +73,8 @@ class SQLConnectionManager(TransactionBase):
 
         if connection_type is SQLConnectionType.TRADE_FILLS:
             self._engine: Engine = create_engine(client_config_map.db_mode.get_url(self.db_path))
+            if self._engine.dialect.name == "sqlite":
+                event.listen(self._engine, "connect", self._sqlite_fast_commits)
             self._metadata: MetaData = self.get_declarative_base().metadata
             self._metadata.create_all(self._engine)
 
@@ -95,6 +97,29 @@ class SQLConnectionManager(TransactionBase):
 
         if connection_type is SQLConnectionType.TRADE_FILLS and (not called_from_migrator):
             self.check_and_migrate_db(client_config_map)
+
+    @classmethod
+    def _sqlite_fast_commits(cls, dbapi_connection, connection_record):
+        """each new SQLite connection: WAL, then synchronous NORMAL (Pavel 2026-10-17, the P2 hot path: "recorder fix").
+        The trade recorder (markets_recorder) commits on HMB's one loop at every order event, created, filled, cancelled,
+        failed and completed, ~1,250 an hour live. In the rollback journal with synchronous FULL each commit waits on two
+        fsyncs: 8.6 ms p50 on the live 1.29 GB test_multi.sqlite, with every book, tick and order held meanwhile. In WAL
+        with NORMAL a commit is an append to the -wal file and the fsync comes only at a checkpoint (0.008 ms). An HMB crash
+        loses nothing; an OS crash or a power cut may lose the last commits, never the file. WAL stays set in the file
+        (the -wal and -shm files sit beside it). NORMAL is set only once the file IS in WAL: it is not crash-safe in the
+        rollback journal. A connection whose file can't switch (another process holding it) keeps its mode, said once"""
+        cursor = dbapi_connection.cursor()
+        try:
+            mode = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+            if mode is not None and str(mode[0]).lower() == "wal":
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            else:
+                cls.logger().warning(f"the trade database stays in journal mode {mode[0] if mode else '?'}: it could not "
+                                     f"switch to WAL, so each commit still waits on its fsyncs")
+        except Exception as e:
+            cls.logger().warning(f"the trade database's journal mode could not be set ({e}): its commits wait on fsyncs")
+        finally:
+            cursor.close()
 
     @property
     def engine(self) -> Engine:
