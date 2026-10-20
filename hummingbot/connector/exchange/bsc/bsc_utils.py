@@ -22,7 +22,7 @@ class BscConfigMap(BaseConnectorConfigMap):
     bsc_rpc_url: SecretStr = Field(
         default=...,
         json_schema_extra={
-            "prompt": "Enter the BSC RPC URL the books are quoted through (BlockPI, with its key)",
+            "prompt": "Enter the BSC RPC URL the books are quoted through (BlockRazor's free RPC: https://bsc.blockrazor.xyz)",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,

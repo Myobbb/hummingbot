@@ -5,8 +5,9 @@ processes ideally should not affect CEX speed and recency").
 Everything the `bsc` connector does with the chain runs here, in a child process of HMB, so none of it holds HMB's event loop,
 which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5-0.7 ms a second with 3 tokens, 5-6 ms with
 20, and 0.42 ms per swap. The child does:
-  - the 1 s book poll (bsc_quoter: the call built, BlockPI asked, the answer decoded into books), the wallet's reads riding in
-    it, and the books gated by the approvals (a side the wallet can't pay into its executor is not shown);
+  - the book poll, one a block, sent when the status node's head shows the block (bsc_quoter: the call built, the book's node
+    asked, the answer decoded into books), the wallet's reads riding in it, and the books gated by the approvals (a side the
+    wallet can't pay into its executor is not shown);
   - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's; each signed
     transaction's line in the swap ledger first (the asset manager's tag for the wallet's fills, P3-DEX decision 3);
   - the wallet's nonce, and every transaction it sends followed to its receipt or its last block;
@@ -33,6 +34,7 @@ import types
 from collections import deque
 from decimal import ROUND_DOWN, Decimal, localcontext
 from typing import Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -136,13 +138,13 @@ def decode_wallet(plan: dict, res: list, block: Optional[int], wallet: str) -> d
 
 
 def mask(text, rpc_url: str, key_hex: Optional[str]) -> str:
-    """the node URL carries its key, and the wallet key is a key: neither reaches a log or a message"""
+    """a node URL that carries a key in its path (BlockPI's), and the wallet key: neither reaches a log or a message. A keyless
+    URL (BlockRazor's, the book's node since 2026-10-19) has nothing to hide, and its host stays readable in every error"""
     text = str(text)
     if rpc_url:
-        text = text.replace(rpc_url, "<rpc>")
         node_key = rpc_url.rstrip("/").rsplit("/", 1)[-1]
-        if len(node_key) >= 16:
-            text = text.replace(node_key, "<key>")
+        if len(node_key) >= 16 and "." not in node_key:
+            text = text.replace(rpc_url, "<rpc>").replace(node_key, "<key>")
     if key_hex:
         text = re.sub(key_hex, "<pk>", text, flags=re.IGNORECASE)
     return text
@@ -150,8 +152,8 @@ def mask(text, rpc_url: str, key_hex: Optional[str]) -> str:
 
 # ---------------------------------------------------------------- the child's side: the chain
 class Feed:
-    """The feed process's work (one per child; a test runs it in-process over the same frames). It polls on its own clock
-    and answers HMB's commands:
+    """The feed process's work (one per child; a test runs it in-process over the same frames). It polls once a block, on
+    its own block clock (_poll_loop), and answers HMB's commands:
       ("cas", [ca]) the CAs to quote · ("caps", {ca: {"buy", "sell"}}) the ladders' ends · ("swap", order id, params) ·
       ("approve", id, call) · ("nonce_lost",) a transaction it didn't send took a nonce · ("stop",).
     It sends: ("poll", books and wallet) or ("poll_failed", why) each poll · ("pools_changed", [ca]) · ("signed", order id,
@@ -194,7 +196,12 @@ class Feed:
         self._quoted: Optional[tuple] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._nonce_task: Optional[asyncio.Task] = None
-        self._wake = asyncio.Event()                  # HMB's ("poll_now",): the next poll goes out now (a DEX order failed)
+        self.clock: Optional[Tuple[int, float]] = None   # (a block, its timestamp to the ms): every block's time (_read_clock)
+        self.clock_read = 0.0                          # when the clock was last asked for (read again every ANCHOR_S)
+        self._clock_task: Optional[asyncio.Task] = None
+        self._retries = 0                              # polls asked again for the block they were sent for (POLL_RETRIES)
+        self._target: Optional[int] = None             # the block the next poll waits for the head to show (_head_wait)
+        self._due: Optional[int] = None                # the block the last poll went out for (set when its head showed it)
         self._tasks: set = set()
         self._key_hex = self.account.key.hex().removeprefix("0x") if self.account is not None else None
 
@@ -233,13 +240,12 @@ class Feed:
             self._spawn(self._approve(message[1], message[2]))
         elif kind == "nonce_lost":
             self.nonce = None                         # read anew after the next wallet read (_after_wallet_read)
-        elif kind == "poll_now":
-            self._wake.set()                          # a DEX order failed: a book taken after it, at once
 
-    def _spawn(self, coro):
+    def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
+        return task
 
     def _task_done(self, task: asyncio.Task):
         self._tasks.discard(task)
@@ -260,7 +266,7 @@ class Feed:
 
     # ---------------------------------------------------------------- the node
     async def _post(self, body: bytes) -> bytes:
-        """one JSON-RPC POST to the node (BlockPI): the quoter's transport"""
+        """one JSON-RPC POST to the book's node (bsc_rpc_url: BlockRazor's free RPC since 2026-10-19): the quoter's transport"""
         if not self.rpc_url:
             raise RuntimeError("no BSC RPC URL: connect bsc")
         return await self._post_to(self.rpc_url, body)
@@ -287,34 +293,121 @@ class Feed:
         """one read on a transaction out (the head, its receipt, the wallet's nonce at its last block): SWAP_STATUS_URL"""
         return await self._read_at(self.status_url, method, params)
 
-    async def _read_at(self, url: str, method: str, params: list):
+    async def _read_at(self, url: str, method: str, params: list, timeout: Optional[float] = None):
         ans = json.loads(await self._post_to(url, json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=CONSTANTS.READ_TIMEOUT_S))
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=timeout or CONSTANTS.READ_TIMEOUT_S))
         if "error" in ans:
             raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
         return ans.get("result")
 
     # ---------------------------------------------------------------- the books
     async def _poll_loop(self):
-        """one poll every poll_s while there is a CA to quote: the books and the wallet in one eth_call (Pavel 2026-10-15: the
-        wallet read rides along, no request of its own; BlockPI bills an eth_call 20 RU whatever it carries, up to a 1 MB
-        answer). Nothing is polled without a CA (HMB then stops this process, unless a transaction is still out)"""
+        """one poll a block while there is a CA to quote (Pavel 2026-10-19: "change our DEX side polling to be every block
+        instead of every 1s ... we should always have current block locally before calculation and broadcast"). Each goes out
+        as soon as SWAP_STATUS_URL's head shows its block (_head_wait; Pavel 2026-10-19: "Move the book to BlockRazor ... use
+        (B) trigger if it's best and robust, clock fix if needed"), so its book is that block's. The books and the wallet ride
+        in one eth_call (Pavel 2026-10-15: the wallet read rides along, no request of its own). Nothing is polled, and no head
+        read, without a CA (HMB then stops this process, unless a transaction is still out)"""
+        self._check_book_node()
         while True:
-            t0 = time.time()
+            sent = time.time()
+            if sent - self.clock_read >= CONSTANTS.ANCHOR_S:
+                self._clock_due(sent)
+            before, polled = (self.quoter.last or {}).get("block"), False
             try:
                 leased = await self._lease_step()
                 self._load_pools()
                 if self.quoter.cas:
                     await self._poll(leased)
+                    polled = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.send(("poll_failed", self._mask(f"{type(e).__name__}: {e}")[:300]))
-            try:                                      # the next poll at POLL_S, or at once on HMB's ("poll_now",)
-                await asyncio.wait_for(self._wake.wait(), max(0.0, self.poll_s - (time.time() - t0)))
-            except asyncio.TimeoutError:
-                pass
-            self._wake.clear()
+            await asyncio.sleep(self._next_poll_in(sent, polled and (self.quoter.last or {}).get("block") == before))
+            if self._target is not None and self.quoter.cas:
+                await self._head_wait()
+
+    def _check_book_node(self):
+        """the trigger reads SWAP_STATUS_URL's head, the call goes to bsc_rpc_url: on two different nodes a call can come before
+        its node has the block (2026-10-19: BlockPI answered the block before on 20-42% of calls sent at BlockRazor's head)"""
+        book, status = urlparse(self.rpc_url or "").hostname, urlparse(self.status_url or "").hostname
+        if book and status and book != status:
+            self._report("book node", self._mask(f"the books are quoted on {book}, but each poll goes when {status} shows its "
+                                                 f"block: set bsc_rpc_url to {self.status_url} (connect bsc)"), "warning")
+
+    def _next_poll_in(self, sent: float, no_newer: bool) -> float:
+        """seconds until the next poll's head reads begin: HEAD_START_S after the next block's slot on the block clock
+        (_head_wait sends the poll when the head shows that block). A poll that brought nothing newer while its block was due
+        (the book's node behind the head) goes again at once, POLL_RETRIES times at most for a block. A poll whose block the
+        clock can't place (newer than the clock allows, or its own timestamp, to the second, more than a second off) has the
+        clock read again. Without the clock: every poll_s, unaligned"""
+        now = time.time()
+        self._target = None
+        if self.clock is None:
+            return max(0.0, self.poll_s - (now - sent))
+        n0, t0 = self.clock
+        due = self._due if self._due is not None else n0 + int((sent - t0) // CONSTANTS.BLOCK_S)   # the block it went out for
+        last = self.quoter.last or {}
+        have = last.get("block") or 0
+        if have > due + 1 or (last.get("ts") and abs(t0 + (have - n0) * CONSTANTS.BLOCK_S - last["ts"]) > 1.0):
+            self._clock_due(now)
+        if no_newer and have < due and self._retries < CONSTANTS.POLL_RETRIES:
+            self._retries += 1
+            return 0.0
+        self._retries, self._due = 0, None
+        self._target = max(have, due) + 1
+        return max(0.0, t0 + (self._target - n0) * CONSTANTS.BLOCK_S + CONSTANTS.HEAD_START_S - now)
+
+    async def _head_wait(self):
+        """the poll for block _target goes as soon as SWAP_STATUS_URL's head shows it: the head read every HEAD_POLL_S (a read
+        that fails, or takes over HEAD_READ_TIMEOUT_S, counts as not there yet). The clock fix (a missed slot moves every
+        later block 0.55 s off the grid, ~59 a day): a block shown over HEAD_LATE_S after its slot has the clock read again;
+        no block by HEAD_GIVE_UP_S after its slot, the poll goes anyway and the clock is read again"""
+        target = self._target
+        n0, t0 = self.clock
+        slot = t0 + (target - n0) * CONSTANTS.BLOCK_S
+        while True:
+            began = time.time()
+            try:
+                head = int(await self._read_at(self.status_url, "eth_blockNumber", [],
+                                               timeout=CONSTANTS.HEAD_READ_TIMEOUT_S), 16)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                head = None
+            now = time.time()
+            if head is not None and head >= target:
+                if now - slot > CONSTANTS.HEAD_LATE_S:
+                    self._clock_due(now)
+                break
+            if now - slot >= CONSTANTS.HEAD_GIVE_UP_S:
+                self._clock_due(now)
+                break
+            await asyncio.sleep(max(0.0, began + CONSTANTS.HEAD_POLL_S - time.time()))
+        self._due = target
+
+    def _clock_due(self, now: float):
+        if self._clock_task is None or self._clock_task.done():
+            self.clock_read = now                     # a read that fails waits ANCHOR_S too
+            self._clock_task = self._spawn(self._read_clock())
+
+    async def _read_clock(self):
+        """the block clock: one block's number and its timestamp to the millisecond (BSC keeps the milliseconds in the header's
+        mixHash), from SWAP_STATUS_URL (no key, no RU). Every other block's time follows, BLOCK_S apart. A read that fails
+        keeps the last clock; with none yet the polls go every poll_s"""
+        try:
+            b = await self._status("eth_getBlockByNumber", ["latest", False])
+            ms = int(b["mixHash"], 16)
+            self.clock = (int(b["number"], 16), int(b["timestamp"], 16) + (ms / 1000 if ms < 1000 else 0.0))
+            if "block clock" in self.reported:
+                self._report("block clock", "read again: one poll a block")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._report("block clock", f"not read ({self._mask(e)[:120]}): "
+                                        + ("the last one kept" if self.clock else f"a poll every {self.poll_s} s until it is"),
+                         "warning")
 
     def _load_pools(self):
         """the payloads of the CAs HMB's pairs are bound to: a file that changed is read again (HMB is told, for its trading

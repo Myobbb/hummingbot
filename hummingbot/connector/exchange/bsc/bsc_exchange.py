@@ -54,7 +54,8 @@ class BscExchange(ExchangePyBase):
       (orders, balances, the wallet's one turn) and exchanges one small message per poll and per transaction with the child.
       It starts the child when a pair has a CA to quote, and stops it when none is left and nothing is out (idle: no
       process).
-    - Books: the child polls one eth_call a second (bsc_quoter.BscQuoter): per traded CA one book per side, from the
+    - Books: the child polls one eth_call a block (bsc_quoter.BscQuoter; per block since 2026-10-19, bsc_feed._poll_loop): per
+      traded CA one book per side, from the
       depth-elected pool, with a $100 watch on its other pools, priced in USDT along each pool's path (Q5, Q7). A book side
       the wallet can't pay into its executor is not shown, so no strategy fires a CEX leg against a DEX leg that would be
       refused.
@@ -132,8 +133,8 @@ class BscExchange(ExchangePyBase):
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
         self._session: Optional[aiohttp.ClientSession] = None
         self._idle = False                             # the last poll found no DEX pair to quote (and made no call)
-        self._fresh_after: Dict[str, float] = {}       # trading pair -> when its last DEX order failed: its book shows again
-                                                       # only from a poll sent after that (DEX first, Pavel 2026-10-17)
+        self._fresh_after: Dict[str, int] = {}         # trading pair -> the newest block we had when its DEX order failed: its
+                                                       # book shows again only from a newer block (DEX first, 2026-10-17/19)
         self._on_filled: Dict[str, Callable[[str, Decimal], None]] = {}   # order id -> who takes its fill first (on_filled)
         self._balances_read = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
@@ -231,7 +232,7 @@ class BscExchange(ExchangePyBase):
         getattr(self.logger(), level if level in ("debug", "info", "warning", "error") else "info")(text)
 
     async def _post(self, body: bytes) -> bytes:
-        """one JSON-RPC POST to the node (BlockPI): `connect bsc`'s balance read and check_network's, the only node requests
+        """one JSON-RPC POST to the book's node (bsc_rpc_url): `connect bsc`'s balance read and check_network's, the only node requests
         HMB's side makes (the feed process has its own session)"""
         if not self._rpc_url:
             raise RuntimeError("no BSC RPC URL: connect bsc")
@@ -475,14 +476,14 @@ class BscExchange(ExchangePyBase):
     def _books_by_pair(self, last: dict) -> Dict[str, tuple]:
         """trading pair -> (bids, asks) as [[price, qty], ...]: the asks are the CA bought on the DEX ("buy"), the bids sold;
         each side as the feed shows it (merged; empty while the wallet can't pay into its executor). A pair whose DEX order
-        failed shows no book until a poll sent after the failure (_after_failure)"""
+        failed shows no book until a poll of a newer block than any we had at the failure (_after_failure)"""
         out = {}
         books = last.get("books") or {}
         for trading_pair in self._trading_pairs:
-            failed_at = self._fresh_after.get(trading_pair)
-            if failed_at is not None:
-                if (last.get("at") or 0.0) <= failed_at:
-                    out[trading_pair] = ([], [])           # this poll went out before the failure: its price is the old one
+            failed_block = self._fresh_after.get(trading_pair)
+            if failed_block is not None:
+                if (last.get("block") or 0) <= failed_block:
+                    out[trading_pair] = ([], [])           # no newer block yet: its price is the one that just lost
                     continue
                 del self._fresh_after[trading_pair]
             book = books.get(self._pair_ca.get(trading_pair)) or {}
@@ -705,16 +706,17 @@ class BscExchange(ExchangePyBase):
         self._free_turn(order_id)
 
     def _after_failure(self, trading_pair: str):
-        """a DEX order that failed (refused, dropped, reverted): the pair's book is hidden at once and shown again only from a
-        poll sent after the failure (Pavel 2026-10-17: "Refire only on a DEX price snapshot taken after the failure"), and
-        that poll goes out now rather than at the next POLL_S, so the next attempt waits one round trip, not up to a poll"""
-        self._fresh_after[trading_pair] = time.time()
-        self._orderbook_ds.hide(trading_pair)
-        if self._feed.running:
-            try:
-                self._feed.send(("poll_now",))
-            except Exception:
-                pass
+        """a DEX order that failed (refused, dropped, reverted): the pair's book is emptied at once, and shown again only from a
+        poll of a block newer than any we had at the failure (Pavel 2026-10-17: "Refire only on a DEX price snapshot taken
+        after the failure"; 10-19: a poll every block, so that is at most a block away, and no extra poll is asked for).
+        Emptied in the tracker's own book too, the one the strategies read: the data source's empty snapshot reaches it only
+        through the tracker's queues, two loop turns later, and a tick in between fired on the old book (ALEO 10-18 14:54:11,
+        10-19 10:47:18: 3-4 ms after a refusal)"""
+        self._fresh_after[trading_pair] = self._orderbook_ds.last_block or 0
+        update_id = self._orderbook_ds.hide(trading_pair)
+        book = self.order_book_tracker.order_books.get(trading_pair)
+        if book is not None:
+            book.apply_snapshot([], [], update_id)
 
     def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                           order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):

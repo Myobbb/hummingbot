@@ -50,8 +50,10 @@ from hummingbot.connector.exchange.bsc.bsc_p1_quoter import (
 
 RUNGS_USD = (100, 250, 500, 1000)   # P1's rungs, capped at $1,000 (Pavel 2026-10-14); a side's ladder ends at the wallet's
                                     # balance (ladder_rungs), and the hops are quoted at these sizes
-# WIP values (Pavel 2026-10-14: "cadence 1 second is fine for starters ... the rest relaxed, we will tune it later")
-POLL_S = 1.0
+# WIP values (Pavel 2026-10-14: "cadence 1 second is fine for starters ... the rest relaxed, we will tune it later").
+# POLL_S: the cadence without the block clock, and the data source's idle wait. One poll a block since 2026-10-19, sent when
+# the status node's head shows the block (bsc_feed._poll_loop, _head_wait); BLOCK_S apart when it has to go unaligned
+POLL_S = 0.45
 SWITCH_BPS = 50.0
 REELECT_S = 900.0
 SIDES = ("buy", "sell")
@@ -305,7 +307,7 @@ class BscQuoter:
                 raise
         block, ts = word(res[0][1], 0), word(res[1][1], 0)
         if self.last and block < self.last["block"]:
-            self.stats["older block"] += 1                # BlockPI spreads requests over its nodes: keep the newest block's books
+            self.stats["older block"] += 1                # a node spreads requests over its backends: keep the newest block's books
             return self.last
         quotes = {}
         for p, ca, side, s, amt, i in top:

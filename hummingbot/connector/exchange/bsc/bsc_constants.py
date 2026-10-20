@@ -22,7 +22,8 @@ SEL_BALANCE_OF = "70a08231"       # ERC-20 balanceOf(address)
 
 # Every request has a timeout (audit 2026-10-15: aiohttp takes timeout=None as no timeout at all, and none was ever set,
 # so one stalled connection could hold the book poll, or the wallet's turn, until TCP gave up)
-RPC_TIMEOUT_S = 2.0               # a node request (BlockPI: the book poll, the balances, check_network): p50 0.2 s from myserver
+RPC_TIMEOUT_S = 2.0               # a request to the book's node (the book poll, the balances, check_network): BlockRazor runs
+                                  # 20 CAs' call in ~0.06 s from myserver (BlockPI ~0.2 s)
 READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle (SWAP_READ_URL, SWAP_STATUS_URL): each a few ms away
 STALE_S = 5.0                     # a book whose block is older than this goes empty, however its poll ended (P1's B7: never a
                                   # kept price); a poll is never waited for past that moment
@@ -58,6 +59,27 @@ APPROVE_RETRY_MAX_S = 3600.0
 # 2 blocks, receipt p50 0.53 s (the public paths were a block slower).
 BUILDERS = ("https://puissant-builder.48.club", "https://rpc.blockrazor.builders")   # 2.6 / 7.5 ms from myserver
 BLOCK_S = 0.45                    # BSC's block time since the Fermi hard fork (2026-01-14)
+# The DEX book: one poll a block (Pavel 2026-10-19: "change our DEX side polling to be every block instead of every 1s ... we
+# should always have current block locally before calculation and broadcast"), sent as soon as SWAP_STATUS_URL's head shows
+# the block (Pavel 2026-10-19: "Move the book to BlockRazor if it's the fastest way we can get quotes, use (B) trigger if it's
+# best and robust, clock fix if needed"): the head read every HEAD_POLL_S from HEAD_START_S after the block's slot on the
+# block clock. The book is quoted on the node bsc_rpc_url names: BlockRazor's free RPC, the status node, so the head and the
+# call see the same node. Measured from myserver (2026-10-19, block_trigger_probe.py, 15 min, 11,982 calls; wiki
+# p2-dex-book-sources): the book in hand p50 0.183 s / p90 0.21-0.22 s after its block for 20 CAs (0.147 / 0.178 for today's
+# 2), the first answer at the block 100%; BlockPI at +240 ms 0.437 / 0.494, at its best offset 0.325 / 0.490
+HEAD_START_S = 0.06               # BlockRazor's head shows a block p10 0.069 s after its timestamp (p50 0.129, p99 0.19-0.21)
+HEAD_POLL_S = 0.02
+HEAD_LATE_S = 0.35                # a block the head shows later than this after its slot: the grid moved, the clock is read
+                                  # again. A missed slot (~59 a day, 2026-10-19) brings one block 1.0 s after its parent and
+                                  # every later one 0.55 s off the grid; its block shows ~0.68 s after the old slot
+HEAD_GIVE_UP_S = 0.9              # no block by then: the poll goes anyway, and the clock is read again
+HEAD_READ_TIMEOUT_S = 0.25        # one head read (BlockRazor ~8 ms away); a slower or failed one counts as not there yet
+POLL_RETRIES = 1                  # a poll answered from the block before (the book node behind the head) is asked again at
+                                  # once, this many times at most for a block
+# The blocks' times: one block's millisecond timestamp (its header's timestamp + mixHash) on SWAP_STATUS_URL places every
+# block, BLOCK_S apart. Read again every ANCHOR_S, at once when a poll's block disagrees with it, and when the head shows a
+# block late (HEAD_LATE_S) or not at all (HEAD_GIVE_UP_S). Without it the feed polls every POLL_S, unaligned
+ANCHOR_S = 60.0
 BUNDLE_BLOCKS = 4                 # valid for the 4 blocks after the head at the send (~1.8 s; Pavel 2026-10-17, was 12). Each of
                                   # the 42 swaps landed by then landed within 3 blocks of the head at its send (+1: 6, +2: 30,
                                   # +3: 6), so blocks +4..+12 only kept a swap that lost its race holding the wallet's one turn
@@ -65,7 +87,8 @@ BUNDLE_BLOCKS = 4                 # valid for the 4 blocks after the head at the
                                   # last block, bsc_feed._landed). The bundle's last block, not the swap's 5 s deadline
                                   # (bsc_swap.DEADLINE_S), is the swap's expiry
 # The wallet's nonce (the lease's too: the asset manager sends on this node, so its pending transactions show here) and an
-# approval's head: BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms), free. The book feed stays on BlockPI (decision 4).
+# approval's head: BNB's public seed, 3 ms from myserver (BlockPI is ~88 ms), free. The book is quoted on BlockRazor
+# (bsc_rpc_url, since 2026-10-19; it was BlockPI).
 SWAP_READ_URL = "https://bsc-dataseed1.bnbchain.org"
 # A transaction out is followed here: the head, its receipt, the wallet's nonce at its last block (Pavel 2026-10-17, DEX first:
 # "minimize the time it takes for us to confirm that our DEX order got placed, and if it did not we need to minimize the wait

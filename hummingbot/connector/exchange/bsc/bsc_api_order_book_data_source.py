@@ -18,7 +18,8 @@ class _NoAnswer(RuntimeError):
 
 class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """The chain's books, polled (P2-DEX step 3, 2026-10-14). listen_for_subscriptions, which the tracker runs where a socket
-    would be, takes each poll the feed process makes, every POLL_S on its own clock: one eth_call (bsc_quoter.BscQuoter, in
+    would be, takes each poll the feed process makes, once a block on its own block clock (since 2026-10-19; every POLL_S
+    without it): one eth_call (bsc_quoter.BscQuoter, in
     bsc_feed's child process, 2026-10-15). Each poll hands the tracker a SNAPSHOT per trading pair, never a diff (the
     runbook: never mix the two). A pair with no book gets an empty one: a market that is off looks empty, never dropped.
     Every book goes empty once the block it was priced at is STALE_S old, however its poll ended (a failed call, an answer
@@ -51,11 +52,13 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._pushed = {}
         self._first_poll.clear()
 
-    def hide(self, trading_pair: str):
-        """a pair's book emptied at once (its DEX order failed: bsc_exchange._after_failure), until a fresh poll shows it"""
+    def hide(self, trading_pair: str) -> int:
+        """a pair's book emptied at once (its DEX order failed: bsc_exchange._after_failure), until a newer block's poll shows
+        it -> the update id of the empty snapshot, which the connector also applies to the tracker's book directly"""
         if trading_pair in self._books:
             self._books[trading_pair] = ([], [])
             self._push()
+        return self._update_id
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         """the book's mid for every pair asked (NaN without a two-sided book): the tracker re-asks at once on a missing pair"""
@@ -167,7 +170,7 @@ class BscAPIOrderBookDataSource(OrderBookTrackerDataSource):
         two_sided = sum(1 for bids, asks in self._books.values() if bids and asks)
         q = self._connector._feed_stats
         self.logger().debug(f"bsc: {self.polls} polls, {self.failed} failed, {two_sided}/{len(self._trading_pairs)} two-sided books, "
-                            f"block {self.last_block}, RU {q.get('ru')}, elections {q.get('elections')}, switches {q.get('switches')}")
+                            f"block {self.last_block}, RU at BlockPI's rate {q.get('ru')}, elections {q.get('elections')}, switches {q.get('switches')}")
 
     async def _subscribe_single_trading_pair(self, ws, trading_pair: str):
         """a runtime-added pair is in the next poll (its CA's payload must be in the pool directory)"""
