@@ -1,18 +1,21 @@
-"""P2-DEX (2026-10-14): the pools of the CAs P2 trades, as P1 handed them over, for the `bsc` connector.
+"""P2-DEX (2026-10-14; the EVM core since 2026-10-22): the pools of the CAs P2 trades, as P1 handed them over, for a DEX
+connector on any EVM chain. The chain's facts come from its spec (`C`): P1's name for the chain (P1_CHAIN), where its payloads
+are (DATA_DIR), its DEX families (FAMILY: quote route -> family), the route kinds an official router can execute
+(ROUTED_KINDS) and its executors (EXECUTORS, through evm_dex_swap.no_executor).
 
 P1 tracks every pool, and records them with each opportunity it catches, exactly as for CEX-CEX (Pavel 2026-10-14):
 ws_book_checker ends a CEX<->DEX arb.log line with ` dex={...}`, the CA's records as it priced them: {chain, ca, ticker,
 decimals, reference_usd, written, pools}, where `pools` are P1's records of that CA's valid pools (route, key, counter and
 its quoted path to USDT `counter.hops`, taxes). The lanes on brr_ws carry it on the page record, and the watcher on
-myserver writes it to `~/p2_dex/<ca>.json` from every page that carries it. A strategy's leg names its CA
-(`control create … bsc:MUBARAK-USDT:0x5c85…`), and the orchestrator binds the pair to it (BscExchange.bind_ca). P1 decides
-which pools are valid; P2 decides which is best each poll (Q7). Once an asset is traded arb.log drops its lines, like any
-CEX-CEX asset, so its file stays as it was at the create.
+myserver writes it to `<DATA_DIR>/<ca>.json` from every page that carries it. A strategy's leg names its CA
+(`control create … bsc:MUBARAK-USDT:0x5c85…`), and the orchestrator binds the pair to it (bind_ca). P1 decides which pools
+are valid; P2 decides which is best each poll (Q7). Once an asset is traded arb.log drops its lines, like any CEX-CEX asset,
+so its file stays as it was at the create.
 
 This module reads those files: per CA the pools P2 can trade, each with its DEX family and its counter's hop candidates inside
 that family; the pools left out with their reason, never silently (no router: decision 2; no hop inside its family: one
 router call chains one family only); and a per-CA signature that changes when P1's pools for the CA change (the re-election
-trigger). No network, no web3. The connector (bsc_exchange.BscExchange, step 3) reads it every poll."""
+trigger). No network, no web3. The connector (evm_dex_exchange.EvmDexExchange) reads it every poll."""
 import glob
 import hashlib
 import json
@@ -23,43 +26,23 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from hummingbot.connector.exchange.bsc.bsc_swap import no_executor
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import no_executor
 
-DATA_DIR = os.path.expanduser("~/p2_dex")
-CHAIN = "BSC"
 STALE_AFTER_S = 6 * 3600.0     # a payload whose P1 stamp is older is counted as stale in summary() (information only)
-
-# The quote routes an official router can execute. P1's own-model pools (routerless pairs, unlisted deployments) have no
-# router, so they stay out for now (decision 2).
-ROUTED_KINDS = frozenset(("v2 router", "QuoterV2", "official quoter", "Algebra quoter"))
-
-# A pool's DEX family, from its quote route. One router call chains pools of one family only, so a counter's hop has to be
-# found inside its pool's family (Q5). PancakeSwap's and Uniswap's Universal Routers each chain their own v2, v3 and
-# v4 / Infinity pools; any other route (a fork's v2 router, another v3 deployment's quoter, an Algebra quoter) is a family
-# of its own. The routers themselves are pinned and checked on-chain in step 4.
-FAMILY = {
-    "0x10ed43c718714eb63d5aa57b78b54704e256024e": "pancakeswap",   # PancakeSwap v2 router
-    "0xb048bbc1ee6b733fffcfb9e9cef7375518e25997": "pancakeswap",   # PancakeSwap v3 QuoterV2
-    "0xd0737c9762912dd34c3271197e362aa736df0926": "pancakeswap",   # PancakeSwap Infinity CL quoter
-    "0xc631f4b0fc2dd68ad45f74b2942628db117dd359": "pancakeswap",   # PancakeSwap Infinity Bin quoter
-    "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24": "uniswap",       # Uniswap v2 router
-    "0x78d78e420da98ad378d7799be8f4af69033eb077": "uniswap",       # Uniswap v3 QuoterV2
-    "0x9f75dd27d6664c475b90e105573e550ff69437b0": "uniswap",       # Uniswap v4 quoter
-}
 ADDRESS = re.compile(r"^0x[0-9a-f]{40}$")
 
 
-def family_of(pool: dict) -> str:
+def family_of(C, pool: dict) -> str:
     address = ((pool.get("route") or {}).get("address") or "").lower()
-    return FAMILY.get(address) or f"route:{address}"
+    return C.FAMILY.get(address) or f"route:{address}"
 
 
-def check_payload(doc) -> Optional[str]:
+def check_payload(C, doc) -> Optional[str]:
     """why a page's `dex` payload can't be used, or None"""
     if not isinstance(doc, dict):
         return f"a {type(doc).__name__}, not an object"
-    if doc.get("chain") != CHAIN:
-        return f"chain {doc.get('chain')!r}, expected {CHAIN}"
+    if doc.get("chain") != C.P1_CHAIN:
+        return f"chain {doc.get('chain')!r}, expected {C.P1_CHAIN}"
     if not ADDRESS.match(str(doc.get("ca") or "").lower()):
         return f"ca {doc.get('ca')!r} is not an address"
     if not doc.get("ticker"):
@@ -73,12 +56,12 @@ def check_payload(doc) -> Optional[str]:
     return None
 
 
-def hop_path(pool: dict, family: str) -> Tuple[List[List[dict]], Optional[int]]:
+def hop_path(C, pool: dict, family: str) -> Tuple[List[List[dict]], Optional[int]]:
     """the counter's links to USDT in path order, each cut to the candidates of `family`
     -> (path, the first link without one, or None). A USDT pool has no link."""
     path, gap = [], None
     for i, link in enumerate((pool.get("counter") or {}).get("hops") or []):
-        same = [c for c in link.get("pools") or [] if family_of(c) == family]
+        same = [c for c in link.get("pools") or [] if family_of(C, c) == family]
         path.append(same)
         if not same and gap is None:
             gap = i
@@ -97,11 +80,13 @@ def signature(pools: List[dict]) -> str:
 
 
 class PoolList:
-    """The CAs P2 trades, one file each (`<DATA_DIR>/<ca>.json`, a page's `dex` payload). load() re-reads only the files that
-    changed and drops the CAs whose file is gone; a file that fails check_payload() is left out with its reason."""
+    """The CAs P2 trades, one file each (`<data_dir>/<ca>.json`, a page's `dex` payload; the spec's DATA_DIR unless given).
+    load() re-reads only the files that changed and drops the CAs whose file is gone; a file that fails check_payload() is
+    left out with its reason."""
 
-    def __init__(self, data_dir: str = DATA_DIR):
-        self.data_dir = data_dir
+    def __init__(self, C, data_dir: Optional[str] = None):
+        self.C = C
+        self.data_dir = data_dir or C.DATA_DIR
         self.mtimes: Dict[str, float] = {}            # path -> mtime last read
         self.cas: Dict[str, dict] = {}                # ca -> {"ticker", "written", "pools": [tradable, annotated]}
         self.left_out: Dict[Tuple[str, str], str] = {}  # (pool, ca) -> why; a pool pairing two of our CAs is under both
@@ -110,6 +95,7 @@ class PoolList:
 
     def load(self) -> List[str]:
         """-> the CAs whose pools changed (new, rewritten with a new signature, or gone)"""
+        C = self.C
         changed, seen = [], set()
         for path in sorted(glob.glob(os.path.join(self.data_dir, "0x*.json"))):
             seen.add(path)
@@ -120,7 +106,7 @@ class PoolList:
             try:
                 with open(path) as f:
                     doc = json.load(f)
-                problem = check_payload(doc)
+                problem = check_payload(C, doc)
             except (OSError, ValueError) as e:
                 problem = f"{type(e).__name__}: {str(e)[:120]}"
             if problem:
@@ -133,16 +119,16 @@ class PoolList:
                 del self.left_out[key]
             for p in doc["pools"]:
                 kind = (p.get("route") or {}).get("kind")
-                if kind not in ROUTED_KINDS:
+                if kind not in C.ROUTED_KINDS:
                     self.left_out[(p.get("pool"), ca)] = f"no router: {kind}"
                     continue
-                fam = family_of(p)
-                why = no_executor(dict(p, family=fam))               # step 4: a pool P2 can't swap is no book pool
+                fam = family_of(C, p)
+                why = no_executor(C, dict(p, family=fam))           # step 4: a pool P2 can't swap is no book pool
                 if why:
                     self.left_out[(p.get("pool"), ca)] = why
                     continue
-                path_, gap = hop_path(p, fam)
-                path_ = [[c for c in link if not no_executor(dict(c, family=fam))] for link in path_]   # executable hops only
+                path_, gap = hop_path(C, p, fam)
+                path_ = [[c for c in link if not no_executor(C, dict(c, family=fam))] for link in path_]   # executable hops only
                 gap = next((i for i, link in enumerate(path_) if not link), gap)
                 if gap is not None:
                     self.left_out[(p.get("pool"), ca)] = f"no hop inside its family ({fam}) for link {gap + 1}"

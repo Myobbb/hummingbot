@@ -1,8 +1,10 @@
-"""P2-DEX build step 2 (2026-10-14): the `bsc` connector's DEX books, one eth_call a poll.
+"""P2-DEX build step 2 (2026-10-14; the EVM core since 2026-10-22): a DEX connector's books, one eth_call a poll, on any EVM
+chain (P1's name for the chain picks its row of P1's CHAINS: its Multicall3, its anchor stable, its wrapped native token).
 
-For the CAs P2 trades (bsc_pool_list.PoolList: P1's records, handed over by the page -> watcher path), each poll is ONE
-Multicall3 aggregate3 eth_call built with P1's own call encoding: bsc_p1_quoter.py is P1's ws_book_checker/core/dex_quoter.py,
-copied unchanged (md5 0621aeea…, 2026-10-14) so a later sync can be checked by md5. The call holds:
+For the CAs P2 trades (evm_dex_pool_list.PoolList: P1's records, handed over by the page -> watcher path), each poll is ONE
+Multicall3 aggregate3 eth_call built with P1's own call encoding: evm_dex_p1_quoter.py is P1's
+ws_book_checker/core/dex_quoter.py, copied unchanged (md5 d660f253…, 2026-10-22: every chain's row, Curve, Balancer; it is
+0621aeea… plus those, the same for every BSC route kind) so a later sync can be checked by md5. The call holds:
   - getBlockNumber + getCurrentBlockTimestamp: every book carries its block, and the poll its own send time (`at`): a swap's
     send estimates the chain's head from these, so placing an order reads nothing (Pavel 2026-10-15);
   - the caller's own reads (`extra`: the connector's wallet, its balances and approvals), at the books' block, in the same
@@ -31,7 +33,7 @@ import json
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-from hummingbot.connector.exchange.bsc.bsc_p1_quoter import (
+from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import (
     CHAINS,
     MAX_SQ,
     MIN_SQ,
@@ -50,10 +52,8 @@ from hummingbot.connector.exchange.bsc.bsc_p1_quoter import (
 
 RUNGS_USD = (100, 250, 500, 1000)   # P1's rungs, capped at $1,000 (Pavel 2026-10-14); a side's ladder ends at the wallet's
                                     # balance (ladder_rungs), and the hops are quoted at these sizes
-# WIP values (Pavel 2026-10-14: "cadence 1 second is fine for starters ... the rest relaxed, we will tune it later").
-# POLL_S: the cadence without the block clock, and the data source's idle wait. One poll a block since 2026-10-19, sent when
-# the status node's head shows the block (bsc_feed._poll_loop, _head_wait); BLOCK_S apart when it has to go unaligned
-POLL_S = 0.45
+# WIP values (Pavel 2026-10-14: "cadence 1 second is fine for starters ... the rest relaxed, we will tune it later"). The
+# cadence (POLL_S) is the chain's: its spec
 SWITCH_BPS = 50.0
 REELECT_S = 900.0
 SIDES = ("buy", "sell")
@@ -84,9 +84,10 @@ def tax_factor(p: dict, side: str) -> Optional[float]:
     return 1.0 / (1.0 - t) if side == "buy" else 1.0 - t
 
 
-class BscQuoter:
-    def __init__(self, post, chain: str = "BSC"):
-        """post: async (body: bytes) -> bytes, one JSON-RPC POST to the node (the caller owns the session, the URL and the key)"""
+class EvmDexQuoter:
+    def __init__(self, post, chain: str):
+        """post: async (body: bytes) -> bytes, one JSON-RPC POST to the node (the caller owns the session, the URL and the key);
+        chain: P1's name for it (the spec's P1_CHAIN), its row of P1's CHAINS"""
         c = CHAINS[chain]
         self.post, self.mc3, self.anchor, self.wrapped = post, c["multicall3"], c["anchor"], c["wrapped"]
         self.cas: Dict[str, dict] = {}            # ca -> {"decimals", "pools": [PoolList's tradable pools]}

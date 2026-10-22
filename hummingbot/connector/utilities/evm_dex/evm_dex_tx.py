@@ -1,11 +1,12 @@
-"""P2-DEX build step 4 (2026-10-14): a swap transaction around its calldata (bsc_swap): the approvals it needs, the signed
-transaction, and what its receipt says. Nothing here sends: the send method is its own session's (Pavel 2026-10-14), and so
-are the nonce and gas POLICIES; this module only takes a nonce, a gas limit and a gas price as given.
+"""P2-DEX build step 4 (2026-10-14; the EVM core since 2026-10-22): a swap transaction around its calldata (evm_dex_swap): the
+approvals it needs, the signed transaction, and what its receipt says, on any EVM chain (its id from its spec, `C`). Nothing
+here sends: the send method is its own session's (Pavel 2026-10-14), and so are the nonce and gas POLICIES; this module only
+takes a nonce, a gas limit and a gas price as given.
 
 - Approvals. A v2-style router pulls the input token by ERC20 allowance (token -> router). A Universal Router pulls it through
   Permit2: ERC20 allowance token -> Permit2, then Permit2's own allowance (wallet, token, router), with an expiry. Each is one
   transaction per token, once (max amounts, the expiry at its maximum).
-- The transaction: legacy type 0, EIP-155 (chain id 56), signed locally with the wallet's key: by libsecp256k1 directly
+- The transaction: legacy type 0, EIP-155 (the spec's CHAIN_ID; 56 on BSC), signed locally with the wallet's key: by libsecp256k1 directly
   (coincurve), the same bytes as eth_account at a third of its time, or by eth_account when that does not check out
   at import (sign, SIGNER).
 - The receipt: status 0 = the swap reverted (a failed order; the gas is still paid). Otherwise the fill is read from the ERC20
@@ -20,7 +21,6 @@ try:
 except ImportError:                                  # sign() falls back to eth_account
     PrivateKey = None
 
-CHAIN_ID = 56
 MAX_UINT256 = (1 << 256) - 1
 MAX_UINT160 = (1 << 160) - 1
 MAX_UINT48 = (1 << 48) - 1
@@ -86,10 +86,14 @@ def missing_approvals(wallet: str, token: str, executor: dict, answers: List[Tup
 
 
 # ---------------------------------------------------------------- the transaction
-def build_tx(to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: int) -> Dict:
-    """a legacy (type 0) EIP-155 transaction, ready to sign (eth_account wants a checksummed `to`)"""
+def build_tx(C, to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: int) -> Dict:
+    """a legacy (type 0) EIP-155 transaction on the spec's chain, ready to sign (eth_account wants a checksummed `to`)"""
+    return _legacy(to, data, value, nonce, gas, gas_price, C.CHAIN_ID)
+
+
+def _legacy(to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: int, chain_id: int) -> Dict:
     return {"to": to_checksum_address(to), "data": "0x" + data.hex(), "value": int(value), "nonce": int(nonce), "gas": int(gas),
-            "gasPrice": int(gas_price), "chainId": CHAIN_ID}
+            "gasPrice": int(gas_price), "chainId": int(chain_id)}
 
 
 def sign(account, tx: Dict) -> Tuple[str, str]:
@@ -147,9 +151,9 @@ def _check_direct() -> Tuple[bool, str]:
     try:
         from eth_account import Account
         account = Account.from_key(bytes(range(1, 33)))
-        for tx in (build_tx("0x" + "5c" * 20, bytes(range(256)) * 2 + bytes(68), 0, 0, 350_000, 50_000_000),
-                   build_tx("0x00000000000000000000000000000000000000ff", bytes(68), 0, 127, 70_000, 1),
-                   build_tx("0x" + "ff" * 20, b"", 10 ** 18, 2 ** 40, 21_000, 10 ** 12)):
+        for tx in (_legacy("0x" + "5c" * 20, bytes(range(256)) * 2 + bytes(68), 0, 0, 350_000, 50_000_000, 56),
+                   _legacy("0x00000000000000000000000000000000000000ff", bytes(68), 0, 127, 70_000, 1, 56),
+                   _legacy("0x" + "ff" * 20, b"", 10 ** 18, 2 ** 40, 21_000, 10 ** 12, 56)):
             if _sign_direct(bytes(account.key), tx) != _sign_eth_account(account, tx):
                 return False, "eth_account (the direct signer's bytes differ from eth_account's)"
     except Exception as e:

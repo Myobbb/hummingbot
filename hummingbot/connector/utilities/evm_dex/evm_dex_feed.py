@@ -2,10 +2,11 @@
 clean as possible, and local orderbooks for CEX to be as fresh as possible, DEX speed is lower priority and DEX related
 processes ideally should not affect CEX speed and recency").
 
-Everything the `bsc` connector does with the chain runs here, in a child process of HMB, so none of it holds HMB's event loop,
+Everything a DEX connector (`bsc`, `eth`: one per chain, each with its spec, the chain's constants module, `C`) does with the
+chain runs here, in a child process of HMB, so none of it holds HMB's event loop,
 which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5-0.7 ms a second with 3 tokens, 5-6 ms with
 20, and 0.42 ms per swap. The child does:
-  - the book poll, one a block, sent when the status node's head shows the block (bsc_quoter: the call built, the book's node
+  - the book poll, one a block, sent when the status node's head shows the block (evm_dex_quoter: the call built, the book's node
     asked, the answer decoded into books), the wallet's reads riding in it, and the books gated by the approvals (a side the
     wallet can't pay into its executor is not shown);
   - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's; each signed
@@ -13,16 +14,17 @@ which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5
   - the wallet's nonce, and every transaction it sends followed to its receipt or its last block;
   - the wallet lease (P3-DEX decision 2): a heartbeat each poll; while another sender (the asset manager's withdraw) holds a
     valid request, no book shown and nothing signed, the grant once nothing signed is out, the nonce read anew at release.
-HMB's side (bsc_exchange.BscExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
+HMB's side (evm_dex_exchange.EvmDexExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
 approvals' back-off. They exchange one small message per poll and per transaction (FeedClient <-> Feed): framed pickles on
 the child's stdin and stdout.
   - The connector starts the child when it has a DEX pair to quote, and stops it when none is left and nothing is out (idle:
     no process at all).
-  - The child's code is the connector's own, captured as HMB imported it (SOURCES) and handed over at the start (BOOT): a pull
-    without a restart never runs other code there than in HMB.
+  - The child's code is the connector's own, captured as HMB imported it (CORE_SOURCES and the chain's spec: sources_for)
+    and handed over at the start (BOOT): a pull without a restart never runs other code there than in HMB.
   - It is niced (FEED_NICE): under CPU contention HMB's process goes first, as DEX speed is the lower priority.
   - It ends with HMB: when its stdin closes, it ends."""
 import asyncio
+import importlib
 import json
 import os
 import pickle
@@ -38,20 +40,20 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from hummingbot.connector.exchange.bsc import bsc_constants as CONSTANTS
-from hummingbot.connector.exchange.bsc.bsc_p1_quoter import adr, word
-from hummingbot.connector.exchange.bsc.bsc_pool_list import PoolList
-from hummingbot.connector.exchange.bsc.bsc_quoter import BscQuoter
-from hummingbot.connector.exchange.bsc.bsc_swap import build_swap, executor
-from hummingbot.connector.exchange.bsc.bsc_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
-                                                       parse_receipt, sign)
+from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import adr, word
+from hummingbot.connector.utilities.evm_dex.evm_dex_pool_list import PoolList
+from hummingbot.connector.utilities.evm_dex.evm_dex_quoter import EvmDexQuoter
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import build_swap, executor
+from hummingbot.connector.utilities.evm_dex.evm_dex_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
+                                                                parse_receipt, sign)
 
 FEED_NICE = 10            # the child's niceness: under CPU contention HMB's own process goes first
 FEED_RESTART_S = 5.0      # a child that ended on its own is started again no sooner than this after it ended
 FEED_STOP_S = 2.0         # a stop waits this long for the child to end, then kills it
 FEED_HUNG_S = 30.0        # a running child that sent no poll for this long is killed and started again
 STDERR_KEPT = 30          # the child's last stderr lines kept, shown when it ends on its own (a traceback fits)
-WORKER_MODULES = ("bsc_constants", "bsc_p1_quoter", "bsc_swap", "bsc_pool_list", "bsc_quoter", "bsc_tx", "bsc_feed")
+# the core's modules the child runs, each after the ones it imports; the chain's spec is handed over with them (sources_for)
+WORKER_MODULES = ("evm_dex_p1_quoter", "evm_dex_swap", "evm_dex_pool_list", "evm_dex_quoter", "evm_dex_tx", "evm_dex_feed")
 # what HMB keeps of a swap out (its settle, its line): the rest of the swap (its calldata, its executor) stays in the child
 SWAP_KEYS = ("side", "ca", "ca_decimals", "token_in", "token_out", "amount_in", "min_out", "pool", "book_block", "book_at",
              "head", "expected_out")
@@ -101,37 +103,37 @@ async def read_frame(reader: asyncio.StreamReader) -> Optional[tuple]:
         return None
 
 
-# ---------------------------------------------------------------- the wallet's reads (both sides: `connect bsc` reads in HMB)
-def wallet_plan(wallet: str, cas: List[str], pool_list) -> dict:
-    """the wallet's reads: its BNB, USDT and the traded CAs, and whether each token it may pay is approved for each router
-    its CAs' pools swap through (USDT for a buy, the CA for a sell)"""
-    tokens = [CONSTANTS.USDT] + [ca for ca in cas if ca != CONSTANTS.USDT]
-    calls = [(CONSTANTS.MULTICALL3, bytes.fromhex(CONSTANTS.SEL_ETH_BALANCE) + adr(wallet))]
-    calls += [(token, bytes.fromhex(CONSTANTS.SEL_BALANCE_OF) + adr(wallet)) for token in tokens]
+# ---------------------------------------------------------------- the wallet's reads (both sides: `connect <k>` reads in HMB)
+def wallet_plan(C, wallet: str, cas: List[str], pool_list) -> dict:
+    """the wallet's reads: its native coin (gas), USDT and the traded CAs, and whether each token it may pay is approved for
+    each router its CAs' pools swap through (USDT for a buy, the CA for a sell)"""
+    tokens = [C.USDT] + [ca for ca in cas if ca != C.USDT]
+    calls = [(C.MULTICALL3, bytes.fromhex(C.SEL_ETH_BALANCE) + adr(wallet))]
+    calls += [(token, bytes.fromhex(C.SEL_BALANCE_OF) + adr(wallet)) for token in tokens]
     pairs = {}
     for ca in cas:
         for pool in pool_list.pools(ca):
-            ex = executor(pool)
+            ex = executor(C, pool)
             if ex:
-                for token in (CONSTANTS.USDT, ca):
+                for token in (C.USDT, ca):
                     pairs[(token, ex["router"])] = ex
     approvals = [(key, ex, allowance_calls(wallet, key[0], ex)) for key, ex in pairs.items()]
     return {"tokens": tokens, "approvals": approvals, "calls": calls + [c for _, _, cs in approvals for c in cs]}
 
 
-def decode_wallet(plan: dict, res: list, block: Optional[int], wallet: str) -> dict:
-    """the plan's answers -> {"block", "bnb": raw or None (its call failed), "balances": {token: raw or None},
+def decode_wallet(C, plan: dict, res: list, block: Optional[int], wallet: str) -> dict:
+    """the plan's answers -> {"block", "native": raw or None (its call failed), "balances": {token: raw or None},
     "approvals": {(token, router): approved}, "missing": the approval calls still needed}"""
     def raw(answer):
         ok, ret = answer
         return word(ret, 0) if ok and len(ret) >= 32 else None
     tokens = plan["tokens"]
-    out = {"block": block, "bnb": raw(res[0]), "balances": {t: raw(r) for t, r in zip(tokens, res[1:1 + len(tokens)])},
+    out = {"block": block, "native": raw(res[0]), "balances": {t: raw(r) for t, r in zip(tokens, res[1:1 + len(tokens)])},
            "approvals": {}, "missing": []}
     i, now = 1 + len(tokens), int(time.time())
     for key, ex, cs in plan["approvals"]:
         answers, i = res[i:i + len(cs)], i + len(cs)
-        need = missing_approvals(wallet, key[0], ex, answers, CONSTANTS.APPROVED_AT_LEAST, now)
+        need = missing_approvals(wallet, key[0], ex, answers, C.APPROVED_AT_LEAST, now)
         out["approvals"][key] = not need
         out["missing"] += [c for c in need if c not in out["missing"]]      # a token -> Permit2 approve serves both routers
     return out
@@ -164,6 +166,7 @@ class Feed:
 
     def __init__(self, init: dict, send: Callable[[tuple], None]):
         self.send = send
+        self.C = importlib.import_module(init["spec"])  # the chain's spec (in the child: installed by BOOT with the code)
         self.rpc_url = init["rpc_url"]
         self.wallet = init["wallet"]
         self.account = None
@@ -176,8 +179,8 @@ class Feed:
         self.builders = tuple(init["builders"])
         self.read_url = init["swap_read_url"]
         self.status_url = init["swap_status_url"]
-        self.pool_list = PoolList(init["data_dir"])
-        self.quoter = BscQuoter(self._post)
+        self.pool_list = PoolList(self.C, init["data_dir"])
+        self.quoter = EvmDexQuoter(self._post, self.C.P1_CHAIN)
         self.wanted: List[str] = list(init.get("cas") or [])
         self.caps: Dict[str, dict] = dict(init.get("caps") or {})
         self.approvals: Dict[tuple, bool] = {}
@@ -251,7 +254,7 @@ class Feed:
         self._tasks.discard(task)
         if not task.cancelled() and task.exception() is not None:
             e = task.exception()
-            self._log("error", self._mask(f"bsc: the feed's task failed: {type(e).__name__}: {e}"))
+            self._log("error", self._mask(f"{self.C.EXCHANGE_NAME}: the feed's task failed: {type(e).__name__}: {e}"))
 
     def _log(self, level: str, text: str):
         self.send(("log", level, text))
@@ -259,26 +262,27 @@ class Feed:
     def _report(self, key: str, text: str, level: str = "info"):
         if self.reported.get(key) != text:
             self.reported[key] = text
-            self._log(level, f"bsc: {key}: {text}")
+            self._log(level, f"{self.C.EXCHANGE_NAME}: {key}: {text}")
 
     def _mask(self, text) -> str:
         return mask(text, self.rpc_url, self._key_hex)
 
     # ---------------------------------------------------------------- the node
     async def _post(self, body: bytes) -> bytes:
-        """one JSON-RPC POST to the book's node (bsc_rpc_url: BlockRazor's free RPC since 2026-10-19): the quoter's transport"""
+        """one JSON-RPC POST to the book's node (<k>_rpc_url; on BSC BlockRazor's free RPC since 2026-10-19): the quoter's
+        transport"""
         if not self.rpc_url:
-            raise RuntimeError("no BSC RPC URL: connect bsc")
+            raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.C.EXCHANGE_NAME}")
         return await self._post_to(self.rpc_url, body)
 
     async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None) -> bytes:
         """one JSON-RPC POST on the feed's kept-alive session: the node, the swap reads, the builders. Every request has a
         timeout, RPC_TIMEOUT_S unless the caller gives its own (aiohttp takes timeout=None as no timeout at all)"""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CONSTANTS.RPC_TIMEOUT_S))
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.C.RPC_TIMEOUT_S))
         try:
             async with self._session.post(url, data=body, headers={"Content-Type": "application/json"},
-                                          timeout=aiohttp.ClientTimeout(total=timeout or CONSTANTS.RPC_TIMEOUT_S)) as r:
+                                          timeout=aiohttp.ClientTimeout(total=timeout or self.C.RPC_TIMEOUT_S)) as r:
                 return await r.read()
         except asyncio.CancelledError:
             raise
@@ -295,7 +299,7 @@ class Feed:
 
     async def _read_at(self, url: str, method: str, params: list, timeout: Optional[float] = None):
         ans = json.loads(await self._post_to(url, json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=timeout or CONSTANTS.READ_TIMEOUT_S))
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), timeout=timeout or self.C.READ_TIMEOUT_S))
         if "error" in ans:
             raise RuntimeError(self._mask(f"{method}: {ans['error']}"))
         return ans.get("result")
@@ -311,7 +315,7 @@ class Feed:
         self._check_book_node()
         while True:
             sent = time.time()
-            if sent - self.clock_read >= CONSTANTS.ANCHOR_S:
+            if sent - self.clock_read >= self.C.ANCHOR_S:
                 self._clock_due(sent)
             before, polled = (self.quoter.last or {}).get("block"), False
             try:
@@ -329,12 +333,13 @@ class Feed:
                 await self._head_wait()
 
     def _check_book_node(self):
-        """the trigger reads SWAP_STATUS_URL's head, the call goes to bsc_rpc_url: on two different nodes a call can come before
+        """the trigger reads SWAP_STATUS_URL's head, the call goes to <k>_rpc_url: on two different nodes a call can come before
         its node has the block (2026-10-19: BlockPI answered the block before on 20-42% of calls sent at BlockRazor's head)"""
         book, status = urlparse(self.rpc_url or "").hostname, urlparse(self.status_url or "").hostname
         if book and status and book != status:
             self._report("book node", self._mask(f"the books are quoted on {book}, but each poll goes when {status} shows its "
-                                                 f"block: set bsc_rpc_url to {self.status_url} (connect bsc)"), "warning")
+                                                 f"block: set {self.C.EXCHANGE_NAME}_rpc_url to {self.status_url} (connect "
+                                                 f"{self.C.EXCHANGE_NAME})"), "warning")
 
     def _next_poll_in(self, sent: float, no_newer: bool) -> float:
         """seconds until the next poll's head reads begin: HEAD_START_S after the next block's slot on the block clock
@@ -347,17 +352,17 @@ class Feed:
         if self.clock is None:
             return max(0.0, self.poll_s - (now - sent))
         n0, t0 = self.clock
-        due = self._due if self._due is not None else n0 + int((sent - t0) // CONSTANTS.BLOCK_S)   # the block it went out for
+        due = self._due if self._due is not None else n0 + int((sent - t0) // self.C.BLOCK_S)   # the block it went out for
         last = self.quoter.last or {}
         have = last.get("block") or 0
-        if have > due + 1 or (last.get("ts") and abs(t0 + (have - n0) * CONSTANTS.BLOCK_S - last["ts"]) > 1.0):
+        if have > due + 1 or (last.get("ts") and abs(t0 + (have - n0) * self.C.BLOCK_S - last["ts"]) > 1.0):
             self._clock_due(now)
-        if no_newer and have < due and self._retries < CONSTANTS.POLL_RETRIES:
+        if no_newer and have < due and self._retries < self.C.POLL_RETRIES:
             self._retries += 1
             return 0.0
         self._retries, self._due = 0, None
         self._target = max(have, due) + 1
-        return max(0.0, t0 + (self._target - n0) * CONSTANTS.BLOCK_S + CONSTANTS.HEAD_START_S - now)
+        return max(0.0, t0 + (self._target - n0) * self.C.BLOCK_S + self.C.HEAD_START_S - now)
 
     async def _head_wait(self):
         """the poll for block _target goes as soon as SWAP_STATUS_URL's head shows it: the head read every HEAD_POLL_S (a read
@@ -366,25 +371,25 @@ class Feed:
         no block by HEAD_GIVE_UP_S after its slot, the poll goes anyway and the clock is read again"""
         target = self._target
         n0, t0 = self.clock
-        slot = t0 + (target - n0) * CONSTANTS.BLOCK_S
+        slot = t0 + (target - n0) * self.C.BLOCK_S
         while True:
             began = time.time()
             try:
                 head = int(await self._read_at(self.status_url, "eth_blockNumber", [],
-                                               timeout=CONSTANTS.HEAD_READ_TIMEOUT_S), 16)
+                                               timeout=self.C.HEAD_READ_TIMEOUT_S), 16)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 head = None
             now = time.time()
             if head is not None and head >= target:
-                if now - slot > CONSTANTS.HEAD_LATE_S:
+                if now - slot > self.C.HEAD_LATE_S:
                     self._clock_due(now)
                 break
-            if now - slot >= CONSTANTS.HEAD_GIVE_UP_S:
+            if now - slot >= self.C.HEAD_GIVE_UP_S:
                 self._clock_due(now)
                 break
-            await asyncio.sleep(max(0.0, began + CONSTANTS.HEAD_POLL_S - time.time()))
+            await asyncio.sleep(max(0.0, began + self.C.HEAD_POLL_S - time.time()))
         self._due = target
 
     def _clock_due(self, now: float):
@@ -426,15 +431,15 @@ class Feed:
 
     async def _poll(self, leased: bool = False):
         """one poll: the books and the wallet's reads in one call. While the wallet is leased the wallet is still read (HMB's
-        balances follow the requester's transfer), but no book is shown: HMB empties every bsc book at this poll (F1, F4)"""
+        balances follow the requester's transfer), but no book is shown: HMB empties every DEX book at this poll (F1, F4)"""
         self.quoter.caps = self.caps
-        plan = wallet_plan(self.wallet, list(self.quoter.cas), self.pool_list) if self.read_wallet else None
+        plan = wallet_plan(self.C, self.wallet, list(self.quoter.cas), self.pool_list) if self.read_wallet else None
         self.quoter.extra = plan["calls"] if plan else []
         last = await self.quoter.poll()
         got = last.get("extra") or []
         wallet = None
         if plan and [c for c, _ in got] == plan["calls"]:   # this poll's answers (an older block's poll gives back the last)
-            wallet = decode_wallet(plan, [a for _, a in got], last.get("block"), self.wallet)
+            wallet = decode_wallet(self.C, plan, [a for _, a in got], last.get("block"), self.wallet)
             self.approvals.update(wallet["approvals"])
         books = {} if leased else {ca: {side: self._side(ca, side, book) for side, book in sides.items()}
                                    for ca, sides in (last.get("books") or {}).items()}
@@ -450,15 +455,15 @@ class Feed:
         if not book:
             return []
         if self.gate:
-            ex = executor(book.get("record") or {})
-            if not ex or not self.approvals.get((CONSTANTS.USDT if side == "buy" else ca, ex["router"])):
+            ex = executor(self.C, book.get("record") or {})
+            if not ex or not self.approvals.get((self.C.USDT if side == "buy" else ca, ex["router"])):
                 return []
         return merged(book.get("levels", []))
 
     def _after_wallet_read(self):
         """the nonce, while it is unknown and nothing is out, is read in the background, never inside the poll (the books
         don't wait for it), so the run's first order finds it"""
-        if (self.nonce is None and not self.out and self.account is not None and CONSTANTS.TRADING_ENABLED
+        if (self.nonce is None and not self.out and self.account is not None and self.C.TRADING_ENABLED
                 and self.lease is None and (self._nonce_task is None or self._nonce_task.done())):
             self._nonce_task = asyncio.ensure_future(self._read_nonce())     # (never while leased: the release reads it)
 
@@ -468,7 +473,7 @@ class Feed:
         (else the largest): the swap runs exactly where its book was priced. A book whose block is STALE_S old is no book,
         the rule that empties the books on show"""
         last = self.quoter.last
-        if not last or time.time() - (last.get("ts") or 0) > CONSTANTS.STALE_S:
+        if not last or time.time() - (last.get("ts") or 0) > self.C.STALE_S:
             raise Refused("no fresh book")
         book = (last.get("books") or {}).get(ca, {}).get(side)
         if not book:
@@ -508,7 +513,7 @@ class Feed:
             tail) and must receive at least cost / (limit x (1 + room)) CA;
           - a sell spends `amount` CA and must receive at least amount x limit x (1 - room) USDT.
         Without the room, an order inside one level of the book (its limit is that level's price) had a minimum equal to
-        the book's own output, so any adverse tick before it landed made it revert (CONSTANTS.SWAP_SLIPPAGE).
+        the book's own output, so any adverse tick before it landed made it revert (the spec's SWAP_SLIPPAGE).
         An order the current book already prices past its limit and the room (beyond PRICE_SLACK) is refused: it could only
         revert. Within the slack the minimum is the book's own output: the limit's, uncapped, would ask for more than the
         book gives."""
@@ -520,7 +525,7 @@ class Feed:
         book_block, book_at = last["block"], last["at"]                  # the block that book was priced at; its poll's send
         # the chain's head now: that block plus the blocks since (Pavel 2026-10-15: the send reads nothing). A node behind
         # makes it low by its lag, and the bundle's window (BUNDLE_BLOCKS) then ends that many blocks sooner
-        head = book_block + int(max(time.time() - book_at, 0.0) / CONSTANTS.BLOCK_S)
+        head = book_block + int(max(time.time() - book_at, 0.0) / self.C.BLOCK_S)
         with localcontext() as ctx:
             ctx.prec = 60
             qty = int((amount * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
@@ -528,32 +533,32 @@ class Feed:
             if qty <= 0 or at_limit <= 0:
                 raise Refused(f"{amount} at {price} is nothing to swap")
             value = self._book_value(book["levels"], amount, price)      # the book's cost (buy) / proceeds (sell) of `amount`
-            slack = at_limit * CONSTANTS.PRICE_SLACK
-            room = f"{CONSTANTS.SWAP_SLIPPAGE * 100:g}%"
+            slack = at_limit * self.C.PRICE_SLACK
+            room = f"{self.C.SWAP_SLIPPAGE * 100:g}%"
             if side == "buy":
-                worst_px = price * (1 + CONSTANTS.SWAP_SLIPPAGE)              # the worst average price accepted
+                worst_px = price * (1 + self.C.SWAP_SLIPPAGE)              # the worst average price accepted
                 if value > amount * worst_px + slack:
                     raise Refused(f"the book moved past the limit and its {room} room: {amount} costs {value:.8g} > "
                                   f"{amount * worst_px:.8g} USDT")
-                amount_in = int((value * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
+                amount_in = int((value * Decimal(10) ** self.C.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
                 min_out = int((min(value / worst_px, amount) * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
                 expected_out = qty                                            # the book: `value` buys `amount`
                 tax = Decimal(str((record.get("tax_pct") or {}).get("buy") or 0)) / 100
                 if tax and record.get("type") != "v2":  # the router checks a v3 / v4 / Infinity pool's output before the tax
                     min_out = int((min_out / (1 - tax)).to_integral_value(rounding=ROUND_DOWN)) + 1
             else:
-                worst_px = price * (1 - CONSTANTS.SWAP_SLIPPAGE)              # the worst average price accepted
+                worst_px = price * (1 - self.C.SWAP_SLIPPAGE)              # the worst average price accepted
                 if value < amount * worst_px - slack:
                     raise Refused(f"the book moved past the limit and its {room} room: {amount} brings {value:.8g} < "
                                   f"{amount * worst_px:.8g} USDT")
                 amount_in = qty
-                min_out = int((min(amount * worst_px, value) * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(
+                min_out = int((min(amount * worst_px, value) * Decimal(10) ** self.C.USDT_DECIMALS).to_integral_value(
                     rounding=ROUND_DOWN))
-                expected_out = int((value * Decimal(10) ** CONSTANTS.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
+                expected_out = int((value * Decimal(10) ** self.C.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
         if amount_in <= 0 or min_out <= 0:
             raise Refused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
         try:
-            swap = build_swap(record, hops, side, amount_in, min_out, self.wallet)
+            swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet)
         except ValueError as e:
             raise Refused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
@@ -570,14 +575,14 @@ class Feed:
             self.send(("signed", order_id, dict(record)))
         try:
             if self.account is None:
-                raise Refused("no wallet key: connect bsc with bsc_private_key")
+                raise Refused(f"no wallet key: connect {self.C.EXCHANGE_NAME} with {self.C.EXCHANGE_NAME}_private_key")
             swap = self._swap_for(p["ca"], p["side"], p["amount"], p["price"])
             if not self.approvals.get((swap["token_in"], swap["executor"]["router"])):
                 raise Refused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
             record.update({k: swap[k] for k in SWAP_KEYS}, trading_pair=p["trading_pair"])
             ledger = {"kind": "swap", "order_id": order_id, "pair": p["trading_pair"], "side": swap["side"],
                       "ca": swap["ca"].lower()}
-            await self._send_tx(record, swap["to"], swap["data"], swap["value"], CONSTANTS.SWAP_GAS_LIMIT, ledger,
+            await self._send_tx(record, swap["to"], swap["data"], swap["value"], self.C.SWAP_GAS_LIMIT, ledger,
                                 head=swap["head"], on_signed=signed)
         except asyncio.CancelledError:
             raise
@@ -605,10 +610,10 @@ class Feed:
                 self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
             if head is None:
                 head = int(await self._read("eth_blockNumber", []), 16)
-            last_block = head + CONSTANTS.BUNDLE_BLOCKS
+            last_block = head + self.C.BUNDLE_BLOCKS
             nonce = self.nonce
             self._lease_check()                      # F4: the lease read again right before the signature (no await between)
-            raw, tx_hash = sign(self.account, build_tx(to, data, value, nonce, gas, CONSTANTS.GAS_PRICE_WEI))
+            raw, tx_hash = sign(self.account, build_tx(self.C, to, data, value, nonce, gas, self.C.GAS_PRICE_WEI))
             self._ledger(nonce, tx_hash, ledger)     # before it goes out: a nonce the chain shows used has its line
         except asyncio.CancelledError:
             raise
@@ -626,7 +631,8 @@ class Feed:
             await self._nonce_lost()                  # nothing went out: its nonce is free again, read anew now
             raise
         except Exception as e:
-            self._log("warning", f"bsc: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it on chain")
+            self._log("warning", f"{self.C.EXCHANGE_NAME}: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it "
+                                 f"on chain")
 
     def _ledger(self, nonce: int, tx_hash: str, entry: dict):
         """the swap ledger's line for a transaction just signed (contract v1; P3-DEX decision 3, Pavel 2026-10-16: the asset
@@ -640,7 +646,7 @@ class Feed:
                 "by": self.ledger_by}
         line.update((k, entry.get(k)) for k in LEDGER_FIELDS[entry["kind"]])
         if line["kind"] == "swap" and self.ledger_by != "strategy":
-            line["order_id"] = None                   # only HMB's own swaps carry a BSC- id: the asset manager's Hummingbot tag
+            line["order_id"] = None                   # only HMB's own swaps carry its id (BSC-…): the asset manager's Hummingbot tag
         data = (json.dumps(line, separators=(",", ":")) + "\n").encode()
         fd = os.open(self.ledger_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
@@ -723,7 +729,8 @@ class Feed:
             granted = None
         if req is not None:
             self.lease, self.granted = req, (granted if granted == req["id"] else None)
-            self._log("info", f"bsc: the wallet is leased to {req.get('by')} ({req['id'][:8]}) at the feed's start: no DEX "
+            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet is leased to {req.get('by')} ({req['id'][:8]}) at the "
+                              f"feed's start: no DEX "
                               f"book or signature until it is released")
         if granted is not None and (req is None or granted != req["id"]):
             self._lease_delete(LEASE_GRANTED)
@@ -744,12 +751,13 @@ class Feed:
             if self._nonce_task is not None and not self._nonce_task.done():
                 self._nonce_task.cancel()               # a read from before the requester's transaction must not land after
             await self._nonce_lost()                    # the nonce read anew, and only then a book is shown again
-            self._log("info", f"bsc: the wallet lease {held['id'][:8]} is released: quoting again")
+            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet lease {held['id'][:8]} is released: quoting again")
         if req is None:
             return False
         if self.lease is None:                          # F1, from this poll on (a new id starts here again)
             self.lease = req
-            self._log("info", f"bsc: the wallet is leased to {req.get('by')} ({req['id'][:8]}): no DEX book or signature "
+            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet is leased to {req.get('by')} ({req['id'][:8]}): no DEX book "
+                              f"or signature "
                               f"until it is released")
         if self.granted != req["id"] and not self.out and not self._approving:   # F2: nothing signed is out; F3, once per id
             try:
@@ -763,7 +771,7 @@ class Feed:
                 self._report("lease", f"the grant for {req['id'][:8]} waits for the next poll: {self._mask(e)}", "warning")
                 return True
             self.granted, self.nonce = req["id"], None  # the requester takes that nonce: read anew at the release
-            self._log("info", f"bsc: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
+            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
         return True
 
     async def _send_bundle(self, raw: str, last_block: int):
@@ -775,7 +783,7 @@ class Feed:
 
         async def ask(url):
             try:
-                return url, json.loads(await self._post_to(url, body, timeout=CONSTANTS.SEND_TIMEOUT_S)), None
+                return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S)), None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -817,13 +825,13 @@ class Feed:
     async def _until_ended(self, record: dict, what: str) -> Optional[dict]:
         """looked at every RECEIPT_POLL_S (_landed) until it ends -> its receipt, or None (not included by its last block)"""
         while True:
-            await asyncio.sleep(CONSTANTS.RECEIPT_POLL_S)
+            await asyncio.sleep(self.C.RECEIPT_POLL_S)
             try:
                 ended, receipt = await self._landed(record)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self._warn(record, f"bsc: {what}: its receipt could not be read: {self._mask(e)}")
+                self._warn(record, f"{self.C.EXCHANGE_NAME}: {what}: its receipt could not be read: {self._mask(e)}")
                 continue
             if ended:
                 return receipt
@@ -831,7 +839,7 @@ class Feed:
     def _warn(self, record: dict, text: str):
         """a transaction's trouble, said at most once per WARN_EVERY_S (it is looked at forty times a second)"""
         now = time.time()
-        if now - record.get("warned", 0.0) >= CONSTANTS.WARN_EVERY_S:
+        if now - record.get("warned", 0.0) >= self.C.WARN_EVERY_S:
             record["warned"] = now
             self._log("warning", text)
 
@@ -858,9 +866,9 @@ class Feed:
         try:
             try:
                 if self.account is None:
-                    raise Refused("no wallet key: connect bsc with bsc_private_key")
+                    raise Refused(f"no wallet key: connect {self.C.EXCHANGE_NAME} with {self.C.EXCHANGE_NAME}_private_key")
                 token, spender = approval_parties(to, data)
-                await self._send_tx(record, to, data, 0, CONSTANTS.APPROVE_GAS_LIMIT,
+                await self._send_tx(record, to, data, 0, self.C.APPROVE_GAS_LIMIT,
                                     {"kind": "approve", "ca": token, "spender": spender})
             except asyncio.CancelledError:
                 raise
@@ -881,11 +889,14 @@ class Feed:
 
 # ---------------------------------------------------------------- HMB's side: the child, started, stopped, spoken to
 class FeedClient:
-    """HMB's end of the feed process (BscExchange._feed): it starts and stops the child, sends it commands and hands its
-    messages on. This is all HMB's loop spends on the DEX: a pickle per message, and a dict or two."""
+    """HMB's end of the feed process (EvmDexExchange._feed): it starts and stops the child, sends it commands and hands its
+    messages on. This is all HMB's loop spends on the DEX: a pickle per message, and a dict or two. `sources`: the chain's code
+    for the child (sources_for its spec), `name`: the connector's (its log lines)."""
 
-    def __init__(self, on_message: Callable[[tuple], None], log: Callable[[str, str], None], mask_text: Callable[[str], str]):
+    def __init__(self, on_message: Callable[[tuple], None], log: Callable[[str, str], None], mask_text: Callable[[str], str],
+                 sources: List[Tuple[str, str]], name: str):
         self.on_message, self.log, self.mask = on_message, log, mask_text
+        self.sources, self.name = sources, name
         self.spawn = spawn_process                # (sources, init) -> (reader, writer, handle); a test runs it in-process
         self.handle = None
         self.writer = None
@@ -903,7 +914,8 @@ class FeedClient:
         return self.handle is not None and self._reader_task is not None and not self._reader_task.done()
 
     async def start(self, init: dict):
-        """the child, with the connector's code (SOURCES) and `init` (the node, the wallet and its key, what to quote)"""
+        """the child, with the connector's code (its sources) and `init` (the spec, the node, the wallet and its key, what to
+        quote)"""
         if self.running:
             return
         wait = self._ended_at + FEED_RESTART_S - time.time()
@@ -912,11 +924,11 @@ class FeedClient:
         self._poll, self._stopping = None, False
         self._poll_event = asyncio.Event()
         self._stderr.clear()
-        reader, self.writer, self.handle = await self.spawn(SOURCES, init)
+        reader, self.writer, self.handle = await self.spawn(self.sources, init)
         self._reader_task = asyncio.ensure_future(self._read(reader))
         if getattr(self.handle, "stderr", None) is not None:
             self._stderr_task = asyncio.ensure_future(self._read_stderr(self.handle.stderr))
-        self.log("info", f"bsc: the feed process started (pid {getattr(self.handle, 'pid', None)})")
+        self.log("info", f"{self.name}: the feed process started (pid {getattr(self.handle, 'pid', None)})")
 
     async def stop(self):
         """the child ended: asked to, then killed if it hasn't within FEED_STOP_S"""
@@ -938,7 +950,7 @@ class FeedClient:
                 task.cancel()
         self.handle = self.writer = self._reader_task = self._stderr_task = None
         self._closed("the feed process was stopped")
-        self.log("info", "bsc: the feed process stopped")
+        self.log("info", f"{self.name}: the feed process stopped")
 
     def send(self, message: tuple):
         if not self.running:
@@ -966,7 +978,7 @@ class FeedClient:
             try:
                 await asyncio.wait_for(self._poll_event.wait(), max(end - time.time(), 0.0))
             except asyncio.TimeoutError:
-                self.log("warning", f"bsc: the feed process sent no poll for {FEED_HUNG_S:.0f} s: restarting it")
+                self.log("warning", f"{self.name}: the feed process sent no poll for {FEED_HUNG_S:.0f} s: restarting it")
                 await self.stop()
                 self._ended_at = time.time()
                 raise RuntimeError(f"the feed process sent no poll for {FEED_HUNG_S:.0f} s") from None
@@ -995,7 +1007,8 @@ class FeedClient:
                 handle = self.handle
                 code = getattr(handle, "returncode", None)
                 tail = " | ".join(self._stderr)
-                self.log("warning", self.mask(f"bsc: the feed process ended on its own (exit code {code}); it is started "
+                self.log("warning", self.mask(f"{self.name}: the feed process ended on its own (exit code {code}); it is "
+                                              f"started "
                                               f"again in {FEED_RESTART_S:.0f} s{': ' + tail if tail else ''}")[:2000])
                 self._closed("the feed process ended")
 
@@ -1007,7 +1020,7 @@ class FeedClient:
                 return
             text = self.mask(line.decode(errors="replace").rstrip())
             self._stderr.append(text)
-            self.log("debug", f"bsc feed: {text}")
+            self.log("debug", f"{self.name} feed: {text}")
 
     def _closed(self, why: str):
         """a stop or an end: a poll awaited wakes (and finds no child), a reply awaited fails"""
@@ -1020,8 +1033,10 @@ class FeedClient:
 
 async def spawn_process(sources: List[Tuple[str, str]], init: dict):
     """the child: this interpreter running BOOT, its code and `init` as the first frame on its stdin (never in its arguments
-    or its environment: init carries the wallet key)"""
-    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", BOOT, stdin=asyncio.subprocess.PIPE,
+    or its environment: init carries the wallet key). BOOT's first line names its connector (`# bsc feed`), so ps tells the
+    chains' children apart"""
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", f"# {init.get('name', 'evm')} feed\n" + BOOT,
+                                                stdin=asyncio.subprocess.PIPE,
                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     proc.stdin.write(pack((sources, init)))
     await proc.stdin.drain()
@@ -1031,8 +1046,9 @@ async def spawn_process(sources: List[Tuple[str, str]], init: dict):
 # ---------------------------------------------------------------- the child's start
 # BOOT nices the child first (its imports are CPU too), reads the first frame from fd 0 unbuffered (a buffered read could
 # swallow the next frames), points fd 1 at stderr (a stray print can't corrupt the frames, which go out on a copy of the
-# original fd 1), installs the code HMB handed over under its own module names (empty parent packages: nothing of HMB is
-# imported; each module's loader gives its source, for a traceback's lines) and runs child_main
+# original fd 1), installs the code HMB handed over under its own module names (the chain's spec and the core's modules; empty
+# parent packages: nothing of HMB is imported; each module's loader gives its source, for a traceback's lines) and runs
+# the core feed's child_main
 BOOT = r"""
 import os, pickle, struct, sys, types
 try:
@@ -1055,20 +1071,23 @@ class _Source:
 _out = os.dup(1)
 os.dup2(2, 1)
 _sources, _init = pickle.loads(_read(struct.unpack(">I", _read(4))[0]))
-_parents = ("hummingbot", "hummingbot.connector", "hummingbot.connector.exchange", "hummingbot.connector.exchange.bsc")
-for _name in _parents:
-    _m = types.ModuleType(_name)
-    _m.__path__ = []
-    sys.modules[_name] = _m
+for _name, _src in _sources:
+    _parts = _name.split(".")
+    for _i in range(1, len(_parts)):
+        _p = ".".join(_parts[:_i])
+        if _p not in sys.modules:
+            _m = types.ModuleType(_p)
+            _m.__path__ = []
+            sys.modules[_p] = _m
 for _name, _src in _sources:
     _m = types.ModuleType(_name)
-    _m.__file__ = "bsc-feed/" + _name.rsplit(".", 1)[1] + ".py"
+    _m.__file__ = _init.get("name", "evm") + "-feed/" + _name.rsplit(".", 1)[1] + ".py"
     _m.__package__ = _name.rsplit(".", 1)[0]
     _m.__loader__ = _Source(_src)
     sys.modules[_name] = _m
     setattr(sys.modules[_m.__package__], _name.rsplit(".", 1)[1], _m)
     exec(compile(_src, _m.__file__, "exec"), _m.__dict__)
-sys.modules[_parents[-1] + ".bsc_feed"].child_main(_init, _out)
+sys.modules["hummingbot.connector.utilities.evm_dex.evm_dex_feed"].child_main(_init, _out)
 """ % FEED_NICE
 
 
@@ -1088,7 +1107,7 @@ async def _child(init: dict, out_fd: int):
 
 # ---------------------------------------------------------------- the child's code: the connector's own, as HMB imported it
 def _sources() -> List[Tuple[str, str]]:
-    """the source of every module the child runs, read now, as HMB imports this package (they are all imported by this
+    """the source of every core module the child runs, read now, as HMB imports this package (they are all imported by this
     point, this one included): a pull without a restart never hands the child other code than HMB's"""
     package = __name__.rsplit(".", 1)[0]
     out = []
@@ -1098,4 +1117,10 @@ def _sources() -> List[Tuple[str, str]]:
     return out
 
 
-SOURCES = _sources()
+def sources_for(C) -> List[Tuple[str, str]]:
+    """the child's code for one chain: its spec first (it imports nothing of ours), then the core's modules. A chain's
+    exchange module calls this as it is imported, right after its spec, so the spec's source is the one HMB runs too"""
+    return [(C.__name__, sys.modules[C.__name__].__loader__.get_source(C.__name__))] + CORE_SOURCES
+
+
+CORE_SOURCES = _sources()
