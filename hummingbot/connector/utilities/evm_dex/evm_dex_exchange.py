@@ -382,10 +382,11 @@ class EvmDexExchange(ExchangePyBase):
         m = self._pool_list.cas[ca]
         step = Decimal(1).scaleb(-min(int(m["decimals"]), 8))
         price_step = Decimal(1).scaleb(Decimal(str(m["reference_usd"])).adjusted() - 6)     # 7 significant digits
-        # No minimum notional: a DEX has none (Pavel 2026-10-14). The strategies' own floor (min_order_usd) applies to every
-        # order but a sell-to-zero sweep, which therefore sells any residue here down to the step.
+        # No minimum notional on BSC: a DEX has none (Pavel 2026-10-14). The strategies' own floor (min_order_usd) applies to
+        # every order but a sell-to-zero sweep, which therefore sells any residue here down to the step. A chain whose gas is
+        # worth counting sets one (the spec's MIN_NOTIONAL_USD; ETH $100, Pavel 2026-10-22: gas at most 0.24% at p90)
         return TradingRule(trading_pair=trading_pair, min_order_size=step, min_price_increment=price_step,
-                           min_base_amount_increment=step, min_notional_size=Decimal(0))
+                           min_base_amount_increment=step, min_notional_size=getattr(self.C, "MIN_NOTIONAL_USD", Decimal(0)))
 
     # ---------------------------------------------------------------- the feed process
     async def _poll_books(self) -> Optional[dict]:
@@ -536,6 +537,8 @@ class EvmDexExchange(ExchangePyBase):
         A started connector never calls it: its wallet rides in every book poll, in the feed process"""
         if self._key_problem:
             raise ValueError(self._key_problem)       # `connect bsc` shows it and keeps no bad key
+        if getattr(self.C, "CHECK_CHAIN_ID", False):
+            await self._check_chain_id()               # `connect eth`: a URL of another chain is refused (the feed checks again)
         if not self._wallet:
             return
         plan = wallet_plan(self.C, self._wallet, self._bound_cas(), self._pool_list)
@@ -544,6 +547,17 @@ class EvmDexExchange(ExchangePyBase):
         ok, ret = res[-1]
         self._apply_wallet(decode_wallet(self.C, plan, res[:-1], word(ret, 0) if ok and len(ret) >= 32 else None,
                                          self._wallet))
+
+    async def _check_chain_id(self):
+        """`connect <k>`'s check of <k>_rpc_url: its eth_chainId must be the spec's CHAIN_ID. A pasted URL of another chain
+        reads that chain with no error, since one wallet address exists on every EVM chain (the runbook's trap); the feed
+        checks every node again before its first poll and signature"""
+        ans = json.loads(await self._post(b'{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'))
+        if "result" not in ans:
+            raise ValueError(self._mask(f"{self.C.EXCHANGE_NAME}_rpc_url: eth_chainId refused: {str(ans.get('error'))[:120]}"))
+        got = int(ans["result"], 16)
+        if got != self.C.CHAIN_ID:
+            raise ValueError(f"{self.C.EXCHANGE_NAME}_rpc_url serves chain {got}, not {self.C.CHAIN_ID} ({self.C.P1_CHAIN})")
 
     def _apply_wallet(self, w: dict):
         """one wallet read (evm_dex_feed.decode_wallet's) onto the balances and the approvals; an asset whose call failed keeps

@@ -180,7 +180,7 @@ class Feed:
         self.read_url = init["swap_read_url"]
         self.status_url = init["swap_status_url"]
         self.pool_list = PoolList(self.C, init["data_dir"])
-        self.quoter = EvmDexQuoter(self._post, self.C.P1_CHAIN)
+        self.quoter = EvmDexQuoter(self._post, self.C.P1_CHAIN, basefee=getattr(self.C, "TX_TYPE", 0) == 2)
         self.wanted: List[str] = list(init.get("cas") or [])
         self.caps: Dict[str, dict] = dict(init.get("caps") or {})
         self.approvals: Dict[tuple, bool] = {}
@@ -207,6 +207,14 @@ class Feed:
         self._due: Optional[int] = None                # the block the last poll went out for (set when its head showed it)
         self._tasks: set = set()
         self._key_hex = self.account.key.hex().removeprefix("0x") if self.account is not None else None
+        # the identity a builder's X-Flashbots-Signature names (ETH, Pavel 2026-10-22, decision 11): a key derived from the wallet
+        # key, one way (keccak), so it is stable (a builder's reputation queue) and holds nothing; no new secret to store
+        self.identity = None
+        if self.account is not None and getattr(self.C, "SIGNED_BUILDERS", ()):
+            from eth_account import Account
+            from eth_hash.auto import keccak as _keccak
+            self.identity = Account.from_key(_keccak(b"p2-dex bundle identity" + bytes(self.account.key)))
+        self.chain_checked = not getattr(self.C, "CHECK_CHAIN_ID", False)   # every node's eth_chainId, before the first poll
 
     # ---------------------------------------------------------------- the loop
     async def serve(self, reader: asyncio.StreamReader):
@@ -275,13 +283,13 @@ class Feed:
             raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.C.EXCHANGE_NAME}")
         return await self._post_to(self.rpc_url, body)
 
-    async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None) -> bytes:
+    async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None, headers: Optional[dict] = None) -> bytes:
         """one JSON-RPC POST on the feed's kept-alive session: the node, the swap reads, the builders. Every request has a
         timeout, RPC_TIMEOUT_S unless the caller gives its own (aiohttp takes timeout=None as no timeout at all)"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.C.RPC_TIMEOUT_S))
         try:
-            async with self._session.post(url, data=body, headers={"Content-Type": "application/json"},
+            async with self._session.post(url, data=body, headers=dict(headers or {}, **{"Content-Type": "application/json"}),
                                           timeout=aiohttp.ClientTimeout(total=timeout or self.C.RPC_TIMEOUT_S)) as r:
                 return await r.read()
         except asyncio.CancelledError:
@@ -312,6 +320,8 @@ class Feed:
         (B) trigger if it's best and robust, clock fix if needed"), so its book is that block's. The books and the wallet ride
         in one eth_call (Pavel 2026-10-15: the wallet read rides along, no request of its own). Nothing is polled, and no head
         read, without a CA (HMB then stops this process, unless a transaction is still out)"""
+        if getattr(self.C, "CLOCK", "") == "slot":
+            return await self._slot_poll_loop()
         self._check_book_node()
         while True:
             sent = time.time()
@@ -331,6 +341,90 @@ class Feed:
             await asyncio.sleep(self._next_poll_in(sent, polled and (self.quoter.last or {}).get("block") == before))
             if self._target is not None and self.quoter.cas:
                 await self._head_wait()
+
+    async def _slot_poll_loop(self):
+        """ETH's poll loop (2026-10-22): one poll a block, sent as soon as SWAP_STATUS_URL's head shows it, as on BSC, but on a
+        slot clock: a block's timestamp IS its slot's start (a fixed 12 s grid, no milliseconds), so the next block's slot is
+        the last block's timestamp + BLOCK_S. The head is read every HEAD_POLL_S from HEAD_START_S after that slot's start
+        (blocks show ~1.5-3.5 s into their slot: the proposer's publishing delay) until it shows the next block. A slot with no
+        block by HEAD_GIVE_UP_S after its start was missed (~0.4% of slots) or the status node is behind: the poll goes anyway
+        (it keeps the wallet, the lease and HMB's hung-feed clock fresh; the book stays the last block's, which nothing
+        changed) and the next slot is awaited. A poll answered from the block before while the head showed its block (the
+        book's node behind the status node) is asked again at once, POLL_RETRIES times at most; a give-up poll is not (the
+        block is not there). The lease step (the heartbeat, F1-F5) also runs every LEASE_STEP_S while a
+        block is awaited: the asset manager takes a heartbeat older than 10 s for no feed at all. Before the first poll, every
+        node's eth_chainId must be the spec's CHAIN_ID (CHECK_CHAIN_ID)"""
+        self._check_book_node()
+        slot = None                                    # the slot whose block is awaited (its start, unix s)
+        shown = False                                  # the status node's head showed the awaited block (no give-up)
+        while True:
+            try:
+                if not self.chain_checked:
+                    await self._check_chain_ids()
+                leased = await self._lease_step()
+                self._load_pools()
+                if self.quoter.cas:
+                    for _ in range(1 + (self.C.POLL_RETRIES if shown else 0)):
+                        await self._poll(leased)
+                        if self._target is None or ((self.quoter.last or {}).get("block") or 0) >= self._target:
+                            break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.send(("poll_failed", self._mask(f"{type(e).__name__}: {e}")[:300]))
+            last = self.quoter.last
+            if not last or not self.quoter.cas or not self.chain_checked:
+                self._target, slot, shown = None, None, False
+                await asyncio.sleep(self.poll_s if self.chain_checked else self.C.LEASE_STEP_S)
+                continue
+            if self._target is None or last["block"] >= self._target:      # a new block: the next one is in the next slot
+                self._target, slot = last["block"] + 1, last["ts"] + self.C.BLOCK_S
+            else:                                                          # the awaited block didn't come: the slot after
+                slot = (slot or last["ts"]) + self.C.BLOCK_S
+            while slot + self.C.HEAD_GIVE_UP_S <= time.time():             # (after an outage: the slot of now)
+                slot += self.C.BLOCK_S
+            shown = await self._slot_head_wait(slot)
+
+    async def _slot_head_wait(self, slot: float) -> bool:
+        """until SWAP_STATUS_URL's head shows block _target (-> True), read from `slot` + HEAD_START_S every HEAD_POLL_S (a read
+        that fails, or takes over HEAD_READ_TIMEOUT_S, counts as not there yet), or until HEAD_GIVE_UP_S after `slot` (-> False:
+        a missed slot, or the node behind). The lease step runs every LEASE_STEP_S meanwhile"""
+        stepped = time.time()
+        while True:
+            if time.time() >= slot + self.C.HEAD_START_S:
+                try:
+                    head = int(await self._read_at(self.status_url, "eth_blockNumber", [],
+                                                   timeout=self.C.HEAD_READ_TIMEOUT_S), 16)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    head = None
+                if head is not None and head >= self._target:
+                    return True
+                if time.time() >= slot + self.C.HEAD_GIVE_UP_S:
+                    return False
+            if time.time() - stepped >= self.C.LEASE_STEP_S:
+                stepped = time.time()
+                try:
+                    await self._lease_step()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._report("lease", f"its step failed: {self._mask(e)}", "warning")
+            now = time.time()
+            wait = slot + self.C.HEAD_START_S - now if now < slot + self.C.HEAD_START_S else self.C.HEAD_POLL_S
+            await asyncio.sleep(max(0.0, min(wait, self.C.LEASE_STEP_S)))
+
+    async def _check_chain_ids(self):
+        """every node this feed talks to (the book's, the status node, the nonce's) serves the spec's chain: a pasted URL of
+        another chain would read that chain without an error, since one wallet address exists on every EVM chain (the runbook's
+        trap). Checked before the first poll and the first signature; until it passes, nothing is quoted or signed"""
+        for name, url in (("the book's node", self.rpc_url), ("the status node", self.status_url), ("the nonce's node", self.read_url)):
+            got = int(await self._read_at(url, "eth_chainId", []), 16)
+            if got != self.C.CHAIN_ID:
+                raise RuntimeError(self._mask(f"{name} serves chain {got}, not {self.C.CHAIN_ID} ({self.C.P1_CHAIN}): "
+                                              f"nothing is quoted or signed"))
+        self.chain_checked = True
 
     def _check_book_node(self):
         """the trigger reads SWAP_STATUS_URL's head, the call goes to <k>_rpc_url: on two different nodes a call can come before
@@ -523,9 +617,7 @@ class Feed:
         book, record, hops = self._book_route(ca, side, self._trade_usd(ca, side, amount, price))
         last = self.quoter.last                                          # fresh: _book_route refuses a stale one
         book_block, book_at = last["block"], last["at"]                  # the block that book was priced at; its poll's send
-        # the chain's head now: that block plus the blocks since (Pavel 2026-10-15: the send reads nothing). A node behind
-        # makes it low by its lag, and the bundle's window (BUNDLE_BLOCKS) then ends that many blocks sooner
-        head = book_block + int(max(time.time() - book_at, 0.0) / self.C.BLOCK_S)
+        head = self._head_now(last)
         with localcontext() as ctx:
             ctx.prec = 60
             qty = int((amount * Decimal(10) ** dec).to_integral_value(rounding=ROUND_DOWN))
@@ -558,11 +650,22 @@ class Feed:
         if amount_in <= 0 or min_out <= 0:
             raise Refused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
         try:
-            swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet)
+            deadline = (int(last["ts"] + self.C.BLOCK_S * (head - book_block + self.C.BUNDLE_BLOCKS))   # ETH: the target
+                        if getattr(self.C, "DEADLINE_FROM_BLOCK", False) else None)        # block's own timestamp (its slot's)
+            swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet, deadline)
         except ValueError as e:
             raise Refused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
                     book_block=book_block, book_at=book_at, head=head, expected_out=expected_out)
+
+    def _head_now(self, last: dict) -> int:
+        """the chain's head now from a poll's block: that block plus the blocks since (Pavel 2026-10-15: the send reads
+        nothing). A node behind makes it low by its lag, and the bundle's window (BUNDLE_BLOCKS) then ends that many blocks
+        sooner. On a slot clock (ETH) the blocks since count from the block's own timestamp, its slot's start: once the next
+        slot has begun, its block is being proposed (too late for a bundle) though no node shows it yet (~1.5-3.5 s), so the
+        bundle names the slot after; a slot missed since moves the blocks one slot later (not included: the chain tells)"""
+        since = last["ts"] if getattr(self.C, "CLOCK", "") == "slot" else last["at"]
+        return last["block"] + int(max(time.time() - since, 0.0) / self.C.BLOCK_S)
 
     async def _swap(self, order_id: str, p: dict):
         """HMB's order (its turn already taken there) as one swap: built (_swap_for), signed and sent (_send_tx). HMB is told
@@ -608,12 +711,15 @@ class Feed:
             self._lease_check()                      # leased: nothing to read either
             if self.nonce is None:
                 self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
+            if head is None and getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last and \
+                    time.time() - self.quoter.last["ts"] <= self.C.STALE_S:
+                head = self._head_now(self.quoter.last)          # a slot clock: a read head lags the slot begun (_head_now)
             if head is None:
                 head = int(await self._read("eth_blockNumber", []), 16)
             last_block = head + self.C.BUNDLE_BLOCKS
             nonce = self.nonce
             self._lease_check()                      # F4: the lease read again right before the signature (no await between)
-            raw, tx_hash = sign(self.account, build_tx(self.C, to, data, value, nonce, gas, self.C.GAS_PRICE_WEI))
+            raw, tx_hash = sign(self.account, build_tx(self.C, to, data, value, nonce, gas, self._gas_price()))
             self._ledger(nonce, tx_hash, ledger)     # before it goes out: a nonce the chain shows used has its line
         except asyncio.CancelledError:
             raise
@@ -633,6 +739,25 @@ class Feed:
         except Exception as e:
             self._log("warning", f"{self.C.EXCHANGE_NAME}: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it "
                                  f"on chain")
+
+    def _gas_price(self):
+        """what a transaction bids: a legacy chain's gas price (BSC: its 0.05 gwei floor), or an EIP-1559 chain's (max fee, tip):
+        the tip a fixed PRIORITY_FEE_WEI (Pavel 2026-10-22, decision 11: about the blocks' median tip, no spike chasing), the max
+        fee twice the base fee of the block after the newest polled (the poll's eth_feeHistory, evm_dex_quoter.FEE_HISTORY)
+        plus the tip (it holds through several full blocks; only what the block charges is paid). Past MAX_FEE_CAP_WEI nothing
+        is sent (a gas spike: the swap's whole edge could go to gas)"""
+        C = self.C
+        if getattr(C, "TX_TYPE", 0) != 2:
+            return C.GAS_PRICE_WEI
+        if not self.chain_checked:
+            raise Refused("the nodes' chain is not checked yet")
+        base = (self.quoter.last or {}).get("basefee")
+        if base is None:
+            raise Refused("no base fee known yet (no poll)")
+        max_fee = 2 * base + C.PRIORITY_FEE_WEI
+        if max_fee > C.MAX_FEE_CAP_WEI:
+            raise Refused(f"gas: the max fee {max_fee / 1e9:.3g} gwei is past the cap {C.MAX_FEE_CAP_WEI / 1e9:.3g} gwei")
+        return max_fee, C.PRIORITY_FEE_WEI
 
     def _ledger(self, nonce: int, tx_hash: str, entry: dict):
         """the swap ledger's line for a transaction just signed (contract v1; P3-DEX decision 3, Pavel 2026-10-16: the asset
@@ -777,13 +902,26 @@ class Feed:
     async def _send_bundle(self, raw: str, last_block: int):
         """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
         one builder takes it. Raises SendRefused when every builder refused it (each answered with an error: nothing is
-        out), and RuntimeError when none took it and at least one never answered (unknown: it may be out)"""
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle",
-                           "params": [{"txs": [raw], "maxBlockNumber": last_block}]}).encode()
+        out), and RuntimeError when none took it and at least one never answered (unknown: it may be out).
+        A per-block chain (the spec's SENDER "bundle_per_block", ETH): the bundle names its one block (`blockNumber`, no builder
+        takes a range there), and the builders in SIGNED_BUILDERS get an X-Flashbots-Signature by the feed's identity. ETH's
+        builders accept a bundle before they simulate it, so "taken" means received there: the chain tells the outcome"""
+        per_block = getattr(self.C, "SENDER", "") == "bundle_per_block"
+        bundle = {"txs": [raw], "blockNumber": hex(last_block)} if per_block else {"txs": [raw], "maxBlockNumber": last_block}
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle", "params": [bundle]}).encode()
+        signed = None
+        if per_block and self.identity is not None:
+            from eth_account.messages import encode_defunct
+            from eth_hash.auto import keccak as _keccak
+            signature = self.identity.sign_message(encode_defunct(text="0x" + _keccak(body).hex())).signature
+            signed = {"X-Flashbots-Signature": f"{self.identity.address}:0x{bytes(signature).hex()}"}
 
         async def ask(url):
             try:
-                return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S)), None
+                headers = signed if signed is not None and url in getattr(self.C, "SIGNED_BUILDERS", ()) else None
+                if headers is None:                    # an unsigned builder (every one on bsc): the call exactly as before
+                    return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S)), None
+                return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S, headers=headers)), None
             except asyncio.CancelledError:
                 raise
             except Exception as e:

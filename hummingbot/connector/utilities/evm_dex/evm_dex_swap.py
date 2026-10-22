@@ -22,7 +22,12 @@ BSC's encodings (sources pinned 2026-10-14; wiki P2-DEX Open Items §step 4), th
     fields; v4 ExactInputSingleParams without a per-hop field. (Uniswap's 2.1.x routers take a 6th field: not these.)
   - PancakeSwap Infinity Universal Router (0xd9C5…, deployed from commit b303b14): the same V2/V3 inputs; INFI_SWAP (0x10)
     with Infinity's actions; paid through PancakeSwap's own Permit2.
-Every encoding is proven by simulating the swap from the wallet on live pools (hmb_local_tools/p2_dex/step4_sim)."""
+ETH's (sources pinned 2026-10-22: Uniswap/universal-router 2.1.2 = 802fe4c1, its v4-periphery 545a5d2a; wiki p2-dex-eth
+§executors): Universal Router 2.1.2 (0x2361…De85), an executor whose "encoding" is "ur-2.1": the V2/V3 swap inputs take a 6th
+field, `uint256[] minHopPriceX36` (empty: off), and v4's ExactInputSingleParams a `uint256 minHopPriceX36` before hookData (0:
+off); the command and action bytes are 2.0.0's. An executor without "encoding" is "ur-2.0" (BSC's routers).
+Every encoding is proven by simulating the swap from the wallet on live pools (hmb_local_tools/p2_dex/step4_sim, ETH's in
+p2_dex_eth)."""
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -114,12 +119,16 @@ def _pool_key(pool: dict):
     return (pool["token0"], pool["token1"], k["hooks"], k["manager"], int(k["fee"]), bytes.fromhex(k["parameters"][2:].rjust(64, "0")))
 
 
-def _pool_swap(pool: dict, tin: str, tout: str, amount: int, minimum: int, first: bool, last: bool) -> bytes:
+def _pool_swap(pool: dict, tin: str, tout: str, amount: int, minimum: int, first: bool, last: bool, v21: bool = False) -> bytes:
     """one v4 / Infinity pool as a POOL_SWAP input: (actions, params). The wallet pays the first pool (SETTLE_ALL after the
     swap, through Permit2); a later pool is paid from the router's balance (SETTLE of CONTRACT_BALANCE first, then the swap
-    of the whole credit). The last pool's output goes to the wallet (TAKE_ALL with the minimum), any other to the router."""
+    of the whole credit). The last pool's output goes to the wallet (TAKE_ALL with the minimum), any other to the router.
+    v21: Universal Router 2.1.x's v4 params (minHopPriceX36 before hookData, 0: off)"""
     zero_for_one = tin.lower() == pool["token0"].lower()
-    if pool["type"] == "uni-v4":
+    if pool["type"] == "uni-v4" and v21:
+        swap = (SWAP_EXACT_IN_SINGLE, encode([f"({UNI_POOLKEY},bool,uint128,uint128,uint256,bytes)"],
+                                             [(_pool_key(pool), zero_for_one, amount if first else OPEN_DELTA, minimum, 0, b"")]))
+    elif pool["type"] == "uni-v4":
         swap = (SWAP_EXACT_IN_SINGLE, encode([f"({UNI_POOLKEY},bool,uint128,uint128,bytes)"],
                                              [(_pool_key(pool), zero_for_one, amount if first else OPEN_DELTA, minimum, b"")]))
     else:                                                            # inf-cl
@@ -167,6 +176,8 @@ def build_swap(C, record: dict, hops: List[dict], side: str, amount_in: int, min
         else:
             segments.append((eng, [leg]))
     commands, inputs = [], []
+    v21 = ex.get("encoding") == "ur-2.1"                             # Universal Router 2.1.x: a 6th field in the v2 / v3 inputs
+    hop_price = (["uint256[]"], [[]]) if v21 else ([], [])           # minHopPriceX36: empty, off (the minimum guards the path)
     for i, (eng, seg) in enumerate(segments):
         first, last = i == 0, i == len(segments) - 1
         tin, tout = seg[0][1], seg[-1][2]
@@ -181,18 +192,19 @@ def build_swap(C, record: dict, hops: List[dict], side: str, amount_in: int, min
         minimum = min_out if last else 0
         if eng == "v2":
             commands.append(V2_SWAP_EXACT_IN)
-            inputs.append(encode(["address", "uint256", "uint256", "address[]", "bool"],
-                                 [recipient, amount, minimum, [tin] + [t for _, _, t in seg], first]))
+            inputs.append(encode(["address", "uint256", "uint256", "address[]", "bool"] + hop_price[0],
+                                 [recipient, amount, minimum, [tin] + [t for _, _, t in seg], first] + hop_price[1]))
         elif eng == "v3":
             packed = bytes.fromhex(tin[2:])
             for pool, _, t in seg:
                 packed += int(pool["key"]["fee"]).to_bytes(3, "big") + bytes.fromhex(t[2:])
             commands.append(V3_SWAP_EXACT_IN)
-            inputs.append(encode(["address", "uint256", "uint256", "bytes", "bool"], [recipient, amount, minimum, packed, first]))
+            inputs.append(encode(["address", "uint256", "uint256", "bytes", "bool"] + hop_price[0],
+                                 [recipient, amount, minimum, packed, first] + hop_price[1]))
         else:
             pool, _, _ = seg[0]
             commands.append(POOL_SWAP)
-            inputs.append(_pool_swap(pool, tin, tout, amount, minimum, first, last))
+            inputs.append(_pool_swap(pool, tin, tout, amount, minimum, first, last, v21))
     data = SEL_EXECUTE + encode(["bytes", "bytes[]", "uint256"], [bytes(commands), inputs, deadline])
     return {"to": ex["router"], "value": 0, "data": data, "token_in": token_in, "token_out": token_out, "executor": ex,
             "deadline": deadline}

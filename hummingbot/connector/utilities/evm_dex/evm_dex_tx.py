@@ -6,9 +6,10 @@ takes a nonce, a gas limit and a gas price as given.
 - Approvals. A v2-style router pulls the input token by ERC20 allowance (token -> router). A Universal Router pulls it through
   Permit2: ERC20 allowance token -> Permit2, then Permit2's own allowance (wallet, token, router), with an expiry. Each is one
   transaction per token, once (max amounts, the expiry at its maximum).
-- The transaction: legacy type 0, EIP-155 (the spec's CHAIN_ID; 56 on BSC), signed locally with the wallet's key: by libsecp256k1 directly
-  (coincurve), the same bytes as eth_account at a third of its time, or by eth_account when that does not check out
-  at import (sign, SIGNER).
+- The transaction, by the spec's TX_TYPE: legacy type 0, EIP-155 (BSC: a gas price), or EIP-1559 type 2 (ETH: a max fee and
+  a priority tip, an empty access list), for the spec's CHAIN_ID; signed locally with the wallet's key: by libsecp256k1
+  directly (coincurve), the same bytes as eth_account at a third of its time, or by eth_account when that does not check
+  out at import, for both types (sign, SIGNER).
 - The receipt: status 0 = the swap reverted (a failed order; the gas is still paid). Otherwise the fill is read from the ERC20
   Transfer logs of the two tokens to and from the wallet, so it is what really moved, net of any token tax."""
 from typing import Dict, List, Optional, Tuple
@@ -86,9 +87,19 @@ def missing_approvals(wallet: str, token: str, executor: dict, answers: List[Tup
 
 
 # ---------------------------------------------------------------- the transaction
-def build_tx(C, to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: int) -> Dict:
-    """a legacy (type 0) EIP-155 transaction on the spec's chain, ready to sign (eth_account wants a checksummed `to`)"""
+def build_tx(C, to: str, data: bytes, value: int, nonce: int, gas: int, gas_price) -> Dict:
+    """a transaction of the spec's type on its chain, ready to sign (eth_account wants a checksummed `to`). `gas_price`: the
+    gas price of a legacy (type 0) chain, or (max fee, priority tip) per gas, in wei, of an EIP-1559 (type 2) chain"""
+    if getattr(C, "TX_TYPE", 0) == 2:
+        max_fee, tip = gas_price
+        return _eip1559(to, data, value, nonce, gas, max_fee, tip, C.CHAIN_ID)
     return _legacy(to, data, value, nonce, gas, gas_price, C.CHAIN_ID)
+
+
+def _eip1559(to: str, data: bytes, value: int, nonce: int, gas: int, max_fee: int, tip: int, chain_id: int) -> Dict:
+    return {"type": 2, "to": to_checksum_address(to), "data": "0x" + data.hex(), "value": int(value), "nonce": int(nonce),
+            "gas": int(gas), "maxFeePerGas": int(max_fee), "maxPriorityFeePerGas": int(tip), "chainId": int(chain_id),
+            "accessList": []}
 
 
 def _legacy(to: str, data: bytes, value: int, nonce: int, gas: int, gas_price: int, chain_id: int) -> Dict:
@@ -101,7 +112,7 @@ def sign(account, tx: Dict) -> Tuple[str, str]:
     libsecp256k1 directly when it gave eth_account's exact bytes at import (SIGNER), else by eth_account (Pavel 2026-10-17:
     "might as well improve ... signer"; eth_account took 0.36 ms p50 of a swap's placement, nearly all of the child's)"""
     if FAST_SIGNER:
-        return _sign_direct(bytes(account.key), tx)
+        return (_sign_direct_1559 if tx.get("type") == 2 else _sign_direct)(bytes(account.key), tx)
     return _sign_eth_account(account, tx)
 
 
@@ -143,9 +154,24 @@ def _sign_direct(key: bytes, tx: Dict) -> Tuple[str, str]:
     return "0x" + raw.hex(), "0x" + keccak(raw).hex()
 
 
+def _sign_direct_1559(key: bytes, tx: Dict) -> Tuple[str, str]:
+    """an EIP-1559 (type 2) transaction as eth_account signs it: 0x02 + the RLP of [chain id, nonce, tip, max fee, gas, to,
+    value, data, access list (empty)], its keccak signed by libsecp256k1, then the same fields + [y parity, r, s]"""
+    fields = [_rlp_int(tx["chainId"]), _rlp_int(tx["nonce"]), _rlp_int(tx["maxPriorityFeePerGas"]), _rlp_int(tx["maxFeePerGas"]),
+              _rlp_int(tx["gas"]), _rlp_bytes(bytes.fromhex(tx["to"][2:])), _rlp_int(tx["value"]),
+              _rlp_bytes(bytes.fromhex(tx["data"][2:])), _rlp_list([])]
+    if tx.get("accessList"):
+        raise ValueError("the direct signer builds no access list")
+    sig = PrivateKey(key).sign_recoverable(keccak(b"\x02" + _rlp_list(fields)), hasher=None)
+    raw = b"\x02" + _rlp_list(fields + [_rlp_int(sig[64]), _rlp_int(int.from_bytes(sig[:32], "big")),
+                                        _rlp_int(int.from_bytes(sig[32:64], "big"))])
+    return "0x" + raw.hex(), "0x" + keccak(raw).hex()
+
+
 def _check_direct() -> Tuple[bool, str]:
-    """the direct signer is used only if it gives eth_account's exact bytes here, at import: a few transactions shaped like
-    ours (a swap's calldata, an approval's, none) with a throwaway key -> (used, the signer in words)"""
+    """the direct signer is used only if it gives eth_account's exact bytes here, at import, for both types: a few
+    transactions shaped like ours (a swap's calldata, an approval's, none) with a throwaway key -> (used, the signer in
+    words)"""
     if PrivateKey is None:
         return False, "eth_account (coincurve is not installed)"
     try:
@@ -156,6 +182,11 @@ def _check_direct() -> Tuple[bool, str]:
                    _legacy("0x" + "ff" * 20, b"", 10 ** 18, 2 ** 40, 21_000, 10 ** 12, 56)):
             if _sign_direct(bytes(account.key), tx) != _sign_eth_account(account, tx):
                 return False, "eth_account (the direct signer's bytes differ from eth_account's)"
+        for tx in (_eip1559("0x" + "5c" * 20, bytes(range(256)) * 2 + bytes(68), 0, 0, 350_000, 2_000_000_000, 50_000_000, 1),
+                   _eip1559("0x00000000000000000000000000000000000000ff", bytes(68), 0, 127, 70_000, 1, 0, 1),
+                   _eip1559("0x" + "ff" * 20, b"", 10 ** 18, 2 ** 40, 21_000, 10 ** 12, 10 ** 9, 1)):
+            if _sign_direct_1559(bytes(account.key), tx) != _sign_eth_account(account, tx):
+                return False, "eth_account (the direct signer's type-2 bytes differ from eth_account's)"
     except Exception as e:
         return False, f"eth_account (the direct signer did not check out: {type(e).__name__}: {e})"
     return True, "libsecp256k1 (coincurve), the same bytes as eth_account"

@@ -57,6 +57,10 @@ RUNGS_USD = (100, 250, 500, 1000)   # P1's rungs, capped at $1,000 (Pavel 2026-1
 SWITCH_BPS = 50.0
 REELECT_S = 900.0
 SIDES = ("buy", "sell")
+# an EIP-1559 chain's base fee, asked in the same POST as the poll's eth_call (a JSON-RPC batch): the block after the newest's,
+# its last baseFeePerGas. Not Multicall3.getBasefee(): inside an eth_call with no gas price a node runs at base fee 0, so
+# it answers 0 there (BlockRazor ETH, 2026-10-22)
+FEE_HISTORY = {"jsonrpc": "2.0", "id": 2, "method": "eth_feeHistory", "params": ["0x1", "latest", []]}
 
 
 def ladder_rungs(cap_usd: Optional[float]) -> List[Tuple[float, bool]]:
@@ -85,10 +89,13 @@ def tax_factor(p: dict, side: str) -> Optional[float]:
 
 
 class EvmDexQuoter:
-    def __init__(self, post, chain: str):
+    def __init__(self, post, chain: str, basefee: bool = False):
         """post: async (body: bytes) -> bytes, one JSON-RPC POST to the node (the caller owns the session, the URL and the key);
-        chain: P1's name for it (the spec's P1_CHAIN), its row of P1's CHAINS"""
+        chain: P1's name for it (the spec's P1_CHAIN), its row of P1's CHAINS; basefee: the poll also reads the next block's
+        base fee, in the same POST (an EIP-1559 chain: the swap's fee comes from it, with no request of its own) ->
+        last["basefee"]"""
         c = CHAINS[chain]
+        self.basefee = basefee
         self.post, self.mc3, self.anchor, self.wrapped = post, c["multicall3"], c["anchor"], c["wrapped"]
         self.cas: Dict[str, dict] = {}            # ca -> {"decimals", "pools": [PoolList's tradable pools]}
         self.size_px: Dict[str, float] = {}       # ca -> USD: the sizing price of a rung's CA amount (follows the mid)
@@ -295,14 +302,14 @@ class EvmDexQuoter:
                 need.setdefault(k, set()).add(side)
         hop_deep = self._hop_calls(calls, list(need.items()), RUNGS_USD[1:])
         try:
-            res = await self._call(calls)
+            res, basefee = await self._answers(calls)
         except Exception:
             if not deep and not hop_deep:
                 self.stats["failed"] += 1
                 raise
             calls, deep, hop_deep = calls[:n_top], [], []      # the ladders never cost the top: once more without them
             try:
-                res = await self._call(calls)
+                res, basefee = await self._answers(calls)
             except Exception:
                 self.stats["failed"] += 1
                 raise
@@ -345,6 +352,8 @@ class EvmDexQuoter:
         self.last = {"block": block, "ts": ts, "at": now, "books": books, "seconds": round(time.time() - now, 3),
                      "calls": len(calls), "ladder quotes": len(deep), "hop quotes": len(hop_top) + len(hop_deep),
                      "electing": len(self.electing), "extra": list(zip(extra, res[2:2 + len(extra)]))}
+        if self.basefee:
+            self.last["basefee"] = basefee
         return self.last
 
     async def _call(self, calls: list) -> list:
@@ -356,6 +365,32 @@ class EvmDexQuoter:
         if "result" not in j:
             raise RuntimeError(f"eth_call refused: {str(j.get('error'))[:200]}")
         return dec_agg3(bytes.fromhex(j["result"][2:]), len(calls))
+
+    async def _answers(self, calls: list) -> Tuple[list, Optional[int]]:
+        """the poll's call -> (its answers, the next block's base fee: an EIP-1559 chain's, in the same POST; else None)"""
+        if not self.basefee:
+            return await self._call(calls), None
+        return await self._call_fees(calls)
+
+    async def _call_fees(self, calls: list) -> Tuple[list, Optional[int]]:
+        """_call's eth_call and FEE_HISTORY in one POST, a JSON-RPC batch (one round trip; answers matched by id) -> (the
+        answers, the base fee of the block after the newest, or None when that answer is missing or malformed: no swap is
+        signed without it). A node that refuses batches answers one error: the poll fails, loudly"""
+        call = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                "params": [{"to": self.mc3, "data": "0x" + enc_agg3(calls).hex()}, "latest"]}
+        ans = await self.post(json.dumps([call, FEE_HISTORY]).encode())
+        self.stats["ru"] += 20 * (1 + max(0, (len(ans) - 1) // 1_000_000))
+        got = json.loads(ans)
+        got = {x.get("id"): x for x in got if isinstance(x, dict)} if isinstance(got, list) else {1: got}
+        j = got.get(1) or {}
+        if "result" not in j:
+            raise RuntimeError(f"eth_call refused: {str(j.get('error'))[:200]}")
+        try:
+            fees = got[2]["result"]["baseFeePerGas"]
+            basefee = int(fees[-1], 16) if fees else None
+        except (KeyError, TypeError, ValueError, IndexError):
+            basefee = None
+        return dec_agg3(bytes.fromhex(j["result"][2:]), len(calls)), basefee
 
     # ---------------------------------------------------------------- prices, election, watch, books
     def _top_prices(self, quotes: dict, rates: dict) -> dict:
