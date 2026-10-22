@@ -38,8 +38,9 @@ STALE_S = 18.0
 FIRST_POLL_WAIT_S = 20.0          # how long a pair's first book waits for the first poll before it starts empty
 SUMMARY_EVERY_S = 300.0
 
-# The kill switch (as BSC's): off until Pavel's first round trip proves the send path end to end (the runbook's phase 6)
-TRADING_ENABLED = False
+# The kill switch (as BSC's): on since Pavel's first round trip proved the send path end to end (the runbook's phase 6:
+# 2026-10-22, $5 AAVE bought and sold, 6/6 transactions in the next block)
+TRADING_ENABLED = True
 
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use (unused gas is not paid): one hop ~108-134k, two ~223k on ETH
 APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
