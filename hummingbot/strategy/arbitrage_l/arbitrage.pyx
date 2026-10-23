@@ -1537,6 +1537,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
         (-> c_stop_tracking_limit_order), so on that one call the order sits in the settled
         balance AND still in the tracker. The `_completed_orders` tombstone is written at the top
         of c_handle_order_completion, before the refresh, so it is already set when we get here.
+
+        DEX FIRST'S WAITING CEX LEG COUNTS TOO (P2-DEX finding 9, Pavel 2026-10-23). A DEX-CEX arb
+        sends its DEX leg first and its CEX leg only on the fill, so for the swap's whole flight
+        (~12 s on ETH) the tracker held one leg of a round trip: the DEX buy alone read as an
+        acquisition (FOLD 10-23 16:40:19: $690, overbought, on a $500 position; two such checks in
+        a row would arm a false sell-off, the UP 10-06 class above). Each plan's CEX leg
+        (_dex_first_pending) is counted on its side, so the arb nets to zero as a CEX-CEX one does.
+        A hold-trimmed plan's leg is its trimmed size (0 for a one-legged correction, whose DEX leg
+        still counts in full). A plan leaves at its fill (its CEX order then in the tracker) or its
+        failure.
         """
         cdef:
             double inflight_buy = 0.0
@@ -1549,6 +1559,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             object executed
             object lo
             object filled
+            object plan
             str oid
             string oid_str
         try:
@@ -1582,6 +1593,16 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         inflight_sell += qty
         except Exception:
             return 0.0                                # fail-open: behave exactly as before
+        try:                                          # DEX first: the CEX leg that waits for its DEX leg's fill
+            for plan in self._dex_first_pending.values():
+                qty = float(plan[2])
+                if qty > 0.0:
+                    if plan[1]:
+                        inflight_buy += qty
+                    else:
+                        inflight_sell += qty
+        except Exception:
+            pass                                      # the tracker's legs alone, as before
         if inflight_buy > inflight_sell:
             return inflight_buy - inflight_sell
         return 0.0

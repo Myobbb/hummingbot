@@ -152,6 +152,31 @@ def mask(text, rpc_url: str, key_hex: Optional[str]) -> str:
     return text
 
 
+def builder_label(url: str) -> str:
+    """a builder's short name for the logs: its host's registered domain (ap.rpc.titanbuilder.xyz -> titanbuilder.xyz,
+    puissant-builder.48.club -> 48.club); a local stand-in (an IP or localhost: the tests) by its host and path"""
+    host, _, path = url.split("//", 1)[-1].partition("/")
+    name = host.split(":")[0]
+    if name == "localhost" or name.replace(".", "").isdigit():
+        return f"{host}/{path}" if path else host
+    return ".".join(name.split(".")[-2:])
+
+
+def answer_of(url: str, ans, err, ms: float) -> tuple:
+    """a builder's answer to a send, for the swap's line (P2-DEX finding 11): (its name, ms from the send, "took it", "refused:
+    <its error>" or "no answer: <why>")"""
+    if err is not None:
+        verdict = f"no answer: {type(err).__name__}"
+    elif not isinstance(ans, dict):
+        verdict = "no answer: not JSON"
+    elif "error" in ans:
+        e = ans["error"]
+        verdict = f"refused: {(e.get('message') if isinstance(e, dict) else e)!s:.60}"
+    else:
+        verdict = "took it"
+    return builder_label(url), round(ms, 1), verdict
+
+
 # ---------------------------------------------------------------- the child's side: the chain
 class Feed:
     """The feed process's work (one per child; a test runs it in-process over the same frames). It polls once a block, on
@@ -727,10 +752,13 @@ class Feed:
             raise Refused(f"not sent: {self._mask(e)}") from None
         self.nonce = nonce + 1                        # taken before the send: the transaction may be out even if the call fails
         record.update(tx_hash=tx_hash, nonce=nonce, last_block=last_block, sent=time.time())
+        if getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last:      # its block's slot start, for its line (finding 11)
+            record["slot_at"] = self.quoter.last["ts"] + self.C.BLOCK_S * (last_block - self.quoter.last["block"])
         if on_signed is not None:
             on_signed()
+        answers = record["builders"] = []             # each builder's answer as it comes (_send_bundle), for its line
         try:
-            await self._send_bundle(raw, last_block)
+            await self._send_bundle(raw, last_block, answers)
         except SendRefused:
             for k in ("tx_hash", "nonce", "last_block", "sent"):
                 record.pop(k, None)                   # nothing to follow
@@ -899,13 +927,15 @@ class Feed:
             self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
         return True
 
-    async def _send_bundle(self, raw: str, last_block: int):
+    async def _send_bundle(self, raw: str, last_block: int, answers: Optional[list] = None):
         """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
         one builder takes it. Raises SendRefused when every builder refused it (each answered with an error: nothing is
         out), and RuntimeError when none took it and at least one never answered (unknown: it may be out).
         A per-block chain (the spec's SENDER "bundle_per_block", ETH): the bundle names its one block (`blockNumber`, no builder
         takes a range there), and the builders in SIGNED_BUILDERS get an X-Flashbots-Signature by the feed's identity. ETH's
-        builders accept a bundle before they simulate it, so "taken" means received there: the chain tells the outcome"""
+        builders accept a bundle before they simulate it, so "taken" means received there: the chain tells the outcome.
+        `answers` gets each builder's answer as it comes (answer_of: the ms from here), also the ones after this call
+        returned (P2-DEX finding 11, Pavel 2026-10-23); nothing waits on them"""
         per_block = getattr(self.C, "SENDER", "") == "bundle_per_block"
         bundle = {"txs": [raw], "blockNumber": hex(last_block)} if per_block else {"txs": [raw], "maxBlockNumber": last_block}
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle", "params": [bundle]}).encode()
@@ -916,16 +946,22 @@ class Feed:
             signature = self.identity.sign_message(encode_defunct(text="0x" + _keccak(body).hex())).signature
             signed = {"X-Flashbots-Signature": f"{self.identity.address}:0x{bytes(signature).hex()}"}
 
+        sent_at = time.time()
+
         async def ask(url):
             try:
                 headers = signed if signed is not None and url in getattr(self.C, "SIGNED_BUILDERS", ()) else None
                 if headers is None:                    # an unsigned builder (every one on bsc): the call exactly as before
-                    return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S)), None
-                return url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S, headers=headers)), None
+                    got = url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S)), None
+                else:
+                    got = url, json.loads(await self._post_to(url, body, timeout=self.C.SEND_TIMEOUT_S, headers=headers)), None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return url, None, e
+                got = url, None, e
+            if answers is not None:                    # its answer as it comes: the first taker's and every later one's
+                answers.append(answer_of(url, got[1], got[2], (time.time() - sent_at) * 1e3))
+            return got
         refused, silent = [], []
         for answer in asyncio.as_completed([asyncio.ensure_future(ask(url)) for url in self.builders]):
             url, ans, err = await answer
@@ -994,7 +1030,24 @@ class Feed:
             info = {"block": int(receipt["blockNumber"], 16), "index": int(index, 16) if index else None,
                     "gas_used": int(receipt["gasUsed"], 16)}
         self.out.pop(order_id, None)
-        self.send(("ended", order_id, parsed, info))
+        self.send(("ended", order_id, parsed, info, list(record.get("builders") or [])))
+        if receipt is None and getattr(self.C, "SENDER", "") == "bundle_per_block":
+            self._spawn(self._dropped_block(order_id, record["last_block"]))     # after its end: nothing waits on it
+
+    async def _dropped_block(self, order_id: str, block: int):
+        """who built the block a bundle missed, one INFO line after the drop's own (P2-DEX findings 10 and 11, Pavel 2026-10-23:
+        the builders and the tip are decided on more trading data; FOLD 16:45:59 was bobTheBuilder's, none of ours). One read on
+        the status node, after the end went to HMB"""
+        try:
+            b = await self._status("eth_getBlockByNumber", [hex(block), False])
+            extra = bytes.fromhex((b.get("extraData") or "0x")[2:]).decode("latin-1")
+            extra = "".join(c for c in extra if 32 <= ord(c) < 127).strip() or "?"
+            self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block} was built by '{extra}' "
+                              f"({len(b.get('transactions') or [])} transactions, fee recipient {b.get('miner')})")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
 
     async def _approve(self, call_id: str, call: Tuple[str, bytes]):
         """one one-time approval, sent like a swap (its turn taken in HMB) and followed to its end here"""

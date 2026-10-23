@@ -22,6 +22,7 @@ from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_wrapper
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.connector.utilities.evm_dex.evm_dex_feed import FeedClient, decode_wallet, mask, merged, wallet_plan  # noqa: F401
+from hummingbot.connector.utilities.evm_dex.evm_dex_feed import builder_label
 from hummingbot.connector.utilities.evm_dex.evm_dex_order_book_data_source import EvmDexAPIOrderBookDataSource
 from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import word
 from hummingbot.connector.utilities.evm_dex.evm_dex_pool_list import PoolList
@@ -463,7 +464,7 @@ class EvmDexExchange(ExchangePyBase):
         elif kind == "signed":                     # it may be out from here: known before its send is answered
             self._swaps[message[1]] = message[2]
         elif kind == "ended":
-            self._ended(message[1], message[2], message[3])
+            self._ended(message[1], message[2], message[3], message[4] if len(message) > 4 else None)
         elif kind == "pools_changed":
             self._pools_stale = True
         elif kind == "swap":                       # an answer no placement waits for any more (its task ended)
@@ -736,14 +737,24 @@ class EvmDexExchange(ExchangePyBase):
         super()._update_order_after_failure(order_id, trading_pair, exception)
         self._free_turn(order_id)
 
-    def _after_failure(self, trading_pair: str):
+    def _after_failure(self, trading_pair: str, dropped_at: Optional[int] = None):
         """a DEX order that failed (refused, dropped, reverted): the pair's book is emptied at once, and shown again only from a
         poll of a block newer than any we had at the failure (Pavel 2026-10-17: "Refire only on a DEX price snapshot taken
         after the failure"; 10-19: a poll every block, so that is at most a block away, and no extra poll is asked for).
         Emptied in the tracker's own book too, the one the strategies read: the data source's empty snapshot reaches it only
         through the tracker's queues, two loop turns later, and a tick in between fired on the old book (ALEO 10-18 14:54:11,
-        10-19 10:47:18: 3-4 ms after a refusal)"""
-        self._fresh_after[trading_pair] = self._orderbook_ds.last_block or 0
+        10-19 10:47:18: 3-4 ms after a refusal).
+        A bundle dropped at its last block (`dropped_at`) on a chain with REFIRE_ON_DROP_BLOCK (ETH, P2-DEX finding 7, Pavel
+        2026-10-23): that block came after the failure, so its own book is fresh enough. Held already: nothing is hidden; not
+        yet: it shows as soon as that block's poll lands. One try per block, not one per two (FOLD 16:46:00: the next try
+        skipped 12 s). A refusal, a revert and bsc keep the newer-block rule"""
+        held = self._orderbook_ds.last_block or 0
+        if dropped_at is not None and getattr(self.C, "REFIRE_ON_DROP_BLOCK", False):
+            if held >= dropped_at:
+                return                                 # the book on show is of the drop's own block (or newer)
+            self._fresh_after[trading_pair] = dropped_at - 1
+        else:
+            self._fresh_after[trading_pair] = held
         update_id = self._orderbook_ds.hide(trading_pair)
         book = self.order_book_tracker.order_books.get(trading_pair)
         if book is not None:
@@ -804,12 +815,12 @@ class EvmDexExchange(ExchangePyBase):
         return [CancellationResult(oid, oid not in self.in_flight_orders) for oid in waiting]
 
     # ---------------------------------------------------------------- a swap's end, as the feed process saw it
-    def _ended(self, order_id: str, parsed: Optional[dict], info: Optional[dict]):
+    def _ended(self, order_id: str, parsed: Optional[dict], info: Optional[dict], builders: Optional[list] = None):
         """a swap's end, the moment its message is read (parsed None: dropped, its nonce already read anew by the feed).
         What it got is worked out first, and a fill goes straight to whoever waits on it (on_filled: arb_l's DEX first sends
         its CEX leg there), before anything else; a failure has its pair's book hidden and a fresh poll asked for. Then the
         rest (_settle), started eagerly: it runs to its end here, with no wait for the loop, so no tick sees the swap ended
-        and its fill not yet on the balances"""
+        and its fill not yet on the balances. `builders`: each builder's answer to its send, for its line (the feed's)"""
         swap = self._swaps.get(order_id)
         if swap is None:
             return
@@ -825,13 +836,13 @@ class EvmDexExchange(ExchangePyBase):
                     self.logger().error(f"{self.C.EXCHANGE_NAME}: {order_id} filled, but whoever waited on its fill failed",
                                         exc_info=True)
                 handed = time.perf_counter() - read_at
-            if end[0] == OrderState.FAILED:
-                self._after_failure(swap["trading_pair"])    # before the failure event reaches the strategy
+            if end[0] == OrderState.FAILED:                  # before the failure event reaches the strategy
+                self._after_failure(swap["trading_pair"], swap.get("last_block") if parsed is None else None)
         except Exception:                                    # never the feed's reader: the settle works it out again
             self.logger().error(f"{self.C.EXCHANGE_NAME}: {order_id}: its end could not be worked out at once", exc_info=True)
         # (the loop given: Python 3.12's C Task starts eagerly on the loop it is GIVEN, and fails without one)
-        asyncio.Task(safe_wrapper(self._settle(order_id, swap, parsed, info, end, handed)), loop=asyncio.get_running_loop(),
-                     eager_start=True)
+        asyncio.Task(safe_wrapper(self._settle(order_id, swap, parsed, info, end, handed, builders)),
+                     loop=asyncio.get_running_loop(), eager_start=True)
 
     def _end_of(self, order_id: str, swap: dict, parsed: Optional[dict]) -> Tuple[OrderState, Optional[TradeUpdate],
                                                                                     Optional[tuple]]:
@@ -843,7 +854,7 @@ class EvmDexExchange(ExchangePyBase):
         return self._outcome(order_id, swap, parsed)
 
     async def _settle(self, order_id: str, swap: dict, parsed: Optional[dict], info: Optional[dict], end: Optional[tuple],
-                      handed: Optional[float]):
+                      handed: Optional[float], builders: Optional[list] = None):
         """a swap's end, after its fill was handed on (_ended): this side's own work. Its receipt's moves go on the balances
         first, so whoever reads them at the fill event sees the trade (the hold band, the balancer); then the fill and FILLED
         with what it really got, or FAILED, processed in place (no 5 s wait: what the swap got IS the order); then the
@@ -851,7 +862,7 @@ class EvmDexExchange(ExchangePyBase):
         if end is None:
             end = self._end_of(order_id, swap, parsed)
             if end[0] == OrderState.FAILED:
-                self._after_failure(swap["trading_pair"])
+                self._after_failure(swap["trading_pair"], swap.get("last_block") if parsed is None else None)
         state, fill, problem = end
         if parsed is not None:
             self._book_receipt(swap, parsed)
@@ -861,7 +872,7 @@ class EvmDexExchange(ExchangePyBase):
             if order is not None and order.executed_amount_base < order.amount:
                 order.amount = order.executed_amount_base     # an exact-input buy may get less than its amount: no more comes
         try:
-            line = self._swap_line(order_id, swap, info, parsed, problem, handed)
+            line = self._swap_line(order_id, swap, info, parsed, problem, handed, builders)
         except Exception as e:                        # the line is information only: it never holds the settle up
             line = (f"{self.C.EXCHANGE_NAME}: {order_id} {swap.get('tx_hash')}: {problem[1] if problem else 'filled'} "
                     f"({type(e).__name__} in its line)")
@@ -872,22 +883,24 @@ class EvmDexExchange(ExchangePyBase):
         self._send_caps()                                   # its moves are on the balances: the ladders end there now
 
     def _swap_line(self, order_id: str, swap: dict, info: Optional[dict], parsed: Optional[dict],
-                   problem: Optional[tuple], handed: Optional[float] = None) -> str:
+                   problem: Optional[tuple], handed: Optional[float] = None, builders: Optional[list] = None) -> str:
         """one line per swap's end (Pavel 2026-10-15; audit finding 7: the data the room, a gas bid and the cadence are tuned
         on): what it got against its book, where it landed against its book's block (+N, its index in the block), the
         seconds from the send, how old its book was at the send, the gas. The send reads no head, so the book's block is
         the line's reference: +N covers the book's age and the wait for inclusion. A fill someone waited on (on_filled)
-        also says how long from its end read to that taker done ("handed on in": arb_l's CEX leg sent, Pavel 2026-10-17)"""
+        also says how long from its end read to that taker done ("handed on in": arb_l's CEX leg sent, Pavel 2026-10-17).
+        With the feed's answers, the send too (_send_part)"""
         book = swap["book_block"]
         where = f"its book (block {book}) {swap['sent'] - swap['book_at']:.2f} s old at the send"
         what = f"{self.C.EXCHANGE_NAME}: {swap['trading_pair']} {swap['side']} ({order_id})"
+        out = self._send_part(swap, builders)
         if info is None:
-            return f"{what} DROPPED: {problem[1]}; {where}; {swap['tx_hash']}"
+            return f"{what} DROPPED: {problem[1]}; {where}{out}; {swap['tx_hash']}"
         landed, index = info["block"], info["index"]
         at = (f"landed +{landed - book} blocks after its book (block {landed}, tx #{index if index is not None else '?'}), "
               f"{time.time() - swap['sent']:.2f} s after the send")
         if problem is not None:                                             # its text carries the gas
-            return f"{what} {problem[0]}: {problem[1]}; {at}; {where}; {swap['tx_hash']}"
+            return f"{what} {problem[0]}: {problem[1]}; {at}; {where}{out}; {swap['tx_hash']}"
         got, expected = parsed["amount_out"], swap.get("expected_out")
         decimals, unit = ((swap["ca_decimals"], swap["trading_pair"].split("-")[0]) if swap["side"] == "buy" else
                           (self.C.USDT_DECIMALS, self.C.QUOTE))
@@ -897,8 +910,24 @@ class EvmDexExchange(ExchangePyBase):
                  f"room {self.C.SWAP_SLIPPAGE * 10000:.0f} bps")
         first = f"; its fill handed on in {handed * 1e3:.2f} ms" if handed is not None else ""
         return (f"{what} filled: got {got / 10 ** decimals:.8g} {unit} ({versus}, {floor}); {at}; {where}; gas "
-                f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} {self.C.NATIVE_ASSET} ({info['gas_used']:,}){first}; "
+                f"{Decimal(parsed['gas_fee_wei']).scaleb(-18)} {self.C.NATIVE_ASSET} ({info['gas_used']:,}){first}{out}; "
                 f"{swap['tx_hash']}")
+
+    def _send_part(self, swap: dict, builders: Optional[list]) -> str:
+        """the swap's send, for its line (P2-DEX finding 11, Pavel 2026-10-23: "order announcement to the endpoint, exact
+        blocks, timeline"): the block its bundle was for (ETH: one block; bsc: a window up to it), on a slot clock how long
+        before that block's slot it went out, then each builder's answer in the order they came, ms from the send ("took it"
+        is left unsaid). "" without the feed's answers: the line exactly as before"""
+        if not builders:
+            return ""
+        per_block = getattr(self.C, "SENDER", "") == "bundle_per_block"
+        last = swap.get("last_block")
+        lead = (f", {swap['slot_at'] - swap['sent']:.1f} s before its slot" if swap.get("slot_at") is not None and
+                swap.get("sent") is not None else "")
+        answers = [f"{name} {ms:.0f} ms" + ("" if verdict == "took it" else f" {verdict}") for name, ms, verdict in builders]
+        heard = {name for name, _, _ in builders}
+        answers += [f"{name} no answer yet" for name in map(builder_label, self.C.BUILDERS) if name not in heard]
+        return f"; out {'for' if per_block else 'until'} block {last}{lead}: {', '.join(answers)}"
 
     def _outcome(self, order_id: str, swap: dict, parsed: dict) -> Tuple[OrderState, Optional[TradeUpdate], Optional[tuple]]:
         """a mined swap -> (FILLED, its one fill, None) or (FAILED, None, (error type, why)): reverted (its gas still paid),

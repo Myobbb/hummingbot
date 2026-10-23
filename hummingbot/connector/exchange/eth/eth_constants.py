@@ -87,6 +87,10 @@ LEASE_STEP_S = 3.0                # the lease step (its heartbeat) while a block
 BUNDLE_BLOCKS = 1
 DEADLINE_FROM_BLOCK = True
 DEADLINE_S = 12                   # only without DEADLINE_FROM_BLOCK
+# That block's book is not held back (P2-DEX finding 7, Pavel 2026-10-23): a dropped bundle's last block came after the
+# failure, so arb_l may fire again on its book at once, for the block after (evm_dex_exchange._after_failure). A refusal or a
+# revert still waits for a newer block. bsc keeps the newer-block rule (0.45 s blocks, a 4-block window)
+REFIRE_ON_DROP_BLOCK = True
 # The book's node, the status node and the nonce's node: BlockRazor's ETH RPC (decision 2: first to show a block 19 / 25 and
 # 8 / 15, receipts with its head 25 / 25, the call in ~0.05 s, 0 RU, eth_call cap 50M; it answers a nonce pinned to a block
 # and refuses one it doesn't have). The nonce's node must be the one the asset manager sends ETH transfers on (P3, §0.5)
