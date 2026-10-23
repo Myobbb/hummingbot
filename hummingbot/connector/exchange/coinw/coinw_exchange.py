@@ -143,6 +143,9 @@ class CoinwExchange(ExchangePyBase):
         # a 29001 answer slows the connector's own reads until this monotonic time
         self._rate_limited_until = 0.0
         self._last_rate_limit_alarm = 0.0
+        # Cloudflare's 451 answers since the last [CW-ALARM] cloudflare-legal-block line, and that line's monotonic time
+        self._legal_blocks = 0
+        self._last_legal_block_alarm = 0.0
         # client id -> (the base asset's total, _booked_base of it) when the order was sent: the baseline its terminal
         # update compares the balance with (_balance_shows_fills)
         self._hold_baseline: Dict[str, Tuple[Decimal, Decimal]] = {}
@@ -278,7 +281,8 @@ class CoinwExchange(ExchangePyBase):
           HTTP >= 400, an unparseable body, a transport failure -> IOError (an UNKNOWN outcome)
         Private commands are POSTs with an empty body; the auth adds api_key and the MD5 sign to the query. Every request
         has a timeout (REQUEST_TIMEOUT unless given): aiohttp's session default is 300 s. A 29001 answer slows the
-        connector's own reads (_on_rate_limited).
+        connector's own reads (_on_rate_limited). A 451 (Cloudflare's legal block) also closes the connection that
+        answered it (_on_legal_block).
         """
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         path = CONSTANTS.PRIVATE_PATH if private else CONSTANTS.PUBLIC_PATH
@@ -298,6 +302,8 @@ class CoinwExchange(ExchangePyBase):
         except Exception as e:
             raise IOError(f"CoinW {command}: no answer ({type(e).__name__}: {self._scrub(e)})") from None
         if status >= 400:
+            if status == CONSTANTS.HTTP_LEGAL_BLOCK:
+                self._on_legal_block(command, response)
             raise IOError(f"CoinW {command}: HTTP {status} (outcome unknown): {self._scrub((text or '')[:300])}")
         try:
             body = web_utils.loads(text)
@@ -324,6 +330,24 @@ class CoinwExchange(ExchangePyBase):
 
     def _rate_limited(self) -> bool:
         return time.monotonic() < self._rate_limited_until
+
+    def _on_legal_block(self, command: str, response: Any) -> None:
+        """Cloudflare answered 451, its legal block (HTTP_LEGAL_BLOCK): the keep-alive connection that answered is
+        closed, so no later request reuses it and the next one opens a new connection. The body is read by now, so
+        aiohttp has already put the connection back in the shared pool, which drops a closed one. Said as a
+        [CW-ALARM] at most once a minute, with the number of 451s since the last line: the network check that fails
+        on it logs nothing."""
+        protocol = getattr(getattr(response, "_aiohttp_response", None), "_protocol", None)
+        if protocol is not None:
+            protocol.close()
+        self._legal_blocks += 1
+        now = time.monotonic()
+        if now - self._last_legal_block_alarm >= 60.0:
+            self._last_legal_block_alarm = now
+            self._alarm("cloudflare-legal-block", command=command,
+                        cf_ray=(getattr(response, "headers", None) or {}).get("cf-ray"),
+                        count=self._legal_blocks, connection_dropped=protocol is not None)
+            self._legal_blocks = 0
 
     def _give_up(self, client_order_id: str) -> None:
         """Remember an order this process failed or struck as not found: a push for it later is ours."""

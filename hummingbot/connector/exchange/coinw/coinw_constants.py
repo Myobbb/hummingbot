@@ -211,6 +211,14 @@ FILL_BALANCE_PUSH_WAIT_S = 1.0
 PLACE_ORDER_TIMEOUT = 10.0
 REQUEST_TIMEOUT = 10.0
 
+# --- Cloudflare's legal block (live 2026-10-23, myserver) ----------------------------------------------------
+# api.coinw.com sits behind Cloudflare, which at times answers HTTP 451 "Error 1026" (legal_block, a page in Korean)
+# to myserver's IP, but not on every connection: HMB's network check failed for 6m45s (15:05:43-15:12:28 UTC) while
+# the AM's reads from the same IP (60 of 60) and new connections (52 of 52) went through. The likely cause: HMB kept
+# reusing a keep-alive connection that drew the block. So the connection that answers 451 is closed, and the next
+# request opens a new one (wiki trading/exchanges/exchange-bugs, CoinW).
+HTTP_LEGAL_BLOCK = 451
+
 # --- Rate limiting (CoinW's error policy, "Precautions") ------------------------------------------------------
 # 60 errors per 10 s per account (80 per IP) start a 5-minute warning phase that halves every limit; more errors bring
 # 30-s bans of ALL calls, cancels included, and 10 bans in 8 h an 8-hour blacklist. A 29001 answer is always a
