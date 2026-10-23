@@ -54,9 +54,10 @@ SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * MAX_FEE_CAP_WEI).scaleb(-18)   # 
 APPROVED_AT_LEAST = 1 << 128      # an allowance this large counts as approved (the approvals are for the maximum amount)
 APPROVE_RETRY_S = 300.0
 APPROVE_RETRY_MAX_S = 3600.0
-# A chain whose gas is worth counting: an order under this notional is refused (Pavel 2026-10-22, decision 10: at p90 a leg
-# costs ~$0.24, 0.24% of $100 but 1.6% of arb_l's $15 floor)
-MIN_NOTIONAL_USD = Decimal(100)
+# An order under this notional is refused (the connector's trading rule; the strategies' own floor, arb_l's min_order_usd,
+# applies anyway). 0, as BSC (Pavel 2026-10-22: "tx fee on eth is currently around $0.08 so we don't have to go with $100 min
+# ... keep same minimum as BSC side for now, later we might adjust"); decision 10 had it at $100
+MIN_NOTIONAL_USD = Decimal(0)
 
 # Sending (2026-10-22: the research and the no-funds probe, wiki p2-dex-eth §sending; phase 3 measures it with Pavel's live
 # 0-value sends before it is final). No top builder takes a block range: a single-transaction bundle names its one block, and
