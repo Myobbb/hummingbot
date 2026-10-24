@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 from prompt_toolkit.application import Application
@@ -15,7 +16,6 @@ from hummingbot import init_logging
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.client.tab.data_types import CommandTab
-from hummingbot.client.ui.interface_utils import start_process_monitor, start_timer, start_trade_monitor
 from hummingbot.client.ui.layout import (
     create_input_field,
     create_live_field,
@@ -92,11 +92,13 @@ class HummingbotCLI(PubSub):
         # stdout redirection stack
         self._stdout_redirect_context: ExitStack = ExitStack()
 
-        # start ui tasks
-        loop = asyncio.get_event_loop()
-        loop.create_task(start_timer(self.timer))
-        loop.create_task(start_process_monitor(self.process_usage))
-        loop.create_task(start_trade_monitor(self.trade_monitor))
+        # The footer tasks are not started (2026-10-24): start_timer and start_process_monitor rewrote their footer
+        # every second, start_trade_monitor every 2 s after a full scan of the TradeFill table, and each rewrite
+        # redrew the whole screen (52-75 ms on the live 411x104 tmux pane). Together they blocked the event loop
+        # ~18.5% of the time, in 100-700 ms runs. The footers stay in the layout (the watcher finds the prompt by
+        # its distance from the bottom) and show static text.
+        self.timer.log(f"Started {datetime.now(timezone.utc):%m-%d %H:%M:%S} UTC")
+        self.trade_monitor.log("Trades and P&L: `history`")
 
     def did_start_ui(self):
         self._stdout_redirect_context.enter_context(patch_stdout(log_field=self.log_field))
@@ -113,6 +115,9 @@ class HummingbotCLI(PubSub):
             key_bindings=self.bindings,
             style=load_style(self.client_config_map),
             mouse_support=True,
+            # At most one redraw per second (2026-10-24): a redraw costs 52-75 ms on the live 411x104 tmux pane and
+            # every log line asked for one, so bursts chained them back to back. Typed text shows within a second.
+            min_redraw_interval=1.0,
             # InMemoryClipboard, not PyperclipClipboard: on a headless server pyperclip has no
             # backend (no xclip/xsel/wl-clipboard) and RAISES on any kill-line binding — C-u
             # (unix_line_discard) and C-k (kill_line) both copy the killed text to the clipboard.
