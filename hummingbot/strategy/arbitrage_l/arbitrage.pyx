@@ -134,10 +134,20 @@ class EagerNextTask:
     inside the block, the first task created (the connector's order coroutine: ExchangePyBase.buy/sell) starts eagerly
     (Python 3.12), so it runs to its request on the wire before the order call returns, ahead of any work the loop has
     ready. Only that one: the factory puts the loop's own back before the coroutine runs, so whatever the order's first
-    step schedules (a pre-send failure's update) is an ordinary task, never run inside the strategy's dispatch"""
-    __slots__ = ("_loop", "_previous")
+    step schedules (a pre-send failure's update) is an ordinary task, never run inside the strategy's dispatch.
+    Also every CEX leg of an arb (2026-10-24, Pavel: "build and test the eager start for arb legs"): a leg used to wait for
+    the rest of the tick and the work queued before it (decision -> Bitunix p50 29 ms, ~11 ms of it the network).
+    enabled=False (a swap venue's leg): an ordinary task, as before."""
+    __slots__ = ("_loop", "_previous", "_enabled")
+
+    def __init__(self, enabled=True):
+        self._enabled = enabled
+        self._loop = None
+        self._previous = None
 
     def __enter__(self):
+        if not self._enabled:                       # an ordinary order
+            return self
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:                        # no loop running: an ordinary order
@@ -2517,16 +2527,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
 
             # Execute both orders in rapid succession.
             # When one leg is suppressed (qty=0) that branch is skipped entirely.
+            # A CEX leg starts eagerly (EagerNextTask): its request is on its socket before the call returns, so the buy is
+            # out before the sell is sent and neither waits for the rest of the tick. A swap venue's leg is an ordinary task.
+            # Nothing reaches this strategy from inside (a pre-send failure's update is a task of its own), so the
+            # bookkeeping below still runs before any order event.
             # NOTE: c_buy/c_sell_with_specific_market return immediately (async order placement)
             # Actual exchange failures are handled via MarketOrderFailureEvent -> c_did_fail_order
             # The try/except here only catches rare synchronous validation errors (e.g. TypeError)
             try:
                 if _final_buy_qty > DECIMAL_ZERO and not (dex_first and sell_is_swap):    # DEX first: the buy waits
-                    buy_order_id = self.c_buy_with_specific_market(
-                        buy_market_tuple, _final_buy_qty,
-                        order_type=buy_order_type,
-                        price=dex_limit if (buy_is_swap and dex_limit is not None) else buy_price_decimal,
-                        expiration_seconds=self._next_trade_delay)
+                    with EagerNextTask(not buy_is_swap):
+                        buy_order_id = self.c_buy_with_specific_market(
+                            buy_market_tuple, _final_buy_qty,
+                            order_type=buy_order_type,
+                            price=dex_limit if (buy_is_swap and dex_limit is not None) else buy_price_decimal,
+                            expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error (e.g. invalid type, market not whitelisted)
                 # Use existing framework to trigger timeout logic and logging
@@ -2541,11 +2556,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Immediately place the sell order - minimal delay
             try:
                 if _final_sell_qty > DECIMAL_ZERO and not (dex_first and buy_is_swap):    # DEX first: the sell waits
-                    sell_order_id = self.c_sell_with_specific_market(
-                        sell_market_tuple, _final_sell_qty,
-                        order_type=sell_order_type,
-                        price=dex_limit if (sell_is_swap and dex_limit is not None) else sell_price_decimal,
-                        expiration_seconds=self._next_trade_delay)
+                    with EagerNextTask(not sell_is_swap):
+                        sell_order_id = self.c_sell_with_specific_market(
+                            sell_market_tuple, _final_sell_qty,
+                            order_type=sell_order_type,
+                            price=dex_limit if (sell_is_swap and dex_limit is not None) else sell_price_decimal,
+                            expiration_seconds=self._next_trade_delay)
             except Exception as e:
                 # Rare synchronous error - buy order may have been submitted (will timeout/cancel)
                 from hummingbot.core.event.events import MarketOrderFailureEvent
