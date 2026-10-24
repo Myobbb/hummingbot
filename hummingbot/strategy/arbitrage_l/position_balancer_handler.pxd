@@ -123,6 +123,7 @@ cdef class PositionBalancerHandler:
     cdef object c_placeable_sell_amount(self, object market_tuple, double amount, double price)
     cdef bint c_residue_sellable(self, str asset)
     cdef bint c_reprice_would_strand(self, str asset, str reason)
+    cdef bint c_clean_last_order(self, str asset)
     cdef object c_find_best_sell_market(self, str asset)
     # Helper methods for cancellation logic
     cdef bint c_check_stuck_cancel(self, str order_id, str asset, bint is_buy, double current_time, bint force_short_timeout=*)
