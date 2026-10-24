@@ -2360,12 +2360,15 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # nothing; a crossed fill is a guaranteed loss. (buy_price/sell_price are the
         # worst scanned prices from c_find_best_profitable_amount, already >= min_profit.)
 
-        # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API
-        # OPTIMIZATION: Use Decimal.from_float() instead of Decimal(str()) to avoid expensive string formatting.
-        # This is safe because quantization handles small precision noise.
-        cdef object buy_price_decimal = Decimal.from_float(buy_price)
-        cdef object sell_price_decimal = Decimal.from_float(sell_price)
-        
+        # The limits are the scanned book levels EXACTLY: repr() is the shortest decimal that round-trips, i.e. the venue's
+        # own level (0.2097). Decimal.from_float would pass the double's binary value (0.20969999999999999751...), and the
+        # connector's price quantizer FLOORS it to the tick (0.20969): about half of all levels lost a tick, so a buy rested
+        # under the ask it priced from (2026-10-23, P2 Open Items arb-buy-floor-tick). Two conversions per execution.
+        cdef object buy_price_decimal = Decimal(repr(buy_price))
+        cdef object sell_price_decimal = Decimal(repr(sell_price))
+
+        # Quantize amounts using c-level method when available (with epsilon and price), fallback to Python API.
+        # Amounts keep Decimal.from_float: they are floored on purpose (never above the balance), past QUANTIZATION_EPSILON.
         # Quantize using the larger of the two leg amounts as the capacity reference.
         # This gives the exchange-rounded ceiling that both legs are then capped against.
         cdef double safe_amount_float = max(0.0, max(_hold_buy_amount, _hold_sell_amount) - QUANTIZATION_EPSILON)
