@@ -117,8 +117,8 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Strategy:
         - MBP connection: disconnect and let _manage_connection reconnect, which
           calls _subscribe_mbp with the full updated _trading_pairs list including
-          the new pair.  The immediate `req` snapshot in _subscribe_mbp ensures the
-          C++ OB is seeded before the balancer fires.
+          the new pair.  HTX answers each mbp.refresh.20 `sub` with the current book,
+          which seeds the C++ OB within a few ms.
         - Trade connection: send a `sub` message on the existing open WS so we
           receive trade events for the new pair without disrupting all other pairs.
 
@@ -351,17 +351,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_mbp(self, ws: WSAssistant):
         """Subscribe to MBP Incremental (5) and Refresh (20) channels.
 
-        After sending `sub` messages (which start the 100ms periodic refresh stream),
-        we also send an immediate `req` snapshot request for each pair.  The `rep`
-        response arrives within ~1 RTT (~50ms from VPS) and seeds the C++ order book
-        before any incremental delta can corrupt it.  This is especially important for
-        thin/low-volume pairs (e.g. QUICK-USDT) where the first periodic `mbp.refresh`
-        message may be delayed and the balancer fires immediately on strategy resume.
+        HTX answers each mbp.refresh.20 `sub` with the current 20-level book at once (measured 2026-10-26: 60 of 60
+        subs within 8 ms, pairs with $0-5 of daily volume included), so the refresh sub itself seeds the C++ order
+        book. No `req` snapshot: _manage_connection starts reading only after this returns, and the 12 throttled
+        `req`s held every HTX book for 1.5-3 s per (re)subscribe (and 20 levels were refused on every alt pair).
         """
         try:
             self._last_seq_num.clear()
-
-            symbols_to_snapshot: List[str] = []
 
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -374,22 +370,13 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 }))
 
-                # Snapshot mbp.refresh.20 (starts 100ms periodic stream)
+                # Snapshot mbp.refresh.20 (the current book at once, then ~100ms while it changes)
                 await ws.send(WSJSONRequest({
                     "sub": f"market.{exchange_symbol}.mbp.refresh.{CONSTANTS.MBP_REFRESH_DEPTH}",
                     "id": str(uuid.uuid4())
                 }))
 
-                symbols_to_snapshot.append(exchange_symbol)
-
             self.logger().info("Subscribed to MBP channels...")
-
-            # Request an immediate snapshot for each symbol via `req`.
-            # The `rep` response (handled as SNAPSHOT in _parse_order_book_diff_message)
-            # seeds the C++ OB right away instead of waiting for the first periodic
-            # mbp.refresh message, eliminating the stale-book race on runtime strategy add.
-            for exchange_symbol in symbols_to_snapshot:
-                await self._request_mbp_snapshot(ws, exchange_symbol)
 
         except Exception as e:
             self.logger().error("Error subscribing to MBP channels", exc_info=True)
@@ -412,23 +399,6 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception as e:
             self.logger().error("Error subscribing to Trade channels", exc_info=True)
             raise
-
-    async def _request_mbp_snapshot(self, ws: WSAssistant, exchange_symbol: str):
-        """
-        Request a full MBP snapshot for a symbol (used for initial sync and gap recovery).
-        """
-        mbp_channel = f"market.{exchange_symbol}.mbp.{CONSTANTS.MBP_REFRESH_DEPTH}"
-        snapshot_request: WSJSONRequest = WSJSONRequest({
-            "req": mbp_channel,
-            "id": str(uuid.uuid4())
-        })
-        throttler = getattr(self._api_factory, "throttler", None)
-        if throttler is not None:
-            async with throttler.execute_task(CONSTANTS.WS_REQUEST_LIMIT_ID):
-                await ws.send(snapshot_request)
-        else:
-            await ws.send(snapshot_request)
-        self.logger().debug(f"Requested MBP snapshot for {exchange_symbol}")
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         """
@@ -628,9 +598,9 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
             if status == "error" or ("err-code" in event_message or "err-msg" in event_message):
                 err_msg = str(event_message.get("err-msg", "Unknown error"))
-                # Known-benign: alt pairs don't offer the tick-by-tick mbp.5 channel — only the
-                # ~9 major pairs do. We always send both mbp.5 and mbp.refresh.20; the refresh sub
-                # succeeds and feeds the book, so the rejected mbp.5 sub is expected, not an error.
+                # A channel HTX does not offer for a symbol (20-level MBP exists only for its 30 listed
+                # symbols; mbp.5 and mbp.refresh.20 exist for all). It came from the `req mbp.20` seed,
+                # refused on every alt pair until the seed was removed (2026-10-26).
                 # Log it at DEBUG to avoid flooding launch logs; keep all other WS errors at WARNING.
                 if "does not currently offer subscription services" in err_msg:
                     self.logger().debug(

@@ -2045,10 +2045,11 @@ cdef class PositionBalancerHandler:
     cdef bint c_clean_last_order(self, str asset):
         """
         Is the next sell of this sell-off a CLEAN'S LAST ORDER: a sell-to-zero whose whole remaining position fits in
-        one order (TOTAL value <= _order_size_usd)? That order crosses the spread. One definition for the three places
-        that must agree on it: the selector picks its venue by bid (c_find_best_sell_market), placement prices it at the
-        deepest bid its size reaches (c_execute_sell_limit), and a sell still resting above the bid is cancelled so it
-        is re-placed that way (c_check_immediate_conditions).
+        one order plus the floor (TOTAL value <= _order_size_usd + _min_order_usd: a full order leaves only dust)? That
+        order crosses the spread. One definition for the places that must agree on it: the selector picks its venue by
+        bid (c_find_best_sell_market), placement prices it at the deepest bid its size reaches (c_execute_sell_limit),
+        and the live-order checks (c_check_immediate_conditions) cancel a sell resting above the bid so it is re-placed
+        that way (CHECK 1b), and leave the maker checks (2-4) off it.
 
         WHY. A clean completes only when no venue can take what is left (c_try_mark_sell_complete ->
         c_residue_sellable), so its last order has to FILL. As a maker (ask - 1 tick, or under the wall in refuge) it
@@ -2056,6 +2057,8 @@ cdef class PositionBalancerHandler:
         orchestrator never removed the strategy. USDS 2026-10-24: 24.97 left on coinw, 82 sells and 0 fills (bid
         1.0005, a 73k ask wall at 1.0017). APTM: 79.02 ($4.06) on poloniex, whose 1 USDT minimum keeps it sellable,
         339 sweeps over 41.5 h and 0 fills. Crossing costs cents at that size.
+        The floor in the bound: CVXON 2026-10-24 held $100.2, so its final order ($99.8, capped at the order size) was
+        not "the last" and rested as a maker for 2.7 h with only $0.4 behind it.
         The body of a clean and every graded sell-off stay maker. An unpriceable position (no bid) is not a last order.
         """
         cdef pair[double, double] val
@@ -2063,7 +2066,7 @@ cdef class PositionBalancerHandler:
             return False
         val = self.c_compute_value_and_sell_excess(self.c_get_actual_base_balance(asset),
                                                    self.c_tick_position_bid(asset))
-        return 0.0 < val.first <= self._order_size_usd
+        return 0.0 < val.first <= self._order_size_usd + self.strategy._min_order_usd
 
     cdef object c_find_best_sell_market(self, str asset):
         """
@@ -2464,6 +2467,7 @@ cdef class PositionBalancerHandler:
             bint spread_is_min
             double spread_pct
             bint is_maker_mode
+            bint last_stage = False   # a clean's last order (c_clean_last_order): CHECK 1b only, no maker checks
 
         try:
             # Get order details
@@ -2554,9 +2558,9 @@ cdef class PositionBalancerHandler:
             # the next placement takes the bid. Same age gate as CHECK 2, so a fill already on its way
             # lands first. A proactive reason ("last order"): STEP_UP_COOLDOWN, no streak.
             # ================================================================
-            if (not should_cancel and not is_buy and order_age >= frontrun_delay and current_bid > 0.0
-                    and order_price > current_bid + min_price_increment * HALF_TICK_TOLERANCE
-                    and self.c_clean_last_order(asset)):
+            last_stage = (not is_buy) and self.c_clean_last_order(asset)
+            if (not should_cancel and last_stage and order_age >= frontrun_delay and current_bid > 0.0
+                    and order_price > current_bid + min_price_increment * HALF_TICK_TOLERANCE):
                 should_cancel = True
                 cancel_reason = (f"last order crosses the spread (resting at {order_price:.8g}, "
                                  f"above the bid {current_bid:.8g})")
@@ -2566,8 +2570,12 @@ cdef class PositionBalancerHandler:
             # Gated by MIN_FRONTRUN_CHECK_DELAY — these are real book events,
             # not tick noise. 5s is enough to ignore a single-tick bounce.
             # Skip for aggressive mode (0%) — they don't compete for position.
+            # Skipped for a clean's last order too: they keep a MAKER at the top of the asks, and that
+            # order is a taker at the bid. At or below the bid it is executing; above it, CHECK 1b has
+            # it. MTL 2026-10-25: CHECK 3 (`large gap`) cancelled a last order 5 s after placement,
+            # while it was still filling at the bid.
             # ================================================================
-            if not should_cancel and is_maker_mode and order_age >= frontrun_delay:
+            if not should_cancel and is_maker_mode and order_age >= frontrun_delay and not last_stage:
                 if is_buy:
                     in_refuge = self._in_refuge_buy.get(self._get_canonical_asset(asset), False)
                     # CHECKS 2 and 3 are TOP-OF-BOOK referenced, so both are meaningless for a
@@ -2919,7 +2927,8 @@ cdef class PositionBalancerHandler:
 
         Every tick — via c_check_immediate_conditions (each with its own age gate):
           CHECK 1  better market   — another venue beats us by > 0.1% (buy) / 0.3% (sell); age >= 60s, one scan per 60s
-          CHECK 1b last order      — a clean's last order resting above the bid moves to it (sell; age as CHECK 2)
+          CHECK 1b last order      — a clean's last order resting above the bid moves to it (sell; age as CHECK 2);
+                                     CHECKS 2-4 are off for a clean's last order (a taker at the bid, not a maker)
           CHECK 2  frontrun/undercut — someone got inside us (age >= 5s, 20s at streak >= 5)
           CHECK 3  large gap       — we drifted > LARGE_GAP_THRESHOLD ticks off top +/- 1 tick
           CHECK 4  step-up / refuge re-park — reprice by >= STEP_UP_MIN_GAP_TICKS
@@ -4183,7 +4192,7 @@ cdef class PositionBalancerHandler:
                     f"Position balancer: SELL venue changed for {_canon_venue} "
                     f"{_prev_gone[2]} -> {sell_market_tuple.market.name} — streak and refuge reset (new book)")
 
-        # A CLEAN'S LAST ORDER CROSSES THE SPREAD (c_clean_last_order): what is left fits in one order, and a clean
+        # A CLEAN'S LAST ORDER CROSSES THE SPREAD (c_clean_last_order): what is left fits in one order plus the floor, and a clean
         # ends only once it has sold, so it is priced like a swap, in every mode and refuge included. Its venue was
         # chosen by bid (c_find_best_sell_market).
         last_order = (not is_swap) and self.c_clean_last_order(asset_key)
@@ -4474,7 +4483,8 @@ cdef class PositionBalancerHandler:
                 f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
                 f"on {sell_market_tuple.market.name} at {sell_price:.8g} (clean's last order: taker, "
                 f"{'the deepest bid it reaches' if deep_px > 0.0 else 'the top bid'}; top bid {top_bid:.8g}, "
-                f"${current_value_quote:.2f} left <= order size ${self._order_size_usd:.2f})")
+                f"${current_value_quote:.2f} left <= order size + floor "
+                f"${self._order_size_usd + self.strategy._min_order_usd:.2f})")
         elif self._sell_spread_is_min:
             self.strategy.logger().info(
                 f"[PB] Placed sell limit order {sell_order_id} for {float(quantized_amount):.6f} {asset_key} "
