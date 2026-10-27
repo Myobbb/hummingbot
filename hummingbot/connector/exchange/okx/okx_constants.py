@@ -25,10 +25,11 @@ def get_okx_base_url(sub_domain: str) -> str:
 
 def get_ws_url(sub_domain: str) -> str:
     """Returns OKX WebSocket base URL based on API subdomain ("www", "us", "eea")"""
+    # Port 443: OKX is retiring 8443 (every 8443 socket gets notice 64010 first since 2026-10-27)
     if sub_domain == "www":
-        return "wss://ws.okx.com:8443"
+        return "wss://ws.okx.com:443"
     else:
-        return f"wss://ws{subdomain_to_api_subdomain[sub_domain]}.okx.com:8443"
+        return f"wss://ws{subdomain_to_api_subdomain[sub_domain]}.okx.com:443"
 
 
 DEFAULT_DOMAIN = get_okx_base_url("www")

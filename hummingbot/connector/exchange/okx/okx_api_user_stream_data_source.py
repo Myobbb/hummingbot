@@ -48,10 +48,15 @@ class OkxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_LOGIN_LIMIT_ID):
             await ws.send(login_request)
 
-        response: WSResponse = await ws.receive()
-        message = response.data
+        # OKX can push a notice (e.g. 64010, a port retirement) before the login reply: skip it
+        for _ in range(5):
+            response: WSResponse = await ws.receive()
+            message = response.data
+            if message.get("event") != "notice":
+                break
+            self.logger().warning(f"OKX notice on the private websocket: {message.get('code')} {message.get('msg')}")
         if message.get("event") != "login":
-            self.logger().error("Error authenticating the private websocket connection")
+            self.logger().error(f"Error authenticating the private websocket connection: {message}")
             raise IOError("Private websocket connection authentication failed")
 
         return ws
