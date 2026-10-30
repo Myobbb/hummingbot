@@ -772,8 +772,9 @@ class Feed:
         """what a transaction bids: a legacy chain's gas price (BSC: its 0.05 gwei floor), or an EIP-1559 chain's (max fee, tip):
         the tip a fixed PRIORITY_FEE_WEI (Pavel 2026-10-22, decision 11: about the blocks' median tip, no spike chasing), the max
         fee twice the base fee of the block after the newest polled (the poll's eth_feeHistory, evm_dex_quoter.FEE_HISTORY)
-        plus the tip (it holds through several full blocks; only what the block charges is paid). Past MAX_FEE_CAP_WEI nothing
-        is sent (a gas spike: the swap's whole edge could go to gas)"""
+        plus the tip (it holds through several full blocks; only what the block charges is paid), held to MAX_FEE_CAP_WEI.
+        Refused only when that block would charge more than the cap (base fee + tip past it; ~$5 a swap, Pavel 2026-10-30):
+        below it the swap goes out in any market, and the max fee keeps what one can cost under the cap"""
         C = self.C
         if getattr(C, "TX_TYPE", 0) != 2:
             return C.GAS_PRICE_WEI
@@ -782,10 +783,10 @@ class Feed:
         base = (self.quoter.last or {}).get("basefee")
         if base is None:
             raise Refused("no base fee known yet (no poll)")
-        max_fee = 2 * base + C.PRIORITY_FEE_WEI
-        if max_fee > C.MAX_FEE_CAP_WEI:
-            raise Refused(f"gas: the max fee {max_fee / 1e9:.3g} gwei is past the cap {C.MAX_FEE_CAP_WEI / 1e9:.3g} gwei")
-        return max_fee, C.PRIORITY_FEE_WEI
+        if base + C.PRIORITY_FEE_WEI > C.MAX_FEE_CAP_WEI:
+            raise Refused(f"gas: the base fee + tip {(base + C.PRIORITY_FEE_WEI) / 1e9:.3g} gwei is past the cap "
+                          f"{C.MAX_FEE_CAP_WEI / 1e9:.3g} gwei")
+        return min(2 * base + C.PRIORITY_FEE_WEI, C.MAX_FEE_CAP_WEI), C.PRIORITY_FEE_WEI
 
     def _ledger(self, nonce: int, tx_hash: str, entry: dict):
         """the swap ledger's line for a transaction just signed (contract v1; P3-DEX decision 3, Pavel 2026-10-16: the asset

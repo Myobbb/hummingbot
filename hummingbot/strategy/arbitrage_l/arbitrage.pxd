@@ -88,8 +88,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Track position balancer orders (to prevent main strategy from canceling them)
         set _position_balancer_orders
         # DEX first (Pavel 2026-10-17): a DEX-CEX arb sends its DEX leg alone; its CEX leg waits for the DEX fill
-        dict _dex_first_pending          # DEX order id -> (CEX market tuple, is_buy, amount, limit price, hold-trimmed,
-                                         #   the DEX leg's amount, the hold band's credit for the arb)
+        dict _dex_first_pending          # DEX order id -> (CEX market tuple, is_buy, amount, limit price, the DEX leg's
+                                         #   amount, its send time). While any is pending the position balancer does
+                                         #   nothing (2026-10-30)
         dict _dex_first_failures         # market tuple -> the times its DEX-first legs failed (the 3-in-10-s cap)
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
@@ -106,6 +107,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
         public double _hold_target_usd   # centre of acceptable band, e.g. 1100.0
         public double _hold_band_usd     # half-width, e.g. 100.0 → band is [1000, 1200]
         double _cached_total_base_qty    # sum of base across all venues; refreshed every 60 s
+        double _hold_settled_qty         # its settled part at that refresh (wallets + completed fills they don't show yet):
+                                         #   a correction's size = this + the orders still out on its side, live (2026-10-30)
         dict _hold_dispatch_base         # order id -> (market, base, +1/-1, venue base TOTAL at dispatch, ts): correction legs
         dict _hold_unsettled             # order id -> (market, base, +1/-1, filled, venue base at dispatch, deadline)
         double _cached_mid_price_usd     # position bid: each venue at its own top bid (c_get_position_bid, same as position balancer); refreshed every 60 s
@@ -174,6 +177,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_reconcile_orphan_orders(self)
     cdef void c_cleanup_old_orders(self)
     cdef double c_hold_inflight_base(self)
+    cdef pair[double, double] c_hold_inflight_legs(self)
     cdef double c_hold_unsettled_base(self)
     cdef void c_refresh_hold_cache(self)
     cdef void c_set_hold_correction(self, bint active, bint oversold)

@@ -3365,6 +3365,17 @@ cdef class PositionBalancerHandler:
         if not self._buy_enabled and not self._sell_enabled:
             return False
 
+        # A DEX-first arb in flight (its swap sent, its CEX leg waiting for the fill): nothing at all until it resolves
+        # (Pavel 2026-10-30: "the pending dex first order should prevent any PB activity, that should be by design").
+        # The swap venue already reads 0 available while its swap is out, so nothing can be placed THERE; the CEX venue
+        # was open. NIL 10-29: the swap at 01:32:42.351, our HTX sell of 1,226.99 at 01:32:44.351 (the adjusted balance
+        # counted the swap but not the waiting leg), the leg refused at 01:32:48.436 (account-frozen-balance-insufficient)
+        # and the swap's 740 NIL left one-legged. A plan lives for the swap's flight (seconds): its fill sends the CEX leg
+        # (a resting arb order from then on, counted and locked like any other), its failure drops it, and the strategy's
+        # cleanup drops one that never reports (c_cleanup_old_orders).
+        if self.strategy._dex_first_pending:
+            return False
+
         cdef:
             str asset_key = buy_market_tuple.base_asset
             str canonical_asset = self._get_canonical_asset(asset_key)

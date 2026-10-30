@@ -115,18 +115,11 @@ QUANTIZATION_EPSILON_DEC = Decimal("1e-12")
 cpdef object dex_first_cex_amount(object cex_planned, object dex_planned, object dex_filled):
     """DEX first's CEX leg (Pavel 2026-10-17): its plan less the swap's shortfall (an exact-input DEX buy may get a little
     less than its amount, and that much less is hedged), never more than planned (a swap that got more keeps the extra),
-    never below 0. Untrimmed (CEX plan = DEX plan) it is min(plan, fill); a hold-band trim keeps its intended difference
-    between the legs (Pavel: "fix dex-first sizing but for hold-band affected orders")"""
+    never below 0. With equal plans it is min(plan, fill). The two legs' plans can differ by their venues' lots (each leg
+    is capped and quantized on its own venue); that difference is kept. (A hold-band trim used this too until a correction
+    became one-sided, 2026-10-30)"""
     shortfall = dex_planned - dex_filled if dex_filled < dex_planned else DECIMAL_ZERO
     return cex_planned - shortfall if cex_planned > shortfall else DECIMAL_ZERO
-
-
-cpdef double dex_first_cache_after_failure(double cache, tuple plan):
-    """the hold band's cached base after a DEX-first leg failed: the arb's credit (buy - sell, taken at its dispatch) undone,
-    since neither leg moved (Pavel 2026-10-17: a failed attempt left it credited, so its retries went out untrimmed)"""
-    if plan is not None and len(plan) > 6 and plan[6]:
-        return cache - <double>plan[6]
-    return cache
 
 
 class EagerNextTask:
@@ -247,6 +240,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_target_usd = 0.0
         self._hold_band_usd = 100.0
         self._cached_total_base_qty = 0.0
+        self._hold_settled_qty = 0.0
         self._hold_dispatch_base = {}
         self._hold_unsettled = {}
         self._cached_mid_price_usd = 0.0
@@ -400,6 +394,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_enabled = hold_target_usd > 0.0
         self._hold_band_usd = hold_band_usd
         self._cached_total_base_qty = 0.0
+        self._hold_settled_qty = 0.0
         self._hold_dispatch_base = {}
         self._hold_unsettled = {}
         self._cached_mid_price_usd = 0.0
@@ -1333,7 +1328,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
             list tombstones_to_remove = []
             string order_id_str
             double timestamp
-            
+
+        # DEX first: a plan whose DEX order never reported its end (no fill, no failure) would hold the position balancer
+        # off for good (it does nothing while a plan is pending, 2026-10-30) and keep its CEX leg in the hold band's total.
+        # A swap ends by its last block, seconds after its send, so a plan older than the order timeout lost its event:
+        # dropped, and said so (its CEX leg was never sent)
+        if self._dex_first_pending:
+            for plan_oid in [o for o, p in self._dex_first_pending.items()
+                             if len(p) > 5 and self._current_timestamp - <double>p[5] > self._order_timeout]:
+                self._dex_first_pending.pop(plan_oid, None)
+                self.logger().warning(f"DEX first: {plan_oid} reported no fill or failure in {self._order_timeout:.0f} s; "
+                                      f"its plan is dropped (its CEX leg was never sent)")
+
         # Only clean up if we have orders to check
         if self._order_timestamps.size() == 0 and self._completed_orders.size() == 0:
             return
@@ -1499,15 +1505,41 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef double c_hold_inflight_base(self):
         """
         Net base this strategy has committed to orders that the settled balance cannot see yet,
-        clamped at >= 0. Off the hot path entirely -- one call site, c_refresh_hold_cache.
+        clamped at >= 0. One call site, c_refresh_hold_cache. The legs (what counts, at what size)
+        are c_hold_inflight_legs'.
 
         WHY. `total` in the caller is a sum of settled wallet balances. An order is invisible to
         it from the moment it is placed until the venue credits the fill, and that window is not
         small: on WARD (2026-08-31) bitget filled in 30ms and sent OrderCompleted 11.3s later.
         `_sb_order_tracker` already spans exactly that window -- an order enters at placement and
         leaves on completion / cancel / failure -- so the missing base is already tracked, for
-        free, by the framework. Nothing new to keep in sync. Without this, the 60s refresh would
-        wipe the dispatch-time credit whenever it landed while an order was still in flight.
+        free, by the framework. Nothing new to keep in sync.
+
+        CLAMPED AT >= 0, deliberately asymmetric. Buys and sells are counted symmetrically first,
+        so a round-trip arb nets to zero and this returns 0 -- the guardrail sees exactly what it
+        saw before. What survives the clamp is a net in-flight ACQUISITION, which can only make
+        the position read higher. A net in-flight DISPOSAL is dropped: letting it read lower could
+        talk the guardrail into buying MORE (the divergent direction, which is this whole bug),
+        and would let a resting sell trip the deactivation hysteresis before the sell actually
+        happened -- re-arming then costs HOLD_BREACH_CYCLES_OVERBOUGHT cycles of unguarded
+        full-size arb, which is the DEXE 2026-07-26 failure. Only the convergent direction is
+        applied.
+        The clamp is for the episode's STATE. A correction's SIZE reads the legs themselves
+        (c_execute_arbitrage, 2026-10-30): an overbought one net of every sell still out, which
+        the clamp drops here (after a refresh the next leg sold a resting one again on top: XDC
+        10-30 02:19:35, 16,807 on a 17,150 remainder).
+        """
+        cdef pair[double, double] legs = self.c_hold_inflight_legs()
+        if legs.first > legs.second:
+            return legs.first - legs.second
+        return 0.0
+
+    cdef pair[double, double] c_hold_inflight_legs(self):
+        """
+        (buy, sell): the base this strategy's orders still have out, by side -- our arb legs, the
+        position balancer's orders (the same tracker) and each DEX-first plan's waiting CEX leg.
+        Read by c_hold_inflight_base (the refresh: their clamped net) and by a correction's sizing
+        in c_execute_arbitrage (its own side, live). (0, 0) when the tracker can't be read.
 
         NO ASSET FILTER, deliberately. This tracker holds only THIS strategy's orders and an
         arb_l strategy is single-asset (the whole hold-band already reads
@@ -1524,23 +1556,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
         the guardrail read $671 -- overbought -- on a ~$143 position and sold 798.6 UP.
         The full `quantity` is kept in two cases:
           - an order fully executed but not yet completed: the WARD window (bitget completed 11.3s
-            after its fill), where the balance may not show the fill yet and a 60s refresh would
-            otherwise wipe the dispatch-time credit;
+            after its fill), where the balance may not show the fill yet;
           - an order the connector can't report (no `in_flight_orders`, not found there, or an
             error): the old over-count, nothing worse.
         `.is_nan()` guards both reads; a NaN would otherwise flow into _cached_total_base_qty and
         silently poison every band comparison downstream.
         PositionBalancerHandler.c_arb_pending_base still counts the full `quantity`.
-
-        CLAMPED AT >= 0, deliberately asymmetric. Buys and sells are counted symmetrically first,
-        so a round-trip arb nets to zero and this returns 0 -- the guardrail sees exactly what it
-        saw before. What survives the clamp is a net in-flight ACQUISITION, which can only make
-        the position read higher. A net in-flight DISPOSAL is dropped: letting it read lower could
-        talk the guardrail into buying MORE (the divergent direction, which is this whole bug),
-        and would let a resting sell trip the deactivation hysteresis before the sell actually
-        happened -- re-arming then costs HOLD_BREACH_CYCLES_OVERBOUGHT cycles of unguarded
-        full-size arb, which is the DEXE 2026-07-26 failure. Only the convergent direction is
-        applied.
 
         COMPLETED ORDERS ARE SKIPPED. BuyOrderCompletedListener calls c_did_complete_buy_order
         (-> c_handle_order_completion -> this refresh) BEFORE c_did_complete_buy_order_tracker
@@ -1554,11 +1575,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
         acquisition (FOLD 10-23 16:40:19: $690, overbought, on a $500 position; two such checks in
         a row would arm a false sell-off, the UP 10-06 class above). Each plan's CEX leg
         (_dex_first_pending) is counted on its side, so the arb nets to zero as a CEX-CEX one does.
-        A hold-trimmed plan's leg is its trimmed size (0 for a one-legged correction, whose DEX leg
-        still counts in full). A plan leaves at its fill (its CEX order then in the tracker) or its
-        failure.
+        Only an in-band arb makes a plan: a correction sends one leg (2026-10-30), and a lone DEX
+        leg is a tracked order, counted in full. A plan leaves at its fill (its CEX order then in
+        the tracker) or its failure.
         """
         cdef:
+            pair[double, double] legs
             double inflight_buy = 0.0
             double inflight_sell = 0.0
             double qty
@@ -1602,7 +1624,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     else:
                         inflight_sell += qty
         except Exception:
-            return 0.0                                # fail-open: behave exactly as before
+            legs.first = 0.0                          # fail-open: nothing counted, as before
+            legs.second = 0.0
+            return legs
         try:                                          # DEX first: the CEX leg that waits for its DEX leg's fill
             for plan in self._dex_first_pending.values():
                 qty = float(plan[2])
@@ -1613,9 +1637,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         inflight_sell += qty
         except Exception:
             pass                                      # the tracker's legs alone, as before
-        if inflight_buy > inflight_sell:
-            return inflight_buy - inflight_sell
-        return 0.0
+        legs.first = inflight_buy
+        legs.second = inflight_sell
+        return legs
 
     cdef double c_hold_unsettled_base(self):
         """
@@ -1718,9 +1742,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 total = self._position_balancer.c_get_aggregated_base_balance(base_asset)
             # Base committed to orders the wallet has not caught up with yet. Gated on
             # _hold_enabled because every reader of _cached_total_base_qty is hold-band code.
+            # The settled part (the wallets + completed fills they don't show yet) is kept on its
+            # own: a correction is sized from it plus its own side's orders still out, live.
             if self._hold_enabled:
-                total += self.c_hold_inflight_base()
                 total += self.c_hold_unsettled_base()
+                self._hold_settled_qty = total
+                total += self.c_hold_inflight_base()
+            else:
+                self._hold_settled_qty = total
             self._cached_total_base_qty = total
 
             # Price: the position bid, each venue's balance at that venue's own top bid
@@ -2268,6 +2297,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double _hold_sell_amount
             double _total_usd
             double _delta_base
+            pair[double, double] _hold_legs
             # Final per-leg Decimal amounts used at order placement
             object _final_buy_qty
             object _final_sell_qty
@@ -2296,64 +2326,57 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 self.logger().info("Insufficient balance or no profitable amount found")
             return
 
-        # ── Hold-band guardrail ───────────────────────────────────────────────────
-        # _hold_correction_active drives everything. It is managed entirely by
-        # c_refresh_hold_cache (60s cleanup cycle + per-trade when already active).
-        # When inactive: both legs run at full `amount`. No other checks needed here.
-        # When active (total confirmed outside band, all venues > $20):
-        #   Overbought → reduce buy leg by (total - target) / bid; sell runs full.
-        #   Oversold   → reduce sell leg by (target - total) / bid; buy runs full — EXCEPT when
-        #               the sell venue holds no base, where the sell leg cannot exist at all and
-        #               the buy is capped at the deficit instead (see that branch).
-        #   If delta ≥ amount, the reduced leg is fully suppressed (set to 0).
-        # Either way the invariant is the same: net base moved per trade == _delta_base.
+        # ── Hold-band guardrail: one side while out of the band ──────────────────
+        # _hold_correction_active / _hold_correction_oversold are set exclusively by c_refresh_hold_cache (60s cycle +
+        # per-trade while active), through c_set_hold_correction; active only with the guardrail on, the price cache warm
+        # and the total confirmed outside the band. Inactive: both legs run at full `amount`.
+        # Active: ONLY the leg toward the target goes out (Pavel 2026-10-30: "when asset(strategy) is out of bounds, lets
+        # only allow one side, depending if it's oversold or overbought"), never more than the gap, so a correction can't
+        # overshoot the target:
+        #   overbought → sell only, at most the excess  (total - target) / bid;
+        #   oversold   → buy only,  at most the deficit (target - total) / bid.
         #
-        # _hold_correction_active is set/cleared exclusively in c_refresh_hold_cache (60s cycle +
-        # per-trade when already active). It is True only when guardrail is enabled, price cache
-        # is warm, and total is confirmed outside the band. Single bint read — zero overhead.
-        # Read once here rather than at the base-cap below: the trim needs it too, so this is
-        # the same single call moved earlier, not an added one.
+        # WHY. Until 2026-10-30 the correction trimmed the leg AWAY from the target and kept both legs whenever the gap was
+        # smaller than the arb's amount, so the position moved by exactly the gap only if BOTH legs filled. The venues
+        # fill each leg on its own: in 10-27 → 10-30, 18 of the 20 overbought two-legged trims filled only the buy (XDC,
+        # NIL, AIC: their HTX sells missed), $1,508 away from the target; the oversold ones moved $281 away and $311 past
+        # it. One-sided, the same 39 arbs: nothing away or past, more toward it, $20 of gross profit given up. A one-sided
+        # trade also never goes DEX first (that needs both legs), so a correction leaves no waiting CEX leg the position
+        # balancer could sell from under it (NIL 10-29 01:32). The rule the zero-sell-venue case followed since WARD
+        # 2026-08-31 (the buy capped at the deficit), now for both directions and every venue.
+        # Wiki: P2 Hummingbot Open Items #correction-writers.
+        #
+        # The GAP is net of the orders already working on it (2026-10-30, Pavel: "build 1"): the settled position at the
+        # last refresh (_hold_settled_qty: the wallets + completed fills they don't show yet) plus every order of this
+        # strategy still out ON THE CORRECTION'S SIDE, live (our legs, the position balancer's, a DEX-first plan's waiting
+        # leg; c_hold_inflight_legs). Not the cached total: its in-flight term drops resting sells (the DEXE clamp, which
+        # is for the episode's state), so after a refresh the next leg sold a resting one again on top (XDC 10-30
+        # 02:19:35: 16,807 on a 17,150 remainder). The other side's orders are left out: counting them would correct now
+        # for an order that may never fill. A leg is counted from its dispatch, so it is no longer credited to the cache.
+        # The one thing this misses: part of a resting leg filled since the last refresh (counted by neither), at most
+        # that part, until the next refresh or the leg's completion.
+        #
+        # The SIDE is the episode's flag, never where the position reads: between refreshes it can read past the target
+        # (resting orders covering the gap, or an oversold flip waiting for its 15 cycles). That is a gap of 0 here
+        # (nothing goes out), never the opposite correction.
+        # Read once here rather than at the base-cap below: the same single call, not an added one.
         sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         _hold_buy_amount  = amount
         _hold_sell_amount = amount
         if self._hold_correction_active:
-            _total_usd = self._cached_total_base_qty * self._cached_mid_price_usd
-
-            if _total_usd > self._hold_target_usd:
-                # Overbought: reduce buy leg by exact excess from target.
-                _delta_base = (_total_usd - self._hold_target_usd) / self._cached_mid_price_usd
-                _hold_buy_amount  = max(0.0, amount - _delta_base)
-                # _hold_sell_amount stays at `amount`
+            _hold_legs = self.c_hold_inflight_legs()
+            if self._hold_correction_oversold:
+                _total_usd = (self._hold_settled_qty + _hold_legs.first) * self._cached_mid_price_usd
+                _delta_base = max(0.0, (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd)
+                _hold_sell_amount = 0.0
+                if _hold_buy_amount > _delta_base:
+                    _hold_buy_amount = _delta_base
             else:
-                # Oversold: reduce sell leg by exact deficit from target.
-                _delta_base = (self._hold_target_usd - _total_usd) / self._cached_mid_price_usd
-                _hold_sell_amount = max(0.0, amount - _delta_base)
-                # _hold_buy_amount stays at `amount`
-                # Zero base on the sell venue: there is no sell leg to place, so this is a
-                # SUPPRESSION, not a proportional trim. The subtraction above cannot express
-                # that — `amount` is sized from the buy ask while `_delta_base` uses the cached
-                # bid, and in any real arb sell_bid > buy_ask, so `amount > _delta_base` and the
-                # max(0.0, ...) clamp never engages. The residue scales WITH the spread
-                # (~5.7% of amount at a 6% edge), so the best opportunities fail hardest:
-                # the base cap below fires on the leftover, then propagates to the buy leg and
-                # zeroes it, killing the very trade the correction wants. Setting it flat here
-                # keeps the existing `_hold_sell_amount == 0` fast path (base cap skipped, leg
-                # dropped at quantization) as the single place zero-sell is handled.
-                if sell_available_now <= EPSILON:
-                    _hold_sell_amount = 0.0
-                    # Zeroing the sell leg also breaks the invariant the trim depends on. With a
-                    # residue sell leg the position moves by exactly _delta_base per trade
-                    # (buy - sell == amount - (amount - _delta_base)); with no sell leg it moves by
-                    # the WHOLE buy leg, and the deficit stops bounding anything. Cap the buy at
-                    # the deficit so net acquisition is the same either way.
-                    #
-                    # Only ever REDUCES, and only inside the branch where the sell venue holds no
-                    # base at all — so a normal two-legged arb never reaches it. In [noesc]
-                    # guardrail-only accumulation the sell venue is empty by definition, which is
-                    # why every fire there was a naked full-size buy (WARD 2026-08-31: three fires
-                    # in 66s, $1450 against a $500 target).
-                    if _hold_buy_amount > _delta_base:
-                        _hold_buy_amount = _delta_base
+                _total_usd = (self._hold_settled_qty - _hold_legs.second) * self._cached_mid_price_usd
+                _delta_base = max(0.0, (_total_usd - self._hold_target_usd) / self._cached_mid_price_usd)
+                _hold_buy_amount = 0.0
+                if _hold_sell_amount > _delta_base:
+                    _hold_sell_amount = _delta_base
 
 
         # ─────────────────────────────────────────────────────────────────────────
@@ -2505,8 +2528,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # strategy"): the price at which the arb still makes min_profitability against its CEX leg's average from this scan,
         # in place of the book's own limit and the swap's 1% room (c_dex_first_limit). None: the book's limit, as before
         cdef object dex_limit = None
-        cdef object hold_trimmed
-        cdef double hold_credit = 0.0
         if dex_first:
             dex_limit = self.c_dex_first_limit(
                 buy_market if buy_is_swap else sell_market, buy_is_swap,
@@ -2573,15 +2594,13 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 return
 
             # DEX first: the CEX leg that waits for the DEX leg's fill (c_fire_dex_first_cex_leg), at this arb's own limit.
-            # The plan also holds the DEX leg's own amount (a hold-band trim keeps its CEX leg's size, less only the swap's
-            # shortfall) and the hold band's credit for this arb (undone if the DEX leg fails: nothing moved)
+            # The plan also holds the DEX leg's own amount (its CEX leg is that plan less the swap's shortfall) and its send
+            # time (c_cleanup_old_orders drops a plan whose swap never reports). Only an in-band arb gets here: a correction
+            # sends one leg (the guardrail above), so a plan carries no hold-band trim or credit any more (2026-10-30).
             if dex_first:
-                hold_trimmed = self._hold_correction_active and _final_buy_qty != _final_sell_qty
-                hold_credit = (float(_final_buy_qty) - float(_final_sell_qty)) if hold_trimmed else 0.0
                 if buy_is_swap and buy_order_id:
                     self._dex_first_pending[buy_order_id] = (
-                        sell_market_tuple, False, _final_sell_qty, sell_price_decimal, hold_trimmed, _final_buy_qty,
-                        hold_credit)
+                        sell_market_tuple, False, _final_sell_qty, sell_price_decimal, _final_buy_qty, self._current_timestamp)
                     self.c_dex_first_watch(buy_market, buy_order_id)
                     self.logger().info(
                         f"DEX first: {buy_market.name} buy {_final_buy_qty} {buy_market_tuple.trading_pair} sent "
@@ -2591,8 +2610,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
                 elif sell_is_swap and sell_order_id:
                     self._dex_first_pending[sell_order_id] = (
-                        buy_market_tuple, True, _final_buy_qty, buy_price_decimal, hold_trimmed, _final_sell_qty,
-                        hold_credit)
+                        buy_market_tuple, True, _final_buy_qty, buy_price_decimal, _final_sell_qty, self._current_timestamp)
                     self.c_dex_first_watch(sell_market, sell_order_id)
                     self.logger().info(
                         f"DEX first: {sell_market.name} sell {_final_sell_qty} {sell_market_tuple.trading_pair} sent "
@@ -2601,8 +2619,8 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         f"{dex_limit if dex_limit is not None else sell_price_decimal} holds "
                         f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
 
-            # Explain the asymmetry: without it the log shows a buy and a sell of DIFFERENT
-            # sizes (or a lone sell) with nothing saying why.
+            # Explain the asymmetry: without it the log shows a lone buy or a lone sell with
+            # nothing saying why. (The line keeps its "legs trimmed" wording: audit tools parse it.)
             #
             # MUST stay here, AFTER placement. It first lived in the trim block ~150 lines up,
             # which is reached on every EVALUATION — and the arb path is evaluated at tick rate
@@ -2615,18 +2633,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
             # Logs the FINAL quantities, not the pre-quantization trim: the notional check can
             # drop a leg the trim sized, so the old line could claim a sell that never went out.
             if self._hold_correction_active and _final_buy_qty != _final_sell_qty:
-                # Credit the cache with the net base we just committed, BEFORE the venue can
-                # confirm any of it. _cached_total_base_qty is rebuilt only on the 60s cycle and
-                # on OrderCompleted -- a FILL does not touch it. Bitget filled in 30ms and sent
-                # OrderCompleted 11.3s later, so the trim re-fired twice against a $0 reading
-                # (WARD 2026-08-31). The net base just sent is information we already hold: no
-                # balance read, no venue round-trip, one double-add on a path that runs at most
-                # once per tick and only while a correction is active. The guard is the log
-                # line's own -- buy != sell is exactly "net position change is non-zero".
+                # No credit to the cache here any more (2026-10-30). It was added for WARD 2026-08-31:
+                # Bitget filled in 30ms and sent OrderCompleted 11.3s later, and the trim re-fired twice
+                # against a $0 reading. A correction is now sized from the settled position plus its
+                # side's orders still out, live (above), and this leg is one of them from this moment
+                # until its completion refreshes the cache: counted once, with nothing to undo when a
+                # placement fails. The guard is the log line's own -- buy != sell is exactly "net
+                # position change is non-zero".
                 #
-                # An async placement failure (MarketOrderFailureEvent) leaves this over-credited
-                # until the next refresh, which errs toward buying LESS -- the safe direction.
-                self._cached_total_base_qty += float(_final_buy_qty) - float(_final_sell_qty)
                 # Each leg's venue balance NOW, before any of its fill can show: at completion it
                 # tells whether that venue has credited the fill yet (c_hold_unsettled_base).
                 try:
@@ -2644,7 +2658,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     pass
                 self.logger().info(
                     f"Hold-band [{buy_market_tuple.base_asset}]: legs trimmed "
-                    f"({'overbought' if _total_usd > self._hold_target_usd else 'oversold'}) — "
+                    f"({'oversold' if self._hold_correction_oversold else 'overbought'}) — "
                     f"buy {float(_final_buy_qty):.6f} sell {float(_final_sell_qty):.6f} "
                     f"of {amount:.6f} | total ${_total_usd:.0f} "
                     f"target ${self._hold_target_usd:.0f} | profit {profitability * 100:.3f}%")
@@ -2825,16 +2839,14 @@ cdef class ArbitrageLStrategy(StrategyBase):
         """DEX first (Pavel 2026-10-17): its DEX leg filled, so the CEX leg goes out now, at the arb's own limit (Pavel: "the
         arb's original CEX limit"). Its size is its plan less the swap's shortfall: an exact-input DEX buy may get a little
         less than its amount, and that much less is hedged. Never more than planned (a swap that got more keeps the extra).
-        For an untrimmed arb that is min(plan, fill); a hold-band trim keeps its intended difference between the legs (Pavel:
-        "fix dex-first sizing but for hold-band affected orders"). Its order starts eagerly (EagerNextTask): the request is
-        on the wire before the order call returns. Tracked like any leg of c_execute_arbitrage, after it went out"""
+        (dex_first_cex_amount.) Its order starts eagerly (EagerNextTask): the request is on the wire before the order call
+        returns. Tracked like any leg of c_execute_arbitrage, after it went out"""
         cdef:
             object cex_tuple = plan[0]
             bint cex_is_buy = plan[1]
             object amount = plan[2]
             object price = plan[3]
-            bint hold_trimmed = plan[4]
-            object dex_amount = plan[5] if len(plan) > 5 else plan[2]
+            object dex_amount = plan[4]
             object filled
             object qty
             object cex_order_id = None
@@ -2872,10 +2884,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 pending[cex_tuple] = set()
             pending[cex_tuple].add(cex_order_id)
             self._placed_order_ids[cex_order_id] = self._current_timestamp
-            if hold_trimmed:          # a correction's leg: as c_execute_arbitrage records it at dispatch
-                self._hold_dispatch_base[cex_order_id] = (
-                    cex_tuple.market, cex_tuple.base_asset, 1.0 if cex_is_buy else -1.0,
-                    float(cex_tuple.market.get_balance(cex_tuple.base_asset)), self._current_timestamp)
         except Exception as e:
             self.logger().warning(f"Failed to track the DEX-first CEX leg {cex_order_id}: {e}")
         self.logger().info(
@@ -3059,8 +3067,6 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # failure"); the global trade gate is reset so the 2 s between trades doesn't delay it. The cap ("3 per 10 s") hands
         # a failure that is no lost race to the usual cooldown below
         dex_first_plan = self._dex_first_pending.pop(order_id, None)
-        if dex_first_plan is not None:                              # its hold-band credit undone: neither leg moved
-            self._cached_total_base_qty = dex_first_cache_after_failure(self._cached_total_base_qty, dex_first_plan)
         if dex_first_plan is not None and market_pair_tuple is not None:
             fails = [t for t in self._dex_first_failures.get(market_pair_tuple, [])
                      if self._current_timestamp - t < DEX_FIRST_WINDOW_S]
