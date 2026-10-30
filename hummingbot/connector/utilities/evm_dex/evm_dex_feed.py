@@ -12,6 +12,8 @@ which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5
   - each swap's build (its book's route, its limit and room), signing and bundle send; each approval's; each signed
     transaction's line in the swap ledger first (the asset manager's tag for the wallet's fills, P3-DEX decision 3);
   - the wallet's nonce, and every transaction it sends followed to its receipt or its last block;
+  - each swap that failed (dropped, reverted, or refused by every builder) diagnosed after its end: a pool it can't go through
+    sits out, re-tested every 15 min, so a CA's other pools keep trading (_diagnose; P2-DEX #rad-blacklisted-pool);
   - the wallet lease (P3-DEX decision 2): a heartbeat each poll; while another sender (the asset manager's withdraw) holds a
     valid request, no book shown and nothing signed, the grant once nothing signed is out, the nonce read anew at release.
 HMB's side (evm_dex_exchange.EvmDexExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
@@ -42,8 +44,8 @@ import aiohttp
 
 from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import adr, word
 from hummingbot.connector.utilities.evm_dex.evm_dex_pool_list import PoolList
-from hummingbot.connector.utilities.evm_dex.evm_dex_quoter import EvmDexQuoter
-from hummingbot.connector.utilities.evm_dex.evm_dex_swap import build_swap, executor
+from hummingbot.connector.utilities.evm_dex.evm_dex_quoter import REELECT_S, EvmDexQuoter
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import build_prefix, build_swap, executor, legs
 from hummingbot.connector.utilities.evm_dex.evm_dex_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
                                                                 parse_receipt, sign)
 
@@ -52,6 +54,7 @@ FEED_RESTART_S = 5.0      # a child that ended on its own is started again no so
 FEED_STOP_S = 2.0         # a stop waits this long for the child to end, then kills it
 FEED_HUNG_S = 30.0        # a running child that sent no poll for this long is killed and started again
 STDERR_KEPT = 30          # the child's last stderr lines kept, shown when it ends on its own (a traceback fits)
+TEST_USD = 10.0           # a failed swap's route is simulated with this much of its input, at a minimum of 1 (_diagnose)
 # the core's modules the child runs, each after the ones it imports; the chain's spec is handed over with them (sources_for)
 WORKER_MODULES = ("evm_dex_p1_quoter", "evm_dex_swap", "evm_dex_pool_list", "evm_dex_quoter", "evm_dex_tx", "evm_dex_feed")
 # what HMB keeps of a swap out (its settle, its line): the rest of the swap (its calldata, its executor) stays in the child
@@ -177,6 +180,20 @@ def answer_of(url: str, ans, err, ms: float) -> tuple:
     return builder_label(url), round(ms, 1), verdict
 
 
+def revert_reason(data) -> str:
+    """what a revert's data says: Error(string)'s text, also inside a Universal Router's ExecutionFailed(index, bytes); else
+    the error's selector ("" without data)"""
+    try:
+        raw = bytes.fromhex(str(data)[2:]) if str(data).startswith("0x") else b""
+        if raw[:4].hex() == "2c4029e9":                      # ExecutionFailed(uint256 commandIndex, bytes message)
+            raw = raw[100:100 + int.from_bytes(raw[68:100], "big")]
+        if raw[:4].hex() == "08c379a0":                      # Error(string)
+            return raw[68:68 + int.from_bytes(raw[36:68], "big")].decode("utf-8", "replace")
+        return "0x" + raw[:4].hex() if raw else ""
+    except ValueError:
+        return ""
+
+
 # ---------------------------------------------------------------- the child's side: the chain
 class Feed:
     """The feed process's work (one per child; a test runs it in-process over the same frames). It polls once a block, on
@@ -209,6 +226,8 @@ class Feed:
         self.wanted: List[str] = list(init.get("cas") or [])
         self.caps: Dict[str, dict] = dict(init.get("caps") or {})
         self.approvals: Dict[tuple, bool] = {}
+        self.wallet_read: dict = {}                   # the wallet's last read (decode_wallet): a diagnosis's test amount and block
+        self._diagnosing: set = set()                 # the routes being diagnosed (_diagnose: one at a time each)
         self.nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self.out: Dict[str, dict] = dict(init.get("follow") or {})   # order id -> a swap out (HMB's, after a restart too)
         self.ledger_path = init.get("ledger")         # the swap ledger: every transaction signed gets its line before it goes out
@@ -560,12 +579,15 @@ class Feed:
         if plan and [c for c, _ in got] == plan["calls"]:   # this poll's answers (an older block's poll gives back the last)
             wallet = decode_wallet(self.C, plan, [a for _, a in got], last.get("block"), self.wallet)
             self.approvals.update(wallet["approvals"])
+            self.wallet_read = wallet
         books = {} if leased else {ca: {side: self._side(ca, side, book) for side, book in sides.items()}
                                    for ca, sides in (last.get("books") or {}).items()}
         self.send(("poll", {"block": last["block"], "ts": last["ts"], "at": last["at"], "books": books, "wallet": wallet,
                             "stats": dict(self.quoter.stats), "lease": self.lease["id"] if leased and self.lease else None}))
         if wallet is not None:
             self._after_wallet_read()
+            if not leased:
+                self._retests_due()
 
     def _side(self, ca: str, side: str, book: Optional[dict]) -> List[list]:
         """a book side's levels, or none while the wallet can't pay that side's input (USDT to buy, the CA to sell) into its
@@ -601,7 +623,11 @@ class Feed:
         if not rungs:
             raise Refused("the book has no priced route")
         rung = next((r for r in rungs if r >= usd), rungs[-1])
-        return book, book["record"], book["routes"][rung]
+        hops = book["routes"][rung]
+        out = next((h["pool"] for h in [book["record"]] + hops if h["pool"] in self.quoter.benched), None)
+        if out:                                        # benched since this book's poll: the next poll's books are without it
+            raise Refused(f"pool {out} sits out (a swap through it reverted)")
+        return book, book["record"], hops
 
     def _trade_usd(self, ca: str, side: str, amount: Decimal, price: Decimal) -> float:
         """the trade's own USD size, for its route's rung: its book's value of `amount`, not amount x limit. The limit can sit
@@ -681,7 +707,8 @@ class Feed:
         except ValueError as e:
             raise Refused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
-                    book_block=book_block, book_at=book_at, head=head, expected_out=expected_out)
+                    book_block=book_block, book_at=book_at, head=head, expected_out=expected_out,
+                    route={"record": record, "hops": hops, "side": side})
 
     def _head_now(self, last: dict) -> int:
         """the chain's head now from a poll's block: that block plus the blocks since (Pavel 2026-10-15: the send reads
@@ -696,7 +723,7 @@ class Feed:
         """HMB's order (its turn already taken there) as one swap: built (_swap_for), signed and sent (_send_tx). HMB is told
         "signed" with its hash the moment it may be out, then "sent" or "refused" (nothing went out, why); a swap out is
         followed to its end here (_follow)"""
-        record = {}
+        record, route = {}, None
 
         def signed():
             self.out[order_id] = record
@@ -705,6 +732,7 @@ class Feed:
             if self.account is None:
                 raise Refused(f"no wallet key: connect {self.C.EXCHANGE_NAME} with {self.C.EXCHANGE_NAME}_private_key")
             swap = self._swap_for(p["ca"], p["side"], p["amount"], p["price"])
+            route = swap["route"]
             if not self.approvals.get((swap["token_in"], swap["executor"]["router"])):
                 raise Refused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
             record.update({k: swap[k] for k in SWAP_KEYS}, trading_pair=p["trading_pair"])
@@ -718,9 +746,11 @@ class Feed:
             self.out.pop(order_id, None)
             why = str(e) if isinstance(e, Refused) else f"{type(e).__name__}: {e}"
             self.send(("swap", order_id, "refused", self._mask(why), "send" if isinstance(e, SendRefused) else "order"))
+            if isinstance(e, SendRefused):                 # BSC's builders simulate at the send: a revert is refused there
+                self._spawn(self._diagnose(order_id, route))
             return
         self.send(("swap", order_id, "sent", dict(record)))
-        self._spawn(self._follow(order_id, record))
+        self._spawn(self._follow(order_id, record, route))
 
     async def _send_tx(self, record: dict, to: str, data: bytes, value: int, gas: int, ledger: dict,
                        head: Optional[int] = None, on_signed: Optional[Callable[[], None]] = None):
@@ -1018,9 +1048,10 @@ class Feed:
             record["warned"] = now
             self._log("warning", text)
 
-    async def _follow(self, order_id: str, record: dict):
+    async def _follow(self, order_id: str, record: dict, route: Optional[dict] = None):
         """a swap out, to its end: HMB gets ("ended", its receipt parsed, where it landed), or None when it was not included
-        by its last block (its nonce is then read anew first, so HMB frees the turn with the nonce known)"""
+        by its last block (its nonce is then read anew first, so HMB frees the turn with the nonce known). A swap that failed
+        is diagnosed after that (_diagnose; `route`: its book's, None for a swap out before a restart)"""
         receipt = await self._until_ended(record, f"{order_id} {record['tx_hash']}")
         parsed = info = None
         if receipt is None:
@@ -1034,6 +1065,8 @@ class Feed:
         self.send(("ended", order_id, parsed, info, list(record.get("builders") or [])))
         if receipt is None and getattr(self.C, "SENDER", "") == "bundle_per_block":
             self._spawn(self._dropped_block(order_id, record["last_block"]))     # after its end: nothing waits on it
+        if route is not None and (parsed is None or parsed["status"] == "reverted"):
+            self._spawn(self._diagnose(order_id, route))                         # after its end too
 
     async def _dropped_block(self, order_id: str, block: int):
         """who built the block a bundle missed, one INFO line after the drop's own (P2-DEX findings 10 and 11, Pavel 2026-10-23:
@@ -1049,6 +1082,132 @@ class Feed:
             raise
         except Exception as e:
             self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
+
+    # ---------------------------------------------------------------- a failed swap: a pool that can't execute, or a lost race
+    async def _diagnose(self, order_id: str, route: dict):
+        """a swap that failed (dropped, mined and reverted, or refused by every builder): a pool that can't execute, or a
+        lost race? (P2-DEX #rad-blacklisted-pool, Pavel 2026-10-30: "make sure we handle it properly on P2 side, and retry
+        for when it gets unlocked, also making sure we cover all the pools properly, so if there is another one that is also
+        profitable our logic does not get stuck retrying the blocked one"). After its end went to HMB, off the send path,
+        its route is simulated with TEST_USD of its input and a minimum of 1, so a moved price can't revert it (_simulate):
+          - it passes: a lost race, or a price that moved; nothing changes;
+          - it reverts: its prefixes (the first leg alone, then the first two, ...) name the first pool it breaks at, which
+            sits out (_bench) and is re-tested every REELECT_S (_retest);
+          - no clear answer, or the wallet can't fund the test (_test_amount): not tested, nothing benched (a pool is never
+            blamed for our balance or a node's trouble).
+        Every simulation runs at the block of the wallet read that funds it, so a balance spent since can't revert one, and
+        the prefixes see the state the whole route did"""
+        path = legs(route["record"], route["hops"], route["side"])
+        pools = [pool["pool"] for pool, _, _ in path]
+        key = (route["side"], *pools)
+        if key in self._diagnosing or any(pl in self.quoter.benched for pl in pools):
+            return                                     # being diagnosed, or benched already
+        self._diagnosing.add(key)
+        name = f"{self.C.EXCHANGE_NAME}: {order_id}"
+        try:
+            amount, block, why = self._test_amount(route)
+            verdict = None
+            if amount is not None:
+                verdict, why = await self._simulate(route, len(path), amount, block)
+            if verdict is None:
+                self._log("info", f"{name}: its route was not tested ({why})")
+                return
+            if verdict:
+                self._log("debug", f"{name}: its route passes a ${TEST_USD:g} simulation now (a lost race): nothing benched")
+                return
+            n, reason = len(path), why
+            for k in range(1, len(path)):
+                verdict, why = await self._simulate(route, k, amount, block)
+                if verdict is None:
+                    self._log("info", f"{name}: its route reverts ({reason}); its pools were not tested ({why})")
+                    return
+                if not verdict:
+                    n, reason = k, why
+                    break
+            self._bench(path[n - 1][0], dict(route, n=n), reason, name)
+        finally:
+            self._diagnosing.discard(key)
+
+    def _test_amount(self, route: dict) -> Tuple[Optional[int], Optional[int], str]:
+        """TEST_USD of the route's input, raw (USDT to buy, the CA to sell), when the wallet's last read holds that much and
+        it is approved for the route's executor -> (amount, that read's block, "") or (None, None, why not)"""
+        ca, side, read = route["record"]["ca"], route["side"], self.wallet_read
+        if side == "buy":
+            token, amount = self.C.USDT, int(TEST_USD * 10 ** self.C.USDT_DECIMALS)
+        else:
+            token, amount = ca, self.quoter._ca_amount(ca, TEST_USD) if ca in self.quoter.cas else None
+        held = (read.get("balances") or {}).get(token)
+        if not amount or held is None or held < amount or read.get("block") is None:
+            return None, None, f"the wallet holds under ${TEST_USD:g} of its input"
+        ex = executor(self.C, route["record"])
+        if not ex or not self.approvals.get((token, ex["router"])):
+            return None, None, "its input is not approved for its executor"
+        return amount, read["block"], ""
+
+    async def _simulate(self, route: dict, n: int, amount: int, block: int) -> Tuple[Optional[bool], str]:
+        """the route's first `n` legs as one swap of `amount` at a minimum of 1 (build_prefix), simulated from the wallet:
+        an eth_call at `block` on SWAP_STATUS_URL, nothing signed -> (True, "") it passes, (False, why) it reverts, (None,
+        why) no clear answer (a node's error, a timeout)"""
+        try:
+            swap = build_prefix(self.C, route["record"], route["hops"], route["side"], n, amount, self.wallet)
+        except ValueError as e:
+            return None, f"not built: {e}"
+        call = {"from": self.wallet, "to": swap["to"], "data": "0x" + swap["data"].hex(), "value": hex(swap["value"])}
+        try:
+            ans = json.loads(await self._post_to(self.status_url, json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [call, hex(block)]}).encode()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, self._mask(e)[:160]
+        if isinstance(ans, dict) and "result" in ans:
+            return True, ""
+        err = ans.get("error") if isinstance(ans, dict) else ans
+        text = str(err.get("message") if isinstance(err, dict) else err)
+        if "revert" not in text.lower():
+            return None, self._mask(text)[:160]
+        reason = revert_reason(err.get("data")) if isinstance(err, dict) else ""
+        return False, (f"{text}: {reason}" if reason and reason not in text else text)[:160]
+
+    def _bench(self, pool: dict, test: dict, why: str, name: str):
+        """the pool a failed route breaks at sits out (EvmDexQuoter.bench), its re-test the route up to it (`test`)"""
+        now = time.time()
+        cas = self.quoter.bench(pool["pool"], {"test": test, "why": why, "since": now, "next": now + REELECT_S})
+        self._log("warning", f"{name}: pool {pool['pool']} ({pool.get('type')}) reverts a ${TEST_USD:g} {test['side']} "
+                             f"({why}): it sits out, re-tested every {REELECT_S / 60:g} min; the books through it ("
+                             f"{self._tickers(cas)}) go to the next-best pool, or none")
+
+    def _retests_due(self):
+        """every REELECT_S, each benched pool's re-test (_retest), in the background; a pool no CA trades through any more
+        leaves the bench untested"""
+        now = time.time()
+        for pool, entry in list(self.quoter.benched.items()):
+            if now < entry["next"]:
+                continue
+            entry["next"] = now + REELECT_S            # the next one, whatever this one finds
+            if self.quoter.users(pool):
+                self._spawn(self._retest(pool, entry))
+            else:
+                del self.quoter.benched[pool]
+
+    async def _retest(self, pool: str, entry: dict):
+        """a benched pool's route simulated again (TEST_USD, a minimum of 1): it passes -> the pool takes part again
+        (EvmDexQuoter.unbench, one INFO line); it reverts, or can't be tested -> it sits out until the next re-test"""
+        amount, block, why = self._test_amount(entry["test"])
+        verdict = None
+        if amount is not None:
+            verdict, why = await self._simulate(entry["test"], entry["test"]["n"], amount, block)
+        name = f"{self.C.EXCHANGE_NAME}: pool {pool}"
+        if verdict:
+            cas = self.quoter.unbench(pool)
+            self._log("info", f"{name} passes its re-test (a ${TEST_USD:g} {entry['test']['side']}) after "
+                              f"{(time.time() - entry['since']) / 60:.0f} min: it takes part again; elected again with it: "
+                              f"{self._tickers(cas)}")
+        else:
+            self._log("debug", f"{name} still sits out: its re-test {'reverts' if verdict is False else 'did not run'} ({why})")
+
+    def _tickers(self, cas: List[str]) -> str:
+        return ", ".join(sorted((self.pool_list.cas.get(ca) or {}).get("ticker") or ca for ca in cas)) or "no CA"
 
     async def _approve(self, call_id: str, call: Tuple[str, bytes]):
         """one one-time approval, sent like a swap (its turn taken in HMB) and followed to its end here"""

@@ -23,6 +23,9 @@ ws_book_checker/core/dex_quoter.py, copied unchanged (md5 d660f253…, 2026-10-2
 Election (Q7, Pavel 2026-10-14): per (CA, side) the pool with the best price at the largest rung any of the CA's pools fills
 ($1,000 when one does), at start, every REELECT_S and whenever P1's pools for the CA change. The watch: a pool whose $100 beats
 the elected pool's $100 by more than SWITCH_BPS takes the side's book for as long as it does (a dislocation).
+A pool a swap can't go through sits out (bench; evm_dex_feed's diagnosis of a failed swap, P2-DEX #rad-blacklisted-pool,
+Pavel 2026-10-30): no election, watch, book or hop route takes it, and a CA whose book it was is elected again among its
+other pools (none left: no book), until its re-test passes (unbench).
 Taxes (P1's per-pool `tax_pct`, D17 / D30: the CA's and its counter's route taxes): every price is net of the trade's own
 tax, so a taxed pool competes at what it really pays. An ask is divided by (1 - buy tax) (fewer CA arrive), a bid multiplied by
 (1 - sell tax). The `transfer` tax (wallet <-> CEX) is a rebalancing cost, not a trade's.
@@ -111,6 +114,8 @@ class EvmDexQuoter:
         self.switched: Dict[tuple, str] = {}      # (ca, side) -> pool, while its $100 beats the elected one by > SWITCH_BPS
         self.elected_at: Dict[str, float] = {}    # ca -> when its pools were last elected
         self.electing: Set[str] = set()           # CAs whose every pool gets its full ladder in the next poll
+        self.benched: Dict[str, dict] = {}        # pool -> why it sits out and its re-test (evm_dex_feed's entry): a pool a
+                                                  # swap can't go through, taken by no election, watch, book or hop route
         self.caps: Dict[str, dict] = {}           # ca -> {"buy": USD the wallet can spend, "sell": raw CA it holds}: the
                                                   # connector sets it before each poll ({}: none known, the $100 rung only)
         self.rungs: Dict[tuple, list] = {}        # (ca, side) -> [(USD, raw CA amount or None)]: this poll's ladder
@@ -225,7 +230,7 @@ class EvmDexQuoter:
         """the best quote per link, size and side, in the next token per link token: selling wants the highest, buying the lowest"""
         rates = {}
         for k, h, s, side, amt, i in plan:
-            out = hop_amount(h, *res[i])
+            out = hop_amount(h, *res[i]) if h["pool"] not in self.benched else None
             if not out:
                 continue
             link = self.links[k]
@@ -265,6 +270,34 @@ class EvmDexQuoter:
             route.append(self.links[k]["pools"][r[1]])
         return route
 
+    # ---------------------------------------------------------------- pools that sit out
+    def bench(self, pool: str, entry: dict) -> List[str]:
+        """a pool a swap can't go through sits out from now: no election, watch, book or hop route takes it (_top_prices,
+        _ladder_avgs, _hop_rates). The CAs that trade through it are elected again at the next poll: a book it held goes to
+        the CA's next-best pool, or to none -> those CAs"""
+        self.benched[pool] = entry
+        hit = self.users(pool)
+        for ca in hit:
+            for side in SIDES:
+                for chosen in (self.elected, self.switched):
+                    if chosen.get((ca, side)) == pool:
+                        del chosen[(ca, side)]
+        self.electing.update(hit)
+        return hit
+
+    def unbench(self, pool: str) -> List[str]:
+        """a benched pool whose re-test passed takes part again: the CAs that trade through it are elected again at the next
+        poll (it may win its book back) -> those CAs"""
+        self.benched.pop(pool, None)
+        hit = self.users(pool)
+        self.electing.update(hit)
+        return hit
+
+    def users(self, pool: str) -> List[str]:
+        """the CAs that trade through `pool`: as one of their pools, or as a hop candidate of one"""
+        return [ca for ca, m in self.cas.items() if any(
+            p["pool"] == pool or any(h["pool"] == pool for link in p["hop_path"] for h in link) for p in m["pools"])]
+
     # ---------------------------------------------------------------- the poll
     async def poll(self) -> dict:
         now = time.time()
@@ -285,7 +318,8 @@ class EvmDexQuoter:
         for ca, m in self.cas.items():
             for side in SIDES:
                 book_pool = self.switched.get((ca, side)) or self.elected.get((ca, side))
-                in_use += [(p, ca, side) for p in m["pools"] if ca in self.electing or p["pool"] == book_pool]
+                in_use += [(p, ca, side) for p in m["pools"]
+                           if p["pool"] not in self.benched and (ca in self.electing or p["pool"] == book_pool)]
         deep = []
         for p, ca, side in in_use:
             k = (p["pool"], ca, side)
@@ -397,6 +431,8 @@ class EvmDexQuoter:
         """(ca, side) -> {pool: (usd per CA, qty CA)} at $100, the counter converted along its family path, net of the trade's tax"""
         out = {}
         for (pool, ca, side), (p, s, amt, q) in quotes.items():
+            if pool in self.benched:
+                continue
             usd = self._usd(rates, self._canon(p["counter"]["token"]), p["family"], RUNGS_USD[0], side)
             f = tax_factor(p, side)
             if not q or not amt or not usd or not f:
@@ -411,7 +447,7 @@ class EvmDexQuoter:
         rung without a hop quote"""
         lad = self.ladders.get((p["pool"], ca, side))
         f = tax_factor(p, side)
-        if not lad or lad["t"] != now or not f:
+        if not lad or lad["t"] != now or not f or p["pool"] in self.benched:
             return []
         out = []
         for a_raw, q_raw, rung in lad["pts"]:

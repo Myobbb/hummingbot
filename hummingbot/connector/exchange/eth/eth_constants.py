@@ -56,7 +56,9 @@ PRIORITY_FEE_WEI = 50_000_000     # 0.05 gwei
 MAX_FEE_CAP_WEI = GAS_CAP_USD * 10 ** 18 // (NATIVE_USD_APPROX * SWAP_GAS_TYPICAL)   # ~9.09 gwei: ~$5 a swap
 SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * MAX_FEE_CAP_WEI).scaleb(-18)   # the most one swap can cost (~0.0036 ETH): below
                                                                               # it, nothing trades
-APPROVED_AT_LEAST = 1 << 128      # an allowance this large counts as approved (the approvals are for the maximum amount)
+APPROVED_AT_LEAST = 1 << 95       # an allowance this large counts as approved (the approvals are for the maximum amount;
+                                  # 2^95: a token that caps an allowance at 96 bits, as RAD / COMP / UNI store a max approve
+                                  # as 2^96 - 1, reads as approved; P2-DEX #rad-blacklisted-pool, 2026-10-30)
 APPROVE_RETRY_S = 300.0
 APPROVE_RETRY_MAX_S = 3600.0
 # An order under this notional is refused (the connector's trading rule; the strategies' own floor, arb_l's min_order_usd,

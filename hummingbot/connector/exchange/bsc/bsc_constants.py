@@ -52,7 +52,9 @@ SWAP_GAS_LIMIT = 400_000          # the most a swap may use; unused gas is not p
 APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
 GAS_PRICE_WEI = 50_000_000        # 0.05 gwei: BSC's floor. All 35 of the Sending session's live sends landed at it
 SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * GAS_PRICE_WEI).scaleb(-18)   # the most one swap can cost: below it, nothing trades
-APPROVED_AT_LEAST = 1 << 128      # an allowance this large counts as approved (the approvals are for the maximum amount)
+APPROVED_AT_LEAST = 1 << 95       # an allowance this large counts as approved (the approvals are for the maximum amount;
+                                  # 2^95: a token that caps an allowance at 96 bits, as RAD / COMP / UNI store a max approve
+                                  # as 2^96 - 1, reads as approved; P2-DEX #rad-blacklisted-pool, 2026-10-30)
 # an approval that did not land (reverted, not included, or refused by every builder) is tried again only after a back-off
 # that starts here and doubles each time, up to the cap: one that can never land (a token whose approve always reverts)
 # would otherwise hold the wallet's one turn for up to BUNDLE_BLOCKS x BLOCK_S at every balance read (Pavel 2026-10-15)

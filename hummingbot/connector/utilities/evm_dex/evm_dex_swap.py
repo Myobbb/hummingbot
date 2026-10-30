@@ -8,6 +8,8 @@ An order is an EXACT-INPUT swap along the book's route, the one that priced it (
   sell (the CA sold):   the CA in -> the CA pool -> the counter -> the hops to USDT -> USDT out, to the wallet.
 Exact input everywhere: the v2 fee-on-transfer swaps and every pool type support it, and the wallet always pays a known amount.
 The minimum output is the last pool's own output check; intermediate legs carry 0 (the final minimum covers the whole path).
+A route's first legs alone (build_prefix) are built the same way: evm_dex_feed simulates them after a swap fails, to name the
+pool it broke at (P2-DEX #rad-blacklisted-pool).
 
 Executors (decision 2: official routers; one call chains one family only, Q5), pinned per chain in its spec:
   - a Universal-Router family (`C.EXECUTORS`): its router (v2, v3 and its v4-type pools), paid through its Permit2;
@@ -155,6 +157,24 @@ def build_swap(C, record: dict, hops: List[dict], side: str, amount_in: int, min
     Raises ValueError for a route P2 can't execute (see no_executor) or that doesn't chain."""
     path = legs(record, hops, side)
     token_in, token_out = (C.USDT, record["ca"].lower()) if side == "buy" else (record["ca"].lower(), C.USDT)
+    return _route_call(C, record, path, token_in, token_out, amount_in, min_out, wallet, deadline)
+
+
+def build_prefix(C, record: dict, hops: List[dict], side: str, n: int, amount_in: int, wallet: str,
+                 deadline: Optional[int] = None) -> Dict:
+    """the swap's first `n` legs as a swap of their own (build_swap's dict, `token_out` the n-th pool's output): `amount_in`
+    of the order's input, at least 1 raw unit out to `wallet`. Never sent: evm_dex_feed simulates these to name the pool a
+    route that reverts breaks at (n = every leg: the whole route at a minimum of 1)"""
+    path = legs(record, hops, side)
+    if not 1 <= n <= len(path):
+        raise ValueError(f"no prefix of {n} legs in a route of {len(path)}")
+    token_in = C.USDT if side == "buy" else record["ca"].lower()
+    return _route_call(C, record, path[:n], token_in, path[n - 1][2], amount_in, 1, wallet, deadline)
+
+
+def _route_call(C, record: dict, path: List[Tuple[dict, str, str]], token_in: str, token_out: str, amount_in: int,
+                min_out: int, wallet: str, deadline: Optional[int]) -> Dict:
+    """the executor's call for these legs (build_swap's dict)"""
     check_legs(C, path, token_in, token_out)
     for pool, _, _ in path:
         problem = no_executor(C, dict(pool, family=record.get("family")))
