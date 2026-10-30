@@ -1596,6 +1596,34 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if not active or since <= 0.0:
                 continue
 
+            # Every hold-band line is tagged with the BASE ASSET, while this sweep only knows the
+            # STRATEGY NAME — and they differ whenever a strategy is named for its venues
+            # (tnk_gate_mexc/TNK, AIC_gate_htx/AIC, QORPO_bb_kc_mexc/QORPO). Log both so the two
+            # sides can be grepped together; without it a per-asset join silently mis-reports
+            # those strategies as "never converged" (seen in the 2026-07-31 audit).
+            try:
+                base_asset = instance.market_pairs[0].base_asset
+            except Exception:
+                base_asset = instance.name
+            label = instance.name if base_asset == instance.name else f"{instance.name} [{base_asset}]"
+
+            # A position-balancer side armed AGAINST the correction stops (Pavel 2026-10-30: "stop active sell-off/buy-in
+            # if hold gets activated in opposite direction"): a sell-off still running once the hold band corrects
+            # oversold, a buy-in once it corrects overbought. Stopped only, its target untouched; the side the correction
+            # needs is armed below on the episode's own clock, as for any episode. Target 0 is a clean's: its own sell-off,
+            # never touched here (clean leaves the episode as it was: an oversold one would stop the clean's sell-off).
+            position_balancer = getattr(strategy, '_position_balancer', None)
+            if target_usd > 0.0 and position_balancer is not None and (position_balancer.is_sell_enabled if oversold
+                                                                       else position_balancer.is_buy_enabled):
+                if oversold:
+                    position_balancer.disable_sell_off()
+                else:
+                    position_balancer.disable_buy_in()
+                self.logger().info(
+                    f"Hold-band '{label}': correcting {'oversold' if oversold else 'overbought'} (target ${target_usd:.0f}, "
+                    f"current ${total_usd:.0f}) — position balancer {'sell-off' if oversold else 'buy-in'} stopped: "
+                    f"it worked against the correction")
+
             # RIPENESS = time since the LATER of (episode start, our last arm for this strategy).
             # That single expression is the whole rate limit: at most one arm per
             # HOLD_ESCALATION_AFTER, per strategy.
@@ -1634,21 +1662,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             if oversold and instance.config.get('hold_escalation_enabled', True) is False:
                 continue
 
-            # Every hold-band line is tagged with the BASE ASSET, while this sweep only knows the
-            # STRATEGY NAME — and they differ whenever a strategy is named for its venues
-            # (tnk_gate_mexc/TNK, AIC_gate_htx/AIC, QORPO_bb_kc_mexc/QORPO). Log both so the two
-            # sides can be grepped together; without it a per-asset join silently mis-reports
-            # those strategies as "never converged" (seen in the 2026-07-31 audit).
-            try:
-                base_asset = instance.market_pairs[0].base_asset
-            except Exception:
-                base_asset = instance.name
-            label = instance.name if base_asset == instance.name else f"{instance.name} [{base_asset}]"
-
             # Past this point the correction is RIPE (active, older than the threshold, and not
             # rate-limited). Anything that stops us now is worth one throttled line — silence
             # here is what makes "why did nothing happen after 4h?" undiagnosable.
-            position_balancer = getattr(strategy, '_position_balancer', None)
             skip_reason = None
             if position_balancer is None:
                 skip_reason = "strategy has no position balancer"

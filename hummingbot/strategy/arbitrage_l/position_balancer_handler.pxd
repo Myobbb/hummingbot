@@ -24,8 +24,6 @@ cdef class PositionBalancerHandler:
         bint _buy_completed
         bint _sell_completed
         # Pending order tracking
-        dict _pending_buy_by_asset
-        dict _pending_sell_by_asset
         dict _pending_buy_orders
         dict _pending_sell_orders
         # Limit order refresh
@@ -99,8 +97,10 @@ cdef class PositionBalancerHandler:
     cdef void c_cancel_all_sell_orders(self)
     cdef void c_maybe_disable_buy(self)
     cdef void c_maybe_disable_sell(self)
+    cdef str c_log_asset(self)
     cdef double c_get_pending_buy_base(self, str asset)
     cdef double c_get_pending_sell_base(self, str asset)
+    cdef double c_pending_base(self, dict pending_orders, str asset)
     cdef pair[double, double] c_compute_value_and_buy_shortfall(self, double base_balance, double last_bid)
     cdef pair[double, double] c_compute_value_and_sell_excess(self, double base_balance, double last_bid)
     cdef list c_asset_venues(self, str asset)

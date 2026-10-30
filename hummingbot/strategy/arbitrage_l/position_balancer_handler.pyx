@@ -158,7 +158,8 @@ cdef double STEP_UP_COOLDOWN       = 3.0    # short post-cancel cooldown for a s
 #   REFUGE --(fill | order lands on another venue | backstop: jumper gone or we sank | enable_*)--> NORMAL
 # While in REFUGE we SUPPRESS the frontrun/undercut trigger (we intend to sit 2nd-best) and place
 # at wall ∓ 1 tick (c_refuge_wall) instead of top ∓ 1 tick. CHECK 4 re-parks every
-# REFUGE_REPARK_INTERVAL; the backstop (should_backstop_refresh) decides the exit.
+# REFUGE_REPARK_INTERVAL while the frontrunner is still ahead of us (once it has left we hold the best
+# price: no re-park); the backstop (should_backstop_refresh) decides the exit.
 # Entry is on streak alone; the WALL SEARCH (not an entry gate) is what guarantees we hide under
 # a distinct level — see REFUGE_MIN_WALL_GAP_TICKS below. Placement falls back to top if the book
 # has no usable second level.
@@ -341,9 +342,8 @@ cdef class PositionBalancerHandler:
         self._buy_completed = False
         self._sell_completed = False
 
-        # Pending order tracking (separate for buy/sell)
-        self._pending_buy_by_asset = {}   # asset -> base amount pending
-        self._pending_sell_by_asset = {}  # asset -> base amount pending
+        # Pending order tracking (separate for buy/sell): the ONE record of what is in flight. The pending
+        # base is read from it (c_get_pending_*_base), never kept as a separate running sum.
         self._pending_buy_orders = {}     # order_id -> (asset, total_amount, filled_amount)
         self._pending_sell_orders = {}    # order_id -> (asset, total_amount, filled_amount)
 
@@ -654,9 +654,12 @@ cdef class PositionBalancerHandler:
             self._buy_enabled = False
             # Cancel all active buy orders
             self.c_cancel_all_buy_orders()
+            # Names the asset and its target: with every strategy logging through one logger, a line without
+            # them cannot be attributed (2026-10-30 review).
             self.strategy.log_with_clock(
                 logging.INFO,
-                "Buy-in target reached. Cancelled all buy orders and disabled buy-in for this session.")
+                f"Buy-in target reached for {self.c_log_asset()} (target ${self._buy_target_usd:.2f}). "
+                f"Cancelled all buy orders and disabled buy-in for this session.")
 
     cdef void c_maybe_disable_sell(self):
         """Disable sell-off globally once target is reached, cancel orders, and clean up."""
@@ -666,38 +669,48 @@ cdef class PositionBalancerHandler:
             self.c_cancel_all_sell_orders()
             self.strategy.log_with_clock(
                 logging.INFO,
-                "Sell-off target reached. Cancelled all sell orders and disabled sell-off for this session.")
+                f"Sell-off target reached for {self.c_log_asset()} (target ${self._sell_target_usd:.2f}). "
+                f"Cancelled all sell orders and disabled sell-off for this session.")
+
+    cdef str c_log_asset(self):
+        """The asset this balancer manages (its strategy's first pair's base, canonical), for log lines."""
+        try:
+            return self._get_canonical_asset(self.strategy._market_pairs[0].first.base_asset)
+        except Exception:
+            return "?"
 
     cdef double c_get_pending_buy_base(self, str asset):
         """
-        Return in-flight buy order base amount for asset.
-        For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
+        Return in-flight buy order base amount for asset: the unfilled rest (size - filled) of each live PB buy,
+        read from `_pending_buy_orders`, the one record of what is in flight. For assets with aliases (e.g.,
+        NODE/NODEOPS), sums across all aliases. A completed order is popped from that record, so it adds nothing.
+
+        WHY not a running sum (2026-10-30 review): the pending base used to be a second, per-asset float total,
+        + the size at placement, - each fill, - the unfilled rest at completion only if > 0. Several fills could
+        leave ~1e-13 there (FORT's 10 fills of a 3,290.5 order: 4.5e-13) while size - filled read exactly 0, so
+        nothing ever removed it, and the close at or under the target (`... and c_get_pending_buy_base(...) <= 0`)
+        stayed blocked until a command, restart or reconnect rescanned (c_scan_and_mark_completion).
         """
-        cdef:
-            double total = 0.0
-            list aliases
-            str alias
-        try:
-            aliases = self._get_all_asset_aliases(asset)
-            for alias in aliases:
-                total += <double> self._pending_buy_by_asset.get(alias, 0.0)
-            return total
-        except Exception:
-            return 0.0
+        return self.c_pending_base(self._pending_buy_orders, asset)
 
     cdef double c_get_pending_sell_base(self, str asset):
-        """
-        Return in-flight sell order base amount for asset.
-        For assets with aliases (e.g., NODE/NODEOPS), sums across all aliases.
-        """
+        """In-flight sell order base amount for asset: the mirror of c_get_pending_buy_base."""
+        return self.c_pending_base(self._pending_sell_orders, asset)
+
+    cdef double c_pending_base(self, dict pending_orders, str asset):
+        """The unfilled rest of every order in `pending_orders` (order_id -> (asset, size, filled)) placed for
+        one of `asset`'s aliases; an over-filled record (float noise) counts 0."""
         cdef:
             double total = 0.0
+            double rest
             list aliases
-            str alias
         try:
             aliases = self._get_all_asset_aliases(asset)
-            for alias in aliases:
-                total += <double> self._pending_sell_by_asset.get(alias, 0.0)
+            for asset_key, total_amt, filled_amt in pending_orders.values():
+                if asset_key in aliases:
+                    rest = <double> total_amt - <double> filled_amt
+                    if rest > 0.0:
+                        total += rest
             return total
         except Exception:
             return 0.0
@@ -825,7 +838,7 @@ cdef class PositionBalancerHandler:
           • `_sb_order_tracker.tracked_limit_orders_map` — the raw dict. NOT the `tracked_limit_orders`
             property, which rebuilds a list on every access.
           • `strategy._position_balancer_orders` — the set PB already populates at placement, used
-            here to exclude our own orders (they are counted by _pending_*_by_asset already; counting
+            here to exclude our own orders (they are counted by c_get_pending_*_base already; counting
             them twice would make PB under-order).
 
         SIZE = full `quantity`, deliberately. `OrderTracker` builds its `LimitOrder` without a
@@ -853,8 +866,8 @@ cdef class PositionBalancerHandler:
                 self._arb_pending_cache = {}
                 pb_orders = self.strategy._position_balancer_orders
                 # ...plus orders a stuck-cancel cleanup untracked locally while they were still
-                # live on the venue. They are ours, not arb legs. Their base is NOT re-added to
-                # _pending_*_by_asset (the cleanup cleared it on the assumption the cancel lands),
+                # live on the venue. They are ours, not arb legs. Their base is NOT back in our pending
+                # record, _pending_*_orders (the cleanup popped it on the assumption the cancel lands),
                 # so they are simply not counted here — the same treatment any of our own orders
                 # gets once its pending bookkeeping is gone. Sizing cannot overshoot as a result:
                 # placement is still capped by the venue's own get_available_balance, which
@@ -864,7 +877,7 @@ cdef class PositionBalancerHandler:
                 for _mp, order_map in self.strategy._sb_order_tracker.tracked_limit_orders_map.items():
                     for oid, lo in order_map.items():
                         if oid in pb_orders or oid in disowned:
-                            continue                       # our own — already in _pending_*_by_asset
+                            continue                       # our own — already in c_get_pending_*_base
                         _filled = lo.filled_quantity
                         remaining = float(lo.quantity)
                         if not _filled.is_nan():
@@ -1200,13 +1213,7 @@ cdef class PositionBalancerHandler:
             if order_id in self._pending_buy_orders:
                 asset_key, total_amt, prev_filled = self._pending_buy_orders[order_id]
                 new_filled = prev_filled + filled_amount
-                self._pending_buy_orders[order_id] = (asset_key, total_amt, new_filled)
-                # Subtract filled amount from pending (it's now in our balance)
-                self._pending_buy_by_asset[asset_key] = max(
-                    0.0,
-                    float(self._pending_buy_by_asset.get(asset_key, 0.0)) - filled_amount)
-                if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
-                    self._pending_buy_by_asset.pop(asset_key, None)
+                self._pending_buy_orders[order_id] = (asset_key, total_amt, new_filled)   # pending = size - filled
                 # Reset consecutive-cancel streak — a fill means progress
                 canonical = self._get_canonical_asset(asset_key)
                 self._buy_cancel_streak.pop(canonical, None)
@@ -1219,13 +1226,7 @@ cdef class PositionBalancerHandler:
             elif order_id in self._pending_sell_orders:
                 asset_key, total_amt, prev_filled = self._pending_sell_orders[order_id]
                 new_filled = prev_filled + filled_amount
-                self._pending_sell_orders[order_id] = (asset_key, total_amt, new_filled)
-                # Subtract filled amount from pending (we've sold it)
-                self._pending_sell_by_asset[asset_key] = max(
-                    0.0,
-                    float(self._pending_sell_by_asset.get(asset_key, 0.0)) - filled_amount)
-                if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
-                    self._pending_sell_by_asset.pop(asset_key, None)
+                self._pending_sell_orders[order_id] = (asset_key, total_amt, new_filled)   # pending = size - filled
                 # Reset consecutive-cancel streak — a fill means progress
                 canonical = self._get_canonical_asset(asset_key)
                 self._sell_cancel_streak.pop(canonical, None)
@@ -1239,8 +1240,8 @@ cdef class PositionBalancerHandler:
 
     def handle_order_completion(self, str order_id, bint is_buy):
         """
-        Clean up pending order tracking on order completion.
-        Only subtracts unfilled amount (filled amounts already subtracted in handle_order_fill).
+        Clean up pending order tracking on order completion. Popping the order's `_pending_*_orders`
+        record is what takes it out of the pending base (c_get_pending_*_base).
         """
         try:
             # Remove from position balancer tracking set
@@ -1254,7 +1255,6 @@ cdef class PositionBalancerHandler:
                 pend = self._pending_buy_orders.pop(order_id, None)
                 if pend is not None:
                     asset_key, total_amt, filled_amt = pend
-                    unfilled_amt = total_amt - filled_amt
                     # Exit refuge on a FILL-driven completion (belt-and-suspenders alongside
                     # handle_order_fill). filled_amt > 0 means this completion involved a fill, so
                     # it's a genuine trade, not a pure cancel. A pure cancel (filled_amt == 0 —
@@ -1264,13 +1264,6 @@ cdef class PositionBalancerHandler:
                     if filled_amt > 0 and self._in_refuge_buy.pop(self._get_canonical_asset(asset_key), None):
                         self.strategy.logger().info(
                             f"Position balancer: BUY refuge EXITED for {self._get_canonical_asset(asset_key)} (completion) — resuming normal best-bid chasing")
-                    # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
-                    if unfilled_amt > 0:
-                        self._pending_buy_by_asset[asset_key] = max(
-                            0.0,
-                            float(self._pending_buy_by_asset.get(asset_key, 0.0)) - unfilled_amt)
-                        if self._pending_buy_by_asset.get(asset_key, 0.0) <= 1e-15:
-                            self._pending_buy_by_asset.pop(asset_key, None)
                     # Remove from active tracking
                     if self._active_buy_orders.get(asset_key) == order_id:
                         self._active_buy_orders.pop(asset_key, None)
@@ -1300,13 +1293,6 @@ cdef class PositionBalancerHandler:
                     if filled_amt > 0 and self._in_refuge_sell.pop(self._get_canonical_asset(asset_key), None):
                         self.strategy.logger().info(
                             f"Position balancer: SELL refuge EXITED for {self._get_canonical_asset(asset_key)} (completion) — resuming normal best-ask chasing")
-                    # Only subtract unfilled amount (filled was already subtracted in handle_order_fill)
-                    if unfilled_amt > 0:
-                        self._pending_sell_by_asset[asset_key] = max(
-                            0.0,
-                            float(self._pending_sell_by_asset.get(asset_key, 0.0)) - unfilled_amt)
-                        if self._pending_sell_by_asset.get(asset_key, 0.0) <= 1e-15:
-                            self._pending_sell_by_asset.pop(asset_key, None)
                     # Remove from active tracking
                     if self._active_sell_orders.get(asset_key) == order_id:
                         self._active_sell_orders.pop(asset_key, None)
@@ -1486,7 +1472,7 @@ cdef class PositionBalancerHandler:
         Clean up tracking for an order the exchange REJECTED at placement.
 
         The PB registers its tracking dicts (_active_*_orders, _active_*_order_details,
-        _pending_*_orders, _pending_*_by_asset) as soon as the send call returns an order id —
+        _pending_*_orders) as soon as the send call returns an order id —
         before the exchange has accepted the order — so a rejected placement leaves a phantom
         "active order" for that asset. Placement gate step 3
         ("no active order for any alias") then blocks EVERY future order for that asset,
@@ -1544,7 +1530,8 @@ cdef class PositionBalancerHandler:
         -> refresh. If it reports nothing, the order is still at the right price -> skip.
 
         Fail-safe: on any error, or if the order is unknown / has no details, return True
-        (preserve the original always-refresh behaviour).
+        (preserve the original always-refresh behaviour). An order whose side is no longer active
+        (completed or switched off) is never kept either: True, and nothing re-places it.
         """
         cdef:
             str asset = None
@@ -1575,6 +1562,13 @@ cdef class PositionBalancerHandler:
             # A swap can't be cancelled, so it can't be refreshed: it ends on its own (c_is_swap_venue).
             if self.c_active_order_on_swap_venue(asset, is_buy):
                 return False
+            # A side that is no longer active (completed, or switched off by a command) places nothing, and once
+            # neither side is active the per-tick checks stop too (arb_l calls c_handle_position_balancing only
+            # while `is_active`; CHECK 0 "mode disabled" and the stuck-cancel retry live there). An order of such
+            # a side that is still tracked here, its cancel refused or lost, then has no owner but this backstop:
+            # never keep it. The refresh is just the cancel; nothing re-places it (2026-10-30 review).
+            if not (self.is_buy_active if is_buy else self.is_sell_active):
+                return True
 
             # A refresh is cancel + re-place too: veto it for a sell whose remainder (with the
             # venue's free base) could not be placed again (c_reprice_would_strand); the order
@@ -2375,7 +2369,7 @@ cdef class PositionBalancerHandler:
             # OWNERSHIP MUST SURVIVE THE CLEANUP.
             # handle_order_cancellation -> handle_order_completion discards the id from
             # strategy._position_balancer_orders, and that set is the ONLY thing telling
-            # c_arb_pending_base "this order is ours, it is already in _pending_*_by_asset".
+            # c_arb_pending_base "this order is ours, it is already in _pending_*_orders".
             # But the order is by definition STILL LIVE here — that is what "stuck" means — so
             # dropping ownership re-labels our own resting order as a FOREIGN ARB LEG, counted at
             # its full quantity. The local tracking above must go (it is what blocks placement);
@@ -2610,7 +2604,8 @@ cdef class PositionBalancerHandler:
                     #   REFUGE — anchored on the FRONTRUNNER, via the same c_refuge_wall the placement
                     #     path uses, so the check and the placement can never disagree. Re-park when we
                     #     are >= STEP_UP_MIN_GAP_TICKS - HALF_TICK_TOLERANCE (4.5) ticks off (wall + 1
-                    #     tick), at most once per REFUGE_REPARK_INTERVAL.
+                    #     tick), at most once per REFUGE_REPARK_INTERVAL, and only while the frontrunner is
+                    #     still ahead of us (holding the best bid ourselves, we stay; the backstop exits).
                     #     Anchoring on our own price here was WRONG (fixed 2026-08-16): it could not see
                     #     the market moving away from us — parked 0.1099 with the frontrunner at 0.1077
                     #     it reported "correctly parked" because 0.11 sat one tick above — and when the
@@ -2624,7 +2619,14 @@ cdef class PositionBalancerHandler:
                             if in_refuge:
                                 wall_price, front_price, _ = self.c_refuge_wall(
                                     order_ob, order_price, min_price_increment, True)
-                                if wall_price > 0.0:
+                                # Only while the frontrunner is AHEAD of us (a higher bid). c_refuge_wall takes the first
+                                # foreign level wherever it sits; once the frontrunner has left, that is the level BEHIND
+                                # us, and a re-park under it moves our order off the best bid (the 2026-09-24 gap; over
+                                # 3.3 days to 2026-10-30, 562 of 1,165 such re-parks left the top for good and 359
+                                # re-placed at the same price as the frontrunner flickered back). We hold the best bid then:
+                                # no re-park, the refuge flag and the streak untouched; the backstop's exit decides
+                                # (should_backstop_refresh, "frontrunner gone") once the order is old enough.
+                                if wall_price > 0.0 and front_price > order_price + min_price_increment * HALF_TICK_TOLERANCE:
                                     target_price = wall_price + min_price_increment
                                     drift_ticks = abs(order_price - target_price) / min_price_increment
                                     # Same bar as the normal step-up: is this price improvement worth a
@@ -2674,7 +2676,8 @@ cdef class PositionBalancerHandler:
                     #   NORMAL — we ARE top ask, next foreign ask far above: step UP to
                     #     (next_ask - 1 tick) via c_first_foreign_beyond.
                     #   REFUGE — re-park to (wall - 1 tick) from c_refuge_wall when >= 4.5 ticks off,
-                    #     at most once per REFUGE_REPARK_INTERVAL. Refuge survives (proactive
+                    #     at most once per REFUGE_REPARK_INTERVAL, only while the jumper is still ahead
+                    #     of us (holding the best ask ourselves, we stay). Refuge survives (proactive
                     #     "step-up" prefix + a pure cancel never clears the flag).
                     if not should_cancel and spread_is_min and min_price_increment > 0:
                         canonical_su = self._get_canonical_asset(asset)
@@ -2684,7 +2687,8 @@ cdef class PositionBalancerHandler:
                             if in_refuge:
                                 wall_price, front_price, _ = self.c_refuge_wall(
                                     order_ob, order_price, min_price_increment, False)
-                                if wall_price > 0.0:
+                                # Only while the jumper is AHEAD of us (a lower ask): see the buy side.
+                                if wall_price > 0.0 and front_price < order_price - min_price_increment * HALF_TICK_TOLERANCE:
                                     target_price = wall_price - min_price_increment
                                     drift_ticks = abs(order_price - target_price) / min_price_increment
                                     # Same bar as the normal step-up — see the buy side for the data.
@@ -2762,7 +2766,8 @@ cdef class PositionBalancerHandler:
         (BARD, 2026-08-16: 33 re-parks, one of them landing at the identical price).
 
         Walk (highest-first for bids, lowest-first for asks), skipping our own level once:
-          • first foreign level          -> frontrunner
+          • first foreign level          -> frontrunner (not checked to be ahead of us here: CHECK 4 checks that
+                                            before it re-parks; placement has no live order to be ahead of)
           • levels within REFUGE_MIN_WALL_GAP_TICKS of it -> more penny-jumpers, skipped
           • first level clear of it      -> the wall
         `_near` keeps the deepest skipped level as a fallback (at the default 2-tick gap that is
@@ -3420,7 +3425,7 @@ cdef class PositionBalancerHandler:
             #
             # The guard used to be the WHOLE story, on the premise "with zero pending,
             # adjusted == actual, so this completes on the values already computed — no extra
-            # balance reads". That is true of _pending_buy_by_asset, which the guard reads, and
+            # balance reads". That is true of our own pending buys (c_get_pending_buy_base), which the guard reads, and
             # FALSE of c_arb_pending_base, which it does not: after a stuck-cancel cleanup
             # (handle_order_completion discards the order from strategy._position_balancer_orders
             # while it is still LIVE in _sb_order_tracker) our own buy becomes a foreign arb leg,
@@ -3563,7 +3568,7 @@ cdef class PositionBalancerHandler:
                 # same rule c_get_actual_base_balance and the CHECK-2 site 60 lines below already
                 # follow, and the same rule the 2026-08-09 `available`-vs-`total` fix established.
                 # It used to complete on `current_value` (the ADJUSTED balance) on the premise that
-                # "with zero pending, adjusted == actual" — true of _pending_sell_by_asset, which
+                # "with zero pending, adjusted == actual" — true of our own pending sells (c_get_pending_sell_base), which
                 # the guard above covers, but NOT of c_arb_pending_base, which the guard does not
                 # cover and which counts a leg at its FULL quantity. A stuck-cancel cleanup hands
                 # our own live order to that term, so adjusted went negative (or, when the order
@@ -3707,12 +3712,12 @@ cdef class PositionBalancerHandler:
                                             selected_sell_market.base_asset))
                                         # NO pending-sell deduction here. get_available_balance is
                                         # already net of base locked in our own resting order, so
-                                        # subtracting _pending_sell_by_asset on top counted the SAME
+                                        # subtracting our pending sell base on top counted the SAME
                                         # order twice and refused placement while a live sell sat on
                                         # the book ("insufficient balance (0.04 SMART = $0.00)" —
                                         # 168 such refusals on FLOW alone, each costing a 60s cooldown).
                                         #
-                                        # It was also wrong across venues: _pending_sell_by_asset is
+                                        # It was also wrong across venues: our pending sell base is
                                         # keyed per ASSET, so a sell resting on one venue was deducted
                                         # from every other venue's capacity too.
                                         #
@@ -4063,8 +4068,6 @@ cdef class PositionBalancerHandler:
                         f"(old order may not have been cleaned up properly)")
 
             self._pending_buy_orders[buy_order_id] = (asset_key, float(quantized_amount), 0.0)
-            self._pending_buy_by_asset[asset_key] = (
-                float(self._pending_buy_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_buy_orders[asset_key] = buy_order_id
             self._last_buy_order_time[asset_key] = self.strategy._current_timestamp
             # Store order details for smart cancellation (market_tuple, price)
@@ -4472,8 +4475,6 @@ cdef class PositionBalancerHandler:
                         f"(old order may not have been cleaned up properly)")
 
             self._pending_sell_orders[sell_order_id] = (asset_key, float(quantized_amount), 0.0)
-            self._pending_sell_by_asset[asset_key] = (
-                float(self._pending_sell_by_asset.get(asset_key, 0.0)) + float(quantized_amount))
             self._active_sell_orders[asset_key] = sell_order_id
             self._last_sell_order_time[asset_key] = self.strategy._current_timestamp
             # Store order details for smart cancellation (market_tuple, price)

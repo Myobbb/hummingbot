@@ -1095,6 +1095,8 @@ class Feed:
             sits out (_bench) and is re-tested every REELECT_S (_retest);
           - no clear answer, or the wallet can't fund the test (_test_amount): not tested, nothing benched (a pool is never
             blamed for our balance or a node's trouble).
+        Each diagnosis leaves one line, its verdict (Pavel 2026-10-30: a failed swap with no line after it can't be told from
+        one never diagnosed): INFO, or the bench's WARNING.
         Every simulation runs at the block of the wallet read that funds it, so a balance spent since can't revert one, and
         the prefixes see the state the whole route did"""
         path = legs(route["record"], route["hops"], route["side"])
@@ -1113,7 +1115,7 @@ class Feed:
                 self._log("info", f"{name}: its route was not tested ({why})")
                 return
             if verdict:
-                self._log("debug", f"{name}: its route passes a ${TEST_USD:g} simulation now (a lost race): nothing benched")
+                self._log("info", f"{name}: its route passes a ${TEST_USD:g} simulation now (a lost race): nothing benched")
                 return
             n, reason = len(path), why
             for k in range(1, len(path)):
@@ -1172,7 +1174,7 @@ class Feed:
     def _bench(self, pool: dict, test: dict, why: str, name: str):
         """the pool a failed route breaks at sits out (EvmDexQuoter.bench), its re-test the route up to it (`test`)"""
         now = time.time()
-        cas = self.quoter.bench(pool["pool"], {"test": test, "why": why, "since": now, "next": now + REELECT_S})
+        cas = self.quoter.bench(pool["pool"], {"test": test, "why": why, "since": now, "next": now + REELECT_S, "tests": 0})
         self._log("warning", f"{name}: pool {pool['pool']} ({pool.get('type')}) reverts a ${TEST_USD:g} {test['side']} "
                              f"({why}): it sits out, re-tested every {REELECT_S / 60:g} min; the books through it ("
                              f"{self._tickers(cas)}) go to the next-best pool, or none")
@@ -1192,19 +1194,21 @@ class Feed:
 
     async def _retest(self, pool: str, entry: dict):
         """a benched pool's route simulated again (TEST_USD, a minimum of 1): it passes -> the pool takes part again
-        (EvmDexQuoter.unbench, one INFO line); it reverts, or can't be tested -> it sits out until the next re-test"""
+        (EvmDexQuoter.unbench); it reverts, or can't be tested -> it sits out until the next re-test. One INFO line either
+        way, with the re-test's number and the time benched (Pavel 2026-10-30: every re-test must show in the log)"""
+        entry["tests"] = entry.get("tests", 0) + 1
         amount, block, why = self._test_amount(entry["test"])
         verdict = None
         if amount is not None:
             verdict, why = await self._simulate(entry["test"], entry["test"]["n"], amount, block)
-        name = f"{self.C.EXCHANGE_NAME}: pool {pool}"
+        name, out = f"{self.C.EXCHANGE_NAME}: pool {pool}", (time.time() - entry["since"]) / 60
         if verdict:
             cas = self.quoter.unbench(pool)
-            self._log("info", f"{name} passes its re-test (a ${TEST_USD:g} {entry['test']['side']}) after "
-                              f"{(time.time() - entry['since']) / 60:.0f} min: it takes part again; elected again with it: "
-                              f"{self._tickers(cas)}")
+            self._log("info", f"{name} passes its re-test {entry['tests']} (a ${TEST_USD:g} {entry['test']['side']}) after "
+                              f"{out:.0f} min: it takes part again; elected again with it: {self._tickers(cas)}")
         else:
-            self._log("debug", f"{name} still sits out: its re-test {'reverts' if verdict is False else 'did not run'} ({why})")
+            self._log("info", f"{name} still sits out: re-test {entry['tests']} {'reverts' if verdict is False else 'did not run'} "
+                              f"({why}), out {out:.0f} min; the next in {REELECT_S / 60:g} min")
 
     def _tickers(self, cas: List[str]) -> str:
         return ", ".join(sorted((self.pool_list.cas.get(ca) or {}).get("ticker") or ca for ca in cas)) or "no CA"
