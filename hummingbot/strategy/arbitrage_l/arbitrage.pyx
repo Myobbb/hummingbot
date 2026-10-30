@@ -814,6 +814,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             tuple best_result = None
             tuple current_result
             double best_profitability = 0.0
+            bint pb_ran = False
 
         try:
             # Check market readiness
@@ -890,8 +891,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # CRITICAL: Position balancer MUST run even with pending orders to detect undercuts.
                 for market_pair in self._market_pairs:
                     if self.c_books_ready_for_direction(market_pair.first, market_pair.second):
+                        pb_ran = True
                         if self._position_balancer.c_handle_position_balancing(market_pair.first, market_pair.second):
                             break
+                # The book test above is the arb's question (asks to buy on one leg, bids to sell on the other). The
+                # balancer picks its own venue (c_find_best_buy/sell_market skip a venue without a book) and closes a
+                # side on the TOTAL position, so a leg whose book is empty both ways (a benched DEX pool, a dead pair)
+                # must not keep it from running at all: then it runs once on the first pair. 2026-10-30: RAD's clean
+                # (eth + gate_io, its ETH pool frozen and benched, nothing held) read complete at 14:25 and never closed
+                # nor auto-removed: the balancer was never called.
+                if not pb_ran and self._market_pairs:
+                    self._position_balancer.c_handle_position_balancing(self._market_pairs[0].first,
+                                                                       self._market_pairs[0].second)
             
             # Check ALL pending orders for timeouts every tick
             # This ensures canceled orders are detected even if their market is no longer being considered
