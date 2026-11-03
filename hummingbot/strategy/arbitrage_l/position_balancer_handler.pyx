@@ -4057,6 +4057,22 @@ cdef class PositionBalancerHandler:
             self.strategy.logger().warning(
                 f"Failed to mark order {buy_order_id} ({asset_key} on {market.name}) as position balancer order: {e}")
 
+        # The hold band's dispatch record, as the arb's correction legs write it (arbitrage.pyx, c_execute_arbitrage):
+        # this venue's base TOTAL now, before any of the order's fill can show. At the order's completion
+        # (c_handle_order_completion) it tells whether the venue has credited the fill yet, and until it has (at most
+        # HOLD_UNSETTLED_MAX_SECONDS) the fill stays in the hold band's settled position (c_hold_unsettled_base). Without
+        # it the completion's refresh read the lagging wallet, and a correction leg was sized as if the fill had not
+        # happened: MCRT 2026-11-03 08:32:29, $100 sold on top ($444 on a $500 target). Only while the hold band is on:
+        # that is when the record is read, and pruned (wiki: P2 Hummingbot Open Items #correction-writers).
+        if self.strategy._hold_enabled:
+            try:
+                self.strategy._hold_dispatch_base[buy_order_id] = (
+                    buy_market_tuple.market, buy_market_tuple.base_asset, 1.0,
+                    float(buy_market_tuple.market.get_balance(buy_market_tuple.base_asset)),
+                    self.strategy._current_timestamp)
+            except Exception:
+                pass
+
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:
             # Safety check: warn if we're replacing an existing active order (shouldn't happen)
@@ -4463,6 +4479,17 @@ cdef class PositionBalancerHandler:
         except Exception as e:
             self.strategy.logger().warning(
                 f"Failed to mark order {sell_order_id} ({asset_key} on {market.name}) as position balancer order: {e}")
+
+        # The hold band's dispatch record, as for a buy above (c_execute_buy_limit): the venue's base TOTAL now, so a fill
+        # the venue has not shown at the order's completion stays counted (MCRT 2026-11-03 08:32:29).
+        if self.strategy._hold_enabled:
+            try:
+                self.strategy._hold_dispatch_base[sell_order_id] = (
+                    sell_market_tuple.market, sell_market_tuple.base_asset, -1.0,
+                    float(sell_market_tuple.market.get_balance(sell_market_tuple.base_asset)),
+                    self.strategy._current_timestamp)
+            except Exception:
+                pass
 
         # Track in balancer (asset_key, total_amount, filled_amount)
         try:

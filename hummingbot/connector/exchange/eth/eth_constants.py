@@ -44,15 +44,18 @@ TRADING_ENABLED = True
 
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use (unused gas is not paid): one hop ~108-134k, two ~223k on ETH
 APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
-# The fee (EIP-1559; Pavel 2026-10-22, decision 11: a fixed tip, no spike chasing): the tip about the blocks' per-block median
-# (0.046 gwei on 10-22), the max fee twice the newest base fee plus the tip, held to the cap.
+# The fee (EIP-1559; Pavel 2026-10-22, decision 11: a fixed tip, no spike chasing): the max fee twice the newest base fee plus
+# the tip, held to the cap. The tip was the blocks' per-block median (0.046 gwei on 10-22, 0.05 kept). 1 gwei since Pavel
+# 2026-11-03 (P2-DEX finding 8): 0.05 was exactly the median tip, so our swaps landed mid-block (#153, #252) behind 0.08-3 gwei
+# swaps, and 47 of 98 DEX-first swaps were dropped 10-23 -> 11-03. 1 gwei is about the top quarter of a normal block's gas
+# (p75 0.5, p90 1.5 gwei on 11-03), still fixed: no bidding against the 10-126 gwei searchers. ~$0.53 an included swap.
 # The cap (Pavel 2026-10-30): a swap goes out in any market up to ~$5 of gas, with no outbidding. One constant, no USD math at
 # the send: $5 / (ETH ~$2,200 x ~250k gas; the swaps used 218-276k) = ~9.09 gwei. Re-derive it when ETH's price moves a lot.
 # On 10-29 the old 3 gwei cap refused 333 sends while the base fee went 0.16 -> 140 gwei; 32 of them were under this one.
 GAS_CAP_USD = 5
 NATIVE_USD_APPROX = 2_200
 SWAP_GAS_TYPICAL = 250_000
-PRIORITY_FEE_WEI = 50_000_000     # 0.05 gwei
+PRIORITY_FEE_WEI = 1_000_000_000  # 1 gwei (0.05 gwei until 2026-11-03)
 MAX_FEE_CAP_WEI = GAS_CAP_USD * 10 ** 18 // (NATIVE_USD_APPROX * SWAP_GAS_TYPICAL)   # ~9.09 gwei: ~$5 a swap
 SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * MAX_FEE_CAP_WEI).scaleb(-18)   # the most one swap can cost (~0.0036 ETH): below
                                                                               # it, nothing trades
