@@ -44,18 +44,15 @@ TRADING_ENABLED = True
 
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use (unused gas is not paid): one hop ~108-134k, two ~223k on ETH
 APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
-# The fee (EIP-1559; Pavel 2026-10-22, decision 11: a fixed tip, no spike chasing): the max fee twice the newest base fee plus
-# the tip, held to the cap. The tip was the blocks' per-block median (0.046 gwei on 10-22, 0.05 kept). 1 gwei since Pavel
-# 2026-11-03 (P2-DEX finding 8): 0.05 was exactly the median tip, so our swaps landed mid-block (#153, #252) behind 0.08-3 gwei
-# swaps, and 47 of 98 DEX-first swaps were dropped 10-23 -> 11-03. 1 gwei is about the top quarter of a normal block's gas
-# (p75 0.5, p90 1.5 gwei on 11-03), still fixed: no bidding against the 10-126 gwei searchers. ~$0.53 an included swap.
+# The fee (EIP-1559; Pavel 2026-10-22, decision 11: a fixed tip, no spike chasing): the tip about the blocks' per-block median
+# (0.046 gwei on 10-22), the max fee twice the newest base fee plus the tip, held to the cap.
 # The cap (Pavel 2026-10-30): a swap goes out in any market up to ~$5 of gas, with no outbidding. One constant, no USD math at
 # the send: $5 / (ETH ~$2,200 x ~250k gas; the swaps used 218-276k) = ~9.09 gwei. Re-derive it when ETH's price moves a lot.
 # On 10-29 the old 3 gwei cap refused 333 sends while the base fee went 0.16 -> 140 gwei; 32 of them were under this one.
 GAS_CAP_USD = 5
 NATIVE_USD_APPROX = 2_200
 SWAP_GAS_TYPICAL = 250_000
-PRIORITY_FEE_WEI = 1_000_000_000  # 1 gwei (0.05 gwei until 2026-11-03)
+PRIORITY_FEE_WEI = 50_000_000     # 0.05 gwei
 MAX_FEE_CAP_WEI = GAS_CAP_USD * 10 ** 18 // (NATIVE_USD_APPROX * SWAP_GAS_TYPICAL)   # ~9.09 gwei: ~$5 a swap
 SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * MAX_FEE_CAP_WEI).scaleb(-18)   # the most one swap can cost (~0.0036 ETH): below
                                                                               # it, nothing trades
@@ -71,13 +68,16 @@ MIN_NOTIONAL_USD = Decimal(0)
 
 # Sending (2026-10-22: the research and the no-funds probe, wiki p2-dex-eth §sending; phase 3 measures it with Pavel's live
 # 0-value sends before it is final). No top builder takes a block range: a single-transaction bundle names its one block, and
-# goes to every builder at once (Titan 52%, Quasar 21%, BuilderNet 15%, Eureka 7.5%, bombora 2% of MEV-Boost blocks: ~97%);
+# goes to every builder at once (Titan 52%, Quasar 21%, BuilderNet 15%, Eureka 7.5%, bombora 2% of MEV-Boost blocks: ~97%;
+# + bobTheBuilder 1.45% and BTCS's Builder+ 1.97% since Pavel 2026-11-04: 95.2 -> 98.6% on relayscan's 7 d, P2-DEX finding 10;
+# both take a bundle unsigned, from Flashbots' builder registry, probed from myserver);
 # the ones that want it get an X-Flashbots-Signature by the feed's identity (a key derived from the wallet key: decision 11).
 # A builder takes a bundle before it simulates it, so the chain tells the outcome; a transaction that would revert is not
 # included (nothing paid); no public copy, no RPC that shares with searchers
 SENDER = "bundle_per_block"
 BUILDERS = ("https://ap.rpc.titanbuilder.xyz", "https://direct-ap.buildernet.org", "https://rpc.eurekabuilder.xyz",
-            "https://rpc.quasar.win", "https://ap-rpc.bombora.build")       # 3 / 4 / 2 / 181 / ~190 ms from myserver
+            "https://rpc.quasar.win", "https://ap-rpc.bombora.build",       # 3 / 4 / 2 / 181 / ~190 ms from myserver
+            "https://rpc.bobthebuilder.xyz", "https://rpc.btcs.com")        # 12 / 162 ms (2026-11-04)
 SIGNED_BUILDERS = ("https://direct-ap.buildernet.org", "https://rpc.eurekabuilder.xyz", "https://rpc.quasar.win")
 BLOCK_S = 12.0                    # ETH's slot: a block's timestamp is its slot's start
 POLL_S = 12.0                     # the cadence without a block yet, and the data source's idle wait
