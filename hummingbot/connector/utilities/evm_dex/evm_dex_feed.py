@@ -204,7 +204,8 @@ class Feed:
     swap) the moment a swap may be out · ("swap", order id, "sent", swap) or ("swap", order id, "refused", why, "send" when
     every builder refused it, else "order") · ("ended", order id, receipt
     parsed or None (dropped), where it landed) · ("approval", id, "landed" | "reverted" | "dropped" | "refused", block | why)
-    · ("log", level, text)."""
+    · ("head", block) the status node's head each time a read shows it changed (a spec with STALE_MAX_S) · ("log", level,
+    text)."""
 
     def __init__(self, init: dict, send: Callable[[tuple], None]):
         self.send = send
@@ -249,6 +250,9 @@ class Feed:
         self._retries = 0                              # polls asked again for the block they were sent for (POLL_RETRIES)
         self._target: Optional[int] = None             # the block the next poll waits for the head to show (_head_wait)
         self._due: Optional[int] = None                # the block the last poll went out for (set when its head showed it)
+        self.head_seen: Optional[Tuple[int, float]] = None   # the status node's newest head read on the slot clock: (its
+                                                             # block, when it was asked): a missed slot (_stale_s, _missed)
+        self._head_said: Optional[int] = None          # the head HMB was last told (("head", n) on a change: its books' hold)
         self._tasks: set = set()
         self._key_hex = self.account.key.hex().removeprefix("0x") if self.account is not None else None
         # the identity a builder's X-Flashbots-Signature names (ETH, Pavel 2026-10-22, decision 11): a key derived from the wallet
@@ -432,10 +436,12 @@ class Feed:
     async def _slot_head_wait(self, slot: float) -> bool:
         """until SWAP_STATUS_URL's head shows block _target (-> True), read from `slot` + HEAD_START_S every HEAD_POLL_S (a read
         that fails, or takes over HEAD_READ_TIMEOUT_S, counts as not there yet), or until HEAD_GIVE_UP_S after `slot` (-> False:
-        a missed slot, or the node behind). The lease step runs every LEASE_STEP_S meanwhile"""
+        a missed slot, or the node behind). The lease step runs every LEASE_STEP_S meanwhile. Each read that answers is the
+        newest head (head_seen); a spec with STALE_MAX_S tells HMB each time it changed (its books' hold, finding 13)"""
         stepped = time.time()
         while True:
             if time.time() >= slot + self.C.HEAD_START_S:
+                asked = time.time()
                 try:
                     head = int(await self._read_at(self.status_url, "eth_blockNumber", [],
                                                    timeout=self.C.HEAD_READ_TIMEOUT_S), 16)
@@ -443,6 +449,11 @@ class Feed:
                     raise
                 except Exception:
                     head = None
+                if head is not None:
+                    self.head_seen = (head, asked)
+                    if head != self._head_said and getattr(self.C, "STALE_MAX_S", None):
+                        self._head_said = head
+                        self.send(("head", head))
                 if head is not None and head >= self._target:
                     return True
                 if time.time() >= slot + self.C.HEAD_GIVE_UP_S:
@@ -582,8 +593,11 @@ class Feed:
             self.wallet_read = wallet
         books = {} if leased else {ca: {side: self._side(ca, side, book) for side, book in sides.items()}
                                    for ca, sides in (last.get("books") or {}).items()}
-        self.send(("poll", {"block": last["block"], "ts": last["ts"], "at": last["at"], "books": books, "wallet": wallet,
-                            "stats": dict(self.quoter.stats), "lease": self.lease["id"] if leased and self.lease else None}))
+        msg = {"block": last["block"], "ts": last["ts"], "at": last["at"], "books": books, "wallet": wallet,
+               "stats": dict(self.quoter.stats), "lease": self.lease["id"] if leased and self.lease else None}
+        if last.get("basefee") is not None:            # an EIP-1559 chain (eth): the next block's base fee, from which HMB
+            msg["basefee"] = last["basefee"]           # prices one swap's gas (swap_gas_usd; bsc's message is unchanged)
+        self.send(("poll", msg))
         if wallet is not None:
             self._after_wallet_read()
             if not leased:
@@ -611,10 +625,10 @@ class Feed:
     # ---------------------------------------------------------------- a swap: one exact-input swap along its book's route
     def _book_route(self, ca: str, side: str, usd: float) -> Tuple[dict, dict, List[dict]]:
         """the current (ca, side) book, its CA pool's record and its hop route at the smallest priced rung of at least `usd`
-        (else the largest): the swap runs exactly where its book was priced. A book whose block is STALE_S old is no book,
+        (else the largest): the swap runs exactly where its book was priced. A book whose block is _stale_s old is no book,
         the rule that empties the books on show"""
         last = self.quoter.last
-        if not last or time.time() - (last.get("ts") or 0) > self.C.STALE_S:
+        if not last or time.time() - (last.get("ts") or 0) > self._stale_s(last):
             raise Refused("no fresh book")
         book = (last.get("books") or {}).get(ca, {}).get(side)
         if not book:
@@ -701,8 +715,9 @@ class Feed:
         if amount_in <= 0 or min_out <= 0:
             raise Refused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
         try:
-            deadline = (int(last["ts"] + self.C.BLOCK_S * (head - book_block + self.C.BUNDLE_BLOCKS))   # ETH: the target
-                        if getattr(self.C, "DEADLINE_FROM_BLOCK", False) else None)        # block's own timestamp (its slot's)
+            deadline = (int(last["ts"] + self.C.BLOCK_S * (head - book_block + self._missed(last) + self.C.BUNDLE_BLOCKS))
+                        if getattr(self.C, "DEADLINE_FROM_BLOCK", False) else None)  # ETH: the target block's own timestamp,
+                                                                                     # its slot's start (+ the slots missed)
             swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet, deadline)
         except ValueError as e:
             raise Refused(str(e)) from None
@@ -715,9 +730,26 @@ class Feed:
         nothing). A node behind makes it low by its lag, and the bundle's window (BUNDLE_BLOCKS) then ends that many blocks
         sooner. On a slot clock (ETH) the blocks since count from the block's own timestamp, its slot's start: once the next
         slot has begun, its block is being proposed (too late for a bundle) though no node shows it yet (~1.5-3.5 s), so the
-        bundle names the slot after; a slot missed since moves the blocks one slot later (not included: the chain tells)"""
+        bundle names the slot after. A slot the status node's head shows missed has no block (_missed); one missed but not yet
+        shown so moves the blocks one slot later (not included: the chain tells)"""
         since = last["ts"] if getattr(self.C, "CLOCK", "") == "slot" else last["at"]
-        return last["block"] + int(max(time.time() - since, 0.0) / self.C.BLOCK_S)
+        return last["block"] + int(max(time.time() - since, 0.0) / self.C.BLOCK_S) - self._missed(last)
+
+    def _stale_s(self, last: dict) -> float:
+        """how old a book may get: STALE_S, or STALE_MAX_S while the status node's head (its newest read) still shows its
+        block: HMB's rule for the books on show (evm_dex_order_book_data_source._stale_s; P2-DEX finding 13, 2026-11-04)"""
+        longest = getattr(self.C, "STALE_MAX_S", None)
+        seen = self.head_seen
+        return longest if longest and seen is not None and seen[0] == last.get("block") else self.C.STALE_S
+
+    def _missed(self, last: dict) -> int:
+        """on a slot clock, the slots since `last`'s block the status node's head shows missed: its newest read still showed
+        that block STALE_S - BLOCK_S (6 s; blocks show by ~5.1 s) or more into them, the moment their books would have gone
+        empty (finding 13: they stay; a swap on them names the slot after the missed one's block, not the one after it)"""
+        seen = self.head_seen
+        if getattr(self.C, "CLOCK", "") != "slot" or seen is None or seen[0] != last["block"]:
+            return 0
+        return max(0, int((seen[1] - last["ts"] - (self.C.STALE_S - self.C.BLOCK_S)) // self.C.BLOCK_S))
 
     async def _swap(self, order_id: str, p: dict):
         """HMB's order (its turn already taken there) as one swap: built (_swap_for), signed and sent (_send_tx). HMB is told
@@ -767,7 +799,7 @@ class Feed:
             if self.nonce is None:
                 self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
             if head is None and getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last and \
-                    time.time() - self.quoter.last["ts"] <= self.C.STALE_S:
+                    time.time() - self.quoter.last["ts"] <= self._stale_s(self.quoter.last):
                 head = self._head_now(self.quoter.last)          # a slot clock: a read head lags the slot begun (_head_now)
             if head is None:
                 head = int(await self._read("eth_blockNumber", []), 16)
@@ -783,7 +815,8 @@ class Feed:
         self.nonce = nonce + 1                        # taken before the send: the transaction may be out even if the call fails
         record.update(tx_hash=tx_hash, nonce=nonce, last_block=last_block, sent=time.time())
         if getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last:      # its block's slot start, for its line (finding 11)
-            record["slot_at"] = self.quoter.last["ts"] + self.C.BLOCK_S * (last_block - self.quoter.last["block"])
+            record["slot_at"] = self.quoter.last["ts"] + self.C.BLOCK_S * (last_block - self.quoter.last["block"]
+                                                                           + self._missed(self.quoter.last))
         if on_signed is not None:
             on_signed()
         answers = record["builders"] = []             # each builder's answer as it comes (_send_bundle), for its line

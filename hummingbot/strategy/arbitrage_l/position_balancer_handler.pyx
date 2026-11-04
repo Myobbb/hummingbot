@@ -1917,6 +1917,12 @@ cdef class PositionBalancerHandler:
             is a failure event, so c_did_fail_order cools the venue down for the arb as well. PB
             sells hit it: SUNDOG/bybit 2.22 < 5 (2026-09-22) and CORE/bitget 0.0005 < 1 (09-23).
             Skipped when `price` <= 0 (unknown); the venue is then judged on step and lot alone.
+        And on a SWAP venue, its gas (2026-11-04, Pavel: "skip the dust sweep on eth when gas exceeds it"): a sell worth
+        less than the venue's swap_gas_usd() (its estimate of one swap's gas, from the last poll's base fee) would pay more
+        in gas than it sells for. POWR's clean on 11-04 swept $0.058 on eth for ~$0.074. Only a sweep goes below $15 (every
+        other balancer sell meets _min_order_usd), so in practice this skips a clean's dust on eth, and c_residue_sellable
+        then counts that dust as stuck, so the clean still completes. 0 or no such method = no floor (bsc, every CEX).
+        Skipped when `price` <= 0, as the min notional is.
         OUR notional floor, _min_order_usd, is policy, not physics, and differs by target (applied
         to a graded target, bypassed for a sell-to-zero sweep), so it stays with the caller.
         max_order_size is a cap rather than a floor and likewise stays.
@@ -1940,6 +1946,13 @@ cdef class PositionBalancerHandler:
                     return Decimal("0")
         except Exception:
             pass
+        if price > 0.0 and self.c_is_swap_venue(market_tuple):    # a swap worth less than its gas (see above)
+            try:
+                gas_usd = float(market_tuple.market.swap_gas_usd())
+            except Exception:
+                gas_usd = 0.0                                   # fails OPEN, as an unreadable trading rule does
+            if gas_usd > 0.0 and float(q) * price < gas_usd:
+                return Decimal("0")
         return q
 
     cdef bint c_residue_sellable(self, str asset):
@@ -4369,7 +4382,8 @@ cdef class PositionBalancerHandler:
         if quantized_amount <= Decimal("0"):
             self.strategy.logger().warning(
                 f"Position balancer: Sell order blocked - {asset_key} on {market.name}: residue "
-                f"is below the venue's own step, minimum lot or minimum notional. "
+                f"is below the venue's own step, minimum lot or minimum notional"
+                f"{', or worth less than the gas of one swap' if self.c_is_swap_venue(sell_market_tuple) else ''}. "
                 f"pre_quantize={amount_to_sell:.8g}, placeable={quantized_amount}")
             # For sell-to-zero: ask for completion. c_try_mark_sell_complete closes the clean only
             # when no venue can take what is left (c_residue_sellable), so a residue another venue

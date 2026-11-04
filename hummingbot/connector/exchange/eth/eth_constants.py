@@ -32,9 +32,14 @@ SEL_BALANCE_OF = "70a08231"       # ERC-20 balanceOf(address)
 RPC_TIMEOUT_S = 2.0               # a request to the book's node (BlockRazor ETH: P2's 22-CA call in ~0.05 s from myserver)
 READ_TIMEOUT_S = 1.0              # a read of the swap lifecycle (SWAP_READ_URL, SWAP_STATUS_URL)
 # A book of block N is replaced when N+1 shows: 12 s + its publishing delay (blocks show p10 1.5 / p50 1.9 / p90 3.5 / max
-# 5.1 s into their slot, 10-22), ~12 +/- 2 s and at most ~17 s. So every on-time book stays on show; during a missed slot
-# (0.4% of slots) the book goes empty until the next block shows (conservative)
+# 5.1 s into their slot, 10-22), ~12 +/- 2 s and at most ~17 s. So every on-time book stays on show
 STALE_S = 18.0
+# A missed slot (0.35-0.4% of slots: the next block comes 24 s after N) changes nothing on chain, so while the status node's
+# head still shows N the books stay, until N is STALE_MAX_S old at most: the safety timeout (a head that is wrong, e.g. a
+# node stuck). 30 s covers one missed slot (the next block shows by ~29 s); two in a row still empty them. P2-DEX finding 13,
+# Pavel 2026-11-04: "keep the books while the chain head shows no new block, while having a safety timeout that would still
+# clean the local books, just expand it" (until then they went empty at STALE_S for 5-12 s, 9 times in 8.5 h)
+STALE_MAX_S = 30.0
 FIRST_POLL_WAIT_S = 20.0          # how long a pair's first book waits for the first poll before it starts empty
 SUMMARY_EVERY_S = 300.0
 

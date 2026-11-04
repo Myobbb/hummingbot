@@ -23,8 +23,10 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
     runbook: never mix the two). A pair with no book gets an empty one: a market that is off looks empty, never dropped.
     Every book goes empty once the block it was priced at is STALE_S old, however its poll ended (a failed call, an answer
     from an old block, a node too slow to answer: a poll is never waited for past that moment), so a DEX price is never kept
-    alive (P1's B7). With no DEX pair to quote there is no feed process and no call (idle, Pavel 2026-10-15): nothing is on
-    show, no stale clock runs, and the loop only looks again each POLL_S."""
+    alive (P1's B7). A spec with STALE_MAX_S (eth) keeps them past it while the status node's head, as the feed last read it,
+    still shows their block (a missed slot: nothing changed on chain; finding 13, 2026-11-04), until STALE_MAX_S at most.
+    With no DEX pair to quote there is no feed process and no call (idle, Pavel 2026-10-15): nothing is on show, no stale
+    clock runs, and the loop only looks again each POLL_S."""
 
     def __init__(self, trading_pairs: List[str], connector):
         super().__init__(trading_pairs)
@@ -40,6 +42,8 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self.book_ts = time.time()                    # the timestamp of the block the books on show were priced at (a
                                                       # start counts as one: no good poll within STALE_S of it is an outage)
         self.last_block: Optional[int] = None
+        self.head_block: Optional[int] = None         # the status node's head as the feed last read it (its ("head", n) on a
+                                                      # change; a spec with STALE_MAX_S only): _stale_s
         self.last_error: Optional[str] = None
         self._erring = False                          # a poll failed since the last good one (its error is the outage's)
         self.polls = 0
@@ -49,7 +53,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """a (re)start never shows an earlier run's books: each pair's first snapshot waits for a fresh poll (HMB's network
         iterator stops and starts the connector on every reconnect)"""
         self._books, self._stale, self.book_ts = {}, False, time.time()
-        self._pushed = {}
+        self._pushed, self.head_block = {}, None
         self._first_poll.clear()
 
     def hide(self, trading_pair: str) -> int:
@@ -85,20 +89,26 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _parse_order_book_snapshot_message(self, raw_message: Any, message_queue: asyncio.Queue):
         message_queue.put_nowait(raw_message)         # already an OrderBookMessage
 
+    def _stale_s(self, block: Optional[int]) -> float:
+        """how old the books of `block` may get: STALE_S, or STALE_MAX_S while the status node's head still shows `block`
+        (a missed slot changes nothing on chain; P2-DEX finding 13, Pavel 2026-11-04). A spec without STALE_MAX_S: STALE_S"""
+        longest = getattr(self.C, "STALE_MAX_S", None)
+        return longest if longest and block is not None and block == self.head_block else self.C.STALE_S
+
     def _life(self) -> Optional[float]:
-        """how long the books on show stay fresh: until the block they were priced at is STALE_S old (None: none on show)"""
-        return None if self._stale else self.book_ts + self.C.STALE_S - time.time()
+        """how long the books on show stay fresh: until the block they were priced at is _stale_s old (None: none on show)"""
+        return None if self._stale else self.book_ts + self._stale_s(self.last_block) - time.time()
 
     def _expire(self) -> bool:
-        """the books on show go empty once the block they were priced at is STALE_S old, whatever the poll is doing (audit
+        """the books on show go empty once the block they were priced at is _stale_s old, whatever the poll is doing (audit
         2026-10-15: they went empty only STALE_S after the last good poll, ~10 s in all, and never while a poll hung).
         -> True when they just did; the empty books are handed to the tracker at once"""
         life = self._life()
         if life is None or life > 0:
             return False
         self._stale, self._books = True, {}
-        self.logger().warning(f"{self.C.EXCHANGE_NAME}: no fresh poll for {self.C.STALE_S:.0f} s, every book is empty: "
-                              f"{self.last_error}")
+        self.logger().warning(f"{self.C.EXCHANGE_NAME}: no fresh poll for {self._stale_s(self.last_block):.0f} s, every book "
+                              f"is empty: {self.last_error}")
         self._push()
         return True
 
@@ -130,13 +140,19 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     try:
                         last = await asyncio.wait_for(poll, timeout=life)
                     except asyncio.TimeoutError:
-                        raise _NoAnswer(f"no answer before the books turned {self.C.STALE_S:.0f} s old") from None
+                        raise _NoAnswer(f"no answer before the books turned {self._stale_s(self.last_block):.0f} s old") from None
                 if last is None:                              # idle: no DEX pair to quote, no call made (Pavel 2026-10-15):
-                    self._books, self._stale, self.book_ts = {}, False, time.time()    # nothing on show, no stale clock
+                    self._books, self._stale, self.book_ts = {}, False, time.time()    # nothing on show, no stale clock,
+                    self.head_block = None                                            # no feed (its head goes with it)
                     raise _Idle()
                 age = t0 - last["ts"] if last.get("ts") else 0.0
-                if age > self.C.STALE_S:
+                if age > self._stale_s(last.get("block")):
                     raise RuntimeError(f"block {last.get('block')} is {age:.1f} s old")
+                held = time.time() - self.book_ts if self._books and last.get("block") != self.last_block else 0.0
+                if held > self.C.STALE_S:                     # a newer block ends a hold (_stale_s): one line for it
+                    self.logger().info(f"{self.C.EXCHANGE_NAME}: block {last.get('block')}'s books replace block "
+                                       f"{self.last_block}'s, kept {held:.0f} s (a missed slot: the status node's head showed "
+                                       f"no newer block)")
                 self._books = self._connector._books_by_pair(last)
                 self.last_ok, self.last_block, self.book_ts = time.time(), last.get("block"), last.get("ts") or t0
                 self.polls += 1

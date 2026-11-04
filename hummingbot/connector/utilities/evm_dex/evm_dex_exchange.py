@@ -143,6 +143,7 @@ class EvmDexExchange(ExchangePyBase):
         self._ledger_by = "strategy"                   # whose transactions the swap ledger records: the DEX manual's "manual"
         self._sent: Dict[str, Any] = {}                # what the feed was last told: "cas", "caps"
         self._feed_stats: Dict[str, int] = {}          # the feed's quoter counters, from its last poll
+        self._basefee_wei: Optional[int] = None        # eth: the next block's base fee, from the last poll (swap_gas_usd)
         self._reported: Dict[str, str] = {}           # what was last said about the payloads (a change is logged once)
         self._session: Optional[aiohttp.ClientSession] = None
         self._idle = False                             # the last poll found no DEX pair to quote (and made no call)
@@ -153,6 +154,17 @@ class EvmDexExchange(ExchangePyBase):
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ---------------------------------------------------------------- identity
+    def swap_gas_usd(self) -> float:
+        """About what one swap's gas costs now, in USD: the position balancer places no sell worth less on this venue, so a
+        clean's dust sweep is skipped where its gas would exceed the dust (P2-DEX 2026-11-04, Pavel: "skip the dust sweep on eth
+        when gas exceeds it"; POWR 11-04: $0.058 swept for ~$0.074 of gas). (The next block's base fee, from the last poll, +
+        the tip) x SWAP_GAS_TYPICAL x NATIVE_USD_APPROX. 0.0 = no floor: a spec without those knobs (bsc, where a swap costs
+        ~$0.01) or no base fee known yet."""
+        gas, usd = getattr(self.C, "SWAP_GAS_TYPICAL", 0), getattr(self.C, "NATIVE_USD_APPROX", 0)
+        if not gas or not usd or not self._basefee_wei:
+            return 0.0
+        return (self._basefee_wei + self.C.PRIORITY_FEE_WEI) * gas * usd / 1e18
+
     @property
     def name(self) -> str:
         return self.C.EXCHANGE_NAME
@@ -418,6 +430,8 @@ class EvmDexExchange(ExchangePyBase):
             raise RuntimeError(message[1])
         last = message[1]
         self._feed_stats = last.get("stats") or {}
+        if last.get("basefee"):                       # only an EIP-1559 chain's poll carries it (eth); bsc's never does
+            self._basefee_wei = int(last["basefee"])
         if last.get("wallet") is not None:
             self._apply_wallet(last["wallet"])
             if not last.get("lease"):                  # leased (another sender holds the wallet): no approval is due
@@ -467,6 +481,8 @@ class EvmDexExchange(ExchangePyBase):
             self._ended(message[1], message[2], message[3], message[4] if len(message) > 4 else None)
         elif kind == "pools_changed":
             self._pools_stale = True
+        elif kind == "head":                       # the status node's head, when it changed: the books' hold (_stale_s)
+            self._orderbook_ds.head_block = message[1]
         elif kind == "swap":                       # an answer no placement waits for any more (its task ended)
             if message[2] == "refused":
                 self._swaps.pop(message[1], None)
