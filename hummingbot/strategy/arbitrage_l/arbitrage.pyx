@@ -88,6 +88,9 @@ cdef:
     # example 3 per 10 s)"): then the usual cooldown applies, so a failure that is no lost race can't loop
     double DEX_FIRST_WINDOW_S = 10.0
     int DEX_FIRST_MAX_FAILURES = 3
+    # DEX first's gas check (2026-11-05): a plan whose swap's gas would take its whole profit is skipped on every tick it is
+    # found, so its line is logged at most once per DEX leg in this long
+    double DEX_FIRST_GAS_LOG_S = 60.0
     # A timeout-cancel is FIRE-AND-FORGET: c_cancel_order does not raise when the venue
     # rejects the cancel asynchronously, and the connector emits NO event on that path
     # (exchange_py_base: logs "Failed to cancel order", returns None). We therefore retry
@@ -201,6 +204,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._failure_first_timestamps = {}  # market_tuple -> first failure timestamp (for escalation detection)
         self._dex_first_pending = {}  # DEX first: DEX order id -> the CEX leg that waits for its fill
         self._dex_first_failures = {}  # DEX first: market tuple -> the times its DEX legs failed (the cap)
+        self._dex_first_gas_logged = {}  # DEX first: DEX market tuple -> when its last gas skip was logged
         self._position_balancer = None  # Will be initialized in init_params if enabled
         # Track whether a given order_id has received any fill events
         self._orders_with_fills = set()
@@ -316,6 +320,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._failure_first_timestamps = {}
         self._dex_first_pending = {}
         self._dex_first_failures = {}
+        self._dex_first_gas_logged = {}
         self._last_cleanup_timestamp = 0
         self._last_conv_rates_logged = 0
         
@@ -2537,13 +2542,42 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                and _final_sell_qty > DECIMAL_ZERO)
         # ... and its DEX leg's limit (Pavel 2026-10-17: the swap's room = "minimum profitability that is already set by the
         # strategy"): the price at which the arb still makes min_profitability against its CEX leg's average from this scan,
-        # in place of the book's own limit and the swap's 1% room (c_dex_first_limit). None: the book's limit, as before
+        # in place of the book's own limit and the swap's 1% room (c_dex_first_limit). None: the book's limit, as before.
+        # ... and the swap's gas never takes the whole profit (2026-11-05; Pavel: "make sure that 'alternative' works in this
+        # framework logically and naturally"). The venue's swap_gas_usd() (one swap's gas now: its last poll's base fee + the
+        # tip, the knobs of the feed's gas cap) over this plan's volume_usd is the gas's share. Under the bar, in any normal
+        # market, nothing changes. Over it (a base-fee spike, a small plan) the bar becomes that share: the plan goes out
+        # only while its profit beats it, and its swap's worst price holds it, so even a fill at the limit pays its gas.
+        # Otherwise the plan is skipped as the notional check skips (nothing out, no cooldown). Read once per DEX-first
+        # placement: never on a scan, a CEX-CEX arb or a one-legged correction. 0.0 (bsc; eth before its first base fee) or
+        # a venue without it: nothing changes. Wiki: P2-DEX Open Items #eth-trade-size-gas
+        cdef double gas_usd = 0.0
+        cdef double dex_bar = self._min_profitability
+        cdef object dex_tuple
         cdef object dex_limit = None
         if dex_first:
+            try:
+                gas_usd = float((buy_market if buy_is_swap else sell_market).swap_gas_usd())
+            except Exception:
+                gas_usd = 0.0                                   # fails OPEN, as the position balancer's dust floor does
+            if gas_usd > self._min_profitability * volume_usd:  # the gas's share is over the bar
+                dex_bar = gas_usd / volume_usd
+                if profitability <= dex_bar:                    # it would take the whole profit
+                    self._last_global_trade_timestamp = 0.0
+                    dex_tuple = buy_market_tuple if buy_is_swap else sell_market_tuple
+                    if (self._current_timestamp - self._dex_first_gas_logged.get(dex_tuple, -DEX_FIRST_GAS_LOG_S)
+                            >= DEX_FIRST_GAS_LOG_S):
+                        self._dex_first_gas_logged[dex_tuple] = self._current_timestamp
+                        self.logger().info(
+                            f"DEX first: {dex_tuple.market.name} {'buy' if buy_is_swap else 'sell'} "
+                            f"{_final_buy_qty if buy_is_swap else _final_sell_qty} {dex_tuple.trading_pair} skipped: its "
+                            f"swap's gas ${gas_usd:.3f} is {dex_bar * 100:.3f}% of the ${volume_usd:.2f} plan, its whole "
+                            f"{profitability * 100:.3f}% profit: nothing goes out (this line at most once a minute)")
+                    return
             dex_limit = self.c_dex_first_limit(
                 buy_market if buy_is_swap else sell_market, buy_is_swap,
                 (<double>result[4] if buy_is_swap else <double>result[5]) if len(result) > 5 else 0.0,
-                self._conv_rate(buy_market_tuple, sell_market_tuple))
+                self._conv_rate(buy_market_tuple, sell_market_tuple), dex_bar)
 
         if _final_buy_qty > DECIMAL_ZERO or _final_sell_qty > DECIMAL_ZERO:
             # Log timing for latency monitoring
@@ -2617,8 +2651,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         f"DEX first: {buy_market.name} buy {_final_buy_qty} {buy_market_tuple.trading_pair} sent "
                         f"({buy_order_id}); its {sell_market.name} sell {_final_sell_qty} at {sell_price_decimal} "
                         f"waits for its fill | profit {profitability * 100:.3f}%; the swap's limit "
-                        f"{dex_limit if dex_limit is not None else buy_price_decimal} holds "
-                        f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
+                        f"{dex_limit if dex_limit is not None else buy_price_decimal} holds {dex_bar * 100:.2f}%"
+                        + ("" if dex_bar <= self._min_profitability else
+                           f" (its swap's gas ${gas_usd:.3f} is {dex_bar * 100:.3f}% of the ${volume_usd:.2f} plan, over the "
+                           f"{self._min_profitability * 100:.2f}% bar)")
+                        + ("" if dex_limit is not None else " (no floor: its book's limit)"))
                 elif sell_is_swap and sell_order_id:
                     self._dex_first_pending[sell_order_id] = (
                         buy_market_tuple, True, _final_buy_qty, buy_price_decimal, _final_sell_qty, self._current_timestamp)
@@ -2627,8 +2664,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                         f"DEX first: {sell_market.name} sell {_final_sell_qty} {sell_market_tuple.trading_pair} sent "
                         f"({sell_order_id}); its {buy_market.name} buy {_final_buy_qty} at {buy_price_decimal} "
                         f"waits for its fill | profit {profitability * 100:.3f}%; the swap's limit "
-                        f"{dex_limit if dex_limit is not None else sell_price_decimal} holds "
-                        f"{self._min_profitability * 100:.2f}%" + ("" if dex_limit is not None else " (no floor: its book's limit)"))
+                        f"{dex_limit if dex_limit is not None else sell_price_decimal} holds {dex_bar * 100:.2f}%"
+                        + ("" if dex_bar <= self._min_profitability else
+                           f" (its swap's gas ${gas_usd:.3f} is {dex_bar * 100:.3f}% of the ${volume_usd:.2f} plan, over the "
+                           f"{self._min_profitability * 100:.2f}% bar)")
+                        + ("" if dex_limit is not None else " (no floor: its book's limit)"))
 
             # Explain the asymmetry: without it the log shows a lone buy or a lone sell with
             # nothing saying why. (The line keeps its "legs trimmed" wording: audit tools parse it.)
@@ -2826,21 +2866,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
         if plan is not None:
             self.c_fire_dex_first_cex_leg(order_id, plan, filled)
 
-    cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv):
+    cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv, double bar):
         """DEX first (Pavel 2026-10-17: the swap's room = "minimum profitability that is already set by the strategy. simple
         and robust"): the DEX leg's worst AVERAGE price is where the arb, against its CEX leg's average from the same scan,
-        still makes min_profitability. arb_l's profitability is gross (sell x conv / buy - 1, conv the sell market's price in
-        the buy market's quote), so the bar means at the fill what it meant at the fire. The swap venue turns that price into
-        its order's limit (limit_for_worst_price: its own min-out room folded in), so the swap reverts only below the bar.
-        None (the book's own limit and room) when the venue can't or the scan gave no average"""
+        still makes `bar`: min_profitability, or the share of the arb its swap's gas takes when that is more (2026-11-05: a
+        fill at the limit still pays its gas). arb_l's profitability is gross (sell x conv / buy - 1, conv the sell market's
+        price in the buy market's quote), so the bar means at the fill what it meant at the fire. The swap venue turns that
+        price into its order's limit (limit_for_worst_price: its own min-out room folded in), so the swap reverts only below
+        the bar. None (the book's own limit and room) when the venue can't or the scan gave no average"""
         cdef double worst
         to_limit = getattr(dex_market, "limit_for_worst_price", None)
         if to_limit is None or cex_avg <= 0.0 or conv <= 0.0:
             return None
         if dex_is_buy:          # the CEX sells at cex_avg: (cex_avg x conv) / p - 1 >= bar
-            worst = cex_avg * conv / (1.0 + self._min_profitability)
+            worst = cex_avg * conv / (1.0 + bar)
         else:                   # the CEX buys at cex_avg: (p x conv) / cex_avg - 1 >= bar
-            worst = cex_avg * (1.0 + self._min_profitability) / conv
+            worst = cex_avg * (1.0 + bar) / conv
         try:
             return to_limit(dex_is_buy, Decimal(repr(worst)))
         except Exception:

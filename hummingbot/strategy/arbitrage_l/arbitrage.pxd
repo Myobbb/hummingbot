@@ -92,6 +92,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                          #   amount, its send time). While any is pending the position balancer does
                                          #   nothing (2026-10-30)
         dict _dex_first_failures         # market tuple -> the times its DEX-first legs failed (the 3-in-10-s cap)
+        dict _dex_first_gas_logged       # DEX market tuple -> when its last gas skip was logged (2026-11-05)
 
         # Orchestration mode flag (for multi-strategy orchestrator optimization)
         bint _orchestrated_mode
@@ -162,7 +163,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     
     # Event handlers - unified
     cdef void c_handle_order_completion(self, object order_event, bint is_buy) except *
-    cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv)
+    cdef object c_dex_first_limit(self, object dex_market, bint dex_is_buy, double cex_avg, double conv, double bar)
     cdef c_dex_first_watch(self, object dex_market, str dex_order_id)
     cdef c_fire_dex_first_cex_leg(self, str dex_order_id, tuple plan, object filled_amount)
     cdef c_did_fill_order(self, object order_filled_event)
