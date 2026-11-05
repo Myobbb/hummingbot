@@ -50,7 +50,14 @@ TRADING_ENABLED = True
 SWAP_GAS_LIMIT = 400_000          # the most a swap may use; unused gas is not paid. Measured 2026-10-14 (eth_estimateGas, the
                                   # 16 test books): 124-208k without a hop, 244-285k with one
 APPROVE_GAS_LIMIT = 100_000       # an ERC20 approve or a Permit2.approve (~46-60k)
-GAS_PRICE_WEI = 50_000_000        # 0.05 gwei: BSC's floor. All 35 of the Sending session's live sends landed at it
+# The bid (Pavel 2026-11-05: "go for 0.22"; "getting our trade committed is more important financially"). BSC's base fee is
+# fixed at 0 (BEP-226), so the gas price is the whole bid and the builders rank by it. A type-2 transaction's priority fee is
+# the same number (it pays min(max fee, priority fee): 126 of 126 sampled 2026-11-05), so a legacy transaction loses nothing.
+# The floor 0.05 gwei lost races at the top of the next block to rivals paying 0.05-0.16 gwei; replayed on every BSC drop
+# since 10-26, 0.22 gwei outbids the first rival in 16 of the 20 lost there (dex_history/bsc_bid_backtest.py; wiki P2-DEX
+# Open Items #Gas bid). A landed swap's 102-273k gas costs $0.016-0.043 at it ($0.004-0.010 at 0.05; BNB $716). Tracked:
+# whether going higher has a point (the statistic's rivals)
+GAS_PRICE_WEI = 220_000_000       # 0.22 gwei (0.05 gwei, BSC's floor, until 2026-11-05)
 SWAP_GAS_MAX_NATIVE = Decimal(SWAP_GAS_LIMIT * GAS_PRICE_WEI).scaleb(-18)   # the most one swap can cost: below it, nothing trades
 APPROVED_AT_LEAST = 1 << 95       # an allowance this large counts as approved (the approvals are for the maximum amount;
                                   # 2^95: a token that caps an allowance at 96 bits, as RAD / COMP / UNI store a max approve
