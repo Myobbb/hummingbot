@@ -255,6 +255,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
+        self._last_dust_note_ts = 0.0
 
     def init_params(self,
                     market_pairs: List[ArbitrageLMarketPair],
@@ -410,6 +411,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
+        self._last_dust_note_ts = 0.0
 
         # Optimization: Reserve capacity to avoid reallocations
         self._reusable_arb_opps.reserve(20)
@@ -1159,6 +1161,21 @@ cdef class ArbitrageLStrategy(StrategyBase):
         sell_base_balance = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         if buy_quote_balance <= EPSILON:
             return (0.0, 0.0, 0.0, 0.0)
+        # An OVERSOLD correction is buy-only (c_execute_arbitrage trims the sell leg to zero), so the sell venue's base is
+        # only a size cap here. A balance there too small for one sell order (worth under _min_order_usd, or under the
+        # venue's lot) counts as zero, so the bootstrap below sizes from the hold shortfall. Kept, it sized every
+        # opportunity to the dust and nothing fired, silently: CHEQ 2026-09-28 (3 CHEQ on kucoin, lot 100), GTC 2026-11-07
+        # (0.0001 GTC on kucoin, lot 0.1, while gate's asks sat 9 % under kucoin's bid). Wiki: P2 Hummingbot Open Items
+        # #bootstrap-blocked-by-dust. HOT PATH: outside an oversold correction this costs one bint read.
+        if (self._hold_correction_active and self._hold_correction_oversold and sell_base_balance > EPSILON
+                and self.c_sell_base_is_dust(sell_market_tuple, sell_base_balance)):
+            if self._current_timestamp - self._last_dust_note_ts >= 600.0:
+                self._last_dust_note_ts = self._current_timestamp
+                self.logger().info(
+                    f"Hold-band [{sell_market_tuple.base_asset}]: {sell_market.name} holds {sell_base_balance:.8g} "
+                    f"{sell_market_tuple.base_asset}, too little for one sell order there: counted as zero, so the "
+                    f"oversold correction buys toward its target")
+            sell_base_balance = 0.0
         # Zero sell-side base normally means there is no arb to do. The ONE exception is an
         # active OVERSOLD correction: the guardrail already trims the sell leg to zero in that
         # state (mirror of the `buy 0.000000 sell N` lines an overbought correction produces),
@@ -1324,8 +1341,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
             capacity = float(quantized) if quantized else 0.0
         
         return capacity
- 
- 
+
+    cdef bint c_sell_base_is_dust(self, object sell_market_tuple, double base):
+        """True when `base` can't make one sell order on its venue: worth under _min_order_usd at the hold band's price
+        (every leg needs that much), or under the venue's lot (ExchangePyBase refuses an order under min_order_size; the
+        quantizers only floor to the increment). Only called inside an oversold correction (c_find_best_profitable_amount)."""
+        cdef object rule
+        if self._cached_mid_price_usd > 0.0 and base * self._cached_mid_price_usd < self._min_order_usd:
+            return True
+        rule = sell_market_tuple.market._trading_rules.get(sell_market_tuple.trading_pair)
+        return rule is not None and base < float(rule.min_order_size)
+
 
     cdef void c_cleanup_old_orders(self):
         """

@@ -120,6 +120,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Stuck-correction escalation (orchestrator-driven; see c_set_hold_correction)
         double _hold_correction_since    # timestamp the current correction episode began (0.0 = not correcting)
         public bint _hold_escalated      # True once this episode has been escalated to a PB buy-in/sell-off
+        double _last_dust_note_ts        # the last "too little for one sell order there: counted as zero" line (≤ 1 / 10 min)
         
         # Optimization: Reusable vector to avoid heap allocation in hot loop
         vector[ArbOpportunity] _reusable_arb_opps
@@ -177,6 +178,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef void c_check_filled_order_timeouts(self)
     cdef void c_reconcile_orphan_orders(self)
     cdef void c_cleanup_old_orders(self)
+    cdef bint c_sell_base_is_dust(self, object sell_market_tuple, double base)
     cdef double c_hold_inflight_base(self)
     cdef pair[double, double] c_hold_inflight_legs(self)
     cdef double c_hold_unsettled_base(self)
