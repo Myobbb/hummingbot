@@ -13,7 +13,9 @@ which serves every CEX book and order. Inside HMB the DEX had held that loop 0.5
     transaction's line in the swap ledger first (the asset manager's tag for the wallet's fills, P3-DEX decision 3);
   - the wallet's nonce, and every transaction it sends followed to its receipt or its last block;
   - each swap that failed (dropped, reverted, or refused by every builder) diagnosed after its end: a pool it can't go through
-    sits out, re-tested every 15 min, so a CA's other pools keep trading (_diagnose; P2-DEX #rad-blacklisted-pool);
+    sits out, re-tested every 15 min, so a CA's other pools keep trading (_diagnose; P2-DEX #rad-blacklisted-pool); on a
+    per-block chain (ETH) a dropped swap's own transaction is also simulated at its block: would it have reverted, was it lost
+    within its block, or valid all through (left out by the builder) (_why_dropped; P2-DEX #eth-unknown-drops);
   - the wallet lease (P3-DEX decision 2): a heartbeat each poll; while another sender (the asset manager's withdraw) holds a
     valid request, no book shown and nothing signed, the grant once nothing signed is out, the nonce read anew at release.
 HMB's side (evm_dex_exchange.EvmDexExchange) keeps the framework's state: the orders, the balances, the wallet's one turn, the
@@ -55,6 +57,12 @@ FEED_STOP_S = 2.0         # a stop waits this long for the child to end, then ki
 FEED_HUNG_S = 30.0        # a running child that sent no poll for this long is killed and started again
 STDERR_KEPT = 30          # the child's last stderr lines kept, shown when it ends on its own (a traceback fits)
 TEST_USD = 10.0           # a failed swap's route is simulated with this much of its input, at a minimum of 1 (_diagnose)
+# a dropped swap's own transaction simulated at its block (_why_dropped): the custom errors its revert can name, by selector
+# (the first 4 bytes of each signature's keccak; revert_reason gives Error(string)'s text, else the selector)
+KNOWN_ERRORS = {"0x5bf6f916": "TransactionDeadlinePassed", "0x849eaf98": "V2TooLittleReceived", "0x39d35496": "V3TooLittleReceived",
+                "0x8b063d73": "V4TooLittleReceived", "0xd81b2f2e": "Permit2 AllowanceExpired",
+                "0xf96fb071": "Permit2 InsufficientAllowance", "0xf4d678b8": "InsufficientBalance",
+                "0x675cae38": "InsufficientToken", "0x6a12f104": "InsufficientETH"}
 # the core's modules the child runs, each after the ones it imports; the chain's spec is handed over with them (sources_for)
 WORKER_MODULES = ("evm_dex_p1_quoter", "evm_dex_swap", "evm_dex_pool_list", "evm_dex_quoter", "evm_dex_tx", "evm_dex_feed")
 # what HMB keeps of a swap out (its settle, its line): the rest of the swap (its calldata, its executor) stays in the child
@@ -194,6 +202,18 @@ def revert_reason(data) -> str:
         return ""
 
 
+def call_of(wallet: str, tx: Dict) -> dict:
+    """a signed transaction's own call for an eth_call (build_tx's fields; _why_dropped): from, to, data, value, gas and its
+    fees (type 2: the max fee and the tip; legacy: the gas price), so the simulation checks what the chain would have: its
+    calldata, its gas limit, the wallet's ETH for its gas"""
+    call = {"from": wallet, "to": tx["to"], "data": tx["data"], "value": hex(tx["value"]), "gas": hex(tx["gas"])}
+    if tx.get("type") == 2:
+        call.update(maxFeePerGas=hex(tx["maxFeePerGas"]), maxPriorityFeePerGas=hex(tx["maxPriorityFeePerGas"]))
+    else:
+        call["gasPrice"] = hex(tx["gasPrice"])
+    return call
+
+
 # ---------------------------------------------------------------- the child's side: the chain
 class Feed:
     """The feed process's work (one per child; a test runs it in-process over the same frames). It polls once a block, on
@@ -229,6 +249,8 @@ class Feed:
         self.approvals: Dict[tuple, bool] = {}
         self.wallet_read: dict = {}                   # the wallet's last read (decode_wallet): a diagnosis's test amount and block
         self._diagnosing: set = set()                 # the routes being diagnosed (_diagnose: one at a time each)
+        self._calls: Dict[str, dict] = {}             # a per-block chain's swaps out: each signed transaction's own call, by its
+                                                      # hash, until its end (_send_tx -> _follow: a drop's _why_dropped)
         self.nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self.out: Dict[str, dict] = dict(init.get("follow") or {})   # order id -> a swap out (HMB's, after a restart too)
         self.ledger_path = init.get("ledger")         # the swap ledger: every transaction signed gets its line before it goes out
@@ -806,7 +828,8 @@ class Feed:
             last_block = head + self.C.BUNDLE_BLOCKS
             nonce = self.nonce
             self._lease_check()                      # F4: the lease read again right before the signature (no await between)
-            raw, tx_hash = sign(self.account, build_tx(self.C, to, data, value, nonce, gas, self._gas_price()))
+            tx = build_tx(self.C, to, data, value, nonce, gas, self._gas_price())
+            raw, tx_hash = sign(self.account, tx)
             self._ledger(nonce, tx_hash, ledger)     # before it goes out: a nonce the chain shows used has its line
         except asyncio.CancelledError:
             raise
@@ -814,6 +837,8 @@ class Feed:
             raise Refused(f"not sent: {self._mask(e)}") from None
         self.nonce = nonce + 1                        # taken before the send: the transaction may be out even if the call fails
         record.update(tx_hash=tx_hash, nonce=nonce, last_block=last_block, sent=time.time())
+        if ledger.get("kind") == "swap" and getattr(self.C, "SENDER", "") == "bundle_per_block":
+            self._calls[tx_hash] = call_of(self.wallet, tx)     # its own call, for a drop's simulation (_why_dropped)
         if getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last:      # its block's slot start, for its line (finding 11)
             record["slot_at"] = self.quoter.last["ts"] + self.C.BLOCK_S * (last_block - self.quoter.last["block"]
                                                                            + self._missed(self.quoter.last))
@@ -823,6 +848,7 @@ class Feed:
         try:
             await self._send_bundle(raw, last_block, answers)
         except SendRefused:
+            self._calls.pop(tx_hash, None)
             for k in ("tx_hash", "nonce", "last_block", "sent"):
                 record.pop(k, None)                   # nothing to follow
             await self._nonce_lost()                  # nothing went out: its nonce is free again, read anew now
@@ -1086,6 +1112,7 @@ class Feed:
         by its last block (its nonce is then read anew first, so HMB frees the turn with the nonce known). A swap that failed
         is diagnosed after that (_diagnose; `route`: its book's, None for a swap out before a restart)"""
         receipt = await self._until_ended(record, f"{order_id} {record['tx_hash']}")
+        call = self._calls.pop(record.get("tx_hash"), None)
         parsed = info = None
         if receipt is None:
             await self._nonce_lost()
@@ -1098,6 +1125,7 @@ class Feed:
         self.send(("ended", order_id, parsed, info, list(record.get("builders") or [])))
         if receipt is None and getattr(self.C, "SENDER", "") == "bundle_per_block":
             self._spawn(self._dropped_block(order_id, record["last_block"]))     # after its end: nothing waits on it
+            self._spawn(self._why_dropped(order_id, call, record["last_block"]))  # the swap itself at its block, too
         if route is not None and (parsed is None or parsed["status"] == "reverted"):
             self._spawn(self._diagnose(order_id, route))                         # after its end too
 
@@ -1115,6 +1143,60 @@ class Feed:
             raise
         except Exception as e:
             self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
+
+    async def _why_dropped(self, order_id: str, call: Optional[dict], block: int):
+        """a dropped swap's own transaction simulated at its one block (a per-block chain, ETH), from the state before it (the
+        top of its block: `block` - 1) and after it (`block`): one INFO line, its verdict (Pavel 2026-11-07, "build it": the
+        ETH drops "left out with nothing against us on our pools" were reverts (RAD's frozen pair) or unexplained (FOLD); the
+        route test of _diagnose is $10 at a minimum of 1, never the swap itself; P2-DEX #eth-unknown-drops):
+          - it fails at the top: it could not have landed (why: its limit, a balance or an allowance, its deadline, gas ...);
+          - it passes at the top and fails after it: its block's own transactions took it past (lost within the block);
+          - it passes both: valid all through its block, the builder left it out (not a revert, not a race);
+          - no clear answer from the node, or no call kept (a swap out before a restart): not simulated, and why.
+        Two eth_calls on the status node after the end went to HMB (nothing waits on them), with the signed transaction's own
+        call (call_of: its calldata, value, gas and fees), so nothing is rebuilt"""
+        name = f"{self.C.EXCHANGE_NAME}: {order_id}: the swap itself at its block {block}"
+        if call is None:
+            self._log("info", f"{name}: not simulated (no call kept: out before a restart)")
+            return
+        top, why = await self._call_at(call, block - 1)
+        if top is None:
+            self._log("info", f"{name}: not simulated ({why})")
+        elif not top:
+            self._log("info", f"{name}: fails at the top of it ({why}): it could not have landed")
+        else:
+            end, why = await self._call_at(call, block)
+            if end is None:
+                self._log("info", f"{name}: passes at the top of it; after it not simulated ({why})")
+            elif not end:
+                self._log("info", f"{name}: passes at the top of it, fails after its transactions ({why}): lost within "
+                                  f"the block")
+            else:
+                self._log("info", f"{name}: passes at the top of it and after it: valid all through, the builder left it out")
+
+    async def _call_at(self, call: dict, block: int) -> Tuple[Optional[bool], str]:
+        """`call` (call_of) as an eth_call at `block` on the status node -> (True, "") it passes; (False, why) it fails as the
+        chain would fail it: a revert (its error named when known, KNOWN_ERRORS), out of gas, too little ETH for its gas, its
+        max fee under the base fee; (None, why) no clear answer (a node's error, a timeout)"""
+        try:
+            ans = json.loads(await self._post_to(self.status_url, json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [call, hex(block)]}).encode()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, self._mask(e)[:160]
+        if isinstance(ans, dict) and "result" in ans:
+            return True, ""
+        err = ans.get("error") if isinstance(ans, dict) else ans
+        text = str(err.get("message") if isinstance(err, dict) else err)
+        low = text.lower()
+        if "revert" in low:
+            reason = revert_reason(err.get("data")) if isinstance(err, dict) else ""
+            reason = KNOWN_ERRORS.get(reason, reason)
+            return False, (f"{text}: {reason}" if reason and reason not in text else text)[:160]
+        if any(k in low for k in ("out of gas", "insufficient funds", "less than block base fee", "gas required exceeds")):
+            return False, self._mask(text)[:160]
+        return None, self._mask(text)[:160]
 
     # ---------------------------------------------------------------- a failed swap: a pool that can't execute, or a lost race
     async def _diagnose(self, order_id: str, route: dict):
