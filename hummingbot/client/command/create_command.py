@@ -367,11 +367,12 @@ class CreateCommand:
                 'coinw': 'cw',
                 # eth: the P2-DEX leg on Ethereum (priced from P1's pools, the EVM core's second chain, 2026-10-22)
                 'eth': 'eth',
+                'coinstore': 'cs',
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
-            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx", "bsc", "cw", "eth"]
+            order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx", "bsc", "cw", "eth", "cs"]
             try:
                 return order.index(alias)
             except ValueError:
