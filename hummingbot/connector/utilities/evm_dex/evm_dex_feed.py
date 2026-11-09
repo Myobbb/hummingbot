@@ -63,6 +63,9 @@ KNOWN_ERRORS = {"0x5bf6f916": "TransactionDeadlinePassed", "0x849eaf98": "V2TooL
                 "0x8b063d73": "V4TooLittleReceived", "0xd81b2f2e": "Permit2 AllowanceExpired",
                 "0xf96fb071": "Permit2 InsufficientAllowance", "0xf4d678b8": "InsufficientBalance",
                 "0x675cae38": "InsufficientToken", "0x6a12f104": "InsufficientETH"}
+# a failure only its block's own header can cause (its time: the deadline; its base fee), never its transactions: one after
+# the block is one at its top too, whose eth_call ran on the parent's header (_why_dropped; 11-07 21:01, a missed slot)
+BLOCK_OWN_FAILURES = ("TransactionDeadlinePassed", "less than block base fee")
 # the core's modules the child runs, each after the ones it imports; the chain's spec is handed over with them (sources_for)
 WORKER_MODULES = ("evm_dex_p1_quoter", "evm_dex_swap", "evm_dex_pool_list", "evm_dex_quoter", "evm_dex_tx", "evm_dex_feed")
 # what HMB keeps of a swap out (its settle, its line): the rest of the swap (its calldata, its executor) stays in the child
@@ -1151,6 +1154,7 @@ class Feed:
         route test of _diagnose is $10 at a minimum of 1, never the swap itself; P2-DEX #eth-unknown-drops):
           - it fails at the top: it could not have landed (why: its limit, a balance or an allowance, its deadline, gas ...);
           - it passes at the top and fails after it: its block's own transactions took it past (lost within the block);
+            unless that failure is its block's own time or base fee (BLOCK_OWN_FAILURES): then it fails at the top too;
           - it passes both: valid all through its block, the builder left it out (not a revert, not a race);
           - no clear answer from the node, or no call kept (a swap out before a restart): not simulated, and why.
         Two eth_calls on the status node after the end went to HMB (nothing waits on them), with the signed transaction's own
@@ -1168,6 +1172,9 @@ class Feed:
             end, why = await self._call_at(call, block)
             if end is None:
                 self._log("info", f"{name}: passes at the top of it; after it not simulated ({why})")
+            elif not end and any(k in why for k in BLOCK_OWN_FAILURES):     # the block's header, not its transactions
+                self._log("info", f"{name}: fails at the top of it by its block's own "
+                                  f"{'time' if 'Deadline' in why else 'base fee'} ({why}): it could not have landed")
             elif not end:
                 self._log("info", f"{name}: passes at the top of it, fails after its transactions ({why}): lost within "
                                   f"the block")
