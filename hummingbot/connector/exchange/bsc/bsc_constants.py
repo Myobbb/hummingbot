@@ -127,6 +127,13 @@ SEND_TIMEOUT_S = 2.0              # a builder that hasn't answered a bundle by t
 # (the chain can't tell HMB's swaps from manual ones, and the public node can't give a transaction's hash from its nonce).
 # Contract v1 -> wiki P3-DEX Overview §The swap ledger. Beside P1's records; `.jsonl`, so no `*.json` glob takes it.
 SWAP_LEDGER_PATH = os.path.expanduser("~/p2_dex/swaps.jsonl")
+# Wallet 2 (Pavel 2026-11-10: "simple 1/2 switch, we won't be using more than 2 wallets per EVM chain"): P2's second
+# wallet on this chain, the default for new strategies (`control create ... evm1` keeps wallet 1, this connector's own,
+# which the strategies before it trade, and HTX's). It is this connector under its own name and keys file
+# (bsc_utils.OTHER_DOMAINS: `connect bsc2`); its own nonce sequence, so its own swap ledger and, beside it, its own
+# lease and heartbeat (P3-DEX contract v1, per wallet). Wallet 1 keeps `bsc` and every path above.
+WALLET2_NAME = "bsc2"
+WALLET2_LEDGER_PATH = os.path.expanduser("~/p2_dex/bsc2/swaps.jsonl")
 WARN_EVERY_S = 30.0               # a transaction's trouble (an unreadable receipt) is said at most this often
 PRICE_SLACK = Decimal("1e-6")     # the limit check's relative slack: a strategy's limit and the book's levels are the same
                                   # prices read through float and Decimal, which differ in the last digits

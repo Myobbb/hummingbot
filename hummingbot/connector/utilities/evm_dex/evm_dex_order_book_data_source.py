@@ -107,7 +107,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if life is None or life > 0:
             return False
         self._stale, self._books = True, {}
-        self.logger().warning(f"{self.C.EXCHANGE_NAME}: no fresh poll for {self._stale_s(self.last_block):.0f} s, every book "
+        self.logger().warning(f"{self._connector.name}: no fresh poll for {self._stale_s(self.last_block):.0f} s, every book "
                               f"is empty: {self.last_error}")
         self._push()
         return True
@@ -150,7 +150,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     raise RuntimeError(f"block {last.get('block')} is {age:.1f} s old")
                 held = time.time() - self.book_ts if self._books and last.get("block") != self.last_block else 0.0
                 if held > self.C.STALE_S:                     # a newer block ends a hold (_stale_s): one line for it
-                    self.logger().info(f"{self.C.EXCHANGE_NAME}: block {last.get('block')}'s books replace block "
+                    self.logger().info(f"{self._connector.name}: block {last.get('block')}'s books replace block "
                                        f"{self.last_block}'s, kept {held:.0f} s (a missed slot: the status node's head showed "
                                        f"no newer block)")
                 self._books = self._connector._books_by_pair(last)
@@ -160,7 +160,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 wait, self._erring = False, False
                 if self._stale:
                     self._stale = False
-                    self.logger().info(f"{self.C.EXCHANGE_NAME}: books back (block {self.last_block})")
+                    self.logger().info(f"{self._connector.name}: books back (block {self.last_block})")
             except asyncio.CancelledError:
                 raise
             except _Idle:
@@ -187,7 +187,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_summary = now
         two_sided = sum(1 for bids, asks in self._books.values() if bids and asks)
         q = self._connector._feed_stats
-        self.logger().debug(f"{self.C.EXCHANGE_NAME}: {self.polls} polls, {self.failed} failed, {two_sided}/{len(self._trading_pairs)} "
+        self.logger().debug(f"{self._connector.name}: {self.polls} polls, {self.failed} failed, {two_sided}/{len(self._trading_pairs)} "
                             f"two-sided books, "
                             f"block {self.last_block}, RU at BlockPI's rate {q.get('ru')}, elections {q.get('elections')}, switches {q.get('switches')}")
 
@@ -196,7 +196,7 @@ class EvmDexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return
 
     async def _connected_websocket_assistant(self):
-        raise NotImplementedError(f"{self.C.EXCHANGE_NAME} is polled, not streamed")
+        raise NotImplementedError(f"{self._connector.name} is polled, not streamed")
 
     async def _subscribe_channels(self, ws):
-        raise NotImplementedError(f"{self.C.EXCHANGE_NAME} is polled, not streamed")
+        raise NotImplementedError(f"{self._connector.name} is polled, not streamed")

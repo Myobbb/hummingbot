@@ -50,6 +50,9 @@ class EvmDexExchange(ExchangePyBase):
     sources (their loggers named for the chain) and its error classes (TradingDisabled, OrderRefused, SendRefused: the names in
     its log lines); its constructor keeps the chain's config fields (<k>_rpc_url, <k>_wallet_address, <k>_private_key). The
     text below was written for `bsc`, the first chain; it holds for every chain by its spec.
+    Two wallets per chain since 2026-11-10 (Pavel: "simple 1/2 switch"): wallet 1 is the chain's connector (`bsc`), wallet 2
+    the same class under its other domain (`bsc2`: <k>_utils.OTHER_DOMAINS, `connect bsc2`), with its own keys file, name,
+    swap ledger, lease and heartbeat (_wallet_name, swap_ledger_path). Everything else is one instance's, as before.
 
     - The feed process (bsc_feed, Pavel 2026-10-15: "build the separate DEX feed process ... DEX related processes ideally
       should not affect CEX speed and recency"): everything done with the chain runs in a child process, never on HMB's
@@ -119,6 +122,7 @@ class EvmDexExchange(ExchangePyBase):
         if self.C is None or self.SOURCES is None:
             raise TypeError("an EVM DEX connector is a chain's subclass (its C and SOURCES)")
         domain = domain or self.C.DEFAULT_DOMAIN
+        self._name = self._wallet_name(domain)         # `bsc` (wallet 1) or `bsc2` (wallet 2): logs, the feed, its files
         self._rpc_url = (rpc_url or "").strip()
         self._wallet = (wallet_address or "").strip().lower()
         self._account, self._key_problem = self._load_key(private_key)
@@ -139,7 +143,7 @@ class EvmDexExchange(ExchangePyBase):
         self._pair_ca: Dict[str, str] = {}             # trading pair -> its bound CA with P1's records (_reload_pools)
         self._caps_dirty = True                        # a balance moved since the ladders' ends were last worked out
         self._cas: Dict[str, str] = {}                 # trading pair -> the CA its leg names (bind_ca: the orchestrator)
-        self._feed = FeedClient(self._on_feed, self._log, self._mask, self.SOURCES, self.C.EXCHANGE_NAME)
+        self._feed = FeedClient(self._on_feed, self._log, self._mask, self.SOURCES, self.name)
         self._ledger_by = "strategy"                   # whose transactions the swap ledger records: the DEX manual's "manual"
         self._sent: Dict[str, Any] = {}                # what the feed was last told: "cas", "caps"
         self._feed_stats: Dict[str, int] = {}          # the feed's quoter counters, from its last poll
@@ -167,7 +171,25 @@ class EvmDexExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
-        return self.C.EXCHANGE_NAME
+        return self._name
+
+    def _wallet_name(self, domain: str) -> str:
+        """this instance's connector name, from the domain Hummingbot built it with (Pavel 2026-11-10, a 1/2 switch): the
+        default domain is wallet 1, the chain's own connector (`bsc`); the spec's WALLET2_NAME (<k>_utils.OTHER_DOMAINS) is
+        wallet 2 (`bsc2`). Any other domain is refused: an instance must never share a wallet's ledger and lease by accident"""
+        if domain == self.C.DEFAULT_DOMAIN:
+            return self.C.EXCHANGE_NAME
+        wallet2 = getattr(self.C, "WALLET2_NAME", None)
+        if wallet2 and domain == wallet2:
+            return wallet2
+        raise ValueError(f"{self.C.EXCHANGE_NAME}: no wallet for the domain {domain!r} (wallet 1: {self.C.DEFAULT_DOMAIN!r}, "
+                         f"wallet 2: {wallet2!r})")
+
+    @property
+    def swap_ledger_path(self) -> str:
+        """this wallet's swap ledger (P3-DEX contract v1; the feed keeps its lease and heartbeat beside it): wallet 1's is the
+        spec's SWAP_LEDGER_PATH, wallet 2's its WALLET2_LEDGER_PATH (its own nonce sequence). Read at each feed start"""
+        return self.C.SWAP_LEDGER_PATH if self._name == self.C.EXCHANGE_NAME else self.C.WALLET2_LEDGER_PATH
 
     @property
     def authenticator(self):
@@ -261,7 +283,7 @@ class EvmDexExchange(ExchangePyBase):
         """one JSON-RPC POST to the book's node (<k>_rpc_url): `connect <k>`'s balance read and check_network's, the only node
         requests HMB's side makes (the feed process has its own session)"""
         if not self._rpc_url:
-            raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.C.EXCHANGE_NAME}")
+            raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.name}")
         return await self._post_to(self._rpc_url, body)
 
     async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None) -> bytes:
@@ -344,11 +366,11 @@ class EvmDexExchange(ExchangePyBase):
     def _ca_for_pair(self, trading_pair: str) -> Tuple[Optional[str], str]:
         base, _, quote = trading_pair.partition("-")
         if quote.upper() != self.C.QUOTE:
-            return None, f"quote {quote}: {self.C.EXCHANGE_NAME} books are priced in {self.C.QUOTE}"
+            return None, f"quote {quote}: {self.name} books are priced in {self.C.QUOTE}"
         ca = self._cas.get(trading_pair)
         if not ca:
-            return None, (f"no CA bound: a {self.C.EXCHANGE_NAME} leg is created as "
-                          f"{self.C.EXCHANGE_NAME}:{trading_pair}:0x<CA>")
+            return None, (f"no CA bound: a {self.name} leg is created as "
+                          f"{self.name}:{trading_pair}:0x<CA>")
         if ca not in self._pool_list.cas:
             return None, f"no P1 records for {ca} in {self._pool_list.data_dir} (the watcher writes them from the page)"
         return ca, ""
@@ -365,7 +387,7 @@ class EvmDexExchange(ExchangePyBase):
         try:
             self._pool_list.load()
         except Exception as e:
-            self.logger().warning(f"{self.C.EXCHANGE_NAME}: the pool payloads could not be read: {e}")
+            self.logger().warning(f"{self.name}: the pool payloads could not be read: {e}")
             return
         self._pair_ca = {}
         for trading_pair in self._trading_pairs:
@@ -386,7 +408,7 @@ class EvmDexExchange(ExchangePyBase):
     def _report(self, key: str, text: str):
         if self._reported.get(key) != text:
             self._reported[key] = text
-            self.logger().info(f"{self.C.EXCHANGE_NAME}: {key}: {text}")
+            self.logger().info(f"{self.name}: {key}: {text}")
 
     def _trading_rule(self, trading_pair: str) -> Optional[TradingRule]:
         ca, _ = self._ca_for_pair(trading_pair)
@@ -448,14 +470,14 @@ class EvmDexExchange(ExchangePyBase):
         """what the feed process starts with: the node, the wallet and its key (on its stdin, never in its arguments), what
         to quote, the swaps still out (followed again), the swap ledger with whose transactions it records, and whether it
         holds the wallet lease (P3-DEX: the asset manager's withdrawals; its files beside the ledger)"""
-        return {"spec": self.C.__name__, "name": self.C.EXCHANGE_NAME, "rpc_url": self._rpc_url, "wallet": self._wallet,
+        return {"spec": self.C.__name__, "name": self.name, "rpc_url": self._rpc_url, "wallet": self._wallet,
                 "key": bytes(self._account.key) if self._account is not None else None,
                 "read_wallet": self.is_trading_required and bool(self._wallet) and not self._key_problem,
                 "gate": self.is_trading_required, "data_dir": self._pool_list.data_dir, "poll_s": self.C.POLL_S,
                 "builders": list(self.C.BUILDERS), "swap_read_url": self.C.SWAP_READ_URL,
                 "swap_status_url": self.C.SWAP_STATUS_URL,
                 "cas": cas, "caps": caps, "follow": dict(self._swaps),
-                "ledger": self.C.SWAP_LEDGER_PATH, "ledger_by": self._ledger_by,
+                "ledger": self.swap_ledger_path, "ledger_by": self._ledger_by,
                 "lease": self._ledger_by == "strategy"}   # HMB's feed holds the wallet lease; the DEX manual's never does
 
     def _send_changed(self, kind: str, value):
@@ -654,7 +676,7 @@ class EvmDexExchange(ExchangePyBase):
             self._busy = turn
             what = self._approval_name(to, data)
             try:
-                self.logger().info(f"{self.C.EXCHANGE_NAME}: sending a one-time approval: {what}")
+                self.logger().info(f"{self.name}: sending a one-time approval: {what}")
                 self._approval_id += 1
                 call_id = f"{turn}:{self._approval_id}"
                 try:
@@ -664,14 +686,14 @@ class EvmDexExchange(ExchangePyBase):
                 if outcome == "landed":
                     self._approved_sent.add((to, data))
                     self._approve_retry.pop((to, data), None)
-                    self.logger().info(f"{self.C.EXCHANGE_NAME}: approved in block {detail}: {what}")
+                    self.logger().info(f"{self.name}: approved in block {detail}: {what}")
                 elif outcome == "refused":
                     delay = self._approve_back_off((to, data))
-                    self.logger().warning(f"{self.C.EXCHANGE_NAME}: the approval {what} was not sent: {self._mask(detail)}; it is "
+                    self.logger().warning(f"{self.name}: the approval {what} was not sent: {self._mask(detail)}; it is "
                                           f"tried again in {delay / 60:.0f} min")
                 else:
                     delay = self._approve_back_off((to, data))
-                    self.logger().warning(f"{self.C.EXCHANGE_NAME}: the approval {what} did not land ("
+                    self.logger().warning(f"{self.name}: the approval {what} did not land ("
                                           f"{'reverted' if outcome == 'reverted' else 'not included by its last block'}); "
                                           f"it is tried again in {delay / 60:.0f} min")
             finally:
@@ -782,7 +804,7 @@ class EvmDexExchange(ExchangePyBase):
         if not isinstance(exception, (self.OrderRefused, self.TradingDisabled)):
             return super()._on_order_failure(order_id, trading_pair, amount, trade_type, order_type, price, exception,
                                              **kwargs)
-        self.logger().warning(f"{self.C.EXCHANGE_NAME}: {trade_type.name.lower()} {amount} {trading_pair} at {price} refused: "
+        self.logger().warning(f"{self.name}: {trade_type.name.lower()} {amount} {trading_pair} at {price} refused: "
                               f"{self._mask(exception)}")
         self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
 
@@ -792,13 +814,13 @@ class EvmDexExchange(ExchangePyBase):
         hash = the exchange order id, the time). Off while self.C.TRADING_ENABLED is False. Here it is one message out and one
         back: none of the swap's work is on HMB's loop (Pavel 2026-10-15). The feed follows it on chain and says when it
         ended (_settle). Refused (OrderRefused, why) when nothing went out"""
-        name = self.C.EXCHANGE_NAME
+        name = self.name
         if not self.C.TRADING_ENABLED:
-            raise self.TradingDisabled(f"{name}: orders are off ({name}_constants.TRADING_ENABLED)")
+            raise self.TradingDisabled(f"{name}: orders are off ({self.C.EXCHANGE_NAME}_constants.TRADING_ENABLED)")
         if self._busy != order_id:
             raise self.OrderRefused("one swap at a time: it was placed while another transaction was out")
         if self._account is None:
-            raise self.OrderRefused(self._key_problem or f"no wallet key: connect {name} with {name}_private_key")
+            raise self.OrderRefused(self._key_problem or f"no wallet key: connect {name} with {self.C.EXCHANGE_NAME}_private_key")
         ca, why = self._ca_for_pair(trading_pair)
         if not ca:
             raise self.OrderRefused(why)
@@ -849,13 +871,13 @@ class EvmDexExchange(ExchangePyBase):
                 try:
                     first(order_id, end[1].fill_base_amount)
                 except Exception:
-                    self.logger().error(f"{self.C.EXCHANGE_NAME}: {order_id} filled, but whoever waited on its fill failed",
+                    self.logger().error(f"{self.name}: {order_id} filled, but whoever waited on its fill failed",
                                         exc_info=True)
                 handed = time.perf_counter() - read_at
             if end[0] == OrderState.FAILED:                  # before the failure event reaches the strategy
                 self._after_failure(swap["trading_pair"], swap.get("last_block") if parsed is None else None)
         except Exception:                                    # never the feed's reader: the settle works it out again
-            self.logger().error(f"{self.C.EXCHANGE_NAME}: {order_id}: its end could not be worked out at once", exc_info=True)
+            self.logger().error(f"{self.name}: {order_id}: its end could not be worked out at once", exc_info=True)
         # (the loop given: Python 3.12's C Task starts eagerly on the loop it is GIVEN, and fails without one)
         asyncio.Task(safe_wrapper(self._settle(order_id, swap, parsed, info, end, handed, builders)),
                      loop=asyncio.get_running_loop(), eager_start=True)
@@ -890,7 +912,7 @@ class EvmDexExchange(ExchangePyBase):
         try:
             line = self._swap_line(order_id, swap, info, parsed, problem, handed, builders)
         except Exception as e:                        # the line is information only: it never holds the settle up
-            line = (f"{self.C.EXCHANGE_NAME}: {order_id} {swap.get('tx_hash')}: {problem[1] if problem else 'filled'} "
+            line = (f"{self.name}: {order_id} {swap.get('tx_hash')}: {problem[1] if problem else 'filled'} "
                     f"({type(e).__name__} in its line)")
         (self.logger().warning if problem is not None else self.logger().info)(line)
         await self._order_tracker._process_order_update(self._order_update(order_id, swap, state, problem))
@@ -908,7 +930,7 @@ class EvmDexExchange(ExchangePyBase):
         With the feed's answers, the send too (_send_part)"""
         book = swap["book_block"]
         where = f"its book (block {book}) {swap['sent'] - swap['book_at']:.2f} s old at the send"
-        what = f"{self.C.EXCHANGE_NAME}: {swap['trading_pair']} {swap['side']} ({order_id})"
+        what = f"{self.name}: {swap['trading_pair']} {swap['side']} ({order_id})"
         out = self._send_part(swap, builders)
         if info is None:
             return f"{what} DROPPED: {problem[1]}; {where}{out}; {swap['tx_hash']}"

@@ -194,6 +194,7 @@ class StrategyControlCommand:
                 self.notify("Usage: control create <name> <primary_exchange:PAIR> <secondary_exchange:PAIR>")
                 self.notify("Example: control create arb_bsx_new gate:BSX-USDT kucoin:BSX-USDT")
                 self.notify("A swap venue's leg names its token: bsc:PAIR:0x<CA> or eth:PAIR:0x<CA> (e.g. bsc:MUBARAK-USDT:0x5c85…)")
+                self.notify("It trades from wallet 2 (bsc2 / eth2); add evm1 to trade it from wallet 1 (bsc / eth)")
                 return
             # Check if create capability exists
             if not hasattr(strategy, 'create_strategy'):
@@ -205,9 +206,13 @@ class StrategyControlCommand:
             #   noesc  -> guardrail-only accumulation (buy-in off, buy-in escalation off,
             #             resumed, hold enabled; an overbought correction still escalates to
             #             a sell-off). Without it nothing changes: defaults are untouched.
+            #   evm1   -> a DEX leg trades from wallet 1, the chain's own connector (`bsc`, `eth`); without it, from
+            #             wallet 2 (`bsc2`, `eth2`). P2-DEX wallets, Pavel 2026-11-10: the orchestrator's
+            #             evm_wallet_connector. No effect on a strategy without a DEX leg.
             # Parsed by exact match so it can never be confused with a min_profitability value.
             extras = [str(v).strip() for v in value[2:]]
             no_escalation = any(e.lower() == "noesc" for e in extras)
+            evm_wallet = 1 if any(e.lower() == "evm1" for e in extras) else 2
             # Parse optional min_profitability if provided (e.g., "2.0" as third arg)
             min_profitability = 2.1
             for e in extras:
@@ -219,7 +224,7 @@ class StrategyControlCommand:
                 except ValueError:
                     pass  # Keep default
             safe_ensure_future(self._control_create(identifier, primary_spec, secondary_spec,
-                                                    min_profitability, no_escalation),
+                                                    min_profitability, no_escalation, evm_wallet),
                                loop=self.ev_loop)
         elif action == "clean":
             if identifier is None:
@@ -894,7 +899,8 @@ class StrategyControlCommand:
                               primary_spec: str,
                               secondary_spec: str,
                               min_profitability: float = 2.1,
-                              no_escalation: bool = False):
+                              no_escalation: bool = False,
+                              evm_wallet: int = 2):
         """Create a new arbitrage strategy at runtime (always starts PAUSED)."""
         try:
             strategy = self.trading_core.strategy
@@ -905,12 +911,15 @@ class StrategyControlCommand:
             if no_escalation:
                 self.notify("  noesc: buy-in disabled, buy-in escalation off, hold enabled "
                             "(PB never arms a buy — entry only on arb spread; sell-off still escalates)")
+            if evm_wallet == 1:
+                self.notify("  evm1: its DEX leg trades from wallet 1 (bsc / eth)")
             success = await strategy.create_strategy(
                 name=name,
                 primary_spec=primary_spec,
                 secondary_spec=secondary_spec,
                 min_profitability=min_profitability,
                 no_escalation=no_escalation,
+                evm_wallet=evm_wallet,
             )
 
             if success:

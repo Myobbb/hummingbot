@@ -3,6 +3,7 @@ from decimal import Decimal
 from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.connector.exchange.eth import eth_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 # An ordinary exchange-type connector (P2-DEX, 2026-10-14), not a Gateway one: no gateway code path is involved.
@@ -54,3 +55,21 @@ class EthConfigMap(BaseConnectorConfigMap):
 
 
 KEYS = EthConfigMap.model_construct()
+
+# Wallet 2 (Pavel 2026-11-10): this connector under its own name and keys file, by Hummingbot's other-domain mechanism (as
+# binance_us is binance's), so `connect eth2` stores conf/connectors/eth2.yml and never touches eth.yml. Its fields
+# keep eth's names: Hummingbot hands them to EthExchange as they are, with the domain `eth2`, which makes that instance
+# wallet 2 (eth_constants.WALLET2_*: its name, its swap ledger). `control create` puts a new strategy's eth leg here.
+WALLET2 = CONSTANTS.WALLET2_NAME
+
+
+class Eth2ConfigMap(EthConfigMap):
+    connector: str = WALLET2
+    model_config = ConfigDict(title=WALLET2)
+
+
+OTHER_DOMAINS = [WALLET2]
+OTHER_DOMAINS_PARAMETER = {WALLET2: WALLET2}
+OTHER_DOMAINS_EXAMPLE_PAIR = {WALLET2: EXAMPLE_PAIR}
+OTHER_DOMAINS_DEFAULT_FEES = {WALLET2: DEFAULT_FEES}
+OTHER_DOMAINS_KEYS = {WALLET2: Eth2ConfigMap.model_construct()}

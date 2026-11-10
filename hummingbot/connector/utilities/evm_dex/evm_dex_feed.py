@@ -233,6 +233,7 @@ class Feed:
     def __init__(self, init: dict, send: Callable[[tuple], None]):
         self.send = send
         self.C = importlib.import_module(init["spec"])  # the chain's spec (in the child: installed by BOOT with the code)
+        self.name = init.get("name") or self.C.EXCHANGE_NAME   # its connector: `bsc` (wallet 1) or `bsc2` (wallet 2), in its lines
         self.rpc_url = init["rpc_url"]
         self.wallet = init["wallet"]
         self.account = None
@@ -257,6 +258,8 @@ class Feed:
         self.nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self.out: Dict[str, dict] = dict(init.get("follow") or {})   # order id -> a swap out (HMB's, after a restart too)
         self.ledger_path = init.get("ledger")         # the swap ledger: every transaction signed gets its line before it goes out
+        if self.ledger_path:                          # its folder, made once: wallet 2's (~/p2_dex/bsc2/) by its first feed
+            os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
         self.ledger_by = init.get("ledger_by") or "strategy"         # whose transactions: HMB's, or the DEX manual's
         if self.ledger_by not in LEDGER_BY:
             raise ValueError(f"ledger_by {self.ledger_by!r} is not one of {LEDGER_BY}")
@@ -335,7 +338,7 @@ class Feed:
         self._tasks.discard(task)
         if not task.cancelled() and task.exception() is not None:
             e = task.exception()
-            self._log("error", self._mask(f"{self.C.EXCHANGE_NAME}: the feed's task failed: {type(e).__name__}: {e}"))
+            self._log("error", self._mask(f"{self.name}: the feed's task failed: {type(e).__name__}: {e}"))
 
     def _log(self, level: str, text: str):
         self.send(("log", level, text))
@@ -343,7 +346,7 @@ class Feed:
     def _report(self, key: str, text: str, level: str = "info"):
         if self.reported.get(key) != text:
             self.reported[key] = text
-            self._log(level, f"{self.C.EXCHANGE_NAME}: {key}: {text}")
+            self._log(level, f"{self.name}: {key}: {text}")
 
     def _mask(self, text) -> str:
         return mask(text, self.rpc_url, self._key_hex)
@@ -353,7 +356,7 @@ class Feed:
         """one JSON-RPC POST to the book's node (<k>_rpc_url; on BSC BlockRazor's free RPC since 2026-10-19): the quoter's
         transport"""
         if not self.rpc_url:
-            raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.C.EXCHANGE_NAME}")
+            raise RuntimeError(f"no {self.C.P1_CHAIN} RPC URL: connect {self.name}")
         return await self._post_to(self.rpc_url, body)
 
     async def _post_to(self, url: str, body: bytes, timeout: Optional[float] = None, headers: Optional[dict] = None) -> bytes:
@@ -513,7 +516,7 @@ class Feed:
         if book and status and book != status:
             self._report("book node", self._mask(f"the books are quoted on {book}, but each poll goes when {status} shows its "
                                                  f"block: set {self.C.EXCHANGE_NAME}_rpc_url to {self.status_url} (connect "
-                                                 f"{self.C.EXCHANGE_NAME})"), "warning")
+                                                 f"{self.name})"), "warning")
 
     def _next_poll_in(self, sent: float, no_newer: bool) -> float:
         """seconds until the next poll's head reads begin: HEAD_START_S after the next block's slot on the block clock
@@ -787,7 +790,7 @@ class Feed:
             self.send(("signed", order_id, dict(record)))
         try:
             if self.account is None:
-                raise Refused(f"no wallet key: connect {self.C.EXCHANGE_NAME} with {self.C.EXCHANGE_NAME}_private_key")
+                raise Refused(f"no wallet key: connect {self.name} with {self.C.EXCHANGE_NAME}_private_key")
             swap = self._swap_for(p["ca"], p["side"], p["amount"], p["price"])
             route = swap["route"]
             if not self.approvals.get((swap["token_in"], swap["executor"]["router"])):
@@ -857,7 +860,7 @@ class Feed:
             await self._nonce_lost()                  # nothing went out: its nonce is free again, read anew now
             raise
         except Exception as e:
-            self._log("warning", f"{self.C.EXCHANGE_NAME}: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it "
+            self._log("warning", f"{self.name}: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it "
                                  f"on chain")
 
     def _gas_price(self):
@@ -975,7 +978,7 @@ class Feed:
             granted = None
         if req is not None:
             self.lease, self.granted = req, (granted if granted == req["id"] else None)
-            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet is leased to {req.get('by')} ({req['id'][:8]}) at the "
+            self._log("info", f"{self.name}: the wallet is leased to {req.get('by')} ({req['id'][:8]}) at the "
                               f"feed's start: no DEX "
                               f"book or signature until it is released")
         if granted is not None and (req is None or granted != req["id"]):
@@ -997,12 +1000,12 @@ class Feed:
             if self._nonce_task is not None and not self._nonce_task.done():
                 self._nonce_task.cancel()               # a read from before the requester's transaction must not land after
             await self._nonce_lost()                    # the nonce read anew, and only then a book is shown again
-            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet lease {held['id'][:8]} is released: quoting again")
+            self._log("info", f"{self.name}: the wallet lease {held['id'][:8]} is released: quoting again")
         if req is None:
             return False
         if self.lease is None:                          # F1, from this poll on (a new id starts here again)
             self.lease = req
-            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet is leased to {req.get('by')} ({req['id'][:8]}): no DEX book "
+            self._log("info", f"{self.name}: the wallet is leased to {req.get('by')} ({req['id'][:8]}): no DEX book "
                               f"or signature "
                               f"until it is released")
         if self.granted != req["id"] and not self.out and not self._approving:   # F2: nothing signed is out; F3, once per id
@@ -1017,7 +1020,7 @@ class Feed:
                 self._report("lease", f"the grant for {req['id'][:8]} waits for the next poll: {self._mask(e)}", "warning")
                 return True
             self.granted, self.nonce = req["id"], None  # the requester takes that nonce: read anew at the release
-            self._log("info", f"{self.C.EXCHANGE_NAME}: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
+            self._log("info", f"{self.name}: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
         return True
 
     async def _send_bundle(self, raw: str, last_block: int, answers: Optional[list] = None):
@@ -1098,7 +1101,7 @@ class Feed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self._warn(record, f"{self.C.EXCHANGE_NAME}: {what}: its receipt could not be read: {self._mask(e)}")
+                self._warn(record, f"{self.name}: {what}: its receipt could not be read: {self._mask(e)}")
                 continue
             if ended:
                 return receipt
@@ -1140,12 +1143,12 @@ class Feed:
             b = await self._status("eth_getBlockByNumber", [hex(block), False])
             extra = bytes.fromhex((b.get("extraData") or "0x")[2:]).decode("latin-1")
             extra = "".join(c for c in extra if 32 <= ord(c) < 127).strip() or "?"
-            self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block} was built by '{extra}' "
+            self._log("info", f"{self.name}: {order_id}: its block {block} was built by '{extra}' "
                               f"({len(b.get('transactions') or [])} transactions, fee recipient {b.get('miner')})")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._log("info", f"{self.C.EXCHANGE_NAME}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
+            self._log("info", f"{self.name}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
 
     async def _why_dropped(self, order_id: str, call: Optional[dict], block: int):
         """a dropped swap's own transaction simulated at its one block (a per-block chain, ETH), from the state before it (the
@@ -1159,7 +1162,7 @@ class Feed:
           - no clear answer from the node, or no call kept (a swap out before a restart): not simulated, and why.
         Two eth_calls on the status node after the end went to HMB (nothing waits on them), with the signed transaction's own
         call (call_of: its calldata, value, gas and fees), so nothing is rebuilt"""
-        name = f"{self.C.EXCHANGE_NAME}: {order_id}: the swap itself at its block {block}"
+        name = f"{self.name}: {order_id}: the swap itself at its block {block}"
         if call is None:
             self._log("info", f"{name}: not simulated (no call kept: out before a restart)")
             return
@@ -1227,7 +1230,7 @@ class Feed:
         if key in self._diagnosing or any(pl in self.quoter.benched for pl in pools):
             return                                     # being diagnosed, or benched already
         self._diagnosing.add(key)
-        name = f"{self.C.EXCHANGE_NAME}: {order_id}"
+        name = f"{self.name}: {order_id}"
         try:
             amount, block, why = self._test_amount(route)
             verdict = None
@@ -1323,7 +1326,7 @@ class Feed:
         verdict = None
         if amount is not None:
             verdict, why = await self._simulate(entry["test"], entry["test"]["n"], amount, block)
-        name, out = f"{self.C.EXCHANGE_NAME}: pool {pool}", (time.time() - entry["since"]) / 60
+        name, out = f"{self.name}: pool {pool}", (time.time() - entry["since"]) / 60
         if verdict:
             cas = self.quoter.unbench(pool)
             self._log("info", f"{name} passes its re-test {entry['tests']} (a ${TEST_USD:g} {entry['test']['side']}) after "
@@ -1343,7 +1346,7 @@ class Feed:
         try:
             try:
                 if self.account is None:
-                    raise Refused(f"no wallet key: connect {self.C.EXCHANGE_NAME} with {self.C.EXCHANGE_NAME}_private_key")
+                    raise Refused(f"no wallet key: connect {self.name} with {self.C.EXCHANGE_NAME}_private_key")
                 token, spender = approval_parties(to, data)
                 await self._send_tx(record, to, data, 0, self.C.APPROVE_GAS_LIMIT,
                                     {"kind": "approve", "ca": token, "spender": spender})

@@ -161,6 +161,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import yaml
 from pydantic import BaseModel, Field
 from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.client.config.security import Security
+from hummingbot.client.settings import AllConnectorSettings
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict
@@ -207,6 +209,37 @@ def split_market_spec(spec: str) -> Tuple[str, str, Optional[str]]:
             raise ValueError(f"'{spec}': '{parts[2]}' is not a token address (0x + 40 hex)")
         ca = parts[2].lower()
     return parts[0].lower(), parts[1], ca
+
+
+# P2-DEX wallets (Pavel 2026-11-10: "simple 1/2 switch, we won't be using more than 2 wallets per EVM chain"): each EVM chain
+# trades from two wallets, each its own connector of the chain's class. Wallet 1 is the chain's connector (`bsc`, `eth`: the
+# strategies from before the switch, and HTX's); wallet 2, the default for a new strategy, is `<chain>2` (`bsc2`, `eth2`), the
+# chain connector's other domain (<k>_utils.OTHER_DOMAINS, `connect bsc2`). A create's swap leg names its chain, as P1, the
+# lanes and the watcher do; `control create … evm1` keeps it on wallet 1. The YAML keeps the connector it resolved to
+# (`secondary_market: bsc2`): that is how the watcher and the Asset Manager tell the wallets apart, and how a restart keeps
+# each strategy on its own wallet.
+EVM_WALLET1_TAG = "evm1"
+
+
+def evm_wallet_connector(exchange: str, ca: Optional[str], evm_wallet: int = 2) -> Tuple[str, int]:
+    """-> (the connector a create's leg trades on, its wallet: 1 or 2, or 0 where the switch doesn't apply). It applies to a
+    swap leg (one naming its CA) on a chain with two wallets: wallet 2 (`bsc` -> `bsc2`) unless evm_wallet is 1. A leg naming
+    wallet 2's connector itself (`bsc2:…`) stays as named, and with evm_wallet 1 it is refused (a ValueError naming the
+    conflict). Every other leg, an exchange's or one on a chain with one wallet, stays as named, for the checks after it
+    (_bind_swap_legs) exactly as before."""
+    if not ca:
+        return exchange, 0
+    settings = AllConnectorSettings.get_connector_settings()
+    named = settings.get(exchange)
+    if named is not None and named.is_sub_domain and exchange == f"{named.parent_name}2":
+        if evm_wallet == 1:
+            raise ValueError(f"'{exchange}' is {named.parent_name}'s wallet 2, but the create asks for wallet 1 "
+                             f"({EVM_WALLET1_TAG}): name the leg {named.parent_name}:…")
+        return exchange, 2
+    wallet2 = settings.get(f"{exchange}2")
+    if wallet2 is None or not wallet2.is_sub_domain or wallet2.parent_name != exchange:
+        return exchange, 0
+    return (wallet2.name, 2) if evm_wallet == 2 else (exchange, 1)
 
 # Export convenience functions for easy import
 __all__ = [
@@ -516,7 +549,8 @@ def remove_market(identifier: str, market_spec: str) -> bool:
 def create(name: str, primary_spec: str, secondary_spec: str,
            min_profitability: float = 2.1,
            additional_markets: str = None,
-           no_escalation: bool = False) -> bool:
+           no_escalation: bool = False,
+           evm_wallet: int = 2) -> bool:
     """
     Create a new arbitrage strategy at runtime (starts PAUSED — except with
     no_escalation, whose preset ends in `resume` and leaves it running).
@@ -532,6 +566,7 @@ def create(name: str, primary_spec: str, secondary_spec: str,
             NOTE: reachable only from this console function — `control create` parses
             just the two specs, so a 3-way strategy cannot be made from that command.
         no_escalation: Apply the guardrail-only preset (console tag: `noesc`)
+        evm_wallet: a DEX leg's wallet, 2 (the default) or 1 (console tag: `evm1`): evm_wallet_connector
 
     Returns:
         True if the task was scheduled successfully (actual result logs async)
@@ -559,7 +594,8 @@ def create(name: str, primary_spec: str, secondary_spec: str,
             secondary_spec=secondary_spec,
             min_profitability=min_profitability,
             additional_markets=additional_markets,
-            no_escalation=no_escalation
+            no_escalation=no_escalation,
+            evm_wallet=evm_wallet
         ))
         def _log_result(future):
             try:
@@ -4079,7 +4115,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     async def create_strategy(self, name: str, primary_spec: str, secondary_spec: str,
                               min_profitability: float = 2.1,
                               additional_markets: str = None,
-                              no_escalation: bool = False) -> bool:
+                              no_escalation: bool = False,
+                              evm_wallet: int = 2) -> bool:
         """
         Create a new arbitrage strategy at runtime (always starts PAUSED).
 
@@ -4095,6 +4132,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             no_escalation: Apply the guardrail-only preset (console tag: `noesc`).
                 NOTE: the preset ends with `resume`, so a `noesc` strategy does NOT
                 stay paused — unlike a plain create, it starts running.
+            evm_wallet: a swap leg's wallet (P2-DEX, 2026-11-10): 2, the default, or 1 (console tag: `evm1`). The leg
+                names its chain (`bsc:PAIR:0x<CA>`); the strategy is created on that wallet's connector
+                (evm_wallet_connector: `bsc2` or `bsc`), which the YAML keeps.
 
         Returns:
             True if successful, False otherwise
@@ -4112,6 +4152,29 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             except ValueError as e:
                 self.logger().error(f"Failed to create strategy '{name}': invalid market spec {e}")
                 return False
+
+            # P2-DEX wallets: each swap leg goes to its wallet's connector (wallet 2 unless `evm1`), which must be connected
+            if evm_wallet not in (1, 2):
+                self.logger().error(f"Failed to create strategy '{name}': evm_wallet {evm_wallet!r} is not 1 or 2")
+                return False
+            try:
+                (primary_exchange, primary_wallet), (secondary_exchange, secondary_wallet) = (
+                    evm_wallet_connector(primary_exchange, primary_ca, evm_wallet),
+                    evm_wallet_connector(secondary_exchange, secondary_ca, evm_wallet))
+            except ValueError as e:
+                self.logger().error(f"Failed to create strategy '{name}': {e}")
+                return False
+            wallets = []                                   # said once created, after the line the watcher's verdict reads
+            for spec, exchange, wallet in ((primary_spec, primary_exchange, primary_wallet),
+                                           (secondary_spec, secondary_exchange, secondary_wallet)):
+                if not wallet:
+                    continue
+                if exchange not in self.connectors and not Security.connector_config_file_exists(exchange):
+                    hint = f", or add {EVM_WALLET1_TAG} to trade wallet 1" if wallet == 2 else ""
+                    self.logger().error(f"Failed to create strategy '{name}': {exchange} (wallet {wallet}) is not connected: "
+                                        f"`connect {exchange}`{hint}")
+                    return False
+                wallets.append(f"its {spec.split(':', 1)[0].lower()} leg trades from wallet {wallet} ({exchange})")
 
             # Parse additional_markets
             additional_list = []
@@ -4210,6 +4273,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         self.logger().error(f"Error starting strategy '{name}' on clock: {e}", exc_info=True)
 
             self.logger().info(f"Created strategy '{name}' (PAUSED): {primary_spec} <-> {secondary_spec}")
+            if wallets:
+                self.logger().info(f"Strategy '{name}': {'; '.join(wallets)}")
 
             # Persist to config file
             if self.config.config_file_path:
@@ -5200,7 +5265,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
         # Lower index means higher priority
-        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex', 'bsc', 'coinw', 'eth', 'coinstore']
+        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex', 'bsc', 'coinw', 'eth', 'coinstore', 'bsc2', 'eth2']
         return {name: idx for idx, name in enumerate(order)}
 
     def _display_exchange_name(self, name: str) -> str:

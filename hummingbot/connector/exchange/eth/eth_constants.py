@@ -114,6 +114,13 @@ SWAP_STATUS_URL = "https://eth.blockrazor.xyz"
 RECEIPT_POLL_S = 0.1              # a transaction out is looked at this often (12 s blocks: no need for BSC's 25 ms)
 SEND_TIMEOUT_S = 2.0
 SWAP_LEDGER_PATH = os.path.expanduser("~/p2_dex/eth/swaps.jsonl")     # P3-DEX's contract v1, ETH's own (§0.5)
+# Wallet 2 (Pavel 2026-11-10: "simple 1/2 switch, we won't be using more than 2 wallets per EVM chain"): P2's second
+# wallet on this chain, the default for new strategies (`control create ... evm1` keeps wallet 1, this connector's own,
+# which the strategies before it trade, and HTX's). It is this connector under its own name and keys file
+# (eth_utils.OTHER_DOMAINS: `connect eth2`); its own nonce sequence, so its own swap ledger and, beside it, its own
+# lease and heartbeat (P3-DEX contract v1, per wallet). Wallet 1 keeps `eth` and every path above.
+WALLET2_NAME = "eth2"
+WALLET2_LEDGER_PATH = os.path.expanduser("~/p2_dex/eth2/swaps.jsonl")
 WARN_EVERY_S = 30.0
 PRICE_SLACK = Decimal("1e-6")
 SWAP_SLIPPAGE = Decimal("0.01")   # 1%, as BSC (decision 8)
