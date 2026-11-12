@@ -371,12 +371,13 @@ class CreateCommand:
                 # bsc2 / eth2: P2-DEX's wallet 2 on each chain (2026-11-10), the chain's connector under its other domain
                 'bsc2': 'bsc2',
                 'eth2': 'eth2',
+                'blofin': 'bf',
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
             order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx", "bsc", "cw", "eth", "cs",
-                     "bsc2", "eth2"]
+                     "bsc2", "eth2", "bf"]
             try:
                 return order.index(alias)
             except ValueError:
