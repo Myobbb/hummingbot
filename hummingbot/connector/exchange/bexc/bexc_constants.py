@@ -123,6 +123,11 @@ PLACE_ORDER_TIMEOUT = 10.0
 # Every other request has a timeout of its own (aiohttp's session default is 300 s), for its headers and again for its
 # body (review D, 2026-11-14). GETs take 251-304 ms from myserver, ~800 ms when Cloudflare opens a new connection.
 REQUEST_TIMEOUT = 10.0
+# The network check (GET /time every 10 s, BexcExchange.check_network) takes the connector NOT_CONNECTED only after
+# this many failed checks in a row. On 2026-11-14 ONE /time read slower than the network loop's 5 s did it (14:50:59):
+# it paused bexc's strategy, and the next good read (14:51:09) rebuilt bexc's books, sockets and user stream and
+# re-initialized every strategy in the orchestrator, while the public socket streamed all along.
+NETWORK_CHECK_FAILURES = 3
 # A cancel of an order whose placement still awaits bexc's answer waits for the placement to settle (its id; or given
 # up as unconfirmed: then the cancel names the client id) up to this long: the placement's own timeout, its lookups and
 # their timeouts (review E, 2026-11-14: the base's 10 s wait for the id ran out first, and the cancel was dropped).
@@ -235,7 +240,9 @@ EMIT_DEPTH = 20                     # levels a side handed to the tracker
 #     orchestrator's 120-s stale-book check from repairing a quiet but current book (quiet != dropped).
 #   - A subscribe not answered within SUBSCRIBE_ANSWER_S: the market's stream is not serving (P1 saw bexc leave some
 #     streams silent after a reconnect, and a re-subscribe bring them back). Its book is shown empty and it is
-#     subscribed again, the wait doubling with each unanswered try up to RESUBSCRIBE_RETRY_CAP_S.
+#     subscribed again, the wait doubling with each unanswered try up to RESUBSCRIBE_RETRY_CAP_S. An empty book (no bid,
+#     no ask) is no answer: bexc sends empty snapshots, and after its mass drop of 2026-11-14 14:52 ALPINE's
+#     re-subscribe counted as answered while the strategy found the book empty 21 and 29 s later.
 #   - A socket that carries markets and receives no frame at all for SOCKET_SILENCE_S is reconnected (a zombie: with
 #     quiet markets re-subscribed every MARKET_SILENCE_S, a live socket always hears something sooner).
 #   - A dead TCP path: aiohttp pings after WS_HEARTBEAT_S of silence and closes the socket when no PONG comes within
@@ -266,9 +273,8 @@ SNAPSHOT_REEMIT_DELAY = 0.5
 # its book is shown EMPTY (the XT rule, 2026-09-26); its symbol and trading rule stay. Read from the shared market
 # list (one ~475 KB read serves the switch, the symbol map and the trading rules).
 TRADING_SWITCH_INTERVAL = 120.0
-# Counters (update_id gaps and restarts, silence re-subscribes, unanswered subscribes, crossed pushes, freezes,
-# undecodable frames) are logged
-# at most once per STATS_INTERVAL s, and only when one moved.
+# Counters (update_id gaps and restarts, silence re-subscribes, unanswered subscribes, crossed and empty pushes,
+# freezes, undecodable frames) are logged at most once per STATS_INTERVAL s, and only when one moved.
 STATS_INTERVAL = 60.0
 
 WS_RETRY_BASE = 1.0

@@ -80,11 +80,17 @@ class _Connection:
 
 def _unusable(bids: list, asks: list) -> Optional[Tuple[str, str]]:
     """Why a book push can't be shown, or None: (the kind, what is wrong with it).
+      - empty: no bid and no ask. Not taken as the market's book, so a subscribe it answers stays unanswered and is
+        asked again (2026-11-14: after bexc's 14:52 mass drop, ALPINE's re-subscribe counted as answered, yet the
+        strategy found the book empty 21 and 29 s later; bexc sends empty snapshots, as TEXT frames: P1). A market
+        that really is empty is shown empty all the same;
       - crossed: the best bid at or above the best ask;
       - frozen: one price listed twice within the levels shown or the next one (it may be the other half of the last
         level shown). Only the snapshots of frozen streams did this (2026-11-13: PEPE_USDT 14 of 15, LTC_USDT 1 of 15;
         0 in >100 snapshots of live streams and in every push): individual orders at one price as adjacent levels,
         order_count 1 each, while live pushes list each price once. The tracker's book would keep one of them."""
+    if not bids and not asks:
+        return "empty", "came empty (no bid, no ask)"
     if bids and asks and Decimal(bids[0]["price"]) >= Decimal(asks[0]["price"]):
         return "crossed", f"came crossed (bid {bids[0]['price']} >= ask {asks[0]['price']})"
     for side, levels in (("bids", bids), ("asks", asks)):
@@ -124,14 +130,18 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         answers in ~0.3 s confirms it. A subscribe left unanswered for SUBSCRIBE_ANSWER_S shows the book empty and is
         repeated with a doubling wait; a socket with markets and no frame at all for SOCKET_SILENCE_S is reconnected.
       - A crossed push: the held book is superseded and the new one unusable, so the market is shown empty until a
-        valid push.
+        valid push. So is an empty push (no bid, no ask): bexc sends empty snapshots, and one answering a subscribe
+        leaves the subscribe unanswered, asked again like any other (_unusable).
       - A frozen stream: bexc can stop pushing a market's book for minutes while it trades, its update_id standing
         still (PEPE_USDT and LTC_USDT, 2026-11-13: 150 s, 86 and 76 trades, fresh snapshots showing another book under
         the same update_id). Seen as a trade with no push of a new update_id within FROZEN_AFTER_TRADE_S, a subscribe
         answer under the held update_id with another book, or a frame listing one price twice; the market is then
         shown empty until a push with another update_id (_freeze).
       - The trading switch: /markets `status` and `is_active`. While a tracked market is not trading its book is shown
-        EMPTY (a halt, the XT rule 2026-09-26); the symbol, the trading rule and the held book stay.
+        EMPTY (a halt, the XT rule 2026-09-26); the symbol, the trading rule and the held book stay. A market the list
+        doesn't carry at all is never subscribed: bexc answers each subscribe "Market not found" (FARTCOIN-USDT,
+        2026-11-14: one refusal every 5 min), against decision 4 (listed symbols only). A read that lists it
+        subscribes it.
     REST /orderbook is ~17 s stale, so it is never used: a market the stream doesn't serve is shown empty.
     """
 
@@ -159,11 +169,12 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # bexc's trading switch: markets switched off (shown empty), and markets whose switch has been read.
         self._switched_off: Set[str] = set()
         self._switch_known: Set[str] = set()
+        self._unlisted: Set[str] = set()        # missing from the market list: never subscribed until it is listed
         self._switch_lock = asyncio.Lock()
         self._switch_failing: bool = False
         self._warned: Set[str] = set()
         self._stats: Dict[str, int] = dict.fromkeys(
-            ("uid_gaps", "uid_restarts", "silence_resubscribes", "unanswered_subscribes", "crossed", "freezes",
+            ("uid_gaps", "uid_restarts", "silence_resubscribes", "unanswered_subscribes", "crossed", "empty", "freezes",
              "undecodable"), 0)
         self._stats_at = time.monotonic()
 
@@ -260,7 +271,7 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         await self._ensure_switch_known(symbol)
         book = self._book(symbol)
         connection = self._assign(symbol)
-        if not book.served and connection is not None and connection.ws is not None:
+        if not book.served and symbol not in self._unlisted and connection is not None and connection.ws is not None:
             deadline = time.monotonic() + CONSTANTS.SNAPSHOT_REQUEST_WAIT_S
             while not book.served and connection.ws is not None and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
@@ -288,6 +299,11 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
     def _apply_switch(self, symbol: str, info: Optional[Dict[str, Any]]) -> None:
         self._switch_known.add(symbol)
         trading_pair = self._pair_name(symbol)
+        if info is None:
+            self._unlisted.add(symbol)
+        elif symbol in self._unlisted:
+            self._unlisted.discard(symbol)
+            self._subscribe_listed(symbol)
         if info is not None and (info.get("force_post_only_sell") is True or info.get("protected_pair") is True):
             self._warn_once(f"flags:{symbol}",
                             f"bexc {trading_pair}: force_post_only_sell={info.get('force_post_only_sell')}, "
@@ -307,6 +323,13 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().info(f"bexc {trading_pair}: trading is back on ({flags}); its book is shown again.")
             if self._book(symbol).served:
                 self._emit(symbol)
+
+    def _subscribe_listed(self, symbol: str) -> None:
+        """bexc lists a market it didn't: subscribed now if its socket is open (else that socket's next connect does
+        it, with the others)."""
+        connection = self._connection_of.get(symbol)
+        if connection is not None and connection.ws is not None:
+            safe_ensure_future(self._subscribe(connection, connection.ws, symbol))
 
     async def _ensure_switch_known(self, symbol: str) -> None:
         """Before a market's first snapshot reaches the tracker, so a market that is already off never shows a book.
@@ -413,6 +436,8 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         sent = 0
         try:
             for symbol in symbols:
+                if symbol in self._unlisted:
+                    continue                # not on bexc's market list: the subscribe would be refused
                 if not await self._subscribe(connection, ws, symbol):
                     return
                 sent += 1
@@ -527,9 +552,10 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """Runtime add (control create / add_market): subscribe the new market on its own socket, a new one when every
         socket is full. The base default disconnects the shared socket, which would blank every bexc book."""
         symbol = await self._symbol_for_pair(trading_pair)
+        await self._ensure_switch_known(symbol)
         connection = self._assign(symbol)
-        if connection is None:
-            return
+        if connection is None or symbol in self._unlisted:
+            return               # an unlisted market: subscribed once a read lists it
         live = connection.ws
         book = self._book(symbol)
         if live is None:
@@ -549,7 +575,7 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         connection = self._assign(symbol)
         self._show_empty(symbol)
         self._book(symbol).clear()
-        if connection is not None and connection.ws is not None:
+        if connection is not None and connection.ws is not None and symbol not in self._unlisted:
             await self._subscribe(connection, connection.ws, symbol, again=True)
 
     # ------------------------------------------------------------------ liveness (no server time, no re-push)
@@ -583,7 +609,7 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             for symbol in list(connection.symbols):
                 book = self._books.get(symbol)
-                if book is None or connection.ws is not ws or book.socket is not ws:
+                if book is None or connection.ws is not ws or book.socket is not ws or symbol in self._unlisted:
                     continue
                 if book.awaiting:
                     wait = min(CONSTANTS.SUBSCRIBE_ANSWER_S * 2 ** min(book.unanswered, 8),

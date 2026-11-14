@@ -26,6 +26,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase, TradeFeeSchema
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -146,6 +147,8 @@ class BexcExchange(ExchangePyBase):
         # The symbol map this connector last set: the base keeps its own in a C slot a Python subclass can't read, and
         # the next map carries over the markets still holding tracked orders (S5, 2026-11-14).
         self._last_symbol_map: Optional[bidict] = None
+        # Network checks failed in a row (check_network).
+        self._network_check_failures = 0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         # No balance push exists: the REST poll is authoritative and the base's in-flight snapshot keeps `available`
         # right between polls.
@@ -438,6 +441,33 @@ class BexcExchange(ExchangePyBase):
         response = await self._api_get(path_url=CONSTANTS.SERVER_TIME_PATH, limit_id=CONSTANTS.SERVER_TIME_PATH)
         if not isinstance(response, dict) or response.get("server_time") in (None, ""):
             raise IOError(f"Unexpected bexc answer to the network check: {self._raw(response)}")
+
+    async def check_network(self) -> NetworkStatus:
+        """The base's check (GET /time), NOT_CONNECTED only after NETWORK_CHECK_FAILURES failed checks in a row
+        (bexc_constants). The read gets 80% of the network loop's timeout, so a slow answer counts here as a failure
+        instead of running into the loop's own timeout, which logs at DEBUG and sets NOT_CONNECTED at once. One WARNING
+        when a streak starts, one when it takes the connector down, one INFO when bexc answers again."""
+        try:
+            await asyncio.wait_for(self._make_network_check_request(), timeout=self.check_network_timeout * 0.8)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._network_check_failures += 1
+            reason = "no answer in time" if isinstance(e, asyncio.TimeoutError) else f"{type(e).__name__}: {e}"
+            connected = self.network_status is NetworkStatus.CONNECTED
+            held = connected and self._network_check_failures < CONSTANTS.NETWORK_CHECK_FAILURES
+            if self._network_check_failures == 1:
+                self.logger().warning(f"bexc network check failed ({reason[:300]}); bexc counts as unreachable after "
+                                      f"{CONSTANTS.NETWORK_CHECK_FAILURES} failed checks in a row.")
+            if connected and not held:
+                self.logger().warning(f"bexc network check failed {self._network_check_failures} times in a row "
+                                      f"({reason[:300]}): bexc is unreachable; its strategies pause until it answers.")
+            return NetworkStatus.CONNECTED if held else NetworkStatus.NOT_CONNECTED
+        if self._network_check_failures:
+            self.logger().info(f"bexc network check answers again, after {self._network_check_failures} failed "
+                               f"check(s).")
+            self._network_check_failures = 0
+        return NetworkStatus.CONNECTED
 
     def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                           order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
