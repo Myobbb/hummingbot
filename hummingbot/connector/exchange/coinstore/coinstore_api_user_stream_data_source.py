@@ -29,6 +29,11 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
     Even acknowledged subscriptions can stay silent: live 2026-11-08 one socket pushed nothing for 154 orders, and its
     subscribe answers named another server node (echo startEpochMill) than the two sockets that pushed. The login line
     names the node; the connector drops a socket that misses an order's push (reconnect).
+
+    Deaf backends (2026-11-14, constants §Private WebSocket): the handshake's `sid` cookie routes every reconnect back
+    to the same backend, so reconnect() remembers the backend that missed the push (its !@order startEpochMill) and
+    drops the cookie first. A login that lands on a remembered backend logs in again on a fresh connection, a bounded
+    number of times. A push clears its backend.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -51,6 +56,14 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # the connection's last frame number (S) once subscribed, and the server node its subscriptions named
         self._last_seq: Optional[int] = None
         self._nodes: Set[Any] = set()
+        # the !@order channel's startEpochMill on this connection: the backend the order pushes come from
+        self._order_node: Optional[Any] = None
+        # backends that missed an order push (oldest first, bounded); a push on one clears it
+        self._deaf_backends: Dict[Any, None] = {}
+        # reconnect() closed the socket: the close that follows is ours, already logged
+        self._closing_on_purpose = False
+        # monotonic time the current connection's subscriptions were acknowledged; None while down
+        self._logged_in_at: Optional[float] = None
         # order / account pushes that arrived while the subscriptions were being acknowledged
         self._early: List[Dict[str, Any]] = []
 
@@ -63,16 +76,41 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant) -> None:
         try:
-            self._last_seq = None
-            self._nodes = set()
-            await websocket_assistant.send(WSJSONRequest(payload=self._auth.ws_login_payload(self._next_id())))
-            await self._await_answers(websocket_assistant, login=True, channels=set())
-            channels = {CONSTANTS.WS_ORDER_CHANNEL, CONSTANTS.WS_ACCOUNT_CHANNEL}
-            await websocket_assistant.send(WSJSONRequest(payload={"op": "SUB", "channel": sorted(channels),
-                                                                  "id": self._next_id()}))
-            await self._await_answers(websocket_assistant, login=False, channels=channels)
+            relogins = 0
+            while True:
+                early = len(self._early)
+                await self._log_in(websocket_assistant)
+                if len(self._early) > early:
+                    self._deaf_backends.pop(self._order_node, None)   # it pushed during the acks: not deaf
+                if (self._order_node not in self._deaf_backends
+                        or relogins >= CONSTANTS.DEAF_BACKEND_MAX_RELOGINS):
+                    break
+                # Landed on a backend that missed an order push: log in again on a fresh connection, without the
+                # cookie that would route it straight back here.
+                relogins += 1
+                self.logger().debug(f"Coinstore private stream: backend {self._order_node} missed an order push "
+                                    f"before; logging in again ({relogins}/{CONSTANTS.DEAF_BACKEND_MAX_RELOGINS}).")
+                await websocket_assistant.disconnect()
+                web_utils.forget_backend_affinity(websocket_assistant)
+                await asyncio.sleep(CONSTANTS.DEAF_BACKEND_RELOGIN_PAUSE)
+                try:
+                    websocket_assistant = await self._connected_websocket_assistant()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # the listen loop's usual path for a failed connection: a WARNING, the backoff, a new attempt
+                    raise ConnectionError(f"Coinstore private stream: the re-login off backend {self._order_node} "
+                                          f"could not connect ({e!r})") from e
+                self._ws_assistant = websocket_assistant   # the listen loop reads its socket from here
+            self._closing_on_purpose = False
+            self._logged_in_at = time.monotonic()
+            note = ""
+            if relogins:
+                note = f"; {relogins} re-login(s) off backends that missed an order push"
+                if self._order_node in self._deaf_backends:
+                    note += ", still on one: REST covers"
             self.logger().info(f"Logged in to the Coinstore private stream; subscribed to order and account updates "
-                               f"(server node {sorted(self._nodes, key=str)}).")
+                               f"(server node {sorted(self._nodes, key=str)}{note}).")
             self._backoff.connected()
             # Pushes sent while the socket was down (or before this first login) are gone: poll orders, fills and
             # balances over REST now (review F12: the first login too).
@@ -85,6 +123,18 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
         except Exception:
             self.logger().exception("Unexpected error subscribing to the Coinstore private stream...")
             raise
+
+    async def _log_in(self, websocket_assistant: WSAssistant) -> None:
+        """LOGIN, then one SUB for both private channels; returns once the server acknowledged all three."""
+        self._last_seq = None
+        self._nodes = set()
+        self._order_node = None
+        await websocket_assistant.send(WSJSONRequest(payload=self._auth.ws_login_payload(self._next_id())))
+        await self._await_answers(websocket_assistant, login=True, channels=set())
+        channels = {CONSTANTS.WS_ORDER_CHANNEL, CONSTANTS.WS_ACCOUNT_CHANNEL}
+        await websocket_assistant.send(WSJSONRequest(payload={"op": "SUB", "channel": sorted(channels),
+                                                              "id": self._next_id()}))
+        await self._await_answers(websocket_assistant, login=False, channels=channels)
 
     async def _await_answers(self, websocket_assistant: WSAssistant, login: bool, channels: Set[str]) -> None:
         """Read until the login succeeded (login=True) or every channel in `channels` is subscribed. Echoes and anything
@@ -122,6 +172,8 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 pending.discard(name)
                 if isinstance(echo, dict) and echo.get("startEpochMill") is not None:
                     self._nodes.add(echo["startEpochMill"])
+                    if name == CONSTANTS.WS_ORDER_CHANNEL:
+                        self._order_node = echo["startEpochMill"]
                 if isinstance(message.get("S"), int):
                     self._last_seq = message["S"]   # frames are counted from the last subscribe answer on
             elif code not in (None, 200):
@@ -150,12 +202,24 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def reconnect(self, reason: str) -> None:
         """Drop the private socket: the listen loop logs in again at once (and the connector polls REST). Asked by the
-        connector when an order got no push."""
+        connector ORDER_PUSH_EXPECTED_WITHIN s after a placement answer that got no push. A backend that was already up
+        when the order went out is deaf: it is remembered, and the cookie that would route the next login back to it
+        is dropped first. A younger connection (or none) proves nothing, since the push may have gone to the one
+        before: it stays, and the connector's REST poll covers the order."""
         websocket_assistant = self._ws_assistant
-        if websocket_assistant is None:
+        if websocket_assistant is None or self._logged_in_at is None:
             return
+        if time.monotonic() - self._logged_in_at < CONSTANTS.ORDER_PUSH_EXPECTED_WITHIN + 1.0:
+            return
+        if self._order_node is not None:
+            self._deaf_backends.pop(self._order_node, None)
+            self._deaf_backends[self._order_node] = None
+            while len(self._deaf_backends) > CONSTANTS.DEAF_BACKENDS_REMEMBERED:
+                del self._deaf_backends[next(iter(self._deaf_backends))]
+        web_utils.forget_backend_affinity(websocket_assistant)
         self.logger().warning(f"Reconnecting the Coinstore private stream (server node {sorted(self._nodes, key=str)}): "
                               f"{reason}.")
+        self._closing_on_purpose = True
         await websocket_assistant.disconnect()
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue) -> None:
@@ -170,6 +234,8 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 self._note_seq(message)
                 kind = message.get("T")
                 if kind in ("order", "account"):
+                    if self._deaf_backends:
+                        self._deaf_backends.pop(self._order_node, None)   # this backend pushes
                     queue.put_nowait(message)
                 elif message.get("C") not in (None, 200):
                     meaning = str(message.get("M") or "")
@@ -183,7 +249,12 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
         except asyncio.TimeoutError:
             raise ConnectionError(f"no frame from the Coinstore private stream for "
                                   f"{CONSTANTS.WS_MESSAGE_TIMEOUT:.0f} s") from None
+        except ConnectionError:
+            if self._closing_on_purpose:
+                return   # reconnect() closed it and said why: the base loop's second WARNING would repeat that
+            raise
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]) -> None:
+        self._logged_in_at = None
         await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
         await self._backoff.wait()  # the listen loop reconnects right after this

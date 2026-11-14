@@ -3,6 +3,7 @@ import json
 import time
 from decimal import Decimal
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from hummingbot.connector.exchange.coinstore import coinstore_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
@@ -101,6 +102,19 @@ class CoinstoreReconnectBackoff:
             return
         self._failures = min(self._failures + 1, 16)
         await asyncio.sleep(min(CONSTANTS.WS_RETRY_BASE * 2 ** (self._failures - 1), CONSTANTS.WS_RETRY_CAP))
+
+
+def forget_backend_affinity(ws_assistant: Optional[WSAssistant]) -> bool:
+    """Drop the cookies the socket host set on earlier handshakes (`sid`). Sent back, the cookie routes the next
+    handshake to the same backend, deaf or not (live 2026-11-14: 6 of 6 connections; with it cleared, all three
+    backends). The jar is the socket's aiohttp session's, HMB's shared one, so only the socket host's cookies go;
+    REST and the other venues keep theirs. Returns whether a jar was found."""
+    connection = getattr(ws_assistant, "_connection", None)
+    jar = getattr(getattr(connection, "_client_session", None), "cookie_jar", None)
+    if jar is None:
+        return False
+    jar.clear_domain(urlsplit(CONSTANTS.WSS_URL).hostname)
+    return True
 
 
 async def connected_ws_assistant(api_factory: WebAssistantsFactory, ws_url: str = CONSTANTS.WSS_URL) -> WSAssistant:

@@ -267,6 +267,18 @@ WS_RETRY_RESET_SEC = 30.0
 WS_LOGIN_TIMEOUT = 10.0
 WS_ORDER_CHANNEL = "!@order"
 WS_ACCOUNT_CHANNEL = "!@account"
+# Deaf backends. Several private backends sit behind the socket host, and some acknowledge LOGIN and both channels
+# yet never push. On 2026-11-14 one of three pushed: the AM had 680 pushes on it and 0 on the other two, and HMB had 0
+# pushes for 234 orders since 11-10. The handshake sets a `sid` cookie that routes every later handshake back to the
+# same backend: 6 of 6 connections with it, all three backends with it cleared. HMB's sockets share one cookie jar,
+# so a re-login after a missed push came back to the deaf backend every time (174 of 174).
+# A backend that missed an order push is remembered by its !@order startEpochMill, and the cookie is dropped before
+# the reconnect. A login that lands on a remembered backend logs in again on a fresh connection, up to
+# DEAF_BACKEND_MAX_RELOGINS times, DEAF_BACKEND_RELOGIN_PAUSE s apart; after that REST covers. A push clears its
+# backend. The newest DEAF_BACKENDS_REMEMBERED are kept: a Coinstore restart brings new startEpochMills.
+DEAF_BACKEND_MAX_RELOGINS = 8
+DEAF_BACKEND_RELOGIN_PAUSE = 0.5
+DEAF_BACKENDS_REMEMBERED = 32
 
 # --- First-live-run audit logging ---------------------------------------------------------------------------------
 # Every line tagged [CS-AUDIT], scoped to what the docs and probes could not settle (runbook §1.6). Money-guard firings
