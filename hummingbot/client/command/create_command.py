@@ -372,12 +372,13 @@ class CreateCommand:
                 'bsc2': 'bsc2',
                 'eth2': 'eth2',
                 'blofin': 'bf',
+                'bexc': 'bx',
             }
             return m.get((connector or "").lower())
 
         def _priority(alias: str) -> int:
             order = ["bb", "kc", "gate", "mexc", "htx", "bn", "bg", "cx", "xt", "hc", "lb", "bu", "gx", "plx", "bsc", "cw", "eth", "cs",
-                     "bsc2", "eth2", "bf"]
+                     "bsc2", "eth2", "bf", "bx"]
             try:
                 return order.index(alias)
             except ValueError:
