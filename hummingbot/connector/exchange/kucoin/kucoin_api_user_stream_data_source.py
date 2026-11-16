@@ -75,7 +75,7 @@ class KucoinAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await websocket_assistant.send(subscribe_balance_request)
 
             self._last_ws_message_sent_timestamp = self._time()
-            self.logger().info("Subscribed to private order changes and balance updates channels...")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to private order changes and balance updates channels...")
         except asyncio.CancelledError:
             raise
         except Exception:

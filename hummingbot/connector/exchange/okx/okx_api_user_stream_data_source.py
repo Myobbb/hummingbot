@@ -84,7 +84,7 @@ class OkxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await websocket_assistant.send(subscribe_account_request)
             async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIPTION_LIMIT_ID):
                 await websocket_assistant.send(subscribe_orders_request)
-            self.logger().info("Subscribed to private account and orders channels...")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to private account and orders channels...")
         except asyncio.CancelledError:
             raise
         except Exception:

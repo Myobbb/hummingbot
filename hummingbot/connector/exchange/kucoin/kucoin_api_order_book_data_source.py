@@ -167,7 +167,8 @@ class KucoinAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await ws.send(subscribe_orderbook_request)
 
             self._last_ws_message_sent_timestamp = self._time()
-            self.logger().info(f"Subscribed to public order book and trade channels (cached {len(self._symbol_to_pair_cache)} symbols)")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to public order book and trade channels (cached %d symbols)",
+                              len(self._symbol_to_pair_cache))
         except asyncio.CancelledError:
             raise
         except Exception:

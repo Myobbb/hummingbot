@@ -82,7 +82,7 @@ class XtAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 "listenKey": self._listen_key,
                 "id": self._request_id(),
             }))
-            self.logger().info("Subscribed to XT private balance, order and trade channels.")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to XT private balance, order and trade channels.")
             self._backoff.connected()
             if self._ping_task is not None:
                 self._ping_task.cancel()

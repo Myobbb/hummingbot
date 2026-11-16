@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from hummingbot.connector.exchange.coinstore import coinstore_constants as CONSTANTS, coinstore_web_utils as web_utils
 from hummingbot.connector.exchange.coinstore.coinstore_auth import CoinstoreAuth
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -75,6 +77,7 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return await web_utils.connected_ws_assistant(self._api_factory, CONSTANTS.WSS_URL)
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant) -> None:
+        after_mark = self._closing_on_purpose   # this login follows reconnect(): a missed order push
         try:
             relogins = 0
             while True:
@@ -109,8 +112,10 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 note = f"; {relogins} re-login(s) off backends that missed an order push"
                 if self._order_node in self._deaf_backends:
                     note += ", still on one: REST covers"
-            self.logger().info(f"Logged in to the Coinstore private stream; subscribed to order and account updates "
-                               f"(server node {sorted(self._nodes, key=str)}{note}).")
+            # INFO: the first login, the login after a mark and any re-login; DEBUG after a transient drop
+            level = logging.INFO if (after_mark or relogins or not self._signed_in_before) else logging.DEBUG
+            self.logger().log(level, f"Logged in to the Coinstore private stream; subscribed to order and account updates "
+                                     f"(server node {sorted(self._nodes, key=str)}{note}).")
             self._backoff.connected()
             # Pushes sent while the socket was down (or before this first login) are gone: poll orders, fills and
             # balances over REST now (review F12: the first login too).
@@ -220,6 +225,7 @@ class CoinstoreAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self.logger().warning(f"Reconnecting the Coinstore private stream (server node {sorted(self._nodes, key=str)}): "
                               f"{reason}.")
         self._closing_on_purpose = True
+        stream_reconnects(self, "private stream").ours(f"a missed order push: {reason}")
         await websocket_assistant.disconnect()
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue) -> None:

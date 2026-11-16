@@ -80,7 +80,7 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
             auth_response = resp.data
             if auth_response.get("code", 0) != 200:
                 raise ValueError(f"User Stream Authentication Fail! {auth_response}")
-            self.logger().info("Successfully authenticated to user stream...")
+            self.logger().log(self._subscribed_log_level(), "Successfully authenticated to user stream...")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -103,7 +103,7 @@ class HtxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     await websocket_assistant.send(subscribe_request)
             else:
                 await websocket_assistant.send(subscribe_request)
-            self.logger().info(f"Subscribed to {topic}")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to %s", topic)
         except asyncio.CancelledError:
             raise
         except Exception:

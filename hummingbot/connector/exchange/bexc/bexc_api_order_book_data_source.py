@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from collections import deque
 from decimal import Decimal
@@ -11,6 +12,7 @@ from hummingbot.connector.exchange.bexc import bexc_constants as CONSTANTS, bexc
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -441,7 +443,10 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if not await self._subscribe(connection, ws, symbol):
                     return
                 sent += 1
-            self.logger().info(f"Subscribed bexc book_update for {sent} markets on public socket #{connection.number}.")
+            level = logging.INFO if stream_reconnects(self, f"public socket #{connection.number}").connects <= 1 \
+                else logging.DEBUG
+            self.logger().log(level, "Subscribed bexc book_update for %d markets on public socket #%d.", sent,
+                              connection.number)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -471,6 +476,8 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._connect_failed(connection, f"{type(e).__name__}: {e}")
                 await connection.backoff.wait()
                 continue
+            reconnects = stream_reconnects(self, f"public socket #{connection.number}")
+            reconnects.up(report=not connection.refused)
             if connection.refused:
                 self.logger().info(f"bexc public socket #{connection.number} connected after {connection.refused} "
                                    f"failed attempt(s).")
@@ -499,8 +506,7 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # The liveness check closed it and has said why: one WARNING per event.
                     self.logger().debug(f"bexc public socket #{connection.number} closed ({e!r}); reconnecting.")
                 else:
-                    self.logger().warning(f"bexc public socket #{connection.number} lost ({type(e).__name__}: {e}); "
-                                          f"reconnecting.")
+                    stream_reconnects(self, f"public socket #{connection.number}").closed(f"{type(e).__name__}: {e}")
             except Exception:
                 self.logger().exception(f"Unexpected error on bexc public socket #{connection.number}; reconnecting.")
             finally:
@@ -565,7 +571,7 @@ class BexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return               # already subscribed on this socket (its connect burst took it)
         book.clear()
         if await self._subscribe(connection, live, symbol):
-            self.logger().info(f"Subscribed bexc {trading_pair} on public socket #{connection.number} (no reconnect).")
+            self.logger().debug("Subscribed bexc %s on public socket #%d (no reconnect).", trading_pair, connection.number)
 
     async def _refresh_snapshot_for_pair(self, trading_pair: str, symbol: str) -> None:
         """Per-market repair for the orchestrator's stale-book recovery: re-subscribe this one market (the answer is a

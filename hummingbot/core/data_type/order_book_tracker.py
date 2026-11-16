@@ -541,10 +541,8 @@ class OrderBookTracker:
             return False
 
         if trading_pair in self._trading_pairs:
-            self.logger().warning(
-                f"Trading pair {trading_pair} in list but not initialized. "
-                f"Initializing now."
-            )
+            # the usual path: the connector shares its pair list with the tracker and adds the pair first
+            self.logger().debug("Trading pair %s in list but not initialized. Initializing now.", trading_pair)
         else:
             self._trading_pairs.append(trading_pair)
 
@@ -555,9 +553,8 @@ class OrderBookTracker:
             # --- 1. Subscribe FIRST, so the snapshot window is buffered, not lost -----------
             subscribed = await self._data_source.subscribe_to_trading_pair(trading_pair)
             if subscribed:
-                self.logger().info(
-                    f"Successfully added and subscribed to trading pair: {trading_pair}"
-                )
+                # the orchestrator's "Subscribed to <pair> on <exchange>" is the one INFO line per added pair
+                self.logger().debug("Successfully added and subscribed to trading pair: %s", trading_pair)
             else:
                 self.logger().info(
                     f"Added trading pair {trading_pair}. "

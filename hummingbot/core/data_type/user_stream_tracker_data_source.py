@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 from aiohttp import ClientError, WSServerHandshakeError, ServerDisconnectedError
 
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
@@ -73,28 +74,30 @@ class UserStreamTrackerDataSource(metaclass=ABCMeta):
 
         :param output: the queue to use to store the received messages
         """
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "private stream")
         while True:
             try:
                 self._ws_assistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(websocket_assistant=self._ws_assistant)
                 await self._send_ping(websocket_assistant=self._ws_assistant)  # to update last_recv_timestamp
+                reconnects.up()
                 await self._process_websocket_messages(websocket_assistant=self._ws_assistant, queue=output)
+                reconnects.closed("the stream ended")
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+                reconnects.closed(connection_exception)
             except ClientError as client_error:
                 # Handle aiohttp client errors (WSServerHandshakeError, ServerDisconnectedError, etc.)
-                if self._is_transient_connection_error(client_error):
-                    self.logger().warning(f"Transient connection error, reconnecting... ({type(client_error).__name__}: {client_error})")
-                else:
+                reconnects.closed(f"{type(client_error).__name__}: {client_error}")
+                if not self._is_transient_connection_error(client_error):
                     self.logger().exception("Client error while listening to user stream. Retrying after 5 seconds...")
                     await self._sleep(1.0)
             except Exception as e:
                 # Check if the general exception has transient characteristics
-                if self._is_transient_connection_error(e):
-                    self.logger().warning(f"Transient connection error, reconnecting... ({type(e).__name__}: {e})")
-                else:
+                reconnects.closed(f"{type(e).__name__}: {e}")
+                if not self._is_transient_connection_error(e):
                     self.logger().exception("Unexpected error while listening to user stream. Retrying after 5 seconds...")
                     await self._sleep(1.0)
             finally:
@@ -125,6 +128,10 @@ class UserStreamTrackerDataSource(metaclass=ABCMeta):
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
         if len(event_message) > 0:
             queue.put_nowait(event_message)
+
+    def _subscribed_log_level(self) -> int:
+        """For a connector's own "subscribed" line: INFO on the stream's first subscribe, DEBUG after a reconnect."""
+        return stream_reconnects(self, "private stream").level
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         websocket_assistant and await websocket_assistant.disconnect()

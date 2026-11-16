@@ -262,7 +262,8 @@ class GateIoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 # Initialize staleness tracking
                 self._symbol_last_update_time[symbol] = self._time()
 
-            self.logger().info(f"Gate.io: Subscribed to public order book (L{CONSTANTS.ORDER_BOOK_V2_LEVEL}) and trade channels for {len(self._trading_pairs)} pairs")
+            self.logger().log(self._subscribed_log_level(), "Gate.io: Subscribed to public order book (L%s) and trade channels for %d pairs",
+                              CONSTANTS.ORDER_BOOK_V2_LEVEL, len(self._trading_pairs))
             
             # Kick off periodic application ping to keep the connection active
             self._last_ws_message_sent_timestamp = self._time()

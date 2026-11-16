@@ -13,6 +13,7 @@ from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -346,6 +347,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
         exchange. Each message is stored in its own queue.
         """
         ws = None
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "public stream")
         while True:
             try:
                 ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -359,6 +362,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._subscribe_channels(ws)
                 # Wait briefly to allow subscribe acks without consuming messages
                 await self._wait_for_initial_subscribe_acks(ws, timeout=5.0)
+                reconnects.up()
                 self._last_ws_message_sent_timestamp = self._time()
                 self._conn_start_time = self._time()
                 self._last_ws_recv_ts = self._time()
@@ -447,6 +451,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                         if (self._conn_start_time is not None and
                             (now - self._conn_start_time) > self._max_connection_age_seconds):
+                            reconnects.ours("max connection age")
                             raise ConnectionError("Bybit public WS reached max connection age; reconnecting proactively.")
 
                     """
@@ -488,21 +493,15 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     code = self._extract_close_code(connection_exception)
                     self._pending_reconnect_notice = {"code": code or "unknown", "t0": self._time()}
                     self._suppress_reconnect_logs = True
-                    try:
-                        self.logger().warning(
-                            f"Bybit public WS transient close (code={code or 'unknown'}). Reconnecting...")
-                    except Exception:
-                        pass
+                    reconnects.closed(f"transient close, code {code or 'unknown'}")
                     backoff = self._backoff_seconds(transient=True)
                 else:
-                    try:
-                        self.logger().warning(f"Bybit public WS reconnecting: {connection_exception}")
-                    except Exception:
-                        pass
+                    reconnects.closed(connection_exception)
                     backoff = self._backoff_seconds(transient=False)
                 await self._sleep(backoff)
-            except Exception:
+            except Exception as e:
                 self._reconnect_attempts += 1
+                reconnects.closed(f"{type(e).__name__}: {e}")
                 self.logger().error(
                     "Unexpected error occurred when listening to order book streams.",
                     exc_info=True,
@@ -565,15 +564,14 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 try:
                     elapsed = max(0.0, self._time() - self._pending_reconnect_notice.get("t0", self._time()))
                     code = self._pending_reconnect_notice.get("code", "unknown")
-                    self.logger().info(
-                        f"Bybit public WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
-                        f"subscribed to public orderbook channels"
-                    )
+                    self.logger().debug("Bybit public WS reconnected after transient close (code=%s) in %.1fs; "
+                                        "subscribed to public orderbook channels", code, elapsed)
                 finally:
                     self._pending_reconnect_notice = None
                     self._suppress_reconnect_logs = False
             else:
-                self.logger().info(f"Subscribed to public order book and trade channels for {len(self._trading_pairs)} pairs")
+                self.logger().log(self._subscribed_log_level(), "Subscribed to public order book and trade channels for %d pairs",
+                                  len(self._trading_pairs))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -663,7 +661,7 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     # Successful subscribe ack (rarely carries args). Log at info for visibility.
                     try:
                         acked = data.get("args") or data.get("topic") or "<unknown>"
-                        self.logger().info(f"Bybit subscribe acknowledged: {acked}")
+                        self.logger().debug("Bybit subscribe acknowledged: %s", acked)
                     except Exception:
                         pass
                 continue
@@ -776,7 +774,8 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 last_warn = self._symbol_last_warn_time.get(symbol or trading_pair, 0)
                 if (now - last_warn) >= 60.0:
                     try:
-                        self.logger().warning(f"Bybit orderbook idle {idle:.0f}s for {trading_pair}")
+                        # a detection only: a quiet market is idle too; the re-subscribe below is the action line
+                        self.logger().debug("Bybit orderbook idle %.0fs for %s", idle, trading_pair)
                     except Exception:
                         pass
                     self._symbol_last_warn_time[symbol or trading_pair] = now

@@ -344,7 +344,8 @@ class PoloniexAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._backoff.connected()
             await ws.send(WSJSONRequest(payload={"event": "subscribe", "channel": [CONSTANTS.WS_EXCHANGE_CHANNEL]}))
             await self._subscribe_symbols(ws, symbols)
-            self.logger().info(f"Subscribed to Poloniex book_lv2, book (check) and trades for {len(symbols)} markets.")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to Poloniex book_lv2, book (check) and trades for %d markets.",
+                              len(symbols))
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))
@@ -374,7 +375,7 @@ class PoloniexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._book(symbol).reset()
         await self._subscribe_symbols(ws, [symbol])
         self._subscribed.add(symbol)
-        self.logger().info(f"Subscribed Poloniex {trading_pair} on the live connection (no reconnect).")
+        self.logger().debug("Subscribed Poloniex %s on the live connection (no reconnect).", trading_pair)
 
     def _schedule_resubscribe(self, symbol: str, reason: str) -> None:
         """From the reader: one rebuild at a time per market. The book stops taking pushes at once (its fresh snapshot

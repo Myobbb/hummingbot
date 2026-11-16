@@ -10,6 +10,7 @@ from hummingbot.connector.exchange.coinw import coinw_constants as CONSTANTS, co
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -206,6 +207,8 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._switch_failing = False
         self._subscribed: Set[str] = set()
         self._last_resubscribe: Dict[str, float] = {}
+        # symbol -> (re-subscribes since its last frame, UTC time of the first of them)
+        self._silent: Dict[str, Tuple[int, float]] = {}
         self._stream_live = False
         self._backoff = web_utils.CoinwReconnectBackoff()
         # counters, logged with each re-subscribe / cross-check warning
@@ -364,6 +367,7 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._book(symbol).reset()
                 symbols.append(symbol)
             self._subscribed = set()
+            self._silent.clear()  # a new socket: every market's re-subscribe count starts over
             self._stream_live = True
             now = time.monotonic()
             self._last_pong = now
@@ -380,7 +384,7 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                       f"{CONSTANTS.WS_FAST_PATH_RTT * 1e3:.0f} ms: this socket's frames may arrive "
                                       f"~100 ms late (the fastest one tried is kept).")
             else:
-                self.logger().info(message)
+                self.logger().log(self._subscribed_log_level(), message)
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))
@@ -409,12 +413,16 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         book.last_frame = time.monotonic()
         if await self._send_market(ws, symbol, "sub"):
             self._subscribed.add(symbol)
-            self.logger().info(f"Subscribed CoinW {trading_pair} on the live connection (no reconnect).")
+            self.logger().debug("Subscribed CoinW %s on the live connection (no reconnect).", trading_pair)
 
     async def _resubscribe(self, symbol: str, reason: str) -> None:
         """Rebuild one market's book from fresh frames: unsub then sub its channels on the live socket; the socket and
         every other book are untouched. At most once per RESUBSCRIBE_MIN_INTERVAL per market; it shows empty
-        meanwhile."""
+        meanwhile.
+
+        A repair that brings no frame does not repeat forever: the first one of a silence is one INFO, the next ones are
+        DEBUG, and at RESUBSCRIBE_RECONNECT_AFTER the socket is reconnected (an in-place repair cannot heal a topic
+        wedged on the socket; a new socket streams the market). The counter resets on the market's first frame."""
         ws = self._active_ws
         self._show_empty(symbol)
         book = self._book(symbol)
@@ -428,8 +436,22 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await asyncio.sleep(wait)
             if self._active_ws is not ws:
                 return
-        self.logger().warning(f"CoinW {self._symbol_to_pair_cache.get(symbol, symbol)}: {reason}; re-subscribing its "
-                              f"market data.")
+        attempts, silent_since = self._silent.get(symbol, (0, time.time()))
+        attempts += 1
+        pair = self._symbol_to_pair_cache.get(symbol, symbol)
+        since = time.strftime("%H:%M", time.gmtime(silent_since))
+        if attempts >= CONSTANTS.RESUBSCRIBE_RECONNECT_AFTER:
+            self._silent.pop(symbol, None)
+            self.logger().info(f"CoinW {pair}: {attempts - 1} re-subscribe(s) since {since} UTC brought no book frame; "
+                               f"reconnecting the socket.")
+            await ws.disconnect()
+            return
+        self._silent[symbol] = (attempts, silent_since)
+        if attempts == 1:
+            self.logger().info(f"CoinW {pair}: {reason}; re-subscribing its market data (silent since {since} UTC).")
+        else:
+            self.logger().debug("CoinW %s: %s; re-subscribing its market data (silent since %s UTC, %d)",
+                                pair, reason, since, attempts)
         try:
             await self._send_market(ws, symbol, "unsub")
             await self._send_market(ws, symbol, "sub")
@@ -476,8 +498,11 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     continue
                 now = time.monotonic()
                 if self._subscribed and now - self._last_socket_frame > CONSTANTS.SOCKET_SILENCE_S:
-                    self.logger().warning(f"CoinW public WS: no frame for {now - self._last_socket_frame:.1f} s with "
-                                          f"{len(self._subscribed)} markets subscribed; reconnecting.")
+                    self._deaf_reconnects = getattr(self, "_deaf_reconnects", 0) + 1
+                    self.logger().info(f"CoinW public WS: no frame for {now - self._last_socket_frame:.1f} s with "
+                                       f"{len(self._subscribed)} markets subscribed; reconnecting (deaf socket "
+                                       f"{self._deaf_reconnects} since "
+                                       f"{stream_reconnects(self, 'public stream').since_utc} UTC).")
                     await ws.disconnect()
                     continue
                 for symbol in list(self._subscribed):
@@ -572,6 +597,8 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
         book = self._book(symbol)
         book.last_frame = time.monotonic()
+        if self._silent:
+            self._silent.pop(symbol, None)  # the market is streaming again: its re-subscribe count starts over
         try:
             if kind == CONSTANTS.WS_SNAPSHOT_CHANNEL:
                 self._on_snapshot(symbol, book, raw, output, full_seq=False)
@@ -723,6 +750,7 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
         was_live, self._stream_live = self._stream_live, False
         self._subscribed.clear()
+        self._silent.clear()
         if self._ping_task is not None:
             self._ping_task.cancel()
             self._ping_task = None

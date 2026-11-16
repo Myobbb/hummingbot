@@ -104,7 +104,7 @@ class CoinwAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                       f"{CONSTANTS.WS_FAST_PATH_RTT * 1e3:.0f} ms: this socket's pushes may arrive "
                                       f"~100 ms late (the fastest one tried is kept).")
             else:
-                self.logger().info(message)
+                self.logger().log(self._subscribed_log_level(), message)
             self._backoff.connected()
             self._last_pong = time.monotonic()
             if self._ping_task is not None:

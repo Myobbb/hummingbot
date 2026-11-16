@@ -9,6 +9,7 @@ from aiohttp import ClientError, WSServerHandshakeError, ServerDisconnectedError
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
@@ -130,6 +131,8 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         exchange. Each message is stored in its own queue.
         """
         ws: Optional[WSAssistant] = None
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "public stream")
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
@@ -137,23 +140,23 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
                 async with self._ws_lock:
                     self._active_ws = ws
                 await self._subscribe_channels(ws)
+                reconnects.up()
                 await self._process_websocket_messages(websocket_assistant=ws)
+                reconnects.closed("the stream ended")
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+                reconnects.closed(connection_exception)
             except ClientError as client_error:
                 # Handle aiohttp client errors (WSServerHandshakeError, ServerDisconnectedError, etc.)
-                if self._is_transient_connection_error(client_error):
-                    self.logger().warning(f"Transient connection error, reconnecting... ({type(client_error).__name__}: {client_error})")
-                else:
+                reconnects.closed(f"{type(client_error).__name__}: {client_error}")
+                if not self._is_transient_connection_error(client_error):
                     self.logger().exception("Client error while listening to order book streams. Retrying in 5 seconds...")
                     await self._sleep(1.0)
             except Exception as e:
                 # Check if the general exception has transient characteristics
-                if self._is_transient_connection_error(e):
-                    self.logger().warning(f"Transient connection error, reconnecting... ({type(e).__name__}: {e})")
-                else:
+                reconnects.closed(f"{type(e).__name__}: {e}")
+                if not self._is_transient_connection_error(e):
                     self.logger().exception(
                         "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
                     )
@@ -319,6 +322,10 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
     def _get_messages_queue_keys(self) -> List[str]:
         return [self._snapshot_messages_queue_key, self._diff_messages_queue_key, self._trade_messages_queue_key]
 
+    def _subscribed_log_level(self) -> int:
+        """For a connector's own "subscribed" line: INFO on the stream's first subscribe, DEBUG after a reconnect."""
+        return stream_reconnects(self, "public stream").level
+
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         websocket_assistant and await websocket_assistant.disconnect()
 
@@ -366,10 +373,8 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
             )
             return False
         
-        self.logger().info(
-            f"Triggering websocket reconnection to subscribe to {trading_pair}. "
-            f"All trading pairs will be re-subscribed using exchange's standard flow."
-        )
+        self.logger().debug("Triggering websocket reconnection to subscribe to %s. All trading pairs will be "
+                            "re-subscribed using exchange's standard flow.", trading_pair)
         
         # Set reconnect flag for exchanges that check it
         self._reconnect_requested = True
@@ -401,9 +406,8 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         # Disconnect the active websocket to trigger reconnection
         if ws is not None:
             try:
-                self.logger().info(
-                    f"Disconnecting websocket to force reconnection for {trading_pair}"
-                )
+                self.logger().debug("Disconnecting websocket to force reconnection for %s", trading_pair)
+                stream_reconnects(self, "public stream").ours(f"reconnecting to add {trading_pair}")
                 await ws.disconnect()
             except Exception:
                 pass  # Ignore disconnect errors - reconnection will happen anyway

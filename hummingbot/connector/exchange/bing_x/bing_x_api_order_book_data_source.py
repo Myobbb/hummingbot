@@ -12,6 +12,7 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -222,6 +223,8 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_subscriptions(self):
         ws = None
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "public stream")
         while True:
             reconnect_delay = 1.0
             try:
@@ -236,8 +239,11 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._active_ws = ws
                 self._reconnect_attempts = 0
                 await self._subscribe_channels(ws)
+                reconnects.up()
                 self._last_ws_message_sent_timestamp = self._time()
                 await self._process_ws_messages(ws=ws)
+                if not self.check_and_clear_reconnect_request():
+                    reconnects.closed("the stream ended")
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, Exception) as e:
@@ -245,20 +251,17 @@ class BingXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 if intentional:
                     # Disconnect was triggered by subscribe_to_trading_pair — expected, not an error
                     self._reconnect_attempts = 0
-                    self.logger().info(
-                        f"BingX public WS reconnecting to subscribe new pair "
-                        f"({len(self._trading_pairs)} pairs total)"
-                    )
+                    self.logger().debug("BingX public WS reconnecting to subscribe new pair (%d pairs total)",
+                                        len(self._trading_pairs))
                     reconnect_delay = 0.0
                 elif self._is_transient_ws_close_exception(e):
                     self._reconnect_attempts += 1
                     code = self._extract_close_code(e)
-                    self.logger().warning(
-                        f"BingX public WS transient close (code={code or 'unknown'}). Reconnecting..."
-                    )
+                    reconnects.closed(f"transient close, code {code or 'unknown'}")
                     reconnect_delay = self._backoff_seconds(transient=True)
                 else:
                     self._reconnect_attempts += 1
+                    reconnects.closed(f"{type(e).__name__}: {e}")
                     self.logger().error("Error in public WS loop; reconnecting...", exc_info=True)
                     reconnect_delay = self._backoff_seconds(transient=False)
             finally:

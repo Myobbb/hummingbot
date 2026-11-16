@@ -125,6 +125,11 @@ BOOK_GAP_WAIT_S = 1.0
 # is re-subscribed (no more often than RESUBSCRIBE_MIN_INTERVAL).
 MARKET_SILENCE_S = 3.0
 RESUBSCRIBE_MIN_INTERVAL = 5.0
+# An in-place unsub+sub does not heal every stall: the topic can be wedged on the socket itself (XDC_USDT, 2026-11-16:
+# 10-15 min blind windows while every other market on the same socket kept streaming, and a fresh socket streamed the
+# market at once). After this many consecutive re-subscribes that brought no frame for a market, the socket is
+# reconnected. One knob: the counter resets on the market's first frame.
+RESUBSCRIBE_RECONNECT_AFTER = 3
 # A socket that delivered nothing for this long while markets are subscribed is half-open: reconnected.
 SOCKET_SILENCE_S = 5.0
 # The client pings ({"event":"ping"} -> {"event":"pong"}); the server does not require it.

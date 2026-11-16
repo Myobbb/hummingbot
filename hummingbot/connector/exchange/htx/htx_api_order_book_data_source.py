@@ -9,6 +9,7 @@ from hummingbot.connector.exchange.htx.htx_web_utils import public_rest_url
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -166,9 +167,11 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Generic loop to manage a single WebSocket connection (connect, subscribe, process, retry).
         """
         ws = None
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, f"{name} stream")
         while True:
             try:
-                self.logger().info(f"Connecting to {name} WebSocket: {url}")
+                self.logger().log(reconnects.level, "Connecting to %s WebSocket: %s", name, url)
                 ws = await self._get_ws_assistant(url)
                 
                 # Reset tracking for this connection type
@@ -181,6 +184,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 self._reconnect_attempts = 0
                 await subscribe_func(ws)
+                reconnects.up()
 
                 # Create tasks for message processing and keep-alive
                 message_processor_task = asyncio.create_task(
@@ -207,22 +211,27 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     exception = task.exception()
                     if exception:
                         raise exception
-                        
+                # no exception: the socket closed under the reader, or the keep-alive gave up on it
+                if name == "MBP" and self.check_and_clear_reconnect_request():
+                    self.logger().debug("HTX MBP WS reconnecting to subscribe new pair (%d pairs total)",
+                                        len(self._trading_pairs))
+                else:
+                    reconnects.closed("the stream ended")
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 if name == "MBP" and self.check_and_clear_reconnect_request():
                     # Disconnect was triggered by _subscribe_single_trading_pair — expected
                     self._reconnect_attempts = 0
-                    self.logger().info(
-                        f"HTX MBP WS reconnecting to subscribe new pair "
-                        f"({len(self._trading_pairs)} pairs total)"
-                    )
+                    self.logger().debug("HTX MBP WS reconnecting to subscribe new pair (%d pairs total)",
+                                        len(self._trading_pairs))
                 elif self._is_transient_ws_close_exception(e):
                     self._reconnect_attempts += 1
-                    self.logger().debug(f"Transient close on {name} WS: {e}. Reconnecting...")
+                    reconnects.closed(f"transient close: {e}")
                 else:
                     self._reconnect_attempts += 1
+                    reconnects.closed(f"{type(e).__name__}: {e}")
                     self.logger().error(f"Unexpected error on {name} WS: {e}", exc_info=True)
                 await asyncio.sleep(2.0)  # Backoff
             finally:
@@ -376,7 +385,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 }))
 
-            self.logger().info("Subscribed to MBP channels...")
+            self.logger().log(stream_reconnects(self, "MBP stream").level, "Subscribed to MBP channels...")
 
         except Exception as e:
             self.logger().error("Error subscribing to MBP channels", exc_info=True)
@@ -394,7 +403,7 @@ class HtxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "id": str(uuid.uuid4())
                 }))
                 
-            self.logger().info("Subscribed to Trade channels...")
+            self.logger().log(stream_reconnects(self, "Trade stream").level, "Subscribed to Trade channels...")
             
         except Exception as e:
             self.logger().error("Error subscribing to Trade channels", exc_info=True)

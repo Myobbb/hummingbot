@@ -311,8 +311,8 @@ class BlofinAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._backoff.connected()
             if symbols:
                 await self._send_markets(ws, symbols, "SUBSCRIBE")
-            self.logger().info(f"Subscribed to BloFin DEPTH ({CONSTANTS.WS_DEPTH_SPEED}), DEPTH-20 "
-                               f"({CONSTANTS.WS_CHECK_SPEED}) and TRADE for {len(symbols)} markets.")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to BloFin DEPTH (%s), DEPTH-20 (%s) and TRADE for %d "
+                              "markets.", CONSTANTS.WS_DEPTH_SPEED, CONSTANTS.WS_CHECK_SPEED, len(symbols))
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))
@@ -341,7 +341,7 @@ class BlofinAPIOrderBookDataSource(OrderBookTrackerDataSource):
         book.subscribed_at = book.last_frame = time.monotonic()
         await self._send_markets(ws, [symbol], "SUBSCRIBE")
         self._subscribed.add(symbol)
-        self.logger().info(f"Subscribed BloFin {trading_pair} on the live connection (no reconnect).")
+        self.logger().debug("Subscribed BloFin %s on the live connection (no reconnect).", trading_pair)
 
     def _schedule_resubscribe(self, symbol: str, reason: str, quiet: bool = False) -> None:
         """From the frame path (a gap, a cross-check miss, a crossed book) and the watchdog: the book is unsynced at

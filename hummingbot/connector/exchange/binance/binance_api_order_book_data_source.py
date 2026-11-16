@@ -92,7 +92,7 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await ws.send(subscribe_trade_request)
             await ws.send(subscribe_orderbook_request)
 
-            self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
             raise
         except Exception:

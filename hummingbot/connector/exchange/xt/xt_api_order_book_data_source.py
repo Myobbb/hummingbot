@@ -422,7 +422,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "params": topics[i:i + CONSTANTS.WS_TOPICS_PER_REQUEST],
                     "id": self._request_id(),
                 }))
-            self.logger().info(f"Subscribed to XT depth_update and trade channels for {subscribed} markets.")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to XT depth_update and trade channels for %d markets.", subscribed)
             if self._ping_task is not None:
                 self._ping_task.cancel()
             self._ping_task = asyncio.ensure_future(self._ping_loop(ws))
@@ -444,7 +444,7 @@ class XtAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "params": self._topics(symbol),
             "id": self._request_id(),
         }))
-        self.logger().info(f"Subscribed XT {trading_pair} on the live connection (no reconnect).")
+        self.logger().debug("Subscribed XT %s on the live connection (no reconnect).", trading_pair)
 
     async def _refresh_snapshot_for_pair(self, trading_pair: str, symbol: str) -> None:
         """Per-market repair for the orchestrator's stale-book recovery: rebuild this one book from

@@ -1216,9 +1216,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                         f"Trading rules will be updated on next polling cycle."
                     )
             
-            self.logger().info(
-                f"Successfully added trading pair subscription: {trading_pair}"
-            )
+            # the orchestrator's "Subscribed to <pair> on <exchange>" is the one INFO line per added pair
+            self.logger().debug("Successfully added trading pair subscription: %s", trading_pair)
             return True
                 
         except Exception as e:

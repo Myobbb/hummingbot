@@ -152,9 +152,11 @@ REAL_TIME_BALANCE_UPDATE = True
 BALANCE_AUDIT_PUSHES = 5
 
 # --- First-live-run audit logging -------------------------------------------------------------------------------
-# Every line is tagged [PLX-AUDIT]; scoped to what the docs could not settle. Money-guard firings always log as
-# [PLX-ALARM] WARNINGs, whatever this says.
-LIVE_AUDIT_LOGGING = True
+# Every line is tagged [PLX-AUDIT]; scoped to what the docs could not settle. Off since 2026-11-15: five weeks live
+# (2026-10-09 →) settled them (the balance push equals the REST balance; the live states, key sets and fee rows are in
+# wiki trading/exchanges/poloniex-api), and order-push / place-order / cancel-order alone wrote up to 9,800 INFO lines
+# a day. True brings them back. Money-guard firings always log as [PLX-ALARM] WARNINGs, whatever this says.
+LIVE_AUDIT_LOGGING = False
 
 # --- Rate limits (Spot Rest API/Overview "Rate Limits": per UID for VIP0 trading/account calls, per IP public) ------
 RATE_LIMITS = [

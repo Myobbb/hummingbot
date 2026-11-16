@@ -10,6 +10,7 @@ import hummingbot.connector.exchange.bing_x.bing_x_web_utils as web_utils
 from hummingbot.connector.exchange.bing_x.bing_x_auth import BingXAuth
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -20,6 +21,11 @@ from hummingbot.logger import HummingbotLogger
 class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     LISTEN_KEY_KEEP_ALIVE_INTERVAL = 1800  # 30 minutes per BingX docs (key valid 60 min, docs recommend ping every 30 min)
+    # listen-key rotations, for their one INFO line: the key in use, when we first got it, how long the last one lived
+    _key_in_use: Optional[str] = None
+    _key_since: float = 0.0
+    _old_key_lived: Optional[float] = None
+    _key_rotations: int = 0
 
     _bausds_logger: Optional[HummingbotLogger] = None
 
@@ -72,6 +78,8 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         :param output: the queue to use to store the received messages
         """
         ws = None
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "private stream")
         while True:
             reconnect_delay = 1.0
             try:
@@ -79,11 +87,13 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 # Store which key we're connected with
                 self._connected_listen_key = self._current_listen_key
                 await self._subscribe_channels(ws)
+                reconnects.up()
                 self._last_ws_message_sent_timestamp = self._time()
 
                 # Simply process messages continuously - no timeout logic needed
                 # BingX server sends pings every 5 seconds, we respond in _process_ws_messages
                 await self._process_ws_messages(ws=ws, output=output)
+                reconnects.closed("the stream ended")
 
             except asyncio.CancelledError:
                 raise
@@ -91,14 +101,15 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 self._reconnect_attempts += 1
                 # Treat listen key rotations as expected, not errors
                 if isinstance(e, ConnectionError) and "Listen key changed" in str(e):
-                    self.logger().info("Listen key rotated; reconnecting with new key")
+                    self.logger().debug("Listen key rotated; reconnecting with new key")
                     reconnect_delay = self._backoff_seconds(transient=True)
                 else:
                     code = self._extract_close_code(e)
                     if self._is_transient_ws_close_exception(e):
-                        self.logger().warning(f"BingX private WS transient close (code={code or 'unknown'}). Reconnecting...")
+                        reconnects.closed(f"transient close, code {code or 'unknown'}")
                         reconnect_delay = self._backoff_seconds(transient=True)
                     else:
+                        reconnects.closed(f"{type(e).__name__}: {e}")
                         self.logger().exception("Unexpected error while listening to user stream. Reconnecting...")
                         reconnect_delay = self._backoff_seconds(transient=False)
             finally:
@@ -130,7 +141,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await ws.send(subscribe_trade_request)
             await ws.send(subscribe_balance_request)
 
-            self.logger().info("Subscribed to private channel...")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to private channel...")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -155,9 +166,14 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             if (self._connected_listen_key is not None and
                 self._current_listen_key is not None and
                 self._connected_listen_key != self._current_listen_key):
-                self.logger().warning(
+                # the rotation's one INFO line: the renewal was refused (404), a new key was made, the socket moves to it
+                self._key_rotations += 1
+                lived = (f"; the old key lived {self._old_key_lived / 60:.0f} min"
+                         if self._old_key_lived is not None else "")
+                self.logger().info(
                     f"Listen key changed from {self._connected_listen_key[:8]}... to "
-                    f"{self._current_listen_key[:8]}... - reconnecting with new key"
+                    f"{self._current_listen_key[:8]}... - reconnecting with new key (rotation {self._key_rotations} "
+                    f"since {stream_reconnects(self, 'private stream').since_utc} UTC{lived})"
                 )
                 raise ConnectionError("Listen key changed - reconnection required")
 
@@ -349,7 +365,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 
                 # Handle 404 - key not found, need new key
                 if response.status == 404:
-                    self.logger().warning(f"Listen key {self._current_listen_key} not found (404). Will create new key.")
+                    self.logger().debug("Listen key %s not found (404). Will create new key.", self._current_listen_key)
                     self._current_listen_key = None
                     self._listen_key_initialized_event.clear()
                     return False
@@ -402,7 +418,14 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                 continue
                             else:
                                 self._current_listen_key = new_key
-                                self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
+                                first_key = self._key_in_use is None
+                                if new_key != self._key_in_use:   # BingX hands back a live key unchanged
+                                    now_s = time.time()
+                                    self._old_key_lived = None if first_key else now_s - self._key_since
+                                    self._key_in_use, self._key_since = new_key, now_s
+                                # INFO for the process's first key; a rotation says so in its one line
+                                self.logger().log(logging.INFO if first_key else logging.DEBUG,
+                                                  "Successfully obtained listen key %s", self._current_listen_key)
                                 self._listen_key_initialized_event.set()
                                 self._last_listen_key_ping_ts = int(time.time())
 
@@ -416,7 +439,8 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             if not success:
                                 # _ping_listen_key already cleared the key if it was 404
                                 # Just log and continue - next iteration will create new key
-                                self.logger().warning("Error occurred renewing listen key, will get a new one...")
+                                # _ping_listen_key logged why (a 404 at DEBUG: the rotation's own line follows)
+                                self.logger().debug("Error occurred renewing listen key, will get a new one...")
                                 await self._sleep(5)  # Brief delay before retry
                                 continue
                             else:
@@ -428,7 +452,7 @@ class BingXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     sleep_duration = max(5, next_renewal - int(time.time()))
                     await self._sleep(min(sleep_duration, 300))  # Cap at 5 minutes
         except asyncio.CancelledError:
-            self.logger().info("Listen key management task cancelled")
+            self.logger().debug("Listen key management task cancelled")
             raise
         except Exception as e:
             self.logger().error(f"Unexpected error in listen key management: {e}", exc_info=True)

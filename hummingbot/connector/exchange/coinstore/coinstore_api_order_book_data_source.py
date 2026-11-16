@@ -495,8 +495,8 @@ class CoinstoreAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._stream_live = True
             self._backoff.connected()
             await self._send(ws, "SUB", symbols)
-            self.logger().info(f"Subscribed to Coinstore depth@{CONSTANTS.EMIT_DEPTH} and trade channels for "
-                               f"{len(symbols)} markets.")
+            self.logger().log(self._subscribed_log_level(), "Subscribed to Coinstore depth@%s and trade channels for %d "
+                              "markets.", CONSTANTS.EMIT_DEPTH, len(symbols))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -512,7 +512,7 @@ class CoinstoreAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._book(symbol).clear()
         self._refused.discard(symbol)
         await self._send(ws, "SUB", [symbol])
-        self.logger().info(f"Subscribed Coinstore {trading_pair} on the live connection (no reconnect).")
+        self.logger().debug("Subscribed Coinstore %s on the live connection (no reconnect).", trading_pair)
 
     async def _refresh_snapshot_for_pair(self, trading_pair: str, symbol: str) -> None:
         """Per-market repair for the orchestrator's stale-book recovery: re-subscribe this one market (a SUB brings a

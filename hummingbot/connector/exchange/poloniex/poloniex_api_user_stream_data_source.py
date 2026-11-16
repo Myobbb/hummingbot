@@ -73,7 +73,8 @@ class PoloniexAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 "event": "subscribe", "channel": [CONSTANTS.WS_ORDERS_CHANNEL], "symbols": ["all"]}))
             await websocket_assistant.send(WSJSONRequest(payload={
                 "event": "subscribe", "channel": [CONSTANTS.WS_BALANCES_CHANNEL]}))
-            self.logger().info("Authenticated and subscribed to the Poloniex private orders and balances channels.")
+            self.logger().log(self._subscribed_log_level(), "Authenticated and subscribed to the Poloniex private orders and balances "
+                              "channels.")
             self._backoff.connected()
             self._last_pong = time.monotonic()
             if self._ping_task is not None:

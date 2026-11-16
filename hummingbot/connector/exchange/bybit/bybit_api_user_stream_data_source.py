@@ -10,6 +10,7 @@ from hummingbot.connector.exchange.bybit.bybit_auth import BybitAuth
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.data_type.stream_reconnects import stream_reconnects
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -69,11 +70,14 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         output queue
         :param output: the queue to use to store the received messages
         """
+        # A drop that is back within seconds logs at DEBUG; slow recoveries and frequent drops reach INFO
+        reconnects = stream_reconnects(self, "private stream")
         while True:
             try:
                 ws: Optional[WSAssistant] = None
                 ws = await self._connected_websocket_assistant(self._domain)
                 await self._subscribe_channels(ws)
+                reconnects.up()
                 # Reset attempts on successful connection + subscribe
                 self._reconnect_attempts = 0
                 self._suppress_reconnect_logs = False
@@ -100,18 +104,15 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     # Defer noisy logs; emit concise INFO after resubscribe
                     self._pending_reconnect_notice = {"code": code or "unknown", "t0": time.time()}
                     self._suppress_reconnect_logs = True
-                    try:
-                        if self._is_pong_timeout_exception(e):
-                            self.logger().warning("Bybit private WS PONG not received within expected time. Reconnecting...")
-                        elif self._is_inactivity_reconnect_exception(e):
-                            self.logger().warning("Bybit private WS inactive; reconnecting...")
-                        else:
-                            self.logger().warning(
-                                f"Bybit private WS transient close (code={code or 'unknown'}). Reconnecting...")
-                    except Exception:
-                        pass
+                    if self._is_pong_timeout_exception(e):
+                        reconnects.closed("no PONG within the expected time")
+                    elif self._is_inactivity_reconnect_exception(e):
+                        reconnects.closed("inactive")
+                    else:
+                        reconnects.closed(f"transient close, code {code or 'unknown'}")
                     backoff = self._backoff_seconds(transient=True)
                 else:
+                    reconnects.closed(f"{type(e).__name__}: {e}")
                     self.logger().error(
                         "Unexpected error while listening to user stream. Will retry.",
                         exc_info=True,
@@ -169,15 +170,13 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 try:
                     elapsed = max(0.0, self._time() - self._pending_reconnect_notice.get("t0", self._time()))
                     code = self._pending_reconnect_notice.get("code", "unknown")
-                    self.logger().info(
-                        f"Bybit private WS reconnected after transient close (code={code}) in {elapsed:.1f}s; "
-                        f"subscribed to private channels"
-                    )
+                    self.logger().debug("Bybit private WS reconnected after transient close (code=%s) in %.1fs; "
+                                        "subscribed to private channels", code, elapsed)
                 finally:
                     self._pending_reconnect_notice = None
                     self._suppress_reconnect_logs = False
             else:
-                self.logger().info("Subscribed to private orders, executions and wallet channels")
+                self.logger().log(self._subscribed_log_level(), "Subscribed to private orders, executions and wallet channels")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -211,8 +210,7 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     else:
                         try:
                             acked = data.get("args") or data.get("topic") or "<unknown>"
-                            if not self._suppress_reconnect_logs:
-                                self.logger().info(f"Bybit private subscribe acknowledged: {acked}")
+                            self.logger().debug("Bybit private subscribe acknowledged: %s", acked)
                         except Exception:
                             pass
                 elif data.get("op") == "ping":
@@ -288,7 +286,7 @@ class BybitAPIUserStreamDataSource(UserStreamTrackerDataSource):
         if not data.get("success"):
             raise IOError(f"Private channel authentication failed - {data['ret_msg']}")
         else:
-            self.logger().info("Private channel authentication success.")
+            self.logger().log(self._subscribed_log_level(), "Private channel authentication success.")
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:
