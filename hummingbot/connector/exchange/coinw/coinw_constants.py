@@ -125,11 +125,15 @@ BOOK_GAP_WAIT_S = 1.0
 # is re-subscribed (no more often than RESUBSCRIBE_MIN_INTERVAL).
 MARKET_SILENCE_S = 3.0
 RESUBSCRIBE_MIN_INTERVAL = 5.0
-# An in-place unsub+sub does not heal every stall: the topic can be wedged on the socket itself (XDC_USDT, 2026-11-16:
-# 10-15 min blind windows while every other market on the same socket kept streaming, and a fresh socket streamed the
-# market at once). After this many consecutive re-subscribes that brought no frame for a market, the socket is
-# reconnected. One knob: the counter resets on the market's first frame.
-RESUBSCRIBE_RECONNECT_AFTER = 3
+# After this many consecutive in-place re-subscribes that brought no frame for a market, that market is left alone for
+# MARKET_DEAD_RETRY_S (shown EMPTY). The socket is never touched for one market: reconnecting it would blank every
+# CoinW book and pause every strategy, and cannot help when the venue is simply not publishing that market (XDC_USDT,
+# 2026-11-16). One knob: a frame from the market clears the count and the quarantine.
+RESUBSCRIBE_QUARANTINE_AFTER = 3
+# A market whose channels the venue ACKs and then never streams (XDC_USDT, 2026-11-16: 0 frames while every other
+# market on the same socket streamed) is not ours to repair: after the one socket reconnect it is left alone and retried
+# this often, shown EMPTY meanwhile. One knob: the first frame clears it.
+MARKET_DEAD_RETRY_S = 300.0
 # A socket that delivered nothing for this long while markets are subscribed is half-open: reconnected.
 SOCKET_SILENCE_S = 5.0
 # The client pings ({"event":"ping"} -> {"event":"pong"}); the server does not require it.

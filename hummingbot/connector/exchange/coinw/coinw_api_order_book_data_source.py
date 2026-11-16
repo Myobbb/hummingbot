@@ -209,6 +209,10 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_resubscribe: Dict[str, float] = {}
         # symbol -> (re-subscribes since its last frame, UTC time of the first of them)
         self._silent: Dict[str, Tuple[int, float]] = {}
+        # symbol -> monotonic time its next retry is due: the venue is not serving it, so it is left alone meanwhile
+        self._quarantined: Dict[str, float] = {}
+        # markets whose current silence is already known (one INFO per episode, not one per retry); a frame clears it
+        self._dead: Set[str] = set()
         self._stream_live = False
         self._backoff = web_utils.CoinwReconnectBackoff()
         # counters, logged with each re-subscribe / cross-check warning
@@ -421,8 +425,9 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         meanwhile.
 
         A repair that brings no frame does not repeat forever: the first one of a silence is one INFO, the next ones are
-        DEBUG, and at RESUBSCRIBE_RECONNECT_AFTER the socket is reconnected (an in-place repair cannot heal a topic
-        wedged on the socket; a new socket streams the market). The counter resets on the market's first frame."""
+        DEBUG, and at RESUBSCRIBE_QUARANTINE_AFTER the market is left EMPTY and retried every MARKET_DEAD_RETRY_S. The
+        socket and every other market stay up: a book the venue is not publishing is not the connection's problem
+        (XDC_USDT, 2026-11-16). The counter resets on the market's first frame."""
         ws = self._active_ws
         self._show_empty(symbol)
         book = self._book(symbol)
@@ -440,14 +445,25 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         attempts += 1
         pair = self._symbol_to_pair_cache.get(symbol, symbol)
         since = time.strftime("%H:%M", time.gmtime(silent_since))
-        if attempts >= CONSTANTS.RESUBSCRIBE_RECONNECT_AFTER:
+        if attempts >= CONSTANTS.RESUBSCRIBE_QUARANTINE_AFTER:
+            # One dead book never touches the socket: a market the venue is not serving at all (XDC_USDT 2026-11-16 —
+            # a fresh socket on two hosts ACKed its channels and pushed 0 frames while every other market streamed)
+            # is shown EMPTY and retried on its own schedule. Reconnecting for it would blank every CoinW book and
+            # pause every CoinW strategy, and cannot help: the other markets are fine.
             self._silent.pop(symbol, None)
-            self.logger().info(f"CoinW {pair}: {attempts - 1} re-subscribe(s) since {since} UTC brought no book frame; "
-                               f"reconnecting the socket.")
-            await ws.disconnect()
+            first = symbol not in self._dead
+            self._dead.add(symbol)
+            self._quarantined[symbol] = now + CONSTANTS.MARKET_DEAD_RETRY_S
+            if first:
+                self.logger().info(f"CoinW {pair}: {attempts - 1} re-subscribe(s) since {since} UTC brought no book "
+                                   f"frame; shown EMPTY and retried in {CONSTANTS.MARKET_DEAD_RETRY_S:.0f} s (the "
+                                   f"socket and every other market stay up).")
+            else:
+                self.logger().debug("CoinW %s: still no book frame since %s UTC; retrying in %.0f s",
+                                    pair, since, CONSTANTS.MARKET_DEAD_RETRY_S)
             return
         self._silent[symbol] = (attempts, silent_since)
-        if attempts == 1:
+        if attempts == 1 and symbol not in self._dead:
             self.logger().info(f"CoinW {pair}: {reason}; re-subscribing its market data (silent since {since} UTC).")
         else:
             self.logger().debug("CoinW %s: %s; re-subscribing its market data (silent since %s UTC, %d)",
@@ -519,6 +535,11 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         asyncio.ensure_future(self._resubscribe(
                             symbol, f"a sequence gap no snapshot healed within {CONSTANTS.BOOK_GAP_WAIT_S:.0f} s"))
                     elif now - book.last_frame > CONSTANTS.MARKET_SILENCE_S:
+                        due = self._quarantined.get(symbol)
+                        if due is not None:
+                            if due > now:
+                                continue  # the venue is not serving this market: it retries on its own schedule
+                            del self._quarantined[symbol]
                         book.last_frame = now
                         asyncio.ensure_future(self._resubscribe(
                             symbol, f"no book frame for {CONSTANTS.MARKET_SILENCE_S:.0f} s (its stream died)"))
@@ -599,6 +620,8 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         book.last_frame = time.monotonic()
         if self._silent:
             self._silent.pop(symbol, None)  # the market is streaming again: its re-subscribe count starts over
+        self._quarantined.pop(symbol, None)
+        self._dead.discard(symbol)
         try:
             if kind == CONSTANTS.WS_SNAPSHOT_CHANNEL:
                 self._on_snapshot(symbol, book, raw, output, full_seq=False)
