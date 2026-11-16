@@ -211,8 +211,11 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._silent: Dict[str, Tuple[int, float]] = {}
         # symbol -> monotonic time its next retry is due: the venue is not serving it, so it is left alone meanwhile
         self._quarantined: Dict[str, float] = {}
-        # markets whose current silence is already known (one INFO per episode, not one per retry); a frame clears it
+        # markets whose current silence is already known (one INFO per episode, not one per retry); continuous frames
+        # clear it
         self._dead: Set[str] = set()
+        # markets whose current episode already cost its one socket reconnect
+        self._escalated: Set[str] = set()
         self._stream_live = False
         self._backoff = web_utils.CoinwReconnectBackoff()
         # counters, logged with each re-subscribe / cross-check warning
@@ -446,18 +449,24 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         pair = self._symbol_to_pair_cache.get(symbol, symbol)
         since = time.strftime("%H:%M", time.gmtime(silent_since))
         if attempts >= CONSTANTS.RESUBSCRIBE_QUARANTINE_AFTER:
-            # One dead book never touches the socket: a market the venue is not serving at all (XDC_USDT 2026-11-16 —
-            # a fresh socket on two hosts ACKed its channels and pushed 0 frames while every other market streamed)
-            # is shown EMPTY and retried on its own schedule. Reconnecting for it would blank every CoinW book and
-            # pause every CoinW strategy, and cannot help: the other markets are fine.
+            # One market's topic can be wedged on this socket and only a new socket heals it (XDC_USDT 2026-11-16:
+            # a fresh socket streamed it at 160 frames / 25 s while the live one delivered none, and in-place
+            # re-subscribes changed nothing). So ONE socket reconnect per episode — never more — and then the market
+            # is shown EMPTY and retried every MARKET_DEAD_RETRY_S in place, so a dead market cannot churn the
+            # connection. An episode ends only when the market streams continuously again.
             self._silent.pop(symbol, None)
             first = symbol not in self._dead
             self._dead.add(symbol)
             self._quarantined[symbol] = now + CONSTANTS.MARKET_DEAD_RETRY_S
-            if first:
+            if symbol not in self._escalated:
+                self._escalated.add(symbol)
                 self.logger().info(f"CoinW {pair}: {attempts - 1} re-subscribe(s) since {since} UTC brought no book "
-                                   f"frame; shown EMPTY and retried in {CONSTANTS.MARKET_DEAD_RETRY_S:.0f} s (the "
-                                   f"socket and every other market stay up).")
+                                   f"frame; reconnecting the socket (once per episode) and retrying it in "
+                                   f"{CONSTANTS.MARKET_DEAD_RETRY_S:.0f} s.")
+                await ws.disconnect()
+            elif first:
+                self.logger().info(f"CoinW {pair}: still no book frame since {since} UTC; shown EMPTY and retried "
+                                   f"in {CONSTANTS.MARKET_DEAD_RETRY_S:.0f} s.")
             else:
                 self.logger().debug("CoinW %s: still no book frame since %s UTC; retrying in %.0f s",
                                     pair, since, CONSTANTS.MARKET_DEAD_RETRY_S)
@@ -617,11 +626,15 @@ class CoinwAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if symbol is None or symbol not in self._symbol_to_pair_cache:
             return
         book = self._book(symbol)
-        book.last_frame = time.monotonic()
-        if self._silent:
-            self._silent.pop(symbol, None)  # the market is streaming again: its re-subscribe count starts over
-        self._quarantined.pop(symbol, None)
-        self._dead.discard(symbol)
+        now = time.monotonic()
+        streaming = now - book.last_frame <= CONSTANTS.MARKET_SILENCE_S  # this frame came within the silence window
+        book.last_frame = now
+        if streaming and (self._silent or self._quarantined or self._dead):
+            # Streaming properly again, not one stray frame from a flapping market: the episode is over.
+            self._silent.pop(symbol, None)
+            self._quarantined.pop(symbol, None)
+            self._dead.discard(symbol)
+            self._escalated.discard(symbol)
         try:
             if kind == CONSTANTS.WS_SNAPSHOT_CHANNEL:
                 self._on_snapshot(symbol, book, raw, output, full_seq=False)
