@@ -31,6 +31,11 @@ from hummingbot.connector.utilities.evm_dex.evm_dex_tx import receipt_problem
 from hummingbot.connector.utilities.evm_dex.evm_dex_user_stream_data_source import EvmDexAPIUserStreamDataSource
 
 
+# check_network's second try, before it calls the connector disconnected (2026-11-20). NetworkIterator allows 5 s per check
+# and a node read is bounded by the chain's RPC_TIMEOUT_S (2 s), so the pair and this gap fit.
+CHECK_RETRY_S = 0.3
+
+
 class EvmDexTradingDisabled(Exception):
     """an order while the chain's TRADING_ENABLED is False (the kill switch)"""
 
@@ -322,17 +327,30 @@ class EvmDexExchange(ExchangePyBase):
 
     async def check_network(self) -> NetworkStatus:
         """a fresh poll answers by itself; so does an idle connector (no DEX pair to quote: nothing is polled, and the first
-        poll when a pair comes checks the node itself); otherwise one eth_blockNumber (the poll only runs after
-        start_network)"""
+        poll when a pair comes checks the node itself); otherwise eth_blockNumber, TRIED TWICE (2026-11-20): one transient
+        failure on that single call — a 429, a timeout, a reset — used to flip the connector NOT_CONNECTED, stop the feed
+        process and pause every strategy for ~13 s. Every one of the 61 stops from 11-11 to 11-19 was this path (0 children
+        died, 0 hung polls), most right after a missed slot had aged the book past STALE_S. The second try rides a transient
+        out; a real outage fails both, logs its last error once, and still stops the feed. Both tries and the gap fit
+        NetworkIterator's 5 s check timeout (2 x RPC_TIMEOUT_S + CHECK_RETRY_S)."""
         if self._idle or time.time() - self._orderbook_ds.last_ok < self.C.STALE_S:
             return NetworkStatus.CONNECTED
-        try:
-            ans = json.loads(await self._post(b'{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'))
-            return NetworkStatus.CONNECTED if "result" in ans else NetworkStatus.NOT_CONNECTED
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return NetworkStatus.NOT_CONNECTED
+        err = None
+        for attempt in (1, 2):
+            try:
+                ans = json.loads(await self._post(b'{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'))
+                if "result" in ans:
+                    return NetworkStatus.CONNECTED
+                err = ans.get("error") if isinstance(ans, dict) else ans
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                err = e
+            if attempt == 1:
+                await asyncio.sleep(CHECK_RETRY_S)
+        self.logger().warning(f"{self.name}: the node's head read failed twice ({self._mask(str(err))[:160]}); "
+                              f"stopping networking")
+        return NetworkStatus.NOT_CONNECTED
 
     # ---------------------------------------------------------------- P1's pools: the CAs quoted, symbol map, trading rules
     def bind_ca(self, trading_pair: str, ca: str):

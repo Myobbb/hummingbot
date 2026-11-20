@@ -2201,6 +2201,25 @@ cdef class PositionBalancerHandler:
                                 else:
                                     continue
 
+                            # A clean (sell-to-zero) must not be steered by a venue that holds only
+                            # dust: a CEX venue with no inventory — or a residue below its own step,
+                            # minimum lot or minimum notional — cannot take any order, so it must not
+                            # enter the price ranking at all. Left in, it wins on price and the
+                            # funding filter below logs "sell venue X -> Y — X cannot fund its own
+                            # minimum lot" every tick while the sweep runs on another venue
+                            # (MILADYCULT 2026-11-20: kucoin held ~4.7k tokens of dust, eth held the
+                            # position; the same line fired 2,357× on RATS). The test is
+                            # c_placeable_sell_amount — the same call the funding filter and
+                            # placement use, so the three cannot drift. Graded targets keep the old
+                            # path: there _min_order_usd is the bar and the insufficient-balance
+                            # cooldown is wanted.
+                            if self._sell_target_usd == 0.0:
+                                fund_bal = float(market_tuple.market.get_available_balance(
+                                    market_tuple.base_asset))
+                                if self.c_placeable_sell_amount(market_tuple, fund_bal,
+                                                                current_price) <= Decimal("0"):
+                                    continue
+
                             candidates.append((market_tuple, current_price))
 
                             if current_price > best_price:
