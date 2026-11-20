@@ -262,6 +262,13 @@ BALANCE_REFRESH_DEBOUNCE_S = 0.3
 # applied at the send, on every read and push, and undone when an order fails. Below this the two are the same
 # (rounding of size x price).
 OWN_LOCK_TOLERANCE = Decimal("1e-8")
+# An asset whose locked balance exceeds what HMB's own open orders hold: the venue is holding base for an order HMB
+# does not track (another process's, or one this process lost) or a stale lock. A clean whose position is held this
+# way cannot finish and leaves no other sign -- the position balancer's sell selector finds no venue to fund it and
+# stays silent. Said once per asset per episode ([CW-ALARM] untracked-lock), and the affected markets' open orders
+# are read once to name the order. An order whose orderNumber this process saw a push for is ours and lost: cancelled.
+# Any other is only reported -- the AM shares this key and CoinW's open orders carry no client id.
+UNTRACKED_LOCK_ALARM = True
 
 # --- First-live-run audit logging ----------------------------------------------------------------------------
 # Every line is tagged [CW-AUDIT]; scoped to what the docs could not settle. Off since 2026-10-16 (Pavel): the live

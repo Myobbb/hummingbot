@@ -140,6 +140,9 @@ class CoinwExchange(ExchangePyBase):
         self._missing_balance_reads: Dict[str, int] = {}
         # client ids this process gave up (failed, or struck as not found): a later push for one is ours, untracked
         self._given_up: Dict[str, float] = {}
+        # assets whose locked balance exceeds what HMB's own open orders hold: said once per episode, dropped when the
+        # lock clears (_note_untracked_lock). An order HMB does not track or a stale venue lock stalls a clean silently.
+        self._untracked_locks: Set[str] = set()
         # a 29001 answer slows the connector's own reads until this monotonic time
         self._rate_limited_until = 0.0
         self._last_rate_limit_alarm = 0.0
@@ -1306,6 +1309,67 @@ class CoinwExchange(ExchangePyBase):
         shortfall = self._own_locked(asset) - locked
         self._account_available_balances[asset] = (max(available - shortfall, Decimal("0"))
                                                    if shortfall > CONSTANTS.OWN_LOCK_TOLERANCE else available)
+        self._note_untracked_lock(asset, locked)
+
+    def _note_untracked_lock(self, asset: str, locked: Decimal) -> None:
+        """CoinW reports more locked than HMB's own open orders hold. Either an order HMB does not track (another
+        process's, or one this process lost) or a stale venue lock. A clean whose position is held this way cannot
+        finish and leaves no other sign: the position balancer's sell selector finds no venue to fund it and stays
+        silent. Said once per asset per episode; the episode ends when the lock is back within our own orders."""
+        own = self._own_locked(asset)
+        unexplained = locked - own
+        if unexplained <= CONSTANTS.OWN_LOCK_TOLERANCE:
+            self._untracked_locks.discard(asset)
+            return
+        if not CONSTANTS.UNTRACKED_LOCK_ALARM or asset in self._untracked_locks:
+            return
+        self._untracked_locks.add(asset)
+        pairs = [p for p in self._trading_pairs if split_hb_trading_pair(p)[0] == asset]
+        self._alarm("untracked-lock", asset=asset, locked=str(locked), own_orders_lock=str(own),
+                    unexplained=str(unexplained), markets=pairs or "none",
+                    action="the venue holds base for an order HMB does not track; reading its open orders")
+        if pairs:
+            safe_ensure_future(self._report_untracked_orders(pairs))
+
+    async def _report_untracked_orders(self, pairs: List[str]) -> None:
+        """Name every open order on these markets that HMB does not track. One whose orderNumber this process saw a
+        push for is ours and lost: cancelled. Any other is said, not touched -- the AM shares this key and CoinW's
+        open orders carry no client id, so an order we cannot attribute is not ours to cancel."""
+        try:
+            tracked = {str(o.exchange_order_id) for o in self._order_tracker.all_fillable_orders.values()
+                       if o.exchange_order_id is not None}
+            for pair in pairs:
+                try:
+                    symbol = await self.exchange_symbol_associated_to_pair(trading_pair=pair)
+                    rows = await self._private(CONSTANTS.CMD_OPEN_ORDERS, {"currencyPair": symbol})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._alarm("untracked-orders-unreadable", pair=pair, error=repr(e))
+                    continue
+                if not isinstance(rows, list):
+                    self._alarm("untracked-orders-unreadable", pair=pair, answer=self._raw(rows)[:120])
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    order_id = str(row.get("orderNumber") or "")
+                    if not order_id or order_id in tracked or order_id in self._orphan_ids:
+                        continue
+                    self._orphan_ids[order_id] = None
+                    fields = dict(order_id=order_id, pair=pair, side=row.get("type"), price=row.get("prize"),
+                                  total=row.get("total"), filled=row.get("success_count"),
+                                  created=row.get("date"))
+                    if order_id in self._pushed_order_ids:
+                        self._alarm("failed-order-alive", **fields, action="cancelling")
+                        safe_ensure_future(self._cancel_by_exchange_id(order_id))
+                    else:
+                        self._alarm("untracked-order-open", **fields,
+                                    action="not cancelled: not placed by this process")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._alarm("untracked-orders-scan-failed", error=repr(e))
 
     def _reapply_balances(self, *assets: str) -> None:
         """HMB's own orders changed (one sent, one failed): CoinW's last figures re-applied, so a new order's hold shows
