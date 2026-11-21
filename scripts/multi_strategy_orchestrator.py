@@ -1802,7 +1802,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 }
             except Exception:
                 continue
-        if state == self._pb_state_written:
+        # `or not exists`: a file removed out from under us (a log sweep, a manual rm) is
+        # republished on the next tick instead of staying missing until some side happens to
+        # change — the reader would otherwise fail open for as long as the state is stable.
+        if state == self._pb_state_written and os.path.exists(PB_STATE_PATH):
             return
         try:
             tmp = PB_STATE_PATH + ".tmp"
@@ -3047,6 +3050,72 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return True
         except Exception as e:
             self.logger().error(f"Error enabling hold for '{strategy_name}': {e}")
+            return False
+
+    def restore_hold_by_identifier(self, identifier: str) -> bool:
+        """Restore the hold-band guardrail without arming a correction (the AM's transfer restore)."""
+        strategy_name = self._resolve_identifier_to_name(identifier)
+        return self.restore_hold(strategy_name) if strategy_name else False
+
+    def restore_hold(self, strategy_name: str) -> bool:
+        """Undo `disable_hold`: saved target back, stale episode cleared, NO immediate arm.
+
+        `enable_hold` ends with `arm_hold_correction()`, i.e. it SKIPS the confirmation window —
+        right for an operator who has decided the asset is out of band NOW, wrong for the Asset
+        Manager's automatic restore when a transfer clears. The total that restore reads can be
+        understated by a transfer that has just started: POR/ARG 2026-11-21 16:29, a restore
+        0.12 s before a new withdrawal bought 6,645 ARG against a $231 deficit. So this variant
+        restores the state and lets the normal hysteresis decide — `clear_hold_correction()` so a
+        stale episode cannot resume, `refresh_hold_cache()` so the re-check is from live balances,
+        and any correction earns the same 15-cycle window as on a never-suppressed asset.
+        """
+        strategy_instance = self._get_strategy_instance(strategy_name)
+        if not strategy_instance:
+            return False
+        try:
+            strategy = strategy_instance.strategy
+            if not hasattr(strategy, '_hold_target_usd'):
+                return False
+            # Same source as enable_hold: the value disable_hold preserved in the instance config.
+            target = float(strategy_instance.config.get('hold_target_usd', 1100.0))
+            if target <= 0.0:
+                self.logger().warning(f"hold_target_usd is 0 for '{strategy_name}' — set it first with "
+                                      f"'control set hold_target {strategy_name} <usd>'")
+                return False
+            strategy._hold_target_usd = target
+            strategy_instance.config['hold_target_usd'] = target
+            if hasattr(strategy, '_hold_enabled'):
+                strategy._hold_enabled = True
+            self._persist_hold_config(strategy_name, {'hold_target_usd': target,
+                                                      'hold_target_enabled': True})
+
+            was_correcting = False
+            try:
+                was_correcting = bool(strategy.hold_correction_state[0])
+            except Exception:
+                pass
+            cleared_stale = False
+            if hasattr(strategy, 'clear_hold_correction'):
+                strategy.clear_hold_correction()
+                cleared_stale = was_correcting
+            if hasattr(strategy, 'refresh_hold_cache'):
+                strategy.refresh_hold_cache()
+
+            band = float(strategy._hold_band_usd)
+            total_usd = None
+            try:
+                total_usd = float(strategy.hold_correction_state[4])
+            except Exception:
+                pass
+            where = f"total ${total_usd:.0f}" if total_usd is not None else "total unknown"
+            self.logger().info(
+                f"Hold-band restored for '{strategy_name}': target={target:.0f} USD "
+                f"band=±{band:.0f} — re-check: {where}, "
+                f"{'stale correction CLEARED' if cleared_stale else 'no stale correction'}; "
+                f"no immediate arm — the confirmation window applies")
+            return True
+        except Exception as e:
+            self.logger().error(f"Error restoring hold for '{strategy_name}': {e}")
             return False
 
     def disable_hold_by_identifier(self, identifier: str) -> bool:

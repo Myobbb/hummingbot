@@ -40,6 +40,7 @@ class StrategyControlCommand:
             control set min_profitability <id> <value>  - Set minimum profitability percentage
             control enable_hold <id>                    - Enable hold-band guardrail (arb size capped near target)
             control disable_hold <id>                   - Disable hold-band guardrail
+            control restore_hold <id>                   - Restore the saved target after disable_hold, no immediate correction
             control set hold_target <id> <value>        - Set hold target USD (also enables guardrail)
             control set hold_band <id> <value>          - Set hold band half-width USD
             control set hold_escalation <id> <on|off>    - Auto-arm PB buy-in after stuck correction (default on; sell-off always escalates)
@@ -253,11 +254,20 @@ class StrategyControlCommand:
                 self.notify("The current strategy does not support hold-band controls.")
                 return
             safe_ensure_future(self._control_disable_hold(identifier), loop=self.ev_loop)
+        elif action == "restore_hold":
+            if identifier is None:
+                self.notify("Error: Please specify a strategy name or token symbol.")
+                self.notify("Usage: control restore_hold <strategy_name_or_token>")
+                return
+            if not hasattr(strategy, 'restore_hold_by_identifier'):
+                self.notify("The current strategy does not support hold-band controls.")
+                return
+            safe_ensure_future(self._control_restore_hold(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
             self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
                        "enable_buyin, disable_buyin, enable_selloff, disable_selloff, "
-                       "enable_hold, disable_hold, set, add_market, remove_market, create, clean")
+                       "enable_hold, disable_hold, restore_hold, set, add_market, remove_market, create, clean")
 
     async def _control_list(self  # type: HummingbotApplication
                             ):
@@ -346,6 +356,7 @@ class StrategyControlCommand:
             self.notify("  control set hold_band <name> <usd>                - Set hold band half-width USD")
             self.notify("  control enable_hold <name_or_token>               - Re-enable after disable_hold")
             self.notify("  control disable_hold <name_or_token>              - Disable hold-band guardrail")
+            self.notify("  control restore_hold <name_or_token>              - Restore the saved target, no immediate arm")
             self.notify("  control add_market <name_or_token> <exchange:PAIR> - Add market to strategy")
             self.notify("  control remove_market <name_or_token> <exchange:PAIR> - Remove market from strategy")
             self.notify("  control clean <name_or_token>                     - Set sell-off target to 0 and enable sell-off")
@@ -832,6 +843,22 @@ class StrategyControlCommand:
         except Exception as e:
             self.notify(f"Error enabling hold-band: {e}")
             self.logger().error(f"Error in control enable_hold: {e}", exc_info=True)
+
+    async def _control_restore_hold(self,  # type: HummingbotApplication
+                                    identifier: str):
+        """Restore the saved hold target after disable_hold — without arming a correction."""
+        try:
+            strategy = self.trading_core.strategy
+            success = strategy.restore_hold_by_identifier(identifier)
+            if success:
+                self.notify(f"\n✓ Hold-band guardrail restored for {identifier}")
+                self.notify("  Target restored; a correction must earn the normal confirmation window")
+            else:
+                self.notify(f"\n✗ Failed to restore hold-band for: {identifier}")
+                self.notify("  Check hold_target_usd is set (use 'control set hold_target <id> <usd>')")
+        except Exception as e:
+            self.notify(f"Error restoring hold-band: {e}")
+            self.logger().error(f"Error in control restore_hold: {e}", exc_info=True)
 
     async def _control_disable_hold(self,  # type: HummingbotApplication
                                     identifier: str):
