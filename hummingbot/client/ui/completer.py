@@ -12,6 +12,7 @@ from prompt_toolkit.document import Document
 
 from hummingbot.client import settings
 from hummingbot.client.command.connect_command import OPTIONS as CONNECT_OPTIONS
+from hummingbot.client.command.control_actions import CONTROL_ACTIONS
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.settings import (
     GATEWAY_CHAINS,
@@ -78,12 +79,7 @@ class HummingbotCompleter(Completer):
         self._controller_completer = self.get_available_controllers()
         self._rate_oracle_completer = WordCompleter(list(RATE_ORACLE_SOURCES.keys()), ignore_case=True)
         self._mqtt_completer = WordCompleter(["start", "stop", "restart"], ignore_case=True)
-        self._control_completer = WordCompleter([
-            "list", "pause", "resume", "pause_all", "resume_all", "remove", "add",
-            "enable_buyin", "disable_buyin", "enable_selloff", "disable_selloff",
-            "enable_hold", "disable_hold", "restore_hold", "set",
-            "add_market", "remove_market", "create", "clean"
-        ], ignore_case=True)
+        self._control_completer = WordCompleter(list(CONTROL_ACTIONS), ignore_case=True)
         self._control_set_completer = WordCompleter([
             "buyin", "selloff", "buy_spread", "sell_spread", "order_size", "refresh_interval",
             "min_profitability", "hold_target", "hold_band", "hold_escalation"

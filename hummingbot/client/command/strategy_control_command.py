@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 
+from hummingbot.client.command.control_actions import CONTROL_ACTIONS
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
 if TYPE_CHECKING:
@@ -265,9 +266,7 @@ class StrategyControlCommand:
             safe_ensure_future(self._control_restore_hold(identifier), loop=self.ev_loop)
         else:
             self.notify(f"Unknown action: {action}")
-            self.notify("Available actions: list, pause, resume, pause_all, resume_all, remove, add, "
-                       "enable_buyin, disable_buyin, enable_selloff, disable_selloff, "
-                       "enable_hold, disable_hold, restore_hold, set, add_market, remove_market, create, clean")
+            self.notify("Available actions: " + ", ".join(CONTROL_ACTIONS))
 
     async def _control_list(self  # type: HummingbotApplication
                             ):

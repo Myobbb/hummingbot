@@ -619,6 +619,41 @@ def create(name: str, primary_spec: str, secondary_spec: str,
         orchestrator.logger().error(f"Failed to schedule strategy creation: {e}")
         return False
 
+
+def _write_yaml_atomic(config_path: Path, data) -> None:
+    """Rewrite the strategies YAML atomically (tmp + os.replace).
+
+    Seven methods here do a read-modify-write of test_multi.yml — the hold config, min
+    profitability, add/remove market, create and merge. A plain `open(path, 'w')` truncates
+    first, so a kill inside the dump leaves the file unparseable and Hummingbot will not start;
+    a reader (the Asset Manager's grader, the watcher) can also see the half-written file. A
+    same-directory replace is atomic on POSIX, and the mode is carried over so the deploy's
+    permissions do not drift.
+    """
+    tmp = config_path.with_name(config_path.name + ".tmp")
+    try:
+        mode = config_path.stat().st_mode & 0o777
+    except OSError:
+        mode = None
+    try:
+        with open(tmp, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+    os.replace(tmp, config_path)
+
+
 @dataclass
 class V1StrategyInstance:
     """Wrapper for a V1 strategy instance with metadata"""
@@ -2897,8 +2932,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                                 break
                         
                         # Write back
-                        with open(config_path, 'w') as f:
-                            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+                        _write_yaml_atomic(config_path, yaml_data)
                     except Exception as e:
                         self.logger().warning(f"Failed to update config file: {e}")
                 
@@ -2929,8 +2963,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 if strat_config.get('name') == strategy_name:
                     strat_config.update(updates)
                     break
-            with open(config_path, 'w') as f:
-                yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+            _write_yaml_atomic(config_path, yaml_data)
         except Exception as e:
             self.logger().warning(f"Failed to persist hold config for '{strategy_name}': {e}")
 
@@ -3635,8 +3668,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                             )
 
         # Write updated config back to file
-        with open(config_path, 'w') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        _write_yaml_atomic(config_path, yaml_data)
 
     # ====================================================================================
     # MARKET MANIPULATION (add/remove markets from strategies at runtime)
@@ -4182,8 +4214,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 yaml_data['markets'][exchange].append(pair)
 
         # Write updated config back to file
-        with open(config_path, 'w') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        _write_yaml_atomic(config_path, yaml_data)
 
     # ====================================================================================
     # RUNTIME STRATEGY CREATION
@@ -4501,8 +4532,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         yaml_data['markets'][exchange].append(pair)
 
         # Write updated config back to file
-        with open(config_path, 'w') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        _write_yaml_atomic(config_path, yaml_data)
 
         self.logger().info(f"Strategy '{config.name}' added to config file")
 
@@ -4670,8 +4700,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                         self.logger().info(f"Removed exchange '{exchange}' from markets (no pairs remaining)")
 
         # Write updated config back to file
-        with open(config_path, 'w') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        _write_yaml_atomic(config_path, yaml_data)
 
     async def add_strategy_from_file(self, config_file: str) -> bool:
         """
@@ -4896,8 +4925,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         self.logger().info(f"Added strategy '{strategy_config['name']}' to config")
 
         # Write updated config back to file
-        with open(config_path, 'w') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False, indent=2)
+        _write_yaml_atomic(config_path, yaml_data)
 
         self.logger().info(f"Config file updated: {config_path}")
 
