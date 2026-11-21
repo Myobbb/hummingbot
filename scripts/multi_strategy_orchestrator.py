@@ -149,9 +149,11 @@ The strategy automatically shows available commands when it starts.
 
 """
 
+import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
@@ -189,6 +191,10 @@ HOLD_ESCALATION_CHECK_INTERVAL = 60.0        # sweep cadence; matches c_refresh_
 # Re-check cadence for an auto-remove held back by a non-drained position (see on_tick).
 AUTO_REMOVE_RECHECK_INTERVAL = 60.0
 HOLD_ESCALATION_SKIP_LOG_INTERVAL = 900.0    # re-state a "ripe but skipped" reason at most once per window
+# HMB's live position-balancer side state, published for external readers — the asset manager's
+# sell-off gate. Deliberately under logs/ (generated, never in the config tree, so a checkout
+# clean cannot matter). Same default as asset_manager's HMB_PB_STATE_PATH.
+PB_STATE_PATH = os.environ.get("HMB_PB_STATE_PATH", os.path.expanduser("~/hummingbot/logs/pb_state.json"))
 
 # P2-DEX (2026-10-14): a market spec is `exchange:PAIR`, or `exchange:PAIR:CA` for a swap venue's leg — the token P1 reported
 # the opportunity on (`bsc:MUBARAK-USDT:0x5c85…`). The pair stays P1's ticker + "-USDT", so the hold band, the balancer and
@@ -954,6 +960,9 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
 
         # Throttle clock for the stuck-hold-correction sweep (see _check_hold_escalations).
         self._last_hold_escalation_check: float = 0.0
+        # Last PB-state snapshot written to PB_STATE_PATH (None = nothing written yet); the file
+        # is rewritten only when the state actually changes.
+        self._pb_state_written: Optional[Dict[str, Dict[str, bool]]] = None
         # strategy_name -> last time we logged why a ripe correction was NOT escalated.
         self._hold_escalation_skip_logged: Dict[str, float] = {}
         # strategy_name -> timestamp of the last PB side we armed for it. This is the escalation
@@ -1761,6 +1770,49 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                     f"Hold-band escalation failed for '{label}': {e}", exc_info=True
                 )
 
+    def _write_pb_state(self) -> None:
+        """Publish each strategy's live position-balancer side state for external readers.
+
+        `pb.is_sell_enabled` / `pb.is_buy_enabled` are the properties `control list` already
+        reports — the truth after every arm, completion, clean, stop rule or operator command,
+        with no log parsing on the reader's side. Written to PB_STATE_PATH only when it changes,
+        from the same 60 s tick as the escalation sweep (so a side armed by that sweep is in the
+        same snapshot), atomically so a reader never sees a partial file.
+
+        WHO READS IT. The asset manager's low-balance gate: a refill while HMB is selling this
+        asset down is what moved a position onto the venue the position balancer sold next. Its
+        first attempt inferred "selling" from its own balances × price, which cannot tell an
+        asset being sold down (SKY 2026-11-21: $521 vs a $500 target, side active) from one
+        drifting up inside its band (LYX: $527, nothing selling). This is the actual state.
+
+        Restart: the file keeps its last content until the first tick rewrites it, so a reader
+        may see a stale `true` for up to one interval. Chosen deliberately — holding one refill
+        cycle is harmless, guessing "not selling" is not.
+        """
+        state: Dict[str, Dict[str, bool]] = {}
+        for instance in self.strategies:
+            try:
+                pb = getattr(instance.strategy, '_position_balancer', None)
+                if pb is None:
+                    continue
+                state[instance.name] = {
+                    "sell": bool(pb.is_sell_enabled),
+                    "buy": bool(pb.is_buy_enabled),
+                    "escalated": bool(getattr(instance.strategy, '_hold_escalated', False)),
+                }
+            except Exception:
+                continue
+        if state == self._pb_state_written:
+            return
+        try:
+            tmp = PB_STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"updated": time.time(), "strategies": state}, f)
+            os.replace(tmp, PB_STATE_PATH)
+            self._pb_state_written = state
+        except Exception as e:
+            self.logger().debug(f"Could not write position-balancer state to {PB_STATE_PATH}: {e}")
+
     def _is_strategy_ready(self, strategy_instance: V1StrategyInstance) -> bool:
         """
         Check if a strategy's specific connectors are ready.
@@ -1936,6 +1988,8 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         if current_timestamp - self._last_hold_escalation_check >= HOLD_ESCALATION_CHECK_INTERVAL:
             self._last_hold_escalation_check = current_timestamp
             self._check_hold_escalations(current_timestamp)
+            # After the sweep, so a side it just armed/stopped is in the same snapshot.
+            self._write_pb_state()
 
     async def on_stop(self):
         """
