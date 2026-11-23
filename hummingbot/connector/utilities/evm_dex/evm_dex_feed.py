@@ -707,6 +707,21 @@ class Feed:
         if ca not in self.quoter.cas:
             raise Refused(f"{ca} is not quoted")
         dec = int(self.quoter.cas[ca]["decimals"])
+        if side == "sell":
+            # NEVER sell more than the wallet holds (2026-11-23). A full-balance order leaves the PB as a float, and the
+            # nearest double sits a few wei ABOVE the exact balance: WOJAK's clean asked 2477104870.80057570 while the
+            # wallet held 2477104870.800575518433999851 (1.8e11 wei over), so every bundle reverted at the top of its
+            # block with TRANSFER_FROM_FAILED while the $10 diagnosis passed. Clamped to the last wallet read (exact wei),
+            # the same order sells the balance. A partial sell is untouched.
+            held = (self.wallet_read.get("balances") or {}).get(ca)
+            if held is None:
+                held = (self.wallet_read.get("balances") or {}).get(ca.lower())
+            if held is not None:
+                with localcontext() as ctx:
+                    ctx.prec = 60
+                    held_amount = Decimal(held) / (Decimal(10) ** dec)
+                if amount > held_amount:
+                    amount = held_amount
         book, record, hops = self._book_route(ca, side, self._trade_usd(ca, side, amount, price))
         last = self.quoter.last                                          # fresh: _book_route refuses a stale one
         book_block, book_at = last["block"], last["at"]                  # the block that book was priced at; its poll's send
