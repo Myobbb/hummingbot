@@ -393,10 +393,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
         # Orchestration mode (for multi-strategy orchestrator optimization)
         self._orchestrated_mode = orchestrated_mode
 
-        # Hold-band guardrail
+        # Hold-band guardrail. The target is configuration and always carries its real value;
+        # the orchestrator sets `_hold_enabled` from the YAML flag right after init_params
+        # (2026-11-24 — a disable must never rewrite the target, and target 0 belongs to
+        # clean's armed-at-zero state). This derivation is the fallback for other callers.
         self._hold_target_usd = hold_target_usd
-        # Orchestrator collapses hold_target_enabled into the target (0 when disabled),
-        # so a positive target here means enabled. clean() arms 0 explicitly at runtime.
         self._hold_enabled = hold_target_usd > 0.0
         self._hold_band_usd = hold_band_usd
         self._cached_total_base_qty = 0.0
@@ -2405,7 +2406,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
         sell_available_now = float(sell_market.c_get_available_balance(sell_market_tuple.base_asset))
         _hold_buy_amount  = amount
         _hold_sell_amount = amount
-        if self._hold_correction_active:
+        # The ENABLED check is the second gate (2026-11-24): disable_hold now keeps the configured
+        # target, and target 0 belongs to `clean` alone, so a latch that somehow survives a disable
+        # must never trim against a real target on a disabled band.
+        if self._hold_enabled and self._hold_correction_active:
             _hold_legs = self.c_hold_inflight_legs()
             if self._hold_correction_oversold:
                 _total_usd = (self._hold_settled_qty + _hold_legs.first) * self._cached_mid_price_usd

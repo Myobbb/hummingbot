@@ -1381,8 +1381,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             "position_balancer_refresh_interval": config.position_balancer_refresh_interval,
             "position_balancer_order_size_usd": config.position_balancer_order_size_usd,
             "orchestrated_mode": True,  # Enable orchestrated mode for coordinated readiness checking
-            # Hold-band guardrail: pass target > 0 only when enabled; 0.0 disables the feature
-            "hold_target_usd": config.hold_target_usd if config.hold_target_enabled else 0.0,
+            # Hold-band guardrail: the target is configuration and always passed as-is;
+            # `hold_target_enabled` is the only on/off switch (2026-11-24). Target 0 is
+            # `clean`'s armed-at-zero state, not "off" — a disable must never rewrite the target.
+            "hold_target_usd": config.hold_target_usd,
             "hold_band_usd": config.hold_band_usd,
         }
 
@@ -1394,6 +1396,13 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # This will call c_add_markets() which registers event listeners on shared connectors
         # CRITICAL: Set orchestrated_mode=True to skip redundant readiness checks
         strategy.init_params(**init_params)
+
+        # The YAML flag is the only hold-band on/off switch (2026-11-24): init_params derives
+        # `_hold_enabled` from `target > 0` for callers outside the orchestrator, so set it
+        # explicitly from the flag here. A disabled strategy therefore keeps its configured
+        # target while its guardrail stays off; target 0 is reserved for `clean`.
+        if hasattr(strategy, '_hold_enabled'):
+            strategy._hold_enabled = bool(config.hold_target_enabled)
 
         # Store strategy instance
         strategy_instance = V1StrategyInstance(
@@ -1524,8 +1533,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         for si in self.strategies:
             try:
                 strat = si.strategy
-                if (hasattr(strat, '_hold_target_usd') and
-                        float(strat._hold_target_usd) > 0.0 and
+                if (getattr(strat, '_hold_enabled', False) and
                         hasattr(strat, 'refresh_hold_cache')):
                     strat.refresh_hold_cache()
             except Exception as e:
@@ -1534,16 +1542,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         # Re-arm any `control clean` that was in flight when the process stopped.
         #
         # clean() holds four of its five effects in MEMORY only — sell target 0, sell-off enabled,
-        # the _pending_auto_remove entry, and the guardrail armed AT 0 — and the one thing it does
-        # persist is read back as the opposite of what it meant: it writes
-        # `hold_target_usd: 0.0` + `hold_target_enabled: true`, but the config->strategy hand-off
-        # collapses the pair ("hold_target_usd": config.hold_target_usd if
-        # config.hold_target_enabled else 0.0) and arbitrage.pyx then derives
-        # `_hold_enabled = hold_target_usd > 0.0`, i.e. False. So a restart mid-clean used to leave
-        # the asset with nothing selling it down, nothing scheduled to remove it, and — the part
-        # that can actually cost money — the GUARDRAIL OFF, which is what stops a routine arb from
-        # buying back the position the clean is trying to liquidate. Silently: no line said the
-        # clean had been dropped.
+        # the _pending_auto_remove entry, and the guardrail armed AT 0. The one thing it persists is
+        # `hold_target_usd: 0.0` + `hold_target_enabled: true`, and since 2026-11-24 that pair loads
+        # with the guardrail correctly ON at target 0 (the flag is the only on/off switch). But the
+        # sell-off, its target and the auto-remove entry are still gone, so a restart mid-clean
+        # would leave the asset with nothing selling it down and nothing scheduled to remove it —
+        # hence this block. Silently, before it existed: no line said the clean had been dropped.
         #
         # The fingerprint is `hold_target_enabled: true` AND `hold_target_usd == 0.0`, a pair only
         # clean() writes — set_hold_target(0) persists hold_target_enabled False explicitly "so
@@ -1672,6 +1676,10 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 active, oversold, since, target_usd, total_usd, escalated = strategy.hold_correction_state
             except AttributeError:
                 continue  # not an arb_l strategy — no hold-band guardrail
+            # The flag is the only on/off switch (2026-11-24): a disabled band never escalates,
+            # even if an episode latched before the disable somehow survived (defence in depth).
+            if not getattr(strategy, '_hold_enabled', False):
+                continue
             # Not correcting / clock not yet armed.
             if not active or since <= 0.0:
                 continue
@@ -3152,12 +3160,12 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             return False
 
     def disable_hold_by_identifier(self, identifier: str) -> bool:
-        """Disable hold-band guardrail for a strategy (sets target to 0, disabling the clamp)."""
+        """Disable hold-band guardrail for a strategy (flips the enable flag off; keeps the target)."""
         strategy_name = self._resolve_identifier_to_name(identifier)
         return self.disable_hold(strategy_name) if strategy_name else False
 
     def disable_hold(self, strategy_name: str) -> bool:
-        """Disable hold-band guardrail for a strategy by full name."""
+        """Disable hold-band guardrail for a strategy by full name. Keeps its configured target."""
         strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
             return False
@@ -3165,13 +3173,18 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             strategy = strategy_instance.strategy
             if not hasattr(strategy, '_hold_target_usd'):
                 return False
-            strategy._hold_target_usd = 0.0
-            if hasattr(strategy, '_hold_enabled'):
-                strategy._hold_enabled = False
-            if hasattr(strategy, '_hold_correction_active'):
-                strategy._hold_correction_active = False
-            if hasattr(strategy, '_hold_breach_count'):
-                strategy._hold_breach_count = 0
+            # The TARGET IS NOT TOUCHED (2026-11-24): it is configuration, kept in the instance
+            # config and the YAML, and restored verbatim by enable_hold/restore_hold. Zeroing it
+            # used to be how "off" was encoded, but target 0 is `clean`'s "armed at zero" — and
+            # the attempt to clear the running episode silently failed (hasattr on a non-public
+            # cdef), so a disable mid-correction turned clean's sell-to-zero into a real clean
+            # (TLOS 2026-11-24). `hold_target_enabled` is the only off switch from here on.
+            strategy._hold_enabled = False
+            # End any episode latched before the disable. clear_hold_correction routes through
+            # c_set_hold_correction, the only writer that keeps the flag, clock and latch in sync;
+            # the direct writes this replaces were dead (non-public cdef attributes).
+            if hasattr(strategy, 'clear_hold_correction'):
+                strategy.clear_hold_correction()
             self._persist_hold_config(strategy_name, {'hold_target_enabled': False})
             self.logger().info(f"Hold-band disabled for '{strategy_name}'")
             return True
@@ -3189,32 +3202,24 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
         strategy_instance = self._get_strategy_instance(strategy_name)
         if not strategy_instance:
             return False
+        if target_usd <= 0.0:
+            # Target 0 belongs to `clean` (armed at zero), not to the operator's off switch.
+            # Route to disable_hold so the configured target survives (Pavel 2026-11-24).
+            return self.disable_hold(strategy_name)
         try:
             strategy = strategy_instance.strategy
             if not hasattr(strategy, '_hold_target_usd'):
                 return False
             strategy._hold_target_usd = target_usd
-            if hasattr(strategy, '_hold_enabled'):
-                strategy._hold_enabled = target_usd > 0.0
-            # Mirror into instance config so enable_hold can restore it later
+            strategy._hold_enabled = True
+            # Mirror into instance config so enable_hold/restore_hold can restore it later
             strategy_instance.config['hold_target_usd'] = target_usd
-            persist = {'hold_target_usd': target_usd}
-            if target_usd > 0.0:
-                persist['hold_target_enabled'] = True
-            else:
-                # Explicitly mark disabled so YAML stays consistent on reload
-                persist['hold_target_enabled'] = False
-            self._persist_hold_config(strategy_name, persist)
+            self._persist_hold_config(strategy_name, {'hold_target_usd': target_usd,
+                                                      'hold_target_enabled': True})
             # Immediately refresh so _hold_correction_active reflects new target.
-            if target_usd > 0.0 and hasattr(strategy, 'refresh_hold_cache'):
+            if hasattr(strategy, 'refresh_hold_cache'):
                 strategy.refresh_hold_cache()
-            elif target_usd <= 0.0:
-                if hasattr(strategy, '_hold_correction_active'):
-                    strategy._hold_correction_active = False
-                if hasattr(strategy, '_hold_breach_count'):
-                    strategy._hold_breach_count = 0
-            enabled_str = "enabled" if target_usd > 0.0 else "disabled (target=0)"
-            self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' ({enabled_str})")
+            self.logger().info(f"Hold-band target set to {target_usd:.0f} USD for '{strategy_name}' (enabled)")
             return True
         except Exception as e:
             self.logger().error(f"Error setting hold target for '{strategy_name}': {e}")
@@ -5045,7 +5050,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
             hold_band = None
             try:
                 strat = strategy_instance.strategy
-                if hasattr(strat, '_hold_target_usd') and float(strat._hold_target_usd) > 0.0:
+                if getattr(strat, '_hold_enabled', False) and hasattr(strat, '_hold_target_usd'):
                     hold_target = float(strat._hold_target_usd)
                     hold_band = float(strat._hold_band_usd)
             except Exception:

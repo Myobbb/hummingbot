@@ -766,7 +766,7 @@ class Feed:
             raise Refused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
                     book_block=book_block, book_at=book_at, head=head, expected_out=expected_out,
-                    route={"record": record, "hops": hops, "side": side})
+                    route={"record": record, "hops": hops, "side": side, "amount_in": amount_in})
 
     def _head_now(self, last: dict) -> int:
         """the chain's head now from a poll's block: that block plus the blocks since (Pavel 2026-10-15: the send reads
@@ -1255,6 +1255,21 @@ class Feed:
                 self._log("info", f"{name}: its route was not tested ({why})")
                 return
             if verdict:
+                # A $10 route that passes does NOT mean the swap's own amount could have: the $10 probe's purpose is to tell a
+                # broken route from a working one, so it is small on purpose — but a size-dependent revert then reads "a lost
+                # race" and sends the next audit hunting a race that never existed (WOJAK 2026-11-23: the full balance was
+                # 1.8e11 wei over the wallet's, every bundle reverted TRANSFER_FROM_FAILED, and this line said "lost race").
+                # Test the swap's OWN input at the same block, minimum 1 (so a moved price can't revert it): if it fails there
+                # while $10 passes, the size is the problem — balance, allowance, or the pool's depth — not a race. Nothing is
+                # benched either way: the pool is not at fault.
+                exact = route.get("amount_in")
+                if exact and exact > amount:
+                    v_ex, why_ex = await self._simulate(route, len(path), exact, block)
+                    if v_ex is False:
+                        self._log("info", f"{name}: its route passes ${TEST_USD:g} but the swap's own amount {exact} reverts "
+                                          f"at the same block ({why_ex}): a size problem (its balance, its allowance or the "
+                                          f"pool's depth), not a race; nothing benched")
+                        return
                 self._log("info", f"{name}: its route passes a ${TEST_USD:g} simulation now (a lost race): nothing benched")
                 return
             n, reason = len(path), why
