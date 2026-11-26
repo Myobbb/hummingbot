@@ -117,6 +117,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         bint _hold_correction_oversold   # True = correcting up (was below lower band); False = correcting down
         int  _hold_breach_count          # consecutive 60s-cycle readings outside band before activation
         bint _hold_breach_oversold       # direction of the pending breach (resets the window on a flip)
+        bint _hold_fast_armed            # episode armed by a completed fill (2026-11-26): DEBUG until a 60 s cycle confirms it
         # Stuck-correction escalation (orchestrator-driven; see c_set_hold_correction)
         double _hold_correction_since    # timestamp the current correction episode began (0.0 = not correcting)
         public bint _hold_escalated      # True once this episode has been escalated to a PB buy-in/sell-off
@@ -182,7 +183,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
     cdef double c_hold_inflight_base(self)
     cdef pair[double, double] c_hold_inflight_legs(self)
     cdef double c_hold_unsettled_base(self)
-    cdef void c_refresh_hold_cache(self)
+    cdef void c_refresh_hold_cache(self, bint immediate)
     cdef void c_set_hold_correction(self, bint active, bint oversold)
 
 # Single optimized function for finding profitable orders (nogil compliant)

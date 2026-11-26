@@ -252,6 +252,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
         self._hold_breach_oversold = False
+        self._hold_fast_armed = False
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
@@ -409,6 +410,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
         self._hold_correction_oversold = False
         self._hold_breach_count = 0
         self._hold_breach_oversold = False
+        self._hold_fast_armed = False
         # Escalation state is in-memory only and starts clean on every (re)start by design.
         self._hold_correction_since = 0.0
         self._hold_escalated = False
@@ -932,7 +934,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 # re-evaluated the hysteresis. (2026-07-26: DEXE sat ~$550 over its $1550
                 # ceiling for 61 min unflagged, then placed a full-size unguarded arb pair on
                 # waking, because activation needs 2 cycles it had not been running.)
-                self.c_refresh_hold_cache()
+                self.c_refresh_hold_cache(False)
                 self._last_cleanup_timestamp = timestamp
            # Log conversion rates periodically if using oracle
             if (self._use_oracle_conversion_rate and 
@@ -1720,15 +1722,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return 0.0                                # fail-open: behave exactly as before
         return credit
 
-    cdef void c_refresh_hold_cache(self):
+    cdef void c_refresh_hold_cache(self, bint immediate):
         """
         Refresh cached total base quantity and mid-price used by the hold-band guardrail.
         Also updates the hysteresis flag (_hold_correction_active).
 
         Called from the periodic-maintenance block in c_tick (~60 s interval, handles
         activation — unconditional, independent of whether any orders are tracked) and from
-        c_handle_order_completion (only while _hold_correction_active, handles fast
-        deactivation). Never on the hot arb path.
+        c_handle_order_completion (unconditional since 2026-11-26; `immediate=True` arms the
+        correction at once when a COMPLETED fill left the position outside the band, bypassing
+        the confirmation cycles — the 60 s path keeps them for price drift). Never on the hot
+        arb path.
         Uses the same balance-aggregation pattern as PositionBalancerHandler so the two
         systems see a consistent view of holdings.
 
@@ -1745,6 +1749,7 @@ cdef class ArbitrageLStrategy(StrategyBase):
             double total_usd = 0.0
             double venue_bal = 0.0
             double hold_release_tol = 0.0   # how close to target counts as "converged"
+            bint was_fast = False           # the episode being deactivated was armed by a fill
             object mp, mt, key
             str base_asset
             set checked
@@ -1861,8 +1866,22 @@ cdef class ArbitrageLStrategy(StrategyBase):
                     # before activating — a duration filter that rides out withdrawals/in-transfer
                     # moments without needing to guess at balances. Any reading back inside the
                     # band resets the counter, as does a flip to the opposite edge (below).
-                    # Per-trade refresh never runs this branch (only fires when already active).
-                    if total_usd < hold_lower:
+                    #
+                    # FILL-DRIVEN ARM (Pavel 2026-11-26): a COMPLETED fill moved the position, so a total
+                    # outside the band is a known move, not drift — arm at once when the caller says
+                    # immediate (c_handle_order_completion). The 60 s cycle keeps the cycles above.
+                    # The fill is already credited (c_hold_unsettled, written before this call), so a
+                    # venue balance that has not pushed the fill yet cannot hide it.
+                    if immediate and (total_usd < hold_lower or total_usd > hold_upper):
+                        self._hold_breach_count = 0
+                        self.c_set_hold_correction(True, total_usd < hold_lower)
+                        self._hold_fast_armed = True
+                        self.logger().debug(
+                            f"Hold-band [{base_asset}]: correction armed on a fill "
+                            f"({'oversold' if total_usd < hold_lower else 'overbought'}) — "
+                            f"total ${total_usd:.0f} outside band [${hold_lower:.0f}, ${hold_upper:.0f}] "
+                            f"| avail-by-venue: {venue_detail}")
+                    elif total_usd < hold_lower:
                         # A flip to the other edge restarts the window — otherwise an asset
                         # oscillating across BOTH edges would accumulate count on mixed readings
                         # and then activate in whichever direction it happened to land on.
@@ -1922,6 +1941,18 @@ cdef class ArbitrageLStrategy(StrategyBase):
                                 f"[${hold_lower:.0f}, ${hold_upper:.0f}]")
                         self._hold_breach_count = 0
                 else:
+                    # A fill-armed episode that survives a full 60 s cycle is a real one-sided
+                    # position, not the temporary half of a two-legged arb — say it once at INFO.
+                    # Transient arms stay at DEBUG (armed on a fill, cleared below) so a normal
+                    # buy-then-sell arb near the band edge does not chatter in INFO.
+                    if (not immediate and self._hold_fast_armed
+                            and (total_usd < hold_lower or total_usd > hold_upper)):
+                        self.logger().info(
+                            f"Hold-band [{base_asset}]: fill-armed correction confirmed "
+                            f"({'oversold' if self._hold_correction_oversold else 'overbought'}) — "
+                            f"total ${total_usd:.0f} still outside band [${hold_lower:.0f}, ${hold_upper:.0f}] "
+                            f"| avail-by-venue: {venue_detail}")
+                        self._hold_fast_armed = False
                     # Direction flip. This branch was written for a CONFIG change: `set_hold_target`
                     # moves the band, so an active correction can legitimately land on the opposite
                     # side at once (was overbought at $1321 with target=1100; target raised to 2100
@@ -1992,11 +2023,17 @@ cdef class ArbitrageLStrategy(StrategyBase):
                               total_usd >= self._hold_target_usd - hold_release_tol) or
                              (not self._hold_correction_oversold and
                               total_usd <= self._hold_target_usd + hold_release_tol))):
+                        was_fast = self._hold_fast_armed
                         self.c_set_hold_correction(False, self._hold_correction_oversold)
-                        self.logger().info(
-                            f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
-                            f"reached target ${self._hold_target_usd:.0f} (±${hold_release_tol:.0f}) "
-                            f"| avail-by-venue: {venue_detail}")
+                        if was_fast:
+                            self.logger().debug(
+                                f"Hold-band [{base_asset}]: fill-armed correction cleared — total ${total_usd:.0f} "
+                                f"back at target ${self._hold_target_usd:.0f} (±${hold_release_tol:.0f})")
+                        else:
+                            self.logger().info(
+                                f"Hold-band [{base_asset}]: correction complete — total ${total_usd:.0f} "
+                                f"reached target ${self._hold_target_usd:.0f} (±${hold_release_tol:.0f}) "
+                                f"| avail-by-venue: {venue_detail}")
                     else:
                         # Still correcting, not below the floor, not deactivating. Any pending
                         # OVERSOLD-flip window is stale — the reading that started it did not
@@ -2042,10 +2079,12 @@ cdef class ArbitrageLStrategy(StrategyBase):
             if (not self._hold_correction_active) or (self._hold_correction_oversold != oversold):
                 self._hold_correction_since = self._current_timestamp
                 self._hold_escalated = False
+                self._hold_fast_armed = False   # a new episode starts unconfirmed (the arm sets it after this call)
             self._hold_correction_oversold = oversold
         else:
             self._hold_correction_since = 0.0
             self._hold_escalated = False
+            self._hold_fast_armed = False
         self._hold_correction_active = active
 
     @property
@@ -2067,9 +2106,10 @@ cdef class ArbitrageLStrategy(StrategyBase):
             self._hold_escalated,
         )
 
-    def refresh_hold_cache(self):
-        """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold."""
-        self.c_refresh_hold_cache()
+    def refresh_hold_cache(self, immediate=False):
+        """Python-callable wrapper for c_refresh_hold_cache. Called by orchestrator after enable_hold.
+        `immediate=True` arms at once when outside the band (the fill-driven path's semantics)."""
+        self.c_refresh_hold_cache(immediate)
 
     def arm_hold_correction(self):
         """Activate the correction NOW, skipping the confirmation window. Returns True if armed.
@@ -2370,8 +2410,9 @@ cdef class ArbitrageLStrategy(StrategyBase):
             return
 
         # ── Hold-band guardrail: one side while out of the band ──────────────────
-        # _hold_correction_active / _hold_correction_oversold are set exclusively by c_refresh_hold_cache (60s cycle +
-        # per-trade while active), through c_set_hold_correction; active only with the guardrail on, the price cache warm
+        # _hold_correction_active / _hold_correction_oversold are set exclusively by c_refresh_hold_cache (60s cycle,
+        # and per completion — fill-driven arming since 2026-11-26), through c_set_hold_correction; active only with the
+        # guardrail on, the price cache warm
         # and the total confirmed outside the band. Inactive: both legs run at full `amount`.
         # Active: ONLY the leg toward the target goes out (Pavel 2026-10-30: "when asset(strategy) is out of bounds, lets
         # only allow one side, depending if it's oversold or overbought"), never more than the gap, so a correction can't
@@ -2866,11 +2907,11 @@ cdef class ArbitrageLStrategy(StrategyBase):
                 except Exception:
                     pass
 
-            # Refresh hold-band cache after each trade only while a correction is in progress.
-            # The 60s cycle handles activation (band breach detection); this handles deactivation
-            # fast enough so back-to-back trades (position balancer, rapid arb) don't overshoot.
-            if self._hold_correction_active:
-                self.c_refresh_hold_cache()
+            # Refresh hold-band cache after EVERY trade (2026-11-26, Pavel: "earlier noticing that
+            # asset got out of bound"). The 60 s cycle keeps the confirmation cycles for price
+            # drift; this path arms at once when the completed fill left the total outside the
+            # band (immediate=True) and deactivates fast so back-to-back trades don't overshoot.
+            self.c_refresh_hold_cache(True)
 
         except Exception as e:
             self.logger().error(f"Error handling {order_type.lower()} order completion: {e}", exc_info=True)
