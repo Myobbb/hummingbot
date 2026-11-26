@@ -251,11 +251,18 @@ class EvmDexExchange(ExchangePyBase):
 
     @property
     def status_dict(self) -> Dict[str, bool]:
+        # An IDLE wallet (no strategy has supplied a CA: `_cas` empty) has nothing to quote and by design makes no calls
+        # and reads no wallet (2026-10-15: "stop polling when no dex strategy is left"). The two requirements that ride the
+        # feed can therefore never be met — and they must not hold back the orchestrator's all-connectors-ready gate
+        # (eth2 with NPC skipped behind a disabled Gate, 2026-11-26: `status` stuck on "Waiting for connectors to
+        # initialize", nothing started). Keyed on `_cas`, NOT `_bound_cas()`: a CA supplied but unpooled (missing P1
+        # payloads) is a FAILURE and must stay not-ready.
+        idle = not self._cas
         return {
             "symbols_mapping_initialized": self.trading_pair_symbol_map_ready(),
             "order_books_initialized": self.order_book_tracker.ready,
-            "account_balance": not self.is_trading_required or self._balances_read,
-            "trading_rule_initialized": len(self._trading_rules) > 0 if self.is_trading_required else True,
+            "account_balance": not self.is_trading_required or self._balances_read or idle,
+            "trading_rule_initialized": (len(self._trading_rules) > 0 if self.is_trading_required else True) or idle,
             "wallet_key": self._account is not None,          # a key that controls the wallet: no key, no trading
             "trading_enabled": self.trading_enabled,          # the kill switch (the spec's TRADING_ENABLED)
         }
