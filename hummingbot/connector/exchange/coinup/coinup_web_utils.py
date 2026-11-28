@@ -307,5 +307,9 @@ class CoinupReconnectBackoff:
 async def connected_ws_assistant(ws_url: str = CONSTANTS.WSS_URL) -> WSAssistant:
     connection = await CoinupSessions.shared().get_ws_connection()
     assistant = WSAssistant(connection=connection)
-    await assistant.connect(ws_url=ws_url, ping_timeout=CONSTANTS.WS_HEARTBEAT_SECONDS, message_timeout=None)
+    # Bounded: aiohttp's default total timeout is 5 min, and an unbounded handshake leaves the data source silent with
+    # an empty book (the tracker sees neither a connection nor an error). A timeout lets the base reconnect.
+    await asyncio.wait_for(
+        assistant.connect(ws_url=ws_url, ping_timeout=CONSTANTS.WS_HEARTBEAT_SECONDS, message_timeout=None),
+        timeout=25.0)
     return assistant

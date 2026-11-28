@@ -124,9 +124,14 @@ class CoinupAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().warning(message)
 
     async def _symbol_for_pair(self, trading_pair: str) -> str:
+        """The wire is derived from the pair (P1's rule: `symbol == base.lower() + "usdt"` on all 317 USDT markets,
+        with WIRE_OVERRIDES for the one USDC-quoted market). No REST at connect: the bulk market list is a PUBLIC route
+        behind Cloudflare's challenge, and blocking the socket's first subscribe on it left the book empty (LEO,
+        2026-11-28). The trading-rule map still comes from the REST when it can."""
         symbol = self._pair_to_symbol_cache.get(trading_pair)
         if symbol is None:
-            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            base, quote = trading_pair.split("-")
+            symbol = CONSTANTS.WIRE_OVERRIDES.get(base.upper()) or f"{base}{quote}".lower()
             self._pair_to_symbol_cache[trading_pair] = symbol
             self._symbol_to_pair_cache[symbol] = trading_pair
         return symbol
