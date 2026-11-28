@@ -47,7 +47,7 @@ import aiohttp
 from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import adr, dec_agg3, enc_agg3, word
 from hummingbot.connector.utilities.evm_dex.evm_dex_pool_list import PoolList
 from hummingbot.connector.utilities.evm_dex.evm_dex_quoter import REELECT_S, EvmDexQuoter
-from hummingbot.connector.utilities.evm_dex.evm_dex_swap import (build_prefix, build_swap, canon, family_of, legs,
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import (build_prefix, build_swap, canon, executor, family_of, legs,
                                                                 route_segments, router_pays)
 from hummingbot.connector.utilities.evm_dex.evm_dex_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
                                                                 parse_receipts, sign)
@@ -126,7 +126,21 @@ def approval_pairs(C, pool: dict) -> Dict[tuple, dict]:
     instead, so it needs nothing). A segment starts where the chosen candidate's family differs from the leg before it."""
     pairs, family = {}, family_of(C, pool)
     links = (pool.get("counter") or {}).get("hops") or []
-    link_families = [{family_of(C, c) for c in (link.get("pools") or [])} for link in links]
+    fam_ex = {}                                   # family -> its executor, resolved from a real record (pinned v2 `route:`)
+    for rec, fam in [(pool, family)] + [(c, family_of(C, c)) for link in links for c in (link.get("pools") or [])]:
+        if fam not in fam_ex:
+            ex = executor(C, dict(rec, family=fam))
+            if ex:
+                fam_ex[fam] = ex
+    link_families = []
+    for link in links:
+        cands = link.get("pools") or []
+        # PoolList.hop_path's own cut: a link keeps its family's candidates when it has any, and only falls back to another
+        # family when it has none — so a family's approval is only ever needed where that rule can pick it (WLFI's links
+        # carry a Curve candidate beside Uniswap's; the route can never use it, and 2026-11-28's first live approvals
+        # proved it by asking for one)
+        link_families.append({family} if any(family_of(C, c) == family for c in cands)
+                             else {family_of(C, c) for c in cands})
     for side in ("buy", "sell"):
         if side == "sell":
             legs_ = [(pool.get("ca") or pool["token0"], {family})]
@@ -137,7 +151,7 @@ def approval_pairs(C, pool: dict) -> Dict[tuple, dict]:
         prev = None
         for token, fams in legs_:
             for f in (fams if prev is None else {f for f in fams if prev - {f}}):
-                ex = C.EXECUTORS.get(f)
+                ex = fam_ex.get(f)
                 if ex and (prev is None or not router_pays(C, ex)):
                     pairs[(canon(C, token), ex["router"])] = ex
             prev = fams
@@ -1248,7 +1262,7 @@ class Feed:
         else:
             receipts = await self._leg_receipts(record, legs, receipt)
             present = [(r, leg) for r, leg in zip(receipts, legs) if r is not None]
-            parsed = parse_receipts([r for r, _ in present], self.wallet, [leg for _, leg in present])
+            parsed = parse_receipts(receipts, self.wallet, legs)      # a missing leg (never with an atomic bundle) reads 0
             index = receipt.get("transactionIndex")
             info = {"block": parsed["block"], "index": int(index, 16) if index else None,
                     "gas_used": sum(int(r["gasUsed"], 16) for r, _ in present)}
@@ -1267,13 +1281,17 @@ class Feed:
         receipts: List[Optional[dict]] = [None] * len(legs)
         receipts[-1] = last
         for k, leg in enumerate(legs[:-1]):
-            try:
-                receipts[k] = await self._status("eth_getTransactionReceipt", [leg.get("tx_hash")])
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._log("warning", f"{self.name}: {record.get('tx_hash')}: leg {k + 1}'s receipt could not be read "
-                                     f"({self._mask(e)})")
+            for attempt in range(3):                     # the same block as the last leg's: a node serving one has it,
+                try:                                     # but a lagging backend may need a moment
+                    receipts[k] = await self._status("eth_getTransactionReceipt", [leg.get("tx_hash")])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._log("warning", f"{self.name}: {record.get('tx_hash')}: leg {k + 1}'s receipt could not be read "
+                                         f"({self._mask(e)})")
+                if receipts[k] is not None:
+                    break
+                await asyncio.sleep(0.2)
             if receipts[k] is None:
                 self._log("error", f"{self.name}: {record.get('tx_hash')}: leg {k + 1} of {len(legs)} has no receipt "
                                    f"though the bundle's last landed: a partial bundle (the wallet may hold an "

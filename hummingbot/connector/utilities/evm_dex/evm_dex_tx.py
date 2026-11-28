@@ -219,13 +219,17 @@ def parse_receipt(receipt: Dict, wallet: str, token_in: str, token_out: str) -> 
     return out
 
 
-def parse_receipts(receipts: List[Dict], wallet: str, legs: List[Dict]) -> Dict:
+def parse_receipts(receipts: List[Optional[Dict]], wallet: str, legs: List[Dict]) -> Dict:
     """several transactions of one order (2026-11-28: a route that crosses executors sends one per executor, in one bundle)
     -> parse_receipt's dict for the order as a whole: what left the wallet of the FIRST leg's input and what reached it of
     the LAST leg's output, the gas of all of them, the last one's block. Each receipt is parsed with its own leg's tokens;
-    the intermediate tokens move in and out within the bundle's one block and are not reported."""
+    the intermediate tokens move in and out within the bundle's one block and are not reported. A leg whose receipt is
+    missing (never with an atomic bundle; said loudly by the caller) contributes nothing, so a missing first or last leg
+    reads as no input / no output and receipt_problem refuses the fill — never a fill from half an order."""
     out = {"status": "filled", "amount_in": 0, "amount_out": 0, "gas_fee_wei": 0, "block": 0}
     for k, (receipt, leg) in enumerate(zip(receipts, legs)):
+        if receipt is None:
+            continue
         one = parse_receipt(receipt, wallet, leg["token_in"], leg["token_out"])
         out["gas_fee_wei"] += one["gas_fee_wei"]
         out["block"] = max(out["block"], one["block"])
