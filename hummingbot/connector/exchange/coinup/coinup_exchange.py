@@ -153,6 +153,18 @@ class CoinupExchange(ExchangePyBase):
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return CoinupAPIUserStreamDataSource(self)
 
+    async def start_network(self):
+        """[CU-BOOT] instrumentation: the CoinUp connector built but its order book never started at boot
+        (2026-11-28, "waiting for connector to initialize"); these two lines show whether start_network runs and
+        whether the base's tracker start raises."""
+        self.logger().info("[CU-BOOT] start_network entered")
+        try:
+            await super().start_network()
+        except Exception as e:
+            self.logger().error(f"[CU-BOOT] start_network FAILED: {type(e).__name__}: {e}", exc_info=True)
+            raise
+        self.logger().info("[CU-BOOT] start_network done")
+
     # ------------------------------------------------------------------ public reads (shared caches)
 
     async def _symbols(self, max_age: float = 300.0) -> List[Dict[str, Any]]:

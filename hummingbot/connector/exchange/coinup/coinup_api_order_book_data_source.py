@@ -115,6 +115,7 @@ class CoinupAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._subscribed_at: Dict[str, float] = {}          # exchange symbol -> monotonic time of its (re)subscribe
         self._last_frame_at: float = 0.0                    # monotonic time of the socket's last frame
         self.stale_pushes: int = 0
+        self.logger().info("[CU-BOOT] data source constructed for %d pair(s)", len(trading_pairs))
 
     # ------------------------------------------------------------------ helpers
 
@@ -338,6 +339,7 @@ class CoinupAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                              "params": {"channel": self._channel(symbol), "cb_id": symbol}}))
 
     async def _subscribe_channels(self, ws: WSAssistant) -> None:
+        self.logger().info("[CU-BOOT] _subscribe_channels entered (%d pairs)", len(self._trading_pairs))
         try:
             symbols: List[str] = []
             for trading_pair in list(self._trading_pairs):
@@ -388,10 +390,18 @@ class CoinupAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await self._send(ws, "sub", symbol)
             self._subscribed_at[symbol] = time.monotonic()
 
+    async def listen_for_subscriptions(self) -> None:
+        """[CU-BOOT] the tracker starts THIS loop; entry here proves the tracker started the data source."""
+        self.logger().info("[CU-BOOT] listen_for_subscriptions entered")
+        await super().listen_for_subscriptions()
+
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         self._diff_output = output
         switch_task = safe_ensure_future(self._trading_switch_loop())
         silence_task = safe_ensure_future(self._silence_loop())
+        # ⚠️ The tracker starts `listen_for_subscriptions()` for the WS; this fork's `listen_for_order_book_diffs` is
+        # only a queue reader. The GroveX clone put the whole socket in the latter, so nothing ever connected (found
+        # live on LEO, 2026-11-28: "waiting for connector to initialize: coinup", zero data-source log lines).
         try:
             await super().listen_for_order_book_diffs(ev_loop, output)
         finally:
