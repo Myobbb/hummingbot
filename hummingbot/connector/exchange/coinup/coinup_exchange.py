@@ -71,6 +71,7 @@ class CoinupExchange(ExchangePyBase):
         self._trades_cache: Dict[str, List[Dict[str, Any]]] = {}   # symbol -> rows, per poll
         self._detail_cache: Dict[str, Dict[str, Any]] = {}          # client id -> order row, per poll
         self._audit_seen: Dict[str, None] = {}
+        self._status_log_at: float = 0.0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = CONSTANTS.REAL_TIME_BALANCE_UPDATE
 
@@ -152,6 +153,17 @@ class CoinupExchange(ExchangePyBase):
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return CoinupAPIUserStreamDataSource(self)
+
+    @property
+    def status_dict(self) -> Dict[str, bool]:
+        """[CU-BOOT] log which readiness key is false (once per 10 s while not ready): `ready` is the AND of
+        symbols_mapping_initialized, order_books_initialized, account_balance, trading_rule_initialized and
+        user_stream_initialized — the strategy pauses on any false key."""
+        status = super().status_dict
+        if not all(status.values()) and time.monotonic() - self._status_log_at > 10.0:
+            self._status_log_at = time.monotonic()
+            self.logger().info(f"[CU-BOOT] status not ready: {status}")
+        return status
 
     async def start_network(self):
         """[CU-BOOT] instrumentation: the CoinUp connector built but its order book never started at boot
