@@ -73,6 +73,8 @@ class CoinupExchange(ExchangePyBase):
         self._detail_cache: Dict[str, Dict[str, Any]] = {}          # client id -> order row, per poll
         self._audit_seen: Dict[str, None] = {}
         self._status_log_at: float = 0.0
+        # client id -> (symbol, side, volume, price, sent_ms) of a placement awaiting its answer
+        self._placing: Dict[str, Tuple[str, str, str, str, int]] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = CONSTANTS.REAL_TIME_BALANCE_UPDATE
 
@@ -329,6 +331,10 @@ class CoinupExchange(ExchangePyBase):
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                            order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        sent_at_ms = int(time.time() * 1e3)
+        signature = (symbol, trade_type.name, self._format_decimal(amount),
+                     self._format_decimal(price) if order_type is OrderType.LIMIT else "")
+        self._placing[order_id] = (*signature, sent_at_ms)
         body: Dict[str, Any] = {
             "symbol": symbol,
             "volume": self._format_decimal(amount),
@@ -338,8 +344,23 @@ class CoinupExchange(ExchangePyBase):
         }
         if order_type is OrderType.LIMIT:
             body["price"] = self._format_decimal(price)
-        response = await self._api_post(path_url=CONSTANTS.CREATE_ORDER_PATH, data=body,
-                                        is_auth_required=True, limit_id="coinup_place")
+        try:
+            response = await self._api_post(path_url=CONSTANTS.CREATE_ORDER_PATH, data=body,
+                                            is_auth_required=True, limit_id="coinup_place")
+        except Exception:
+            # A transport failure (timeout, a challenge that outlived the retries): the order may be LIVE at the venue.
+            # openOrders carries NO clientOrderId (probed 2026-11-28), so the lookup is by content — side, exact
+            # quantity, price and creation time — and only a SINGLE candidate is adopted, never while another
+            # identical placement of ours still awaits its answer (runbook §1.5). Retried: the venue's openOrders can
+            # lag a moment, and the first read itself can be challenged.
+            for _ in range(3):
+                found = await self._find_placement(order_id, signature, sent_at_ms)
+                if found is not None:
+                    return found
+                await asyncio.sleep(2.0)
+            raise
+        finally:
+            self._placing.pop(order_id, None)
         self._last_private_read = time.time()
         self._audit_once("placement", symbol=symbol, side=trade_type.name, type=order_type.name,
                          qty=body["volume"], price=body.get("price"), response=response)
@@ -354,10 +375,66 @@ class CoinupExchange(ExchangePyBase):
         timestamp = float(transact_time) / 1e3 if transact_time else time.time()
         return str(order_id_value), timestamp
 
+    async def _find_placement(self, order_id: str, signature: Tuple[str, str, str, str],
+                              sent_at_ms: int) -> Optional[Tuple[str, float]]:
+        """The unanswered placement's recovery: one openOrders read for the symbol, matching side, exact quantity,
+        price (LIMIT) and a creation time within PLACEMENT_LOOKUP_WINDOW_MS. Adopted only when exactly one row
+        matches AND no other identical placement of ours is still unconfirmed; otherwise None (the caller re-raises)."""
+        symbol, side, volume, price = signature
+        try:
+            rows = await self._api_get(path_url=CONSTANTS.OPEN_ORDERS_PATH,
+                                       params={"symbol": symbol, "limit": CONSTANTS.OPEN_ORDERS_LIMIT},
+                                       is_auth_required=True, limit_id="coinup_query")
+        except Exception:
+            return None
+        if not isinstance(rows, list) or not rows:
+            return None
+        candidates: List[Dict[str, Any]] = []
+        for row in rows:
+            if str(row.get("side") or "").upper() != side:
+                continue
+            try:
+                if Decimal(str(row.get("origQty") or "0")) != Decimal(volume):
+                    continue
+                if price and Decimal(str(row.get("price") or "0")) != Decimal(price):
+                    continue
+                created = int(row.get("time") or 0)
+            except Exception:
+                continue
+            if sent_at_ms and created and abs(created - sent_at_ms) > CONSTANTS.PLACEMENT_LOOKUP_WINDOW_MS:
+                continue
+            candidates.append(row)
+        if len(candidates) != 1:
+            return None
+        for other_id, other in self._placing.items():
+            if other_id != order_id and other[:4] == signature:
+                return None
+        row = candidates[0]
+        exchange_order_id = row.get("orderId")
+        if isinstance(exchange_order_id, list):
+            exchange_order_id = exchange_order_id[0] if exchange_order_id else None
+        if exchange_order_id in (None, ""):
+            return None
+        self.logger().info(f"[CU-ALARM] adopted the unanswered placement {order_id} as order {exchange_order_id} "
+                           f"(content match; openOrders carries no clientOrderId)")
+        return str(exchange_order_id), (float(row.get("time") or 0) / 1e3 or time.time())
+
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+        exchange_order_id = tracked_order.exchange_order_id
+        if not exchange_order_id:
+            price = self._format_decimal(tracked_order.price) if tracked_order.order_type is OrderType.LIMIT else ""
+            found = await self._find_placement(
+                tracked_order.client_order_id,
+                (symbol, tracked_order.trade_type.name, self._format_decimal(tracked_order.amount), price),
+                int(tracked_order.creation_timestamp * 1e3))
+            if found is None:
+                raise IOError(f"CoinUp placement {order_id} has no exchange id yet; it is not cancellable until "
+                              f"openOrders shows it")
+            exchange_order_id = found[0]
+            self.logger().info(f"[CU-ALARM] cancelling {order_id} via the recovered order {exchange_order_id}")
         response = await self._api_post(path_url=CONSTANTS.CANCEL_ORDER_PATH,
-                                        data={"orderId": str(tracked_order.exchange_order_id), "symbol": symbol},
+                                        data={"orderId": str(exchange_order_id), "symbol": symbol},
                                         is_auth_required=True, limit_id="coinup_cancel")
         self._last_private_read = time.time()
         self._audit_once("cancel", symbol=symbol, order=str(tracked_order.exchange_order_id), response=response)
@@ -390,6 +467,23 @@ class CoinupExchange(ExchangePyBase):
         return CONSTANTS.ORDER_STATE_MAP.get(key)
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        if not tracked_order.exchange_order_id:
+            # The placement got no answer (challenge/timeout) and the recovery had not found it yet. Keep trying the
+            # content lookup on every poll instead of querying with an id of None (the venue answers code 1 to that,
+            # 2026-11-28: hundreds of warnings and an uncancellable live order). Until it resolves, defer.
+            symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+            price = self._format_decimal(tracked_order.price) if tracked_order.order_type is OrderType.LIMIT else ""
+            found = await self._find_placement(
+                tracked_order.client_order_id,
+                (symbol, tracked_order.trade_type.name, self._format_decimal(tracked_order.amount), price),
+                int(tracked_order.creation_timestamp * 1e3))
+            if found is None:
+                raise CoinupOrderDeferred(tracked_order.client_order_id)
+            self.logger().info(f"[CU-ALARM] recovered the timed-out placement {tracked_order.client_order_id} "
+                               f"as order {found[0]}")
+            return OrderUpdate(trading_pair=tracked_order.trading_pair, update_timestamp=found[1],
+                               new_state=OrderState.OPEN, client_order_id=tracked_order.client_order_id,
+                               exchange_order_id=found[0])
         row = await self._order_row(tracked_order)
         if not row:
             raise CoinupOrderNotFound(tracked_order.client_order_id)
@@ -416,9 +510,24 @@ class CoinupExchange(ExchangePyBase):
                                       params={"symbol": symbol, "limit": CONSTANTS.TRADES_LIMIT},
                                       is_auth_required=True, limit_id="coinup_query")
         self._last_private_read = time.time()
-        rows = payload if isinstance(payload, list) else []
         if web_utils.is_error(payload):
             raise IOError(f"CoinUp's trade history refused: {payload}")
+        rows = payload if isinstance(payload, list) else []
+        if len(rows) >= CONSTANTS.TRADES_LIMIT:
+            # A full page means the window may hold more than we can see (the route has no cursor): re-read at the
+            # documented max before trusting it, and alarm if even that is full (runbook §1.5: fills never truncated).
+            self._alarm_once(f"trades-page-full:{symbol}",
+                             f"myTrades for {symbol} returned a full {CONSTANTS.TRADES_LIMIT}-row page; re-reading "
+                             f"{CONSTANTS.TRADES_LIMIT_MAX}")
+            payload = await self._api_get(path_url=CONSTANTS.MY_TRADES_PATH,
+                                          params={"symbol": symbol, "limit": CONSTANTS.TRADES_LIMIT_MAX},
+                                          is_auth_required=True, limit_id="coinup_query")
+            self._last_private_read = time.time()
+            rows = payload if isinstance(payload, list) else []
+            if len(rows) >= CONSTANTS.TRADES_LIMIT_MAX:
+                self._alarm_once(f"trades-capped:{symbol}",
+                                 f"myTrades for {symbol} is at the {CONSTANTS.TRADES_LIMIT_MAX}-row cap; older fills "
+                                 f"are not visible (no cursor on the route)")
         self._trades_cache[symbol] = rows
         return rows
 
@@ -524,17 +633,38 @@ class CoinupExchange(ExchangePyBase):
     async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception) -> None:
         """Only the venue's own not-found ({}) may strike an order; a Cloudflare challenge or a timeout must not (it
         would fail a live order after four polls)."""
+        if isinstance(error, CoinupOrderDeferred):
+            return
         if isinstance(error, CoinupOrderNotFound):
             await self._order_tracker.process_order_not_found(order.client_order_id)
             return
-        self.logger().warning(f"CoinUp status read for {order.client_order_id} failed; it stays tracked: {error}")
+        key = f"status-failed:{order.client_order_id}"
+        if key not in self._audit_seen:
+            self._audit_seen[key] = None
+            self.logger().warning(f"CoinUp status read for {order.client_order_id} failed; it stays tracked: {error}")
+        else:
+            self.logger().debug(f"CoinUp status read for {order.client_order_id} still failing: {error}")
 
     # ------------------------------------------------------------------ helpers
+
+    def _alarm_once(self, key: str, message: str) -> None:
+        if key not in self._audit_seen:
+            self._audit_seen[key] = None
+            self.logger().warning(f"[CU-ALARM] {message}")
 
     def _audit_once(self, key: str, **fields: Any) -> None:
         if CONSTANTS.LIVE_AUDIT_LOGGING and key not in self._audit_seen:
             self._audit_seen[key] = None
             self.logger().info(f"[CU-AUDIT] {key}: {fields}")
+
+
+class CoinupOrderDeferred(IOError):
+    """A tracked order whose placement answer never arrived and whose content lookup has not found it yet: the poll
+    must not query it (None id -> the venue's code 1) and must not strike it. Retried every poll."""
+
+    def __init__(self, client_order_id: str) -> None:
+        super().__init__(f"CoinUp order {client_order_id} awaits its exchange id")
+        self.client_order_id = client_order_id
 
 
 class CoinupOrderNotFound(IOError):

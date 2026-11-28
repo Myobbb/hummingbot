@@ -115,7 +115,7 @@ class CoinupAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._subscribed_at: Dict[str, float] = {}          # exchange symbol -> monotonic time of its (re)subscribe
         self._last_frame_at: float = 0.0                    # monotonic time of the socket's last frame
         self.stale_pushes: int = 0
-        self.logger().info("[CU-BOOT] data source constructed for %d pair(s)", len(trading_pairs))
+        self.logger().info("[CU-BOOT] data source constructed for %d pair(s)", len(trading_pairs or []))
 
     # ------------------------------------------------------------------ helpers
 
