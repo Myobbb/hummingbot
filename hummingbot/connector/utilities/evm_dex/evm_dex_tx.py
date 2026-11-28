@@ -219,6 +219,25 @@ def parse_receipt(receipt: Dict, wallet: str, token_in: str, token_out: str) -> 
     return out
 
 
+def parse_receipts(receipts: List[Dict], wallet: str, legs: List[Dict]) -> Dict:
+    """several transactions of one order (2026-11-28: a route that crosses executors sends one per executor, in one bundle)
+    -> parse_receipt's dict for the order as a whole: what left the wallet of the FIRST leg's input and what reached it of
+    the LAST leg's output, the gas of all of them, the last one's block. Each receipt is parsed with its own leg's tokens;
+    the intermediate tokens move in and out within the bundle's one block and are not reported."""
+    out = {"status": "filled", "amount_in": 0, "amount_out": 0, "gas_fee_wei": 0, "block": 0}
+    for k, (receipt, leg) in enumerate(zip(receipts, legs)):
+        one = parse_receipt(receipt, wallet, leg["token_in"], leg["token_out"])
+        out["gas_fee_wei"] += one["gas_fee_wei"]
+        out["block"] = max(out["block"], one["block"])
+        if one["status"] != "filled":
+            out["status"] = "reverted"
+        if k == 0:
+            out["amount_in"] = one["amount_in"]
+        if k == len(legs) - 1:
+            out["amount_out"] = one["amount_out"]
+    return out
+
+
 def receipt_problem(parsed: Dict) -> Optional[str]:
     """why a 'filled' receipt can't be booked as a fill, or None"""
     if parsed["status"] != "filled":

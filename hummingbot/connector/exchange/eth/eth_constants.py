@@ -124,11 +124,28 @@ WALLET2_LEDGER_PATH = os.path.expanduser("~/p2_dex/eth2/swaps.jsonl")
 WARN_EVERY_S = 30.0
 PRICE_SLACK = Decimal("1e-6")
 SWAP_SLIPPAGE = Decimal("0.01")   # 1%, as BSC (decision 8)
+# A mixed route (HOP_FALLBACK) hands the value from one executor's transaction to the next with an exact amount (a Curve or
+# v2 router pulls it from the wallet): the previous segment must deliver at least that, and the room it is given is this one,
+# not SWAP_SLIPPAGE. The room is a price-move allowance between the book's block and the execution block (a few bp on the
+# deep pools), not the order's protection (the last segment's minimum is that, SWAP_SLIPPAGE below the book): what the
+# previous segment delivers ABOVE this amount stays in the wallet as the intermediate token (dust), so it is kept tight.
+SEGMENT_SLIPPAGE = Decimal("0.002")
 
 # The chain's DEX families and the contracts the wallet may pay (decision 4: Uniswap's Universal Router + Permit2 only, to
 # start: 30 of the 33 pools the first 22 reported CAs trade on). Every address from Uniswap's own deployment lists, pinned
 # 2026-10-22 (wiki p2-dex-eth §executors) and proven by simulation on live pools before it is used
-ROUTED_KINDS = frozenset(("v2 router", "QuoterV2", "official quoter"))
+#
+# Curve (2026-11-28): a pool's own `get_dy` route, executed through Curve's Router NG v1.2 (docs.curve.finance §router-v2,
+# verified on Etherscan; up to 5 Curve pools in one call, swap_type 1 for both int128 stable and uint256 crypto pools, paid by
+# an ERC20 allowance to the router). The route kind is mapped to the family by KIND_FAMILIES; the router address is per family,
+# not per pool. A pool that holds the native coin is left out for now (its ETH sentinel would need a wrap step wherever the
+# route crosses a segment boundary): hmb_local_tools/p2_dex_research/p2_dex/curve_eth_2026-11-28 proves the ERC20 ones.
+# HOP_FALLBACK: when a link has no candidate in the CA pool's own family, another executable family's candidate may carry it
+# (one route may then need more than one executor: one transaction per executor, one atomic bundle). Off for BSC, whose
+# builder path is untested for multi-transaction bundles.
+ROUTED_KINDS = frozenset(("v2 router", "QuoterV2", "official quoter", "curve get_dy"))
+KIND_FAMILIES = {"curve get_dy": "curve"}
+HOP_FALLBACK = True
 FAMILY = {
     "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": "uniswap",   # Uniswap v2 Router02
     "0x61ffe014ba17989e743c5f6cb21bf9697530b21e": "uniswap",   # Uniswap v3 QuoterV2
@@ -140,5 +157,9 @@ EXECUTORS = {
                 "permit2": "0x000000000022d473030f116ddee9f6b43ac78ba3",         # Uniswap's Permit2
                 "types": ("v2", "v3", "uni-v4"),
                 "encoding": "ur-2.1"},                                            # minHopPriceX36 in the swap inputs
+    "curve": {"router": "0x45312ea0eff7e09c83cbe249fa1d7598c4c8cd4e",            # Curve Router NG v1.2 (router-v2)
+              "permit2": None,                                                    # an ERC20 allowance to the router
+              "types": ("curve",),
+              "encoding": "curve-router-ng"},
 }
 PINNED_V2_ROUTERS = ()            # none yet (ShibaSwap v1, Sushi v2: when the data asks, Pavel's call)

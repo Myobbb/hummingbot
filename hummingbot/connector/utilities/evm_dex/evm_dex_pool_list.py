@@ -26,15 +26,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from hummingbot.connector.utilities.evm_dex.evm_dex_swap import no_executor
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import family_of, no_executor
 
 STALE_AFTER_S = 6 * 3600.0     # a payload whose P1 stamp is older is counted as stale in summary() (information only)
 ADDRESS = re.compile(r"^0x[0-9a-f]{40}$")
-
-
-def family_of(C, pool: dict) -> str:
-    address = ((pool.get("route") or {}).get("address") or "").lower()
-    return C.FAMILY.get(address) or f"route:{address}"
 
 
 def check_payload(C, doc) -> Optional[str]:
@@ -57,11 +52,16 @@ def check_payload(C, doc) -> Optional[str]:
 
 
 def hop_path(C, pool: dict, family: str) -> Tuple[List[List[dict]], Optional[int]]:
-    """the counter's links to USDT in path order, each cut to the candidates of `family`
-    -> (path, the first link without one, or None). A USDT pool has no link."""
+    """the counter's links to USDT in path order, each cut to the candidates of `family` -> (path, the first link without
+    one, or None). A USDT pool has no link. Where the spec allows a hop fallback (HOP_FALLBACK, ETH since 2026-11-28) a link
+    with no candidate of the pool's own family takes every candidate it has: the route then crosses families, and P2 sends
+    one transaction per executor in one bundle (evm_dex_swap.build_swap)."""
     path, gap = [], None
     for i, link in enumerate((pool.get("counter") or {}).get("hops") or []):
-        same = [c for c in link.get("pools") or [] if family_of(C, c) == family]
+        candidates = link.get("pools") or []
+        same = [c for c in candidates if family_of(C, c) == family]
+        if not same and getattr(C, "HOP_FALLBACK", False):
+            same = list(candidates)
         path.append(same)
         if not same and gap is None:
             gap = i
@@ -128,10 +128,10 @@ class PoolList:
                     self.left_out[(p.get("pool"), ca)] = why
                     continue
                 path_, gap = hop_path(C, p, fam)
-                path_ = [[c for c in link if not no_executor(C, dict(c, family=fam))] for link in path_]   # executable hops only
+                path_ = [[c for c in link if not no_executor(C, dict(c, family=family_of(C, c)))] for link in path_]  # executable
                 gap = next((i for i, link in enumerate(path_) if not link), gap)
                 if gap is not None:
-                    self.left_out[(p.get("pool"), ca)] = f"no hop inside its family ({fam}) for link {gap + 1}"
+                    self.left_out[(p.get("pool"), ca)] = f"no hop P2 can execute for link {gap + 1}"
                     continue
                 tradable.append(dict(p, ca=ca, family=fam, hop_path=path_))
             sig = signature(tradable)

@@ -132,6 +132,11 @@ class EvmDexQuoter:
         for ca in self.cas:
             if not self.size_px.get(ca):
                 self.size_px[ca] = pool_list.cas[ca]["reference_usd"]
+        # a Curve pool is bought by exact INPUT of the counter from this poll on (P1's route kind; its exact-output buy raises
+        # in evm_dex_p1_quoter.quote_call, so the old way — learn it from a failed try — would fail the whole poll). Only
+        # Curve for now: another family's P1 `exact_output` refusal keeps the learn-from-a-failed-try path BSC already has
+        self.buy_in |= {p["pool"] for m in self.cas.values() for p in m["pools"]
+                        if (p.get("route") or {}).get("kind") == "curve get_dy"}
         self.links, self.paths = {}, {}
         for m in self.cas.values():
             for p in m["pools"]:
@@ -428,7 +433,8 @@ class EvmDexQuoter:
 
     # ---------------------------------------------------------------- prices, election, watch, books
     def _top_prices(self, quotes: dict, rates: dict) -> dict:
-        """(ca, side) -> {pool: (usd per CA, qty CA)} at $100, the counter converted along its family path, net of the trade's tax"""
+        """(ca, side) -> {pool: (usd per CA, qty CA, CA raw, counter raw)} at $100, the counter converted along its family
+        path, net of the trade's tax. The raw pair serves a book without a current ladder: its per-leg amounts (legs_raw)"""
         out = {}
         for (pool, ca, side), (p, s, amt, q) in quotes.items():
             if pool in self.benched:
@@ -439,8 +445,30 @@ class EvmDexQuoter:
                 continue
             amt_ca, amt_cn = (q, amt) if s == "buy_in" else (amt, q)
             qty = amt_ca / 10 ** self.cas[ca]["decimals"]
-            out.setdefault((ca, side), {})[pool] = (amt_cn / 10 ** p["counter"]["decimals"] * usd / qty * f, qty)
+            out.setdefault((ca, side), {})[pool] = (amt_cn / 10 ** p["counter"]["decimals"] * usd / qty * f, qty,
+                                                    amt_ca, amt_cn)
         return out
+
+    def _leg_amounts(self, rates: dict, p: dict, side: str, counter: str, rung: float, ca_raw: int,
+                     counter_raw: int) -> Optional[List[int]]:
+        """the route's raw amounts in execution order, len = legs + 1, from the book's own ladder point (the CA and counter
+        raws at this rung) and its hops' rates at the same size: what each leg of the swap is expected to see
+        (evm_dex_swap's exact segment inputs across executors)"""
+        links = self.paths.get((counter, p["family"])) or []
+        size = self._hop_size(rung)
+        rs = []
+        for k in links:
+            r = (rates.get(k) or {}).get(size, {}).get(side)
+            if not r or self.links[k]["fd"] is None or self.links[k]["td"] is None:
+                return None
+            rs.append((r[0], self.links[k]["fd"], self.links[k]["td"]))
+        # the walk is the hops' own direction, counter -> USDT (from -> to): raw_to = raw_from x rate x 10^(td - fd). A sell
+        # executes in that order (CA, counter, ... USDT); a buy in the reverse (USDT, ... counter, CA)
+        seq, amt = [ca_raw, counter_raw], counter_raw
+        for r, fd, td in rs:
+            amt = int(amt * r * 10 ** (td - fd))
+            seq.append(amt)
+        return seq if side == "sell" else list(reversed(seq))
 
     def _ladder_avgs(self, p: dict, ca: str, side: str, rates: dict, now: float) -> List[float]:
         """the average USD per CA (net of the trade's tax) at each rung this poll's ladder of the pool fills, up to the first
@@ -502,21 +530,31 @@ class EvmDexQuoter:
                 lad = self.ladders.get((pool, ca, side))
                 f = tax_factor(p, side)
                 levels, rungs, priced_at = None, 0, ()
+                points = {}
                 if lad and lad["pts"] and lad["t"] == now and f:
                     usd_at = {rung: self._usd(rates, self._canon(p["counter"]["token"]), p["family"], rung, side) for _, _, rung in lad["pts"]}
                     if all(usd_at.values()):
                         levels = [[px * f, qty] for px, qty in to_levels(lad["pts"], m["decimals"], p["counter"]["decimals"], usd_at, side)]
                         rungs, priced_at = len(lad["pts"]), tuple(sorted(usd_at))
+                        for a_raw, q_raw, rung in lad["pts"]:
+                            points[rung] = (a_raw, q_raw)            # every ladder point is (CA raw, counter raw)
                 if not levels and pool in top_px.get((ca, side), {}):
-                    px, qty = top_px[(ca, side)][pool]
+                    px, qty, ca_raw, cn_raw = top_px[(ca, side)][pool]
                     levels, rungs, priced_at = [[px, qty]], 1, (RUNGS_USD[0],)
+                    points[RUNGS_USD[0]] = (ca_raw, cn_raw)
                 if levels:
-                    # what a swap must run through: the CA pool's record and, per rung, the hop pools that priced it
+                    # what a swap must run through: the CA pool's record and, per rung, the hop pools that priced it; and the
+                    # route's expected raw amounts at each rung (evm_dex_swap's exact segment inputs across executors)
                     counter = self._canon(p["counter"]["token"])
                     routes = {rung: self._hop_route(rates, counter, p["family"], rung, side) for rung in priced_at}
+                    legs_raw = {}
+                    for rung, (ca_raw, cn_raw) in points.items():
+                        amts = self._leg_amounts(rates, p, side, counter, rung, ca_raw, cn_raw)
+                        if amts:
+                            legs_raw[rung] = amts
                     books.setdefault(ca, {})[side] = {"pool": pool, "levels": levels, "rungs": rungs,
                                                       "switched": (ca, side) in self.switched,
-                                                      "record": p, "routes": routes}
+                                                      "record": p, "routes": routes, "legs_raw": legs_raw}
         return books
 
     def _resize(self, top_px: dict, rates: dict):

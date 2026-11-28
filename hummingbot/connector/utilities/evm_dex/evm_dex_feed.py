@@ -44,12 +44,13 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import adr, word
+from hummingbot.connector.utilities.evm_dex.evm_dex_p1_quoter import adr, dec_agg3, enc_agg3, word
 from hummingbot.connector.utilities.evm_dex.evm_dex_pool_list import PoolList
 from hummingbot.connector.utilities.evm_dex.evm_dex_quoter import REELECT_S, EvmDexQuoter
-from hummingbot.connector.utilities.evm_dex.evm_dex_swap import build_prefix, build_swap, executor, legs
+from hummingbot.connector.utilities.evm_dex.evm_dex_swap import (build_prefix, build_swap, canon, family_of, legs,
+                                                                route_segments, router_pays)
 from hummingbot.connector.utilities.evm_dex.evm_dex_tx import (allowance_calls, approval_parties, build_tx, missing_approvals,
-                                                                parse_receipt, sign)
+                                                                parse_receipts, sign)
 
 FEED_NICE = 10            # the child's niceness: under CPU contention HMB's own process goes first
 FEED_RESTART_S = 5.0      # a child that ended on its own is started again no sooner than this after it ended
@@ -118,19 +119,50 @@ async def read_frame(reader: asyncio.StreamReader) -> Optional[tuple]:
 
 
 # ---------------------------------------------------------------- the wallet's reads (both sides: `connect <k>` reads in HMB)
+def approval_pairs(C, pool: dict) -> Dict[tuple, dict]:
+    """the ((token, router), executor) pairs a route through this pool may need the wallet to pay, both sides: the first leg's
+    token where a segment pays from the wallet — the route's own first (USDT to buy, the CA to sell) and a later one whose
+    executor pulls an exact amount (a Curve or v2 router; a Universal-Router segment after another one spends its own balance
+    instead, so it needs nothing). A segment starts where the chosen candidate's family differs from the leg before it."""
+    pairs, family = {}, family_of(C, pool)
+    links = (pool.get("counter") or {}).get("hops") or []
+    link_families = [{family_of(C, c) for c in (link.get("pools") or [])} for link in links]
+    for side in ("buy", "sell"):
+        if side == "sell":
+            legs_ = [(pool.get("ca") or pool["token0"], {family})]
+            legs_ += [(link["from"], fams) for link, fams in zip(links, link_families)]
+        else:
+            legs_ = [(link["to"], fams) for link, fams in zip(reversed(links), reversed(link_families))]
+            legs_ += [(pool["counter"]["token"], {family})]
+        prev = None
+        for token, fams in legs_:
+            for f in (fams if prev is None else {f for f in fams if prev - {f}}):
+                ex = C.EXECUTORS.get(f)
+                if ex and (prev is None or not router_pays(C, ex)):
+                    pairs[(canon(C, token), ex["router"])] = ex
+            prev = fams
+    return pairs
+
+
+def route_pays(C, record: dict, hops: List[dict], side: str) -> set:
+    """the (token, router) pairs one exact route needs the wallet's approval for: its first segment's input, and any later
+    segment's whose executor pulls from the wallet (a Universal-Router segment after another one spends its own balance)"""
+    path = legs(record, hops or [], side)
+    return {(canon(C, seg[0][1]), ex["router"]) for i, (ex, seg) in enumerate(route_segments(C, record, path))
+            if i == 0 or not router_pays(C, ex)}
+
+
 def wallet_plan(C, wallet: str, cas: List[str], pool_list) -> dict:
     """the wallet's reads: its native coin (gas), USDT and the traded CAs, and whether each token it may pay is approved for
-    each router its CAs' pools swap through (USDT for a buy, the CA for a sell)"""
+    each router its CAs' routes swap through (USDT for a buy, the CA for a sell, an intermediate token where a route crosses
+    executors: approval_pairs)"""
     tokens = [C.USDT] + [ca for ca in cas if ca != C.USDT]
     calls = [(C.MULTICALL3, bytes.fromhex(C.SEL_ETH_BALANCE) + adr(wallet))]
     calls += [(token, bytes.fromhex(C.SEL_BALANCE_OF) + adr(wallet)) for token in tokens]
     pairs = {}
     for ca in cas:
         for pool in pool_list.pools(ca):
-            ex = executor(C, pool)
-            if ex:
-                for token in (C.USDT, ca):
-                    pairs[(token, ex["router"])] = ex
+            pairs.update(approval_pairs(C, pool))
     approvals = [(key, ex, allowance_calls(wallet, key[0], ex)) for key, ex in pairs.items()]
     return {"tokens": tokens, "approvals": approvals, "calls": calls + [c for _, _, cs in approvals for c in cs]}
 
@@ -255,6 +287,8 @@ class Feed:
         self._diagnosing: set = set()                 # the routes being diagnosed (_diagnose: one at a time each)
         self._calls: Dict[str, dict] = {}             # a per-block chain's swaps out: each signed transaction's own call, by its
                                                       # hash, until its end (_send_tx -> _follow: a drop's _why_dropped)
+        self._mc3_code: Optional[str] = None          # Multicall3's runtime code, for a multi-call simulation (the wallet's
+                                                      # code for the call: _call_sequence)
         self.nonce: Optional[int] = None              # the wallet's next nonce (read before the first send, then counted)
         self.out: Dict[str, dict] = dict(init.get("follow") or {})   # order id -> a swap out (HMB's, after a restart too)
         self.ledger_path = init.get("ledger")         # the swap ledger: every transaction signed gets its line before it goes out
@@ -633,14 +667,18 @@ class Feed:
 
     def _side(self, ca: str, side: str, book: Optional[dict]) -> List[list]:
         """a book side's levels, or none while the wallet can't pay that side's input (USDT to buy, the CA to sell) into its
-        route's executor: a side on show is a side that can execute, so a strategy never fires a CEX leg against a DEX leg
-        that would be refused. A trading connector's only; the approvals are read with the balances"""
+        route's executors: a side on show is a side that can execute, so a strategy never fires a CEX leg against a DEX leg
+        that would be refused. A trading connector's only; the approvals are read with the balances. Since 2026-11-28 every
+        segment of every priced route must be covered (a mixed route's intermediate token too: approval_pairs)"""
         if not book:
             return []
         if self.gate:
-            ex = executor(self.C, book.get("record") or {})
-            if not ex or not self.approvals.get((self.C.USDT if side == "buy" else ca, ex["router"])):
-                return []
+            record = book.get("record") or {}
+            hops = [h for h in (book.get("routes") or {}).values() if h is not None] or [[]]
+            for route_hops in hops:
+                need = route_pays(self.C, record, route_hops, side)
+                if not need or not all(self.approvals.get(pair) for pair in need):
+                    return []
         return merged(book.get("levels", []))
 
     def _after_wallet_read(self):
@@ -757,16 +795,23 @@ class Feed:
                 expected_out = int((value * Decimal(10) ** self.C.USDT_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
         if amount_in <= 0 or min_out <= 0:
             raise Refused(f"{amount} at {price} is too small to swap protected (its input or minimum output is 0)")
+        # the route's own expected raw amounts at the rung it was priced at, scaled to this order: a mixed route needs them for
+        # the exact input of a segment that pulls from the wallet (evm_dex_swap._route_calls)
+        rung = next((r for r, route_hops in (book.get("routes") or {}).items() if route_hops is hops), None)
+        legs_raw = (book.get("legs_raw") or {}).get(rung)
+        if legs_raw:
+            scale = amount_in / legs_raw[0] if legs_raw[0] else 1.0
+            legs_raw = [int(raw * scale) for raw in legs_raw]
         try:
             deadline = (int(last["ts"] + self.C.BLOCK_S * (head - book_block + self._missed(last) + self.C.BUNDLE_BLOCKS))
                         if getattr(self.C, "DEADLINE_FROM_BLOCK", False) else None)  # ETH: the target block's own timestamp,
                                                                                      # its slot's start (+ the slots missed)
-            swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet, deadline)
+            swap = build_swap(self.C, record, hops, side, amount_in, min_out, self.wallet, deadline, legs_raw=legs_raw)
         except ValueError as e:
             raise Refused(str(e)) from None
         return dict(swap, side=side, ca=ca, ca_decimals=dec, amount_in=amount_in, min_out=min_out, pool=record["pool"],
-                    book_block=book_block, book_at=book_at, head=head, expected_out=expected_out,
-                    route={"record": record, "hops": hops, "side": side, "amount_in": amount_in})
+                    book_block=book_block, book_at=book_at, head=head, expected_out=expected_out, legs_raw=legs_raw,
+                    route={"record": record, "hops": hops, "side": side, "amount_in": amount_in, "legs_raw": legs_raw})
 
     def _head_now(self, last: dict) -> int:
         """the chain's head now from a poll's block: that block plus the blocks since (Pavel 2026-10-15: the send reads
@@ -808,13 +853,15 @@ class Feed:
                 raise Refused(f"no wallet key: connect {self.name} with {self.C.EXCHANGE_NAME}_private_key")
             swap = self._swap_for(p["ca"], p["side"], p["amount"], p["price"])
             route = swap["route"]
-            if not self.approvals.get((swap["token_in"], swap["executor"]["router"])):
-                raise Refused(f"{swap['token_in']} is not approved for {swap['executor']['router']}")
+            for token, router in route_pays(self.C, record=route["record"], hops=route["hops"], side=route["side"]):
+                # every segment that pulls from the wallet; a Universal-Router segment after another spends the previous
+                # executor's own balance, so it needs no approval (route_pays; a mixed route's first and exact segments)
+                if not self.approvals.get((token, router)):
+                    raise Refused(f"{token} is not approved for {router}")
             record.update({k: swap[k] for k in SWAP_KEYS}, trading_pair=p["trading_pair"])
             ledger = {"kind": "swap", "order_id": order_id, "pair": p["trading_pair"], "side": swap["side"],
                       "ca": swap["ca"].lower()}
-            await self._send_tx(record, swap["to"], swap["data"], swap["value"], self.C.SWAP_GAS_LIMIT, ledger,
-                                head=swap["head"], on_signed=signed)
+            await self._send_swap(record, swap, ledger, on_signed=signed)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -867,7 +914,7 @@ class Feed:
             on_signed()
         answers = record["builders"] = []             # each builder's answer as it comes (_send_bundle), for its line
         try:
-            await self._send_bundle(raw, last_block, answers)
+            await self._send_bundle([raw], last_block, answers)
         except SendRefused:
             self._calls.pop(tx_hash, None)
             for k in ("tx_hash", "nonce", "last_block", "sent"):
@@ -877,6 +924,59 @@ class Feed:
         except Exception as e:
             self._log("warning", f"{self.name}: {tx_hash}: no builder took it for sure ({self._mask(e)}); following it "
                                  f"on chain")
+
+    async def _send_swap(self, record: dict, swap: dict, ledger: dict, on_signed: Optional[Callable[[], None]] = None):
+        """the order's calls as consecutive nonces of ONE bundle (2026-11-28: a route that crosses executors sends one
+        transaction per executor, and a bundle lands whole or not at all): every call signed and every line of the swap ledger
+        written before anything goes out, then the bundle. `record` follows the LAST call (its hash, nonce and last block):
+        the earlier ones are in the same block, and _follow reads their receipts with it. Raises Refused when nothing went
+        out (a build or a ledger line failed, or every builder refused the bundle: the whole nonce range is free again)"""
+        calls = swap["calls"]
+        try:
+            self._lease_check()                      # leased: nothing to read either
+            if self.nonce is None:
+                self.nonce = int(await self._read("eth_getTransactionCount", [self.wallet, "pending"]), 16)
+            last_block = swap["head"] + self.C.BUNDLE_BLOCKS
+            nonce = self.nonce
+            self._lease_check()                      # F4: the lease read again right before the signatures
+            gas_price = self._gas_price()
+            txs = []
+            for k, call in enumerate(calls):
+                tx = build_tx(self.C, call["to"], call["data"], call["value"], nonce + k, self.C.SWAP_GAS_LIMIT, gas_price)
+                raw, tx_hash = sign(self.account, tx)
+                txs.append((tx, raw, tx_hash))
+            for k, (_, _, tx_hash) in enumerate(txs):
+                entry = dict(ledger, leg=[k + 1, len(txs)]) if len(txs) > 1 else ledger
+                self._ledger(nonce + k, tx_hash, entry)      # every leg's line before anything goes out
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise Refused(f"not sent: {self._mask(e)}") from None
+        self.nonce = nonce + len(txs)                # taken before the send: they may be out even if the call fails
+        record.update(tx_hash=txs[-1][2], nonce=nonce + len(txs) - 1, last_block=last_block, sent=time.time())
+        record["legs"] = [{"tx_hash": tx_hash, "nonce": nonce + k, "token_in": call["token_in"],
+                           "token_out": call["token_out"]} for k, ((_, _, tx_hash), call) in enumerate(zip(txs, calls))]
+        if getattr(self.C, "SENDER", "") == "bundle_per_block":
+            for tx, _, tx_hash in txs:
+                self._calls[tx_hash] = call_of(self.wallet, tx)    # each leg's own call, for a drop's simulation
+        if getattr(self.C, "CLOCK", "") == "slot" and self.quoter.last:
+            record["slot_at"] = self.quoter.last["ts"] + self.C.BLOCK_S * (last_block - self.quoter.last["block"]
+                                                                           + self._missed(self.quoter.last))
+        if on_signed is not None:
+            on_signed()
+        answers = record["builders"] = []
+        try:
+            await self._send_bundle([raw for _, raw, _ in txs], last_block, answers)
+        except SendRefused:
+            for _, _, tx_hash in txs:
+                self._calls.pop(tx_hash, None)
+            for k in ("tx_hash", "nonce", "last_block", "sent", "legs"):
+                record.pop(k, None)                  # nothing to follow
+            await self._nonce_lost()                 # the whole range is free again
+            raise
+        except Exception as e:
+            self._log("warning", f"{self.name}: {txs[-1][2]}: no builder took the bundle for sure ({self._mask(e)}); "
+                                 f"following it on chain")
 
     def _gas_price(self):
         """what a transaction bids: a legacy chain's gas price (BSC: its 0.05 gwei floor), or an EIP-1559 chain's (max fee, tip):
@@ -909,6 +1009,8 @@ class Feed:
         line = {"v": 1, "ts": int(time.time() * 1000), "nonce": int(nonce), "hash": tx_hash.lower(), "kind": entry["kind"],
                 "by": self.ledger_by}
         line.update((k, entry.get(k)) for k in LEDGER_FIELDS[entry["kind"]])
+        if entry.get("leg"):                          # a mixed route: this transaction's place in the order ([k, n]);
+            line["leg"] = entry["leg"]                # readers of contract v1 ignore it (P3's join uses it, 2026-11-28)
         if line["kind"] == "swap" and self.ledger_by != "strategy":
             line["order_id"] = None                   # only HMB's own swaps carry its id (BSC-…): the asset manager's Hummingbot tag
         data = (json.dumps(line, separators=(",", ":")) + "\n").encode()
@@ -1038,17 +1140,20 @@ class Feed:
             self._log("info", f"{self.name}: the wallet lease {req['id'][:8]} granted: block {head}, nonce {nonce}")
         return True
 
-    async def _send_bundle(self, raw: str, last_block: int, answers: Optional[list] = None):
-        """the transaction as a one-transaction bundle to every builder at once, valid up to `last_block`. Returns as soon as
-        one builder takes it. Raises SendRefused when every builder refused it (each answered with an error: nothing is
-        out), and RuntimeError when none took it and at least one never answered (unknown: it may be out).
+    async def _send_bundle(self, raws: List[str], last_block: int, answers: Optional[list] = None):
+        """the transactions (one per DEX executor of the order; one is the ordinary case) as ONE bundle to every builder at
+        once, in order, valid up to `last_block`: a bundle lands whole or not at all, so a mixed route's segments execute in
+        one block or none does. Returns as soon as one builder takes it. Raises SendRefused when every builder refused it
+        (each answered with an error: nothing is out), and RuntimeError when none took it and at least one never answered
+        (unknown: it may be out).
         A per-block chain (the spec's SENDER "bundle_per_block", ETH): the bundle names its one block (`blockNumber`, no builder
         takes a range there), and the builders in SIGNED_BUILDERS get an X-Flashbots-Signature by the feed's identity. ETH's
         builders accept a bundle before they simulate it, so "taken" means received there: the chain tells the outcome.
         `answers` gets each builder's answer as it comes (answer_of: the ms from here), also the ones after this call
         returned (P2-DEX finding 11, Pavel 2026-10-23); nothing waits on them"""
         per_block = getattr(self.C, "SENDER", "") == "bundle_per_block"
-        bundle = {"txs": [raw], "blockNumber": hex(last_block)} if per_block else {"txs": [raw], "maxBlockNumber": last_block}
+        bundle = ({"txs": list(raws), "blockNumber": hex(last_block)} if per_block
+                  else {"txs": list(raws), "maxBlockNumber": last_block})
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle", "params": [bundle]}).encode()
         signed = None
         if per_block and self.identity is not None:
@@ -1129,26 +1234,51 @@ class Feed:
             self._log("warning", text)
 
     async def _follow(self, order_id: str, record: dict, route: Optional[dict] = None):
-        """a swap out, to its end: HMB gets ("ended", its receipt parsed, where it landed), or None when it was not included
-        by its last block (its nonce is then read anew first, so HMB frees the turn with the nonce known). A swap that failed
-        is diagnosed after that (_diagnose; `route`: its book's, None for a swap out before a restart)"""
+        """a swap out, to its end: HMB gets ("ended", its transactions parsed, where it landed), or None when it was not
+        included by its last block (its nonce is then read anew first, so HMB frees the turn with the nonce known). A swap
+        that failed is diagnosed after that (_diagnose; `route`: its book's, None for a swap out before a restart). A mixed
+        route's earlier transactions are read too (they are in the last one's block) and the order is parsed as a whole."""
         receipt = await self._until_ended(record, f"{order_id} {record['tx_hash']}")
-        call = self._calls.pop(record.get("tx_hash"), None)
+        legs = record.get("legs") or [{"token_in": record["token_in"], "token_out": record["token_out"],
+                                       "tx_hash": record.get("tx_hash")}]
+        calls = [self._calls.pop(leg.get("tx_hash"), None) for leg in legs]
         parsed = info = None
         if receipt is None:
             await self._nonce_lost()
         else:
-            parsed = parse_receipt(receipt, self.wallet, record["token_in"], record["token_out"])
+            receipts = await self._leg_receipts(record, legs, receipt)
+            present = [(r, leg) for r, leg in zip(receipts, legs) if r is not None]
+            parsed = parse_receipts([r for r, _ in present], self.wallet, [leg for _, leg in present])
             index = receipt.get("transactionIndex")
-            info = {"block": int(receipt["blockNumber"], 16), "index": int(index, 16) if index else None,
-                    "gas_used": int(receipt["gasUsed"], 16)}
+            info = {"block": parsed["block"], "index": int(index, 16) if index else None,
+                    "gas_used": sum(int(r["gasUsed"], 16) for r, _ in present)}
         self.out.pop(order_id, None)
         self.send(("ended", order_id, parsed, info, list(record.get("builders") or [])))
         if receipt is None and getattr(self.C, "SENDER", "") == "bundle_per_block":
             self._spawn(self._dropped_block(order_id, record["last_block"]))     # after its end: nothing waits on it
-            self._spawn(self._why_dropped(order_id, call, record["last_block"]))  # the swap itself at its block, too
+            self._spawn(self._why_dropped(order_id, calls, record["last_block"]))  # the swap itself at its block, too
         if route is not None and (parsed is None or parsed["status"] == "reverted"):
             self._spawn(self._diagnose(order_id, route))                         # after its end too
+
+    async def _leg_receipts(self, record: dict, legs: List[dict], last: dict) -> List[Optional[dict]]:
+        """every transaction of the order in the block its last landed in (a bundle lands whole or not at all): the last
+        one's receipt is in hand, the earlier ones are read here once. A missing one is said loudly — a builder taking part
+        of a bundle is not what the format allows — and the order is parsed from the receipts that are there"""
+        receipts: List[Optional[dict]] = [None] * len(legs)
+        receipts[-1] = last
+        for k, leg in enumerate(legs[:-1]):
+            try:
+                receipts[k] = await self._status("eth_getTransactionReceipt", [leg.get("tx_hash")])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("warning", f"{self.name}: {record.get('tx_hash')}: leg {k + 1}'s receipt could not be read "
+                                     f"({self._mask(e)})")
+            if receipts[k] is None:
+                self._log("error", f"{self.name}: {record.get('tx_hash')}: leg {k + 1} of {len(legs)} has no receipt "
+                                   f"though the bundle's last landed: a partial bundle (the wallet may hold an "
+                                   f"intermediate token)")
+        return receipts
 
     async def _dropped_block(self, order_id: str, block: int):
         """who built the block a bundle missed, one INFO line after the drop's own (P2-DEX findings 10 and 11, Pavel 2026-10-23:
@@ -1165,29 +1295,35 @@ class Feed:
         except Exception as e:
             self._log("info", f"{self.name}: {order_id}: its block {block}'s builder not read ({self._mask(e)})")
 
-    async def _why_dropped(self, order_id: str, call: Optional[dict], block: int):
-        """a dropped swap's own transaction simulated at its one block (a per-block chain, ETH), from the state before it (the
-        top of its block: `block` - 1) and after it (`block`): one INFO line, its verdict (Pavel 2026-11-07, "build it": the
-        ETH drops "left out with nothing against us on our pools" were reverts (RAD's frozen pair) or unexplained (FOLD); the
-        route test of _diagnose is $10 at a minimum of 1, never the swap itself; P2-DEX #eth-unknown-drops):
+    async def _why_dropped(self, order_id: str, calls: Optional[List[Optional[dict]]], block: int):
+        """a dropped swap's own transactions simulated at its one block (a per-block chain, ETH), from the state before them
+        (the top of the block: `block` - 1) and after them (`block`): one INFO line, its verdict (Pavel 2026-11-07, "build
+        it": the ETH drops "left out with nothing against us on our pools" were reverts (RAD's frozen pair) or unexplained
+        (FOLD); the route test of _diagnose is $10 at a minimum of 1, never the swap itself; P2-DEX #eth-unknown-drops):
           - it fails at the top: it could not have landed (why: its limit, a balance or an allowance, its deadline, gas ...);
           - it passes at the top and fails after it: its block's own transactions took it past (lost within the block);
             unless that failure is its block's own time or base fee (BLOCK_OWN_FAILURES): then it fails at the top too;
           - it passes both: valid all through its block, the builder left it out (not a revert, not a race);
           - no clear answer from the node, or no call kept (a swap out before a restart): not simulated, and why.
-        Two eth_calls on the status node after the end went to HMB (nothing waits on them), with the signed transaction's own
-        call (call_of: its calldata, value, gas and fees), so nothing is rebuilt"""
+        Two eth_calls on the status node after the end went to HMB (nothing waits on them), with the signed transactions' own
+        calls (call_of: their calldata, value, gas and fees), so nothing is rebuilt. Since 2026-11-28 an order may be several
+        transactions (one per executor): they are simulated as one sequence, each seeing what the one before left"""
         name = f"{self.name}: {order_id}: the swap itself at its block {block}"
-        if call is None:
+        calls = [call for call in (calls or []) if call is not None]
+        if not calls:
             self._log("info", f"{name}: not simulated (no call kept: out before a restart)")
             return
-        top, why = await self._call_at(call, block - 1)
+
+        async def at(b):
+            return await (self._call_at(calls[0], b) if len(calls) == 1 else self._call_sequence(calls, b))
+
+        top, why = await at(block - 1)
         if top is None:
             self._log("info", f"{name}: not simulated ({why})")
         elif not top:
             self._log("info", f"{name}: fails at the top of it ({why}): it could not have landed")
         else:
-            end, why = await self._call_at(call, block)
+            end, why = await at(block)
             if end is None:
                 self._log("info", f"{name}: passes at the top of it; after it not simulated ({why})")
             elif not end and any(k in why for k in BLOCK_OWN_FAILURES):     # the block's header, not its transactions
@@ -1198,6 +1334,46 @@ class Feed:
                                   f"the block")
             else:
                 self._log("info", f"{name}: passes at the top of it and after it: valid all through, the builder left it out")
+
+    async def _call_sequence(self, calls: List[dict], block: int) -> Tuple[Optional[bool], str]:
+        """several transactions of one order as ONE eth_call (2026-11-28: a route that crosses executors has one call per
+        executor): the wallet's code is Multicall3's for the call and its aggregate3 executes them in order, each seeing the
+        state the one before left (as the bundle does within its block) -> (True, "") every leg passes, (False, why) the
+        first leg that fails, (None, why) no clear answer (a node's error, no state overrides, a timeout)"""
+        try:
+            if self._mc3_code is None:
+                self._mc3_code = await self._status("eth_getCode", [self.C.MULTICALL3, "latest"])
+            data = enc_agg3([(c["to"], bytes.fromhex(c["data"][2:])) for c in calls])
+            call = {"from": self.wallet, "to": self.wallet, "data": "0x" + data.hex(), "value": "0x0"}
+            ans = json.loads(await self._post_to(self.status_url, json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                 "params": [call, hex(block), {self.wallet: {"code": self._mc3_code}}]}).encode()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, self._mask(e)[:160]
+        if isinstance(ans, dict) and "result" in ans:
+            try:
+                results = dec_agg3(bytes.fromhex(ans["result"][2:]), len(calls))
+            except Exception as e:
+                return None, f"the sequence's answer did not decode: {e}"
+            for k, (ok, ret) in enumerate(results):
+                if not ok:
+                    reason = revert_reason(ret)
+                    reason = KNOWN_ERRORS.get(reason, reason)
+                    return False, (f"leg {k + 1} of {len(calls)} reverts: {reason}" if reason
+                                   else f"leg {k + 1} of {len(calls)} reverts (0x{ret[:4].hex()})")[:160]
+            return True, ""
+        err = ans.get("error") if isinstance(ans, dict) else ans
+        text = str(err.get("message") if isinstance(err, dict) else err)
+        low = text.lower()
+        if "revert" in low:
+            reason = revert_reason(err.get("data")) if isinstance(err, dict) else ""
+            reason = KNOWN_ERRORS.get(reason, reason)
+            return False, (f"{text}: {reason}" if reason and reason not in text else text)[:160]
+        if any(k in low for k in ("out of gas", "insufficient funds", "less than block base fee", "gas required exceeds")):
+            return False, self._mask(text)[:160]
+        return None, self._mask(text)[:160]
 
     async def _call_at(self, call: dict, block: int) -> Tuple[Optional[bool], str]:
         """`call` (call_of) as an eth_call at `block` on the status node -> (True, "") it passes; (False, why) it fails as the
@@ -1296,35 +1472,25 @@ class Feed:
         held = (read.get("balances") or {}).get(token)
         if not amount or held is None or held < amount or read.get("block") is None:
             return None, None, f"the wallet holds under ${TEST_USD:g} of its input"
-        ex = executor(self.C, route["record"])
-        if not ex or not self.approvals.get((token, ex["router"])):
+        path = legs(route["record"], route["hops"], route["side"])
+        ex = route_segments(self.C, route["record"], path)[0][0]      # the route's first executor (a mixed route's first)
+        if not ex or not self.approvals.get((canon(self.C, token), ex["router"])):
             return None, None, "its input is not approved for its executor"
         return amount, read["block"], ""
 
     async def _simulate(self, route: dict, n: int, amount: int, block: int) -> Tuple[Optional[bool], str]:
-        """the route's first `n` legs as one swap of `amount` at a minimum of 1 (build_prefix), simulated from the wallet:
-        an eth_call at `block` on SWAP_STATUS_URL, nothing signed -> (True, "") it passes, (False, why) it reverts, (None,
-        why) no clear answer (a node's error, a timeout)"""
+        """the route's first `n` legs as one swap of `amount` at a minimum of 1 (build_prefix), simulated from the wallet at
+        `block` on SWAP_STATUS_URL, nothing signed -> (True, "") it passes, (False, why) it reverts, (None, why) no clear
+        answer (a node's error, a timeout). A prefix that crosses executors is several transactions: one sequence
+        (_call_sequence)"""
         try:
-            swap = build_prefix(self.C, route["record"], route["hops"], route["side"], n, amount, self.wallet)
+            swap = build_prefix(self.C, route["record"], route["hops"], route["side"], n, amount, self.wallet,
+                                legs_raw=route.get("legs_raw"))
         except ValueError as e:
             return None, f"not built: {e}"
-        call = {"from": self.wallet, "to": swap["to"], "data": "0x" + swap["data"].hex(), "value": hex(swap["value"])}
-        try:
-            ans = json.loads(await self._post_to(self.status_url, json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [call, hex(block)]}).encode()))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            return None, self._mask(e)[:160]
-        if isinstance(ans, dict) and "result" in ans:
-            return True, ""
-        err = ans.get("error") if isinstance(ans, dict) else ans
-        text = str(err.get("message") if isinstance(err, dict) else err)
-        if "revert" not in text.lower():
-            return None, self._mask(text)[:160]
-        reason = revert_reason(err.get("data")) if isinstance(err, dict) else ""
-        return False, (f"{text}: {reason}" if reason and reason not in text else text)[:160]
+        calls = [{"from": self.wallet, "to": call["to"], "data": "0x" + call["data"].hex(), "value": hex(call["value"])}
+                 for call in swap["calls"]]
+        return await (self._call_at(calls[0], block) if len(calls) == 1 else self._call_sequence(calls, block))
 
     def _bench(self, pool: dict, test: dict, why: str, name: str):
         """the pool a failed route breaks at sits out (EvmDexQuoter.bench), its re-test the route up to it (`test`)"""
