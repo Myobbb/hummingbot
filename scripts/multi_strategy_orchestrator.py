@@ -3712,6 +3712,16 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
                 self.logger().error(f"Failed to initialize connector '{exchange}'")
                 return False
 
+            # A runtime-initialized connector had never had start_network() called (CoinUp, 2026-11-28: the
+            # connector was built but its order book tracker never started, so the strategy sat "waiting for
+            # connector to initialize"). Venues built at boot are started by the app; this path must start it too.
+            try:
+                await new_connector.start_network()
+                self.logger().info(f"[CU-BOOT] start_network called for runtime-initialized '{exchange}'")
+            except Exception as e:
+                self.logger().error(f"[CU-BOOT] start_network for '{exchange}' failed: {type(e).__name__}: {e}",
+                                    exc_info=True)
+
             # Add to strategy's connector pool
             self.connectors[exchange] = new_connector
 
