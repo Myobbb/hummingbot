@@ -5421,7 +5421,7 @@ class MultiStrategyOrchestrator(ScriptStrategyBase):
     # --- compact status helpers ---
     def _exchange_priority(self) -> Dict[str, int]:
         # Lower index means higher priority
-        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex', 'bsc', 'coinw', 'eth', 'coinstore', 'bsc2', 'eth2', 'blofin', 'bexc', 'nonkyc']
+        order = ['bybit', 'kucoin', 'gate_io', 'mexc', 'htx', 'bing_x', 'okx', 'bitget', 'coinex', 'xt', 'hotcoin', 'lbank', 'bitunix', 'grovex', 'poloniex', 'bsc', 'coinw', 'eth', 'coinstore', 'bsc2', 'eth2', 'blofin', 'bexc', 'nonkyc', 'coinup']
         return {name: idx for idx, name in enumerate(order)}
 
     def _display_exchange_name(self, name: str) -> str:
