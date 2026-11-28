@@ -18,6 +18,7 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase, TradeFeeSchema
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.utils.async_utils import safe_gather
 
@@ -153,6 +154,18 @@ class CoinupExchange(ExchangePyBase):
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return CoinupAPIUserStreamDataSource(self)
+
+    async def check_network(self) -> NetworkStatus:
+        """The network checker calls start_network() only once this returns CONNECTED (NetworkIterator's loop). The
+        base check hits the PUBLIC /sapi/v1/ping, which Cloudflare challenges from myserver, so the connector never
+        started (LEO, 2026-11-28: every status key false, no balance read, no book). The SIGNED account route passes
+        through the challenge window — use it as the health check."""
+        try:
+            await self._api_get(path_url=CONSTANTS.ACCOUNT_PATH, is_auth_required=True, limit_id="coinup_query")
+            self._last_private_read = time.time()
+            return NetworkStatus.CONNECTED
+        except Exception:
+            return NetworkStatus.NOT_CONNECTED
 
     @property
     def status_dict(self) -> Dict[str, bool]:
